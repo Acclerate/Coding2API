@@ -71,6 +71,10 @@ services:
       TRUST_PROXY: ${TRUST_PROXY:-false}
       # 上游端点白名单（逗号分隔）；改 CODEBUDDY_API_ENDPOINT 时必须同时含它
       CODEBUDDY_ALLOWED_ENDPOINTS: ${CODEBUDDY_ALLOWED_ENDPOINTS:-https://copilot.tencent.com,https://www.codebuddy.ai}
+      # CodeBuddy 国际版（独立渠道 codebuddy_intl）的端点与**独立**白名单。
+      # 刻意不含国内站主机：两站 Token 由不同网关签发，混发即泄露。
+      CODEBUDDY_INTL_API_ENDPOINT: ${CODEBUDDY_INTL_API_ENDPOINT:-https://www.codebuddy.ai}
+      CODEBUDDY_INTL_ALLOWED_ENDPOINTS: ${CODEBUDDY_INTL_ALLOWED_ENDPOINTS:-https://www.codebuddy.ai}
       # OpenCode Zen 免费层端点与其白名单（Zen 无凭证；白名单仅防误配）
       ZEN_API_ENDPOINT: ${ZEN_API_ENDPOINT:-https://opencode.ai}
       ZEN_ALLOWED_ENDPOINTS: ${ZEN_ALLOWED_ENDPOINTS:-https://opencode.ai}
@@ -93,6 +97,8 @@ services:
       CODEARTS_ALLOWED_ENDPOINTS: ${CODEARTS_ALLOWED_ENDPOINTS:-https://snap-access.cn-north-4.myhuaweicloud.com,https://sts.cn-north-4.myhuaweicloud.com,https://opengw.developer.huaweicloud.com,https://codearts.huaweicloud.com}
       # CodeBuddy 聊天最小间隔（秒）：同凭证顺序连发节流，0 关闭
       CODEBUDDY_CHAT_MIN_INTERVAL: ${CODEBUDDY_CHAT_MIN_INTERVAL:-5}
+      # CB 国际版聊天最小间隔（秒）：与国内站**各自独立**的节流器
+      CODEBUDDY_INTL_CHAT_MIN_INTERVAL: ${CODEBUDDY_INTL_CHAT_MIN_INTERVAL:-5}
       # Zen 聊天最小间隔（秒）：独立节流器，0（默认）关闭
       ZEN_CHAT_MIN_INTERVAL: ${ZEN_CHAT_MIN_INTERVAL:-0}
       # Kilo 聊天最小间隔（秒）：独立节流器，0（默认）关闭

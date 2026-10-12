@@ -7,7 +7,13 @@ import { useDialogFocus } from "../hooks/useDialogFocus";
 import { Button, Field, Input, Notice, Select, Tabs, Textarea } from "../ui";
 
 /** 支持「登录渠道账号」按钮 / JSON 导入下拉的渠道（有 poll 轨道或需人工导入的渠道）。 */
-const LOGIN_PROVIDERS: Provider[] = ["codebuddy", "trae", "qoder", "codearts"];
+const LOGIN_PROVIDERS: Provider[] = [
+  "codebuddy",
+  "codebuddy_intl",
+  "trae",
+  "qoder",
+  "codearts",
+];
 
 type TabValue = "login" | "import";
 

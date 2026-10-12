@@ -52,6 +52,7 @@ from .config import (
     Settings,
     load_settings,
     validate_codearts_endpoint_allowed,
+    validate_codebuddy_intl_endpoint_allowed,
     validate_endpoint_allowed,
     validate_kilo_endpoint_allowed,
     validate_qoder_endpoint_allowed,
@@ -78,6 +79,7 @@ from .provider.codearts import CodeArtsProvider
 from .provider.codearts.client import CodeArtsClient
 from .provider.codearts.oauth import CodeArtsOAuth
 from .provider.codebuddy.client import CodeBuddyClient, CodeBuddyProvider
+from .provider.codebuddy.intl import CodeBuddyIntlProvider
 from .provider.codebuddy.oauth import CodeBuddyOAuth
 from .provider.kilo.client import KiloClient, KiloProvider
 from .provider.proxy import parse_provider_proxies
@@ -135,6 +137,19 @@ def _codebuddy_endpoint(config: Settings) -> str:
     if not validate_endpoint_allowed(endpoint, config):
         raise ValueError(
             f"CODEBUDDY_API_ENDPOINT {endpoint!r} is not in CODEBUDDY_ALLOWED_ENDPOINTS")
+    return endpoint
+
+
+def _codebuddy_intl_endpoint(config: Settings) -> str:
+    """解析 CodeBuddy 国际站地址，并强制**独立**白名单校验。
+
+    与国内站的白名单刻意互不包含：两站 Token 由不同网关签发，混发即泄露。
+    """
+    endpoint = config.codebuddy_intl_api_endpoint.strip().rstrip("/")
+    if not validate_codebuddy_intl_endpoint_allowed(endpoint, config):
+        raise ValueError(
+            f"CODEBUDDY_INTL_API_ENDPOINT {endpoint!r} is not in "
+            "CODEBUDDY_INTL_ALLOWED_ENDPOINTS")
     return endpoint
 
 
@@ -295,6 +310,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     chat_pacer = Pacer(lambda: runtime.codebuddy_chat_min_interval,
                        lambda: runtime.codebuddy_chat_min_interval,
                        allow_concurrent=True)
+    # CB 国际站独立 pacer：另一套账号体系与另一条网关，共享会让两站请求排进
+    # 同一条队列（国内站请求排队时国际站请求白等满间隔，反之亦然）。
+    codebuddy_intl_pacer = Pacer(lambda: runtime.codebuddy_intl_chat_min_interval,
+                                 lambda: runtime.codebuddy_intl_chat_min_interval,
+                                 allow_concurrent=True)
     # TRAE/CB 共享同一 pacer 实例，但桶键带渠道前缀 + 凭证身份，彼此不互堵。
     # zen 单独一个 pacer：zen 是匿名免费层，没有账号级频率风控，共享只会让
     # zen 请求排在 CB/TRAE 之后空等满最小间隔（连发/并发时每个 +5s，实测）。
@@ -327,6 +347,12 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                 sanitize_markers=config.codebuddy_sanitize_channel_markers,
                 proxy=proxies.get("codebuddy"),
             ), pacer=chat_pacer),
+        "codebuddy_intl": CodeBuddyIntlProvider(
+            client=CodeBuddyClient(
+                endpoint=_codebuddy_intl_endpoint(config),
+                sanitize_markers=config.codebuddy_sanitize_channel_markers,
+                proxy=proxies.get("codebuddy_intl"),
+            ), pacer=codebuddy_intl_pacer),
         "zen": ZenProvider(
             client=ZenClient(host=_zen_endpoint(config),
                              version=config.zen_opencode_version,
@@ -655,15 +681,17 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
 def _upstream_auth(registry: dict, settings: Settings) -> dict:
     """返回支持 poll 轨道的 provider 的 OAuth 实现。
 
-    CodeBuddy 走设备码轮询；Qoder 走设备码 PKCE（区域由 openapi 主机推导）；
+    CodeBuddy 走设备码轮询（国内站与国际站各一套：endpoint 不同、登录域名不同）；
+    Qoder 走设备码 PKCE（区域由 openapi 主机推导）；
     CodeArts 走门户 ticket 轮询（token 响应直接给临时 AK/SK，无本地回调）。
     """
     flows: dict = {}
     proxies = parse_provider_proxies(settings.provider_proxies, KNOWN_PROVIDERS)
-    codebuddy = registry.get("codebuddy")
-    endpoint = getattr(getattr(codebuddy, "client", None), "endpoint", None)
-    if endpoint is not None:
-        flows["codebuddy"] = CodeBuddyOAuth(endpoint, proxy=proxies.get("codebuddy"))
+    for channel in ("codebuddy", "codebuddy_intl"):
+        provider = registry.get(channel)
+        endpoint = getattr(getattr(provider, "client", None), "endpoint", None)
+        if endpoint is not None:
+            flows[channel] = CodeBuddyOAuth(endpoint, proxy=proxies.get(channel))
     qoder = registry.get("qoder")
     host = getattr(getattr(qoder, "client", None), "host", None)
     if host is not None:

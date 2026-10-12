@@ -561,11 +561,15 @@ _MODEL_CACHE: dict[tuple[str, str], tuple[float, list[Model]]] = {}
 CODEBUDDY_IDE_VERSION = "1.42.0"
 
 
-def _pacer_key(credential: CodeBuddyCredential) -> str:
-    """聊天节流桶键：账号身份优先，取不到时退到 token（同账号多凭证共桶）。"""
+def _pacer_key(provider_id: str, credential: CodeBuddyCredential) -> str:
+    """聊天节流桶键：账号身份优先，取不到时退到 token（同账号多凭证共桶）。
+
+    provider_id 参与键构造：国内站与国际站是两条独立渠道，各自持有独立
+    节流器，但仍按渠道 id 分桶，避免将来共用 Pacer 时两站账号互相占位。
+    """
     from ...tasks.pacer import stable_key
 
-    return stable_key("codebuddy", credential.account_uid or credential.user_id
+    return stable_key(provider_id, credential.account_uid or credential.user_id
                       or credential.bearer_token)
 
 
@@ -610,7 +614,7 @@ class CodeBuddyProvider:
     async def stream_chat(self, credential_data: dict, payload: dict,
                           model: str) -> AsyncIterator[Event]:
         credential = CodeBuddyCredential.from_dict(credential_data)
-        key = _pacer_key(credential)
+        key = _pacer_key(self.id, credential)
         if self.pacer is not None:
             await self.pacer.wait_turn(key)
         try:

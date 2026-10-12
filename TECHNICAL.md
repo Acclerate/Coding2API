@@ -316,8 +316,8 @@ def health(q: Quota | None) -> HealthScore:
 **刻意不加**（推翻计划原拟噪音名，全部直连实测）：`*-volc`（`deepseek-v3-2-volc` 实测正常 chat）、`codewise-*` / `completion-*` / `*-lkeap`（两边清单零命中，无从核实）、`aquila` / `sagitta` / `seed-code-pro-0430`（TRAE 实测正常 chat，名字可疑但可用）。**黑名单热更与列表缓存（B4 修正）**：`MODEL_BLOCKLIST` 是热更项，但 `list_models` 的 `model_list_cache` 原存**过滤后**结果，改完最长要等 `MODEL_LIST_TTL_SECONDS`（300s）才反映到 Playground，且被滤模型在 TTL 内会从「上游失败兜底缓存」复活。现缓存只存**未过滤原始表**，过滤在每个出口现做（`_visible()`，命中缓存 / 成功拉取 / 失败兜底三条路径都过）；前端保存后显式 `invalidateQueries(["playground-models"])`，黑名单与列表两条缓存都立即生效，不依赖 TTL。
 **黑名单按归一后的对外写法匹配（2026-10）**：对外 id 改为归一键后，若只比对上游原代号，用户照列表里看到的**归一键 / 展示名**写黑名单就会失效。`_blocked` 改为对 `_block_names(model)` 四种写法取并集：原代号（`kmodel_latest`）、原代号归一键（兜底/哨兵条目的对外 id，`kilo-auto/free` → `kilo-auto`）、展示名（`Kimi K3`）、展示名归一键（正常条目对外 id，`kimi-k3`）。保留原代号是因为默认规则带下划线（`custom_model_*` / `browser_use_*`），归一键把下划线换成连字符后不命中，只有原代号能匹配；清洗后退化为空的名字不参与匹配（否则 `*` 会命中空串）。**按凭证加载（Q41）**：`list_models` 先用 `credential_providers()` 求「当前有可用凭证」的渠道集合（`candidates(selectable_only=True)`：未暂停、未硬禁用；冷却中的仍算有凭证，避免限流时列表闪没），循环里 `provider_id not in connected` 直接 `continue`——**没凭证的渠道不读缓存、不拉上游、不展示**。此前无凭证也会 `list_models({})`（CB/TRAE 回退静态表、zen 匿名拉取），只接部分渠道时列表会出现打不通的幽灵模型；启动预热也不再对无凭证渠道白打上游。zen 自带虚拟凭证，不受影响。**失败也进 TTL（负缓存）**：`model_list_fetched_at` 记**上次尝试**时间（成功或失败都刷新），TTL（300s）内不再打上游——有缓存用缓存，没缓存跳过该渠道。此前只在成功时记时间戳，上游一次抖动（尤其 zen 探活十几秒）会让其后**每次** `/v1/models` 都重跑拉取，把列表请求打成一串超时。
 **HTTP 出口 stale-while-revalidate（2026-10-04）**：TTL 到期后，`GET /v1/models` 与 `GET /api/playground/models` 走 `serve_models`：**有缓存直接回旧列表**，过期渠道丢后台（`_schedule_refresh`）异步刷新。此前 TTL 一过出口同步串行重拉全部渠道（实测合计 30–31s，zen 探活占 23s），Playground 每次打开都卡「载入模型中…」。两条纪律：① **某渠道一条缓存都没有时才同步等它**（冷启动无快照 / 新接入渠道），否则列表会缺一条渠道；② 后台刷新收敛在 `services.model_refresh_tasks` / `pending_model_refreshes`，`model_refreshing` 去重（同渠道不在途才排），`lifespan` 关闭时逐个 `cancel()` + `await`，不把 in-flight 上游请求带出事件循环。代价：列表最多滞后一个 TTL。后台预热（`_warm_model_list`）与兜底循环（每 `MODEL_CATALOG_MINUTES`）仍走同步 `list_models`，保证纯 API 部署也真刷新。**逐渠道增量 publish（2026-10-01）**：别名表原先在 `list_models` **末尾**统一 `clear()+update()`，被最慢的渠道拖着——zen 的 `fetch_models` 逐个免费模型真发探活（实测 12–15s），期间别名表为空，`executor._narrow_providers` 拿不到归属就按「全部渠道」放行，扁平名请求白打不认该模型的上游（实测 CodeBuddy 回 `11102 service info not found`、TRAE 回 `4001`，各留下 (凭证,模型) 负缓存与 `invalid_request` 统计）。现每拉完一条渠道就 `publish_aliases()` 一次（从 `model_list_cache` 重建 + 就地更新，executor 闭包引用同一 dict），不再等最慢那条；合并逻辑收敛到 `merged_entries()`，缓存兜底 / TTL 复用 / 落盘恢复三条路径共用。**落盘快照（2026-10-01，`src/api/model_catalog.py`）**：进程内缓存重启即丢，代价两处——启动到预热跑完之间别名表为空（上面那个扇出），以及某渠道拉取失败时连兜底都没有、模型整体消失。故每次成功拉取后把**未过滤原始表**原子写进 `DATA_DIR/model_catalog.json`（tmp + `os.replace`，格式 `{"version":1,"providers":{pid:{"saved_at":…,"models":[…]}}}`，序列化字段取 `dataclasses.fields(Model)`，新增字段自动带上、未知键忽略）。
-启动时 `main._restore_model_list` **同步**读回并立即 publish 别名表（`restore_model_catalog`，零上游请求、异常只记日志），预热退化为纯后台刷新；快照 `saved_at` 随表交回、折进 `model_list_fetched_at`，故预热（TTL 门禁）不会重拉刚恢复的表——kilo 实测一次 10–22s、zen 探活 12–15s。三条纪律：① 落盘/读回一律宽容（损坏、版本不符、字段缺失、记录非 dict 只丢该渠道，`saved_at` 超 7 天整条丢弃）；② 存原始表不过滤（黑名单热更立即生效）；③ 恢复只覆盖「已注册且当前有可用凭证」的渠道——用户暂停的渠道不因快照复活。**展示顺序（CB / TR 优先）**：合并后按 `_sort_key(entry)` 排序——渠道权重 `_PROVIDER_RANK`（codebuddy 0 → trae 1 → qoder 2 → codearts 3 → 其余 4，未知名 4），多渠道条目取 `min` 权重（含 CB 即进第一段、含 TR 进第二段），同级再按**归一键**字典序（不是对外 id：`_sort_key` 在 `_finalize` 之前跑，此时对外 id 未算出，而 `_disambiguate` 需要确定顺序决定撞 id 时谁保留）。原实现是纯名字典序。Playground 用 `web/src/components/ModelPicker.tsx`：渠道筛选 chips、分组列表（多渠道置顶 + 单渠道按渠道分组）与「强制指定渠道」都走 `web/src/api/providers.ts` 的 `PROVIDER_ORDER` / `providerRank`，与后端权重对齐；分组顺序不再依赖模型列表首次出现顺序。「强制指定渠道」只列当前模型**真实可用**的渠道（此前固定列全部渠道，能选出上游打不通的 `model@provider`）。仅影响展示顺序，调度选号（`model_resolver` 的 `KNOWN_PROVIDERS` 顺序）不变。
-**命名三字段与归一键（2026-10-01，取代此前「按可读名合并」的分渠道口径）**：六条渠道（codebuddy / trae / zen / kilo / qoder / codearts）的每个模型统一成三个字段，规则集中在渠道中立的 `src/provider/naming.py`（纯函数，不 import 任何 provider 子模块）：
+启动时 `main._restore_model_list` **同步**读回并立即 publish 别名表（`restore_model_catalog`，零上游请求、异常只记日志），预热退化为纯后台刷新；快照 `saved_at` 随表交回、折进 `model_list_fetched_at`，故预热（TTL 门禁）不会重拉刚恢复的表——kilo 实测一次 10–22s、zen 探活 12–15s。三条纪律：① 落盘/读回一律宽容（损坏、版本不符、字段缺失、记录非 dict 只丢该渠道，`saved_at` 超 7 天整条丢弃）；② 存原始表不过滤（黑名单热更立即生效）；③ 恢复只覆盖「已注册且当前有可用凭证」的渠道——用户暂停的渠道不因快照复活。**展示顺序（CB / TR 优先）**：合并后按 `_sort_key(entry)` 排序——渠道权重 `_PROVIDER_RANK`（codebuddy 0 → codebuddy_intl 1 → trae 2 → qoder 3 → codearts 4 → 其余 5，未知名 5），多渠道条目取 `min` 权重（含 CB 即进第一段、含 TR 进第二段），同级再按**归一键**字典序（不是对外 id：`_sort_key` 在 `_finalize` 之前跑，此时对外 id 未算出，而 `_disambiguate` 需要确定顺序决定撞 id 时谁保留）。原实现是纯名字典序。Playground 用 `web/src/components/ModelPicker.tsx`：渠道筛选 chips、分组列表（多渠道置顶 + 单渠道按渠道分组）与「强制指定渠道」都走 `web/src/api/providers.ts` 的 `PROVIDER_ORDER` / `providerRank`，与后端权重对齐；分组顺序不再依赖模型列表首次出现顺序。「强制指定渠道」只列当前模型**真实可用**的渠道（此前固定列全部渠道，能选出上游打不通的 `model@provider`）。仅影响展示顺序，调度选号（`model_resolver` 的 `KNOWN_PROVIDERS` 顺序）不变。
+**命名三字段与归一键（2026-10-01，取代此前「按可读名合并」的分渠道口径）**：七条渠道（codebuddy / codebuddy_intl / trae / zen / kilo / qoder / codearts）的每个模型统一成三个字段，规则集中在渠道中立的 `src/provider/naming.py`（纯函数，不 import 任何 provider 子模块）：
 
 | 字段 | 函数 | 例 |
 |---|---|---|
@@ -469,7 +469,7 @@ response.completed | response.incomplete
 
 | 列 | 取值 | 空值语义 |
 |---|---|---|
-| `provider_binding` | 见 `KNOWN_PROVIDERS`（六渠道，如 `codebuddy` / `trae` / `qoder`） | 空 = 自动（跨渠道选健康凭证，原行为） |
+| `provider_binding` | 见 `KNOWN_PROVIDERS`（七渠道，如 `codebuddy` / `codebuddy_intl` / `qoder`） | 空 = 自动（跨渠道选健康凭证，原行为） |
 | `allowed_ips` | 逗号分隔 IP/CIDR | 空 = 不限制来源 IP |
 
 来源 IP 判定在 `deps.api_key_user`（鉴权**当场**判掉，不往上传递）：
@@ -577,6 +577,20 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 修复：`provider.base.aclose_stream` 统一关闭，`stream_guarded` / `stream` / `_stream_loop` / `complete` / `ContinuationStream.__aiter__` 五处提前结束消费处全部显式关闭上游流。回归测试 `tests/test_stream_slot_release.py`（10 例，旧代码 6 例失败）。
 **节流窗口对齐上游口径（2026-10-02）**：泄漏修好后实测仍偶发 `TM.00001041`——上游限制的不是「同时在途 HTTP 数」而是「**每账号每约 60s 最多 3 个会话**」。证据（单账号、真实上游）：① 3 并发结束后名额已全部归还，**紧接着**再发 3 个全部 400；② 打满 3 并发后每 6s 探一个单请求，直到约 **68s** 才恢复；③ 完全顺序（零并发）、每请求换全新 `httpx` client 并显式关闭，仍前 3 个 OK、第 4 个起全 400；④ 间隔 30s 顺序发 6 个则 6/6 OK。即会话在 HTTP 流结束后仍滞留数十秒，纯在途上限挡不住「3 个刚结束就立刻再发 3 个」这类突发，`release` 一让位新请求就再次击穿。故 `Pacer` 增加**滑动窗口**口径：`window_seconds > 0` 时与 `max_concurrency` 组合成「同桶最近 `window_seconds` 秒内最多放行 N 次启动」，窗口内满额则挂起到最早一次启动滑出窗口（睡 `starts[0] + window_seconds - now`，醒来重查，`release` 只减在途计数、不提前让出窗口配额）。CodeArts pacer 装配 `window_seconds=lambda: runtime.codearts_request_window_seconds`（热更项，默认 60s；`0` 关闭窗口口径退回纯在途上限）。取 60s 落在实测恢复区间（60.7–68.6s）的**下沿**（略偏激进，调大可更稳）；代价是高频使用时账号吞吐降到约 3 次/分钟，超出部分排队而非报错。窗口模式配 `max_concurrency=0` 时不生效；`window_seconds` 与在途上限都保留，`0` 均可热更关闭。窗口准入**同时**受窗口与在途两个闸门约束：窗口满则等到最早一次启动滑出，仅因在途满（长流超过窗口）则等 `release` 唤醒——否则长响应会绕过在途上限再次超发。
 
+### 3.17b CodeBuddy 国际版渠道（`codebuddy_intl`）
+
+**为什么是独立渠道而不是「改 `CODEBUDDY_API_ENDPOINT` 切站点」**：endpoint 在本项目是**进程级单值**（`Settings` 单字段，装配时注入一个 client）。切过去会让所有存量国内站凭证立刻打到国际站——两站是各自注册的账号体系，额度与模型清单都不通用，表现为额度错配或 403。国际站作为并列渠道存在，两站凭证可同时在池里，各走各的端点、pacer 与登录流程。
+
+**协议零复制**：两站是**同一套后端**——同一 Keycloak realm（`copilot`）、同一组路径（`/v2/chat/completions`、`/v3/config`、`/v2/plugin/auth/*`、`/v2/billing/*`、`/billing/meter/*`），2026-10-12 匿名探针在两站得到完全一致的响应形态。故 `CodeBuddyIntlProvider` 是 `CodeBuddyProvider` 的**数据类子类**（`src/provider/codebuddy/intl.py`，9 行），只覆盖渠道 id 与三项能力；协议解析、凭证规范化、事件分类、签到、刷新全部共用国内站代码。
+
+**路由存在性的判据（实测方法）**：国际站网关对已注册路径回 `401`（openresty/APISIX 认证插件），对未注册路径回应用层 JSON `{"error_msg":"404 Route Not Found"}`。两者可区分，故能证明 `/billing/meter/daily-checkin`（401）存在而 `/billing/nope`（404）不存在。同法确认 `/v2/config`（回业务码 `12403 check ua`，即已进业务逻辑）、`/v3/config`、`/v2/plugin/auth/state` 均在。
+
+**能力边界：成长中心与活跃上报关闭**。国际站把整个 `/v2/activity/*` **前缀**挂在认证插件后——实测 `/v2/activity/nope`（不存在的子路径）也返回 401 而非 404，因此 401 无法证明 `growth/*` 与 `report` 子路由是否存在。而成长中心含抽奖 / 连登兑换 / 盲盒 / 消耗补登卡等**不可逆**动作，在一个未验证的端点上盲跑会真实消耗账号权益。处置：`growth` / `activity` / `activity_scope` 三个属性置 `None`——调用方一律用 `getattr(provider, "growth", None)` 探测能力（`tasks/growth.py`、`tasks/activity.py`），置 `None` 即自动跳过，**无需在任务层加渠道分支**；管理台的「成长中心 / 活跃上报」菜单项本就按 `credential.provider === "codebuddy"` 判定，对本渠道天然不出现。
+
+**白名单互不含**：`CODEBUDDY_INTL_ALLOWED_ENDPOINTS` 默认只有 `https://www.codebuddy.ai`，**不含**国内站主机（反之国内站那条白名单虽列了两站，但国际站的解析走自己那条校验、不会误用）。两站 Token 由不同网关签发，跨站发送即凭证泄露，故把国内站地址填进 `CODEBUDDY_INTL_API_ENDPOINT` 会在**启动时**抛 `ValueError`，而不是悄悄发出去。
+
+**pacer 与 OAuth 各自独立**：`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`（热更项，默认 5s）装一个独立 `Pacer`——共用会让两站请求排进同一条队列互相空等最小间隔（与 zen/kilo 不共享同理）。`_upstream_auth` 对两个渠道各建一套 `CodeBuddyOAuth`（登录域名不同）。`_pacer_key` 改为带渠道 id 构造（`_pacer_key(provider_id, credential)`）：即便将来共用 Pacer，两站账号也不会互相占位。
+
 ### 3.18 Anthropic Messages 出口（P0-1，Claude Code）
 
 `POST /v1/messages`（流式 + 非流式）与 `POST /v1/messages/count_tokens`，供只走 Anthropic 协议的客户端（Claude Code）接入。与 `/v1/responses` 同一模式：新增 `compat/anthropic/{request,response}.py` + `api/messages.py`，**复用同一 `executor`**（选号 / 冷却 / 轮换 / 统计 / 会话粘性零改动），只换入站映射与出口翻译。
@@ -663,7 +677,7 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 ### 3.23 按渠道出站代理（P1-6）
 
 **动机**：某些渠道可能只在特定网络路径可达（区域限制 / 需经代理），而 `trust_env=False` 的既有约定让 `HTTP_PROXY` 等环境代理一律失效；需要一个**按渠道**、显式可控的出口。
-**配置**（`PROVIDER_PROXIES`，启动期项，默认 `""` 直连）：`渠道=代理URL;渠道2=代理URL2`，渠道取 `KNOWN_PROVIDERS`（`codebuddy/trae/zen/kilo/qoder/codearts`），协议 `http/https/socks5/socks5h`（SOCKS 由 `httpx[socks]` → `socksio` 提供）。
+**配置**（`PROVIDER_PROXIES`，启动期项，默认 `""` 直连）：`渠道=代理URL;渠道2=代理URL2`，渠道取 `KNOWN_PROVIDERS`（`codebuddy/codebuddy_intl/trae/zen/kilo/qoder/codearts`），协议 `http/https/socks5/socks5h`（SOCKS 由 `httpx[socks]` → `socksio` 提供）。
 
 - **纯函数层**（`provider/proxy.py`）：`parse_provider_proxies(raw, known)` **严格**解析——未知渠道 / 非法协议 / 缺 `=` / 空 URL 一律 `ValueError`，只忽略空段（容忍结尾 `;`），渠道名小写、重名后者覆盖。为什么严格而非宽容（对比 §3.21 fallback 组的宽容）：代理常带合规 / 隐私意图，「以为走了代理其实直连」是静默的安全问题，启动报错远好过静默直连。渠道集合由调用方传入，不硬编码。
 - **工厂层**：`build_client(timeout, proxy)` 统一构造 `httpx.AsyncClient(timeout=..., trust_env=False, proxy=proxy)`。`trust_env=False` 是既有约定（不吃环境代理，防部署环境全局代理意外劫持带 Token 的上游请求）；按渠道代理只经显式 `proxy=` 生效。

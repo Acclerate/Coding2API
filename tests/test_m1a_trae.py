@@ -331,7 +331,7 @@ def test_prepare_body_keeps_valid_tool_calls():
 
 def test_resolve_flat_auto_and_forced():
     assert resolve("glm-5.2", "d").providers == (
-        "codebuddy", "trae", "zen", "kilo", "qoder", "codearts")
+        "codebuddy", "codebuddy_intl", "trae", "zen", "kilo", "qoder", "codearts")
     assert resolve("", "glm-5.2").model == "glm-5.2"
     assert resolve("auto", "glm-5.2").model == "glm-5.2"
     assert resolve(None, "glm-5.2").model == "glm-5.2"

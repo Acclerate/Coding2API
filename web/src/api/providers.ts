@@ -9,6 +9,7 @@ import type { Provider } from "./types";
  */
 export const PROVIDER_LABEL: Record<Provider, string> = {
   codebuddy: "CodeBuddy",
+  codebuddy_intl: "CodeBuddy 国际版",
   trae: "TRAE",
   zen: "OpenCode Zen",
   kilo: "Kilo Gateway",
@@ -19,6 +20,7 @@ export const PROVIDER_LABEL: Record<Provider, string> = {
 /** 模型下拉里的渠道缩写（如 `CB x0.29`）。 */
 export const PROVIDER_ABBR: Record<Provider, string> = {
   codebuddy: "CB",
+  codebuddy_intl: "CBi",
   trae: "TR",
   zen: "OC",
   kilo: "KL",
@@ -34,6 +36,7 @@ export const PROVIDER_ABBR: Record<Provider, string> = {
  */
 export const PROVIDER_CHART_COLOR: Record<Provider, string> = {
   codebuddy: "var(--chart-1)",
+  codebuddy_intl: "var(--chart-7)",
   trae: "var(--chart-3)",
   zen: "var(--chart-4)",
   kilo: "var(--chart-2)",
@@ -52,7 +55,15 @@ export const FALLBACK_CHART_COLOR = "var(--chart-5)";
  * zen/kilo 提到 qoder/codearts 之前是有意的 UI 取舍（免费渠道更常被翻），
  * 因此 Playground 的分组顺序与接口返回的 data 顺序并不保证一致。
  */
-export const PROVIDER_ORDER: Provider[] = ["codebuddy", "trae", "zen", "kilo", "qoder", "codearts"];
+export const PROVIDER_ORDER: Provider[] = [
+  "codebuddy",
+  "codebuddy_intl",
+  "trae",
+  "zen",
+  "kilo",
+  "qoder",
+  "codearts",
+];
 
 /** 渠道排序权重；未知渠道排在已知渠道之后。 */
 export function providerRank(provider: string): number {

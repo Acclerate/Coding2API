@@ -217,17 +217,21 @@ def test_build_app_applies_provider_proxies(monkeypatch, tmp_path):
             captured["trae"] = proxy
 
     class _FakeCodeBuddyClient:
-        def __init__(self, *, proxy=None, **kwargs):
-            captured["codebuddy"] = proxy
+        def __init__(self, *, endpoint, proxy=None, **kwargs):
+            # 国内站与国际版是两个渠道各建一个 client，按 endpoint 分别记录
+            captured["cb-intl" if "codebuddy.ai" in endpoint else "codebuddy"] = proxy
 
     monkeypatch.setattr(main, "TraeClient", _FakeTraeClient)
     monkeypatch.setattr(main, "CodeBuddyClient", _FakeCodeBuddyClient)
 
-    settings = _settings(data_dir=str(tmp_path),
-                         provider_proxies="trae=http://p:1;codebuddy=socks5://p:2")
+    settings = _settings(
+        data_dir=str(tmp_path),
+        provider_proxies=("trae=http://p:1;codebuddy=socks5://p:2;"
+                          "codebuddy_intl=http://p:3"))
     app = main.build_app(settings)
     assert app.state.executor is not None
-    assert captured == {"trae": "http://p:1", "codebuddy": "socks5://p:2"}
+    assert captured == {"trae": "http://p:1", "codebuddy": "socks5://p:2",
+                        "cb-intl": "http://p:3"}
 
 
 def test_upstream_auth_applies_proxies(monkeypatch):

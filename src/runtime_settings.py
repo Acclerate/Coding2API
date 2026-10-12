@@ -140,6 +140,11 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "同渠道同凭证顺序连发的最小请求间隔（0 关闭）；按凭证分桶、桶内"
                "允许并发，故同渠道同模型的并发请求不会被串行化。",
                minimum=0.0, group="channels"),
+    HotSetting("codebuddy_intl_chat_min_interval", float,
+               "CodeBuddy 国际版聊天最小间隔（秒）",
+               "国际站（www.codebuddy.ai）专用节流（默认 5s，0 关闭）。与国内站"
+               "各自独立、不共享——共用会让两站请求排进同一条队列互相空等。",
+               minimum=0.0, group="channels"),
     HotSetting("zen_chat_min_interval", float, "Zen 聊天最小间隔（秒）",
                "zen 匿名免费层专用节流（0 关闭，默认）。与 CodeBuddy/TRAE 各自"
                "独立、不共享——共享会让 zen 请求排在 CB/TRAE 之后空等最小间隔。",
@@ -544,6 +549,10 @@ class RuntimeSettings:
     @property
     def codebuddy_chat_min_interval(self) -> float:
         return float(self.get("codebuddy_chat_min_interval"))
+
+    @property
+    def codebuddy_intl_chat_min_interval(self) -> float:
+        return float(self.get("codebuddy_intl_chat_min_interval"))
 
     @property
     def zen_chat_min_interval(self) -> float:

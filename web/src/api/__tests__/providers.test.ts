@@ -14,6 +14,8 @@ import {
 describe("渠道展示元数据", () => {
   it("已知渠道返回中文名与缩写", () => {
     expect(providerLabel("codebuddy")).toBe("CodeBuddy");
+    expect(providerLabel("codebuddy_intl")).toBe("CodeBuddy 国际版");
+    expect(providerAbbr("codebuddy_intl")).toBe("CBi");
     expect(providerLabel("trae")).toBe("TRAE");
     expect(providerLabel("zen")).toBe("OpenCode Zen");
     expect(providerAbbr("zen")).toBe("OC");
@@ -30,7 +32,7 @@ describe("渠道展示元数据", () => {
   it("每个已知渠道都有标签、缩写与专属配色（三者对齐）", () => {
     const providers = Object.keys(PROVIDER_LABEL);
     expect(providers.sort()).toEqual([
-      "codearts", "codebuddy", "kilo", "qoder", "trae", "zen",
+      "codearts", "codebuddy", "codebuddy_intl", "kilo", "qoder", "trae", "zen",
     ]);
     for (const provider of providers) {
       expect(PROVIDER_ABBR[provider as keyof typeof PROVIDER_ABBR]).toBeTruthy();
@@ -40,12 +42,13 @@ describe("渠道展示元数据", () => {
     }
   });
 
-  it("展示顺序 CB → TR → 其余，未知渠道排在已知渠道之后", () => {
-    expect(PROVIDER_ORDER.slice(0, 2)).toEqual(["codebuddy", "trae"]);
+  it("展示顺序 CB → CB 国际版 → TR → 其余，未知渠道排在已知渠道之后", () => {
+    expect(PROVIDER_ORDER.slice(0, 3)).toEqual(["codebuddy", "codebuddy_intl", "trae"]);
     // PROVIDER_ORDER 覆盖全部已知渠道，与 PROVIDER_LABEL 对齐
     expect([...PROVIDER_ORDER].sort()).toEqual(Object.keys(PROVIDER_LABEL).sort());
     expect(providerRank("codebuddy")).toBe(0);
-    expect(providerRank("trae")).toBe(1);
+    expect(providerRank("codebuddy_intl")).toBe(1);
+    expect(providerRank("trae")).toBe(2);
     expect(providerRank("zen")).toBeGreaterThan(providerRank("trae"));
     expect(providerRank("kilo")).toBeGreaterThan(providerRank("trae"));
     expect(providerRank("future")).toBe(PROVIDER_ORDER.length);

@@ -1,6 +1,6 @@
 # Coding2API 立项决策
 
-把 CodeBuddy、TRAE SOLO、OpenCode Zen、Kilo Gateway、Qoder 与 CodeArts 六个上游通道，统一封装为 OpenAI 兼容 API，并提供公共凭证池、统一调度与按人用量统计。
+把 CodeBuddy（国内站 + 国际版）、TRAE SOLO、OpenCode Zen、Kilo Gateway、Qoder 与 CodeArts 七个上游通道，统一封装为 OpenAI 兼容 API，并提供公共凭证池、统一调度与按人用量统计。
 
 > 本文档记录立项决策与可行性核实。实现细节见 [TECHNICAL.md](TECHNICAL.md)，使用与部署见 [README.md](README.md)。
 
@@ -77,14 +77,14 @@
 
 ### 目标
 
-- 单一 OpenAI 兼容端点，后挂 CodeBuddy、TRAE、OpenCode Zen、Kilo Gateway、Qoder 与 CodeArts 六个上游；支持 `model@provider` 精确指定上游
+- 单一 OpenAI 兼容端点，后挂 CodeBuddy（国内站 + 国际版）、TRAE、OpenCode Zen、Kilo Gateway、Qoder 与 CodeArts 七个上游；支持 `model@provider` 精确指定上游
 - 凭证由 admin 集中维护、全员共享，调度器自动挑健康的号；上游死亡自动冷却，不反复踩死号
 - 按人统计用量（请求数、成功率、token、耗时与首字延迟）
 
 ### 非目标（明确不做）
 
 - **不做配额/限流**：上游是订阅制通道，成本不随 token 线性增长；10 人规模靠统计页可见性约束滥用
-- **不做通用 provider 网关**：只硬编码支持上述六个上游，不做插件系统
+- **不做通用 provider 网关**：只硬编码支持上述七个上游，不做插件系统
 - **v1 不做 Anthropic 协议**；不做旧项目数据迁移；不做自更新脚本
 - **不做货币/积分换算**：上游的积分单位不互通，分开记录
 
@@ -365,3 +365,4 @@ M0 骨架 → M1a TRAE → M1b CB 基础 → M1.5 CB 完整化 → M2 前端 →
 | Q73 | 竞品扫描 Round 1/2 的 P0 两项修复：Anthropic 出口缓存 token + Responses `text.format` | 用户要求落地扫描（`docs/competitor-comparison-2026-10-09.md`）里两个「静默丢字段」P0。① **Anthropic 出口补缓存字段**（`compat/anthropic/response.py`）：流式 `message_delta` 与非流式 `completion_to_message` 此前只回 `input_tokens`/`output_tokens`，命中缓存的输入被吞掉，Claude Code 缓存统计恒为 0。修法按 Anthropic 语义**拆两笔**——内部 `Usage.input_tokens` 是 OpenAI 口径的 `prompt_tokens`（含命中），故命中时 `input_tokens = max(0, prompt_tokens − cached_tokens)` 另加 `cache_read_input_tokens = cached_tokens`（两者互斥，不减会重复计费）；命中为 0/None 不补占位。非流式新增 `_completion_usage` 从 `prompt_tokens_details.cached_tokens` 取命中。② **Responses `text.format` → chat `response_format`**（`compat/responses/request.py`）：此前只取 `verbosity`、`format` 整块丢弃，Codex 类结构化输出被静默吞掉。新增 `_map_response_format`：`text`/`json_object` 直通；`json_schema` 按官方 openai-python 形状把扁平 `{type,name,description?,schema,strict?}` 展开成 chat 的嵌套 `{type, json_schema:{...}}`；只有 verbosity 无 format 时不产生 `response_format`；非 dict / 未知 type / json_schema 缺 name 或 schema **显式 400**。**无 schema / DB / 配置变更**。详见 [TECHNICAL.md §3.18](TECHNICAL.md) |
 | Q74 | 模型候选只信模型目录缓存列表：收窄渠道不可用不再扇出到未登记渠道（推翻 Q21「回退全量候选」） | 实测故障（2026-10-10）：请求 `longcat-2.5-preview`，模型目录里只有 zen 登记它（原代号 `longcat-2.5-preview-free`），zen 匿名免费层 429（kind=SOFT）让虚拟凭证进 60s 账号级冷却。此后旧逻辑每次请求都在 `executor._select` 触发 broader 回退，扇出到 CB/TRAE/kilo/CodeArts——别名表里没有这个键，外发仍是原始名，必然被拒：CodeBuddy 11102 / TRAE 4001 / kilo 401 / CodeArts 404，客户端拿到误导性的 400 `invalid_request` 而非「该渠道暂时不可用」，还给 CodeBuddy 写下 6 小时起步的 (凭证, 模型) 负缓存（`usage_events` 里同一模型同时出现 kilo/codearts/codebuddy/trae 的失败记录）。**修复：删除 `_select` 的 broader 回退**，候选渠道只取 `_narrow_providers`（模型目录缓存列表）的结果——登记了该模型的渠道全部不可用时直接出 503，不再拿请求逐个渠道试错。Q67 的「纯模型冷却不扇出」判定（`_model_cooled_only`）随之只服务 503 文案分流。**为什么不会漏掉真正持有该模型的渠道**：目录证不了归属时（模型不在任何渠道的登记表）`_narrow_providers` 本就放行全部候选；而目录证得了归属时，新鲜度上限是模型列表 TTL 300s + 后台兜底刷新（`MODEL_CATALOG_MINUTES`），最坏 300s 后新渠道就会进候选。代价：目录陈旧窗口内「某渠道新增了该模型但别名表未更新」的场景由宽变严（出 503 而非打到别的渠道），但那本来也是打不通的。无 schema / 配置变更。详见 [TECHNICAL.md §6.1](TECHNICAL.md) |
 | Q75 | 管理台列表排序：所有列表加可点列头排序（后端排序为主） | 用户需求：各列表顺序原由 SQL 写死，无法按「剩余额度最多 / 消耗最多 / 最近使用」等自己关心的维度查看。**契约**（新模块 `src/sorting.py`，db 与 api 共用，避免 db → api 反向依赖）：所有 `GET` 列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；**未知 `sort` 键 / 非法 `order` 值回落到该端点默认，不报错**；`sort` 是白名单键、SQL 片段只由受控常量拼出，用户输入永不进 SQL。`parse_sort_order` 是唯一解析入口，`sql_order(tiebreak=...)` 生成 `ORDER BY`（`id`/`rowid` 兜底稳定次序，防翻页跳行），`sort_rows` 供组装后排序（凭证 / 模型目录含派生字段，`None` 值无论升降序都排最后）。**改动点**：仓储 / 查询方法新增**可选** `sort`/`order`，缺省值与旧行为一致（不传参完全不变，`balance.py` 等不受影响）。**默认顺序变更**：分组统计由「分组键字母序」改为**「请求数降序」**（并列时按分组键升序，与旧行为一致）。**逐请求明细两套分页**：默认（`time` 降序）仍走 rowid 游标、返回 `next_before`（`total` null）；按其它列 / 时间升序 / 显式 `offset` 时改 `LIMIT/OFFSET`、额外返回 `total`，此时忽略 `before`（游标只对 rowid 成立；明细只留 90 天，不做复合 keyset 游标）。**前端**：`hooks/useSort.ts`（排序状态 + 每列首次点击方向）+ `components/SortableHead.tsx`（箭头 + `aria-sort`，`ColumnHint` 置于按钮外防误触），切排序 / 改每页数量 / 切范围回到第一页。**不做的**：服务端持久化排序偏好（仅页面内状态）。**无 schema / DB / 配置变更**。详见 [TECHNICAL.md §3.24](TECHNICAL.md) |
+| Q76 | CodeBuddy 国际版（第七渠道 `codebuddy_intl`） | 把 CodeBuddy 国际站 [www.codebuddy.ai](https://www.codebuddy.ai) 接成第七个 provider（`KNOWN_PROVIDERS` 加 `"codebuddy_intl"`，**无 schema 变更**）。**与国内站同协议**（同一 Keycloak realm `copilot`、同一组 `/v2/chat/completions` / `/v3/config` / `/v2/plugin/auth/*` / `/v2/billing/*` / `/billing/meter/*` 路径），2026-10-12 匿名探针在两站得到一致响应形态，故 `src/provider/codebuddy/intl.py` 只是 `CodeBuddyProvider` 的数据类子类（覆盖渠道 id 与三项能力），协议解析 / 凭证规范化 / 事件分类 / 签到 / 刷新全部复用国内站代码，**零复制**。**为什么不是「改 `CODEBUDDY_API_ENDPOINT` 切站点」**：endpoint 是进程级单值，切过去会让所有存量国内站凭证立刻打到国际站（两站各自注册、各自计费，表现为额度错配或 403）。两站凭证可同时在池里，各走各的端点、pacer 与设备码登录流程（`_upstream_auth` 对两渠道各建一套 `CodeBuddyOAuth`）。**新增配置**：`CODEBUDDY_INTL_API_ENDPOINT`（默认 `https://www.codebuddy.ai`）、`CODEBUDDY_INTL_ALLOWED_ENDPOINTS`（**刻意不含**国内站主机——两站 Token 由不同网关签发，跨站发送即凭证泄露；把国内站地址填进端点会在启动时抛错而非悄悄发出去）、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`（热更、默认 5s、**独立 pacer**，共用会让两站请求排进同一条队列互相空等）；`_pacer_key` 改为带渠道 id 构造。**能力边界**：聊天 / 模型列表 / 额度探测 / 签到 / 刷新全部启用；**成长中心与活跃上报关闭**——国际站把整个 `/v2/activity/*` 前缀挂在认证插件后（实测 `/v2/activity/nope` 也回 401 而非 404），无法证明子路由存在，而成长中心含抽奖 / 连登兑换 / 盲盒等**不可逆**动作，未验证端点上盲跑会真实消耗账号权益。处置是 `growth`/`activity`/`activity_scope` 置 `None`——调用方本就 `getattr(..., None)` 探测能力，置 None 即自动跳过，无需在任务层加渠道分支。**未核实**：国际站成长中心是否真的不存在（判据如上，只能证明「无法验证」）；国际站额度包与国内站的换算关系。**无 schema / DB 变更**。详见 [TECHNICAL.md §3.17b](TECHNICAL.md) |

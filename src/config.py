@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # 上游（白名单内的地址才可接收真实 Token）
     codebuddy_api_endpoint: str = _CODEBUDDY_CN
     codebuddy_allowed_endpoints: str = f"{_CODEBUDDY_CN},{_CODEBUDDY_INTL}"
+    # CodeBuddy 国际版（www.codebuddy.ai）：与国内站**同协议同账号体系**的独立
+    # 渠道。为什么要独立渠道而不是改 CODEBUDDY_API_ENDPOINT 切站点：端点是
+    # 进程级单值，切过去会让所有存量国内站凭证立刻打到国际站（403/额度错配）。
+    # 两个站点可同时持有凭证，各走各的 endpoint、节流器、OAuth 设备码流程。
+    codebuddy_intl_api_endpoint: str = _CODEBUDDY_INTL
+    # 国际站自己的白名单：刻意**不含**国内站主机。两站 Token 由不同网关签发，
+    # 混发等于把国内站 token 递到国际站（反之亦然），这是凭证泄露面。
+    codebuddy_intl_allowed_endpoints: str = _CODEBUDDY_INTL
     # OpenCode Zen 免费层：端点固定，UA 版本是门禁的一部分（<阈值 → 426）。
     # Zen 无凭证、不携带任何用户 Token，端点的白名单校验只为防误配。
     zen_api_endpoint: str = "https://opencode.ai"
@@ -148,6 +156,10 @@ class Settings(BaseSettings):
     # 已结束、紧接着又来一个时才补足间隔。（注意 11128 主因是内容指纹风控，
     # 见 codebuddy_sanitize_channel_markers 与 TECHNICAL.md §3.2，调间隔救不了）
     codebuddy_chat_min_interval: float = 5
+    # CodeBuddy 国际版聊天最小间隔：与国内站**各自独立**的节流器与阈值。
+    # 不共享的原因与 zen/kilo 同：共用一个 Pacer 会让两站请求排进同一条队列，
+    # 国际站请求白等国内站的间隔（反之亦然）。默认 5s 对齐国内站。
+    codebuddy_intl_chat_min_interval: float = 5
     # Zen 聊天最小间隔：zen 是匿名免费层，没有 CB/TRAE 那种账号级频率风控，
     # 默认 0（不节流）。刻意**不**与 codebuddy_chat_min_interval 共享 pacer：
     # zen 排在 CB/TRAE 后面会白白等满最小间隔（并发/连发时每个请求 +5s）。
@@ -237,6 +249,12 @@ class Settings(BaseSettings):
         return tuple(e.strip() for e in self.codebuddy_allowed_endpoints.split(",") if e.strip())
 
     @cached_property
+    def codebuddy_intl_allowed(self) -> tuple[str, ...]:
+        return tuple(e.strip().rstrip("/")
+                     for e in self.codebuddy_intl_allowed_endpoints.split(",")
+                     if e.strip())
+
+    @cached_property
     def zen_allowed(self) -> tuple[str, ...]:
         return tuple(e.strip().rstrip("/") for e in self.zen_allowed_endpoints.split(",")
                      if e.strip())
@@ -280,6 +298,11 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
 def validate_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
     """上游地址必须落在白名单内，否则拒绝发出真实 Token（PROPOSAL §8）。"""
     return endpoint.strip() in settings.allowed_endpoints
+
+
+def validate_codebuddy_intl_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
+    """国际站端点白名单校验（防把国内站 Token 发往国际站或反之）。"""
+    return endpoint.strip().rstrip("/") in settings.codebuddy_intl_allowed
 
 
 def validate_zen_endpoint_allowed(endpoint: str, settings: Settings) -> bool:

@@ -14,6 +14,8 @@ type BrandComp = ComponentType<{ size?: number | string; className?: string }>;
 
 const BRAND: Record<string, { Main: BrandComp; Color: BrandComp }> = {
   codebuddy: { Main: CodeBuddyMono, Color: CodeBuddyColor },
+  // 国际版与国内站同一品牌、同一 logo，用渠道名区分而非图标
+  codebuddy_intl: { Main: CodeBuddyMono, Color: CodeBuddyColor },
   trae: { Main: TraeMono, Color: TraeColor },
   // Zen 无独立彩色版：OpenCode 品牌 Mono 同时充当两态
   zen: { Main: OpenCodeMono, Color: OpenCodeMono },
