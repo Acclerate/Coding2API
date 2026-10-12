@@ -16,11 +16,12 @@ from __future__ import annotations
 import pytest
 
 from src.auth.users import create_password_hash
+from tests.helpers.constants import SECRET, USERS
 
-USERS = (("root", "rootpw"), ("guest", "guestpw"), ("alice", "alicepw"))
+# 常量迁到 tests/helpers/constants.py；此处 re-export 以兼容既有
+# `from tests.conftest import SECRET` 调用点（新代码请直接 import helpers）。
 
-# 测试用 APP_SECRET：必须满足 CredentialCipher 的最短长度校验（>=16）
-SECRET = "test-secret-0123456789"
+__all__ = ["SECRET", "USERS"]
 
 
 @pytest.fixture(scope="session")
@@ -61,25 +62,28 @@ def data_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def zen_models_offline(monkeypatch, request):
-    """除 test_zen / test_kilo 外，一律不真连 Zen / Kilo 上游。
+    """除标了 `real_upstream("zen"/"kilo")` 的文件外，一律不真连 Zen / Kilo 上游。
 
     任何 `build_app()` 的启动预热都会调 `ZenClient.fetch_models`（它会逐个
     探活免费模型，真跑一次推理）与 `KiloClient.fetch_models`（真打外网清单）；
     不拦住的话每个用到真实装配的用例都会发外网请求，又慢又依赖外网。两条渠道
-    的真实逻辑由 `tests/test_zen.py` / `tests/test_kilo.py` 用 MockTransport
+    的真实逻辑由 `tests/provider/zen/` / `tests/provider/kilo/` 用 MockTransport
     全覆盖，这里只给它们各一个固定的小名单。
+
+    豁免按 **marker** 而非文件名判定：文件重命名 / 下沉后不会失效（曾按
+    `request.node.path.name` 判 `test_zen.py`，文件一动就静默真连外网）。
     """
-    name = request.node.path.name
     from src.provider.base import Model as _Model
 
-    if name != "test_zen.py":
+    real = _real_upstream(request)
+    if "zen" not in real:
         from src.provider.zen.client import ZenClient
 
         async def fake_zen_models(self) -> list[_Model]:
             return [_Model(id="offline-free", name="opencode")]
 
         monkeypatch.setattr(ZenClient, "fetch_models", fake_zen_models)
-    if name != "test_kilo.py":
+    if "kilo" not in real:
         from src.provider.kilo.client import KiloClient
 
         async def fake_kilo_models(self) -> list[_Model]:
@@ -89,17 +93,26 @@ def zen_models_offline(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
-def price_catalog_offline(monkeypatch):
-    """除 test_benchmarks 外，一律不真连 OpenRouter。
+def price_catalog_offline(monkeypatch, request):
+    """除标了 `real_upstream("openrouter")` 的文件外，一律不真连 OpenRouter。
 
     `build_app()` 在**没有落盘模型目录快照**时会后台补拉一次
     （`_warm_model_catalog`），每个用默认空 DATA_DIR 建 app 的用例都会发外网请求。
-    真实抓取逻辑由 `tests/test_benchmarks.py` 用 MockTransport 覆盖；这里给一个空
+    真实抓取逻辑由 `tests/provider/test_benchmarks.py` 用 MockTransport 覆盖；这里给一个空
     原始表（等价「上游不可用」，成本与分数显示 —），既不打外网也不污染既有断言。
     """
+    if "openrouter" in _real_upstream(request):
+        return
+
     from src import main
 
     async def fake_fetch(_url):
         return {}
 
     monkeypatch.setattr(main, "fetch_openrouter_models", fake_fetch)
+
+
+def _real_upstream(request) -> set[str]:
+    """本测试所属文件声明的 `real_upstream` 豁免项集合（如 {"zen"}）。"""
+    marker = request.node.get_closest_marker("real_upstream")
+    return set(marker.args) if marker else set()

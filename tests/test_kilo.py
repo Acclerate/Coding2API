@@ -47,6 +47,10 @@ def chunk(delta: dict, *, finish: str | None = None, usage: dict | None = None,
     return payload
 
 
+# 本文件用 MockTransport 全覆盖 Kilo 真实逻辑，允许 conftest 跳过 Kilo 的启动预热 stub
+pytestmark = pytest.mark.real_upstream("kilo")
+
+
 # --------------------------------------------------------------- 请求体
 
 def test_prepare_body_forces_stream_and_deepcopies_messages():

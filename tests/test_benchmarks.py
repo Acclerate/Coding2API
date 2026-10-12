@@ -42,8 +42,10 @@ from src.db.migrate import apply_schema
 from src.db.repo import CredentialRepository
 from src.model_match import build_table, lookup, match_keys
 from src.pricing import estimate_cost_usd
+from tests.helpers.constants import SECRET
 
-from .conftest import SECRET
+# 本文件用 MockTransport 覆盖 OpenRouter 抓取，允许 conftest 跳过目录预热 stub
+pytestmark = pytest.mark.real_upstream("openrouter")
 
 # --------------------------------------------------------------- model_match
 

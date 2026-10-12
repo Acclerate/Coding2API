@@ -33,6 +33,9 @@ from src.provider.zen.client import (
 
 SESSION_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
+# 本文件用 MockTransport 全覆盖 Zen 真实逻辑，允许 conftest 跳过 Zen 的启动预热 stub
+pytestmark = pytest.mark.real_upstream("zen")
+
 
 def frame(data: object) -> SSEFrame:
     return SSEFrame(event="", data=data if isinstance(data, str) else json.dumps(data))
