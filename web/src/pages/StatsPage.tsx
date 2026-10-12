@@ -19,7 +19,7 @@ import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { ProviderIcon } from "../components/ProviderIcon";
 import { SortableHead } from "../components/SortableHead";
-import { UsageChart, chartProviders } from "../components/UsageChart";
+import { UsageChart } from "../components/UsageChart";
 import { providerLabel } from "../api/providers";
 import type { GroupStats, UsageEventRow } from "../api/types";
 import {
@@ -273,16 +273,7 @@ export function StatsPage() {
       </section>
 
       <section className="grid gap-4 lg:grid-cols-2">
-        <Panel title="请求量趋势" action={
-          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-            {chartProviders(timeline.data?.points ?? []).map((provider) => (
-              <span key={provider} className="inline-flex items-center gap-1.5">
-                <ProviderIcon provider={provider} size={12} />
-                {providerLabel(provider)}
-              </span>
-            ))}
-          </div>
-        }>
+        <Panel title="请求量趋势">
           {(timeline.data?.points.length ?? 0) === 0 ? (
             <Empty>该范围内没有小时汇总数据</Empty>
           ) : (

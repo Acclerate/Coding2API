@@ -374,7 +374,7 @@ export function ModelPicker({
               </span>
             )}
           </span>
-          <span className="flex flex-wrap items-center gap-1.5">
+          <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
             <BenchmarkBadge item={selectedItem} />
             {sortProviders(selectedItem.providers).map((provider) => (
               <ChannelPill

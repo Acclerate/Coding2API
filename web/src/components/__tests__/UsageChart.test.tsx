@@ -25,4 +25,21 @@ describe("UsageChart", () => {
     );
     expect(getByTestId("usage-chart")).toBeInTheDocument();
   });
+
+  it("渠道图例渲染在图表下方而非标题行", () => {
+    const { getByTestId } = render(
+      <UsageChart points={[
+        { hour: 1_700_000_000, codebuddy: 1, trae: 2 },
+        { hour: 1_700_003_600, codebuddy: 3, trae: 4 },
+      ]} />,
+    );
+    const chart = getByTestId("usage-chart");
+    const legend = getByTestId("usage-chart-legend");
+    // 图例是图表容器（固定高度绘图区）之后的兄弟节点——位于下方，不占标题行
+    const plot = chart.firstElementChild;
+    expect(plot?.className).toContain("h-64");
+    expect(legend.previousElementSibling).toBe(plot);
+    expect(legend).toHaveTextContent("CodeBuddy");
+    expect(legend).toHaveTextContent("TRAE");
+  });
 });
