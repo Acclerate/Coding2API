@@ -69,6 +69,17 @@ class _ModelExhausted(Exception):
         self.code = code
 
 
+class _AggregateOverflow(Exception):
+    """非流式聚合事件数超上限（M10）：上游持续吐 chunk 而不结束。
+
+    内部信号，按瞬态错误处理（换号重试），不对外暴露。
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"aggregate exceeded {limit} events")
+        self.limit = limit
+
+
 @dataclass(slots=True)
 class ExecutorDeps:
     """注入点：provider 客户端、仓储、调度器、统计采集。"""
@@ -98,6 +109,10 @@ class ExecutorDeps:
     # 聚合没有——上游连接半开停滞会让请求无限悬挂并占住凭证。超时按瞬态
     # 错误（SOFT：短冷却不累计）换号重试；≤0 关闭
     complete_timeout_seconds: float = 600
+    # 非流式聚合的事件条数上限（M10）：上游若持续吐 chunk（超长回答 / 死循环
+    # 输出）而不结束，`events` 会无界增长直到 OOM——超时只兜住「慢」，兜不住
+    # 「快而无穷」。超过即按瞬态错误换号重试；≤0 关闭
+    complete_max_events: int = 200_000
     # 跨渠道 fallback 兼容组（P1-5）：配置文本 → 组的解析值（dict）；None 表示
     # 关闭。零参 callable 时每次请求现读（热更）。空 dict 与 None 等价（无组）。
     fallback_groups: Any | None = None
@@ -404,7 +419,8 @@ class Executor:
             return
         # 链至少一项，循环里每项要么正常 return、要么抛 _ModelExhausted；能走到
         # 这里说明整条链都在**未出帧前**用尽——用最后链项的 translator 收尾。
-        assert exhausted is not None
+        if exhausted is None:  # pragma: no cover - 按构造不可达（链非空且必抛）
+            raise RuntimeError("fallback chain produced no terminal error")
         yield state.translator.error_frame(exhausted.message, exhausted.code)
 
     async def _stream_loop(self, request: ChatRequest, target: ModelTarget,
@@ -416,7 +432,8 @@ class Executor:
         attempts = 0
         last_error: Exception | None = None
         last_kind: ErrKind | None = None
-        # 本链项是否已向客户端出过响应帧：出了就绝不再换模型（半截输出不可回滚）
+        # 本链项是否已向客户端出过响应帧：出了就绝不再换模型**或换号**
+        # （半截输出不可回滚，换号会让两个凭证的内容拼进同一条回复）
         emitted = False
 
         def terminal(message: str, code: str) -> bytes:
@@ -428,21 +445,24 @@ class Executor:
         while True:
             pick = self._pick(target, tried, state.affinity_id)
             if pick is None:
+                # 走到这里 emitted 必为 False：已出帧的路径在上面 `if emitted or
+                # not should_rotate` 就 return 了，所以 `terminal()` 在这里**必定**
+                # 抛 `_ModelExhausted`（交给回退链下一项）。直接抛，不留永远
+                # 走不到的 `yield`+`return`。
                 if last_kind is ErrKind.INVALID:
                     # 所有候选上游都拒绝了该模型：400 语义而非 503
-                    yield terminal(
+                    raise _ModelExhausted(
                         _reject_message(target.model, last_error,
                                         self._suggestions(target.model)),
                         "invalid_request")
-                    return
                 self._deps.record(
                     username=state.username, provider=state.provider,
                     credential_id=state.credential_id, model=target.model, ok=False,
                     error_type="no_healthy_credential",
                     latency_ms=_elapsed_ms(state.started))
-                yield terminal(self._unavailable_text(target, last_error),
-                               "no_healthy_credential")
-                return
+                raise _ModelExhausted(
+                    self._unavailable_text(target, last_error),
+                    "no_healthy_credential")
             credential_id, credential_data = pick
             provider_id = self._deps.credentials.provider_of(credential_id)
             state.provider, state.credential_id = provider_id or "-", credential_id
@@ -516,7 +536,7 @@ class Executor:
             finally:
                 # break / 异常 / 客户端断开都走到这里：同步归还节流名额
                 await aclose_stream(iterator)
-            if not self._deps.scheduler.should_rotate(attempts):
+            if not self._deps.scheduler.should_rotate(attempts) or emitted:
                 if last_kind is ErrKind.INVALID:
                     # 流已开始（200 已发出），以 invalid_request 错误帧结束
                     yield terminal(
@@ -525,10 +545,15 @@ class Executor:
                         "invalid_request")
                     return
                 kind = _classify(last_error) if last_error is not None else None
+                # 已出帧后收尾：上游可能已生成内容（真实计费），按已知用量记账，
+                # 否则这次尝试的 token 全部漏记（与断开路径同一理由）
+                usage = state.translator.usage
                 self._deps.record(
                     username=state.username, provider=provider_id,
                     credential_id=credential_id, model=target.model, ok=False,
                     error_type=_error_type_for(kind) if kind else "upstream_protocol",
+                    input_tokens=_usage_field(usage, "input_tokens"),
+                    output_tokens=_usage_field(usage, "output_tokens"),
                     latency_ms=_elapsed_ms(state.started))
                 yield terminal(self._unavailable_text(target, last_error),
                                "no_healthy_credential")
@@ -609,7 +634,8 @@ class Executor:
                     self._with_model(request, attempt.model), attempt, username)
             except (NoHealthyCredential, InvalidRequest) as error:
                 last_error = error
-        assert last_error is not None          # 链至少一项，且必然以异常收尾否则已 return
+        if last_error is None:  # pragma: no cover - 按构造不可达（链非空且必抛）
+            raise NoHealthyCredential(self._unavailable_text(chain[0], None))
         raise last_error
 
     async def _complete_model(self, request: ChatRequest, target: ModelTarget,
@@ -665,6 +691,12 @@ class Executor:
                         if first_event_at is None:
                             first_event_at = time.monotonic()
                         events.append(event)
+                        # 事件条数上限（M10）：超长/死循环输出下 events 会无界
+                        # 增长直到 OOM，超时兜不住「快而无穷」。按瞬态错误换号。
+                        if (self._deps.complete_max_events > 0
+                                and len(events) > self._deps.complete_max_events):
+                            raise _AggregateOverflow(
+                                self._deps.complete_max_events)
             except TimeoutError:
                 logger.warning(
                     "上游 %s 非流式聚合超过 %ss（凭证 %s，按瞬态错误换号）",
@@ -675,6 +707,16 @@ class Executor:
                     kind=EventKind.ERROR,
                     error_message=(f"upstream complete timed out after "
                                    f"{self._deps.complete_timeout_seconds}s")))
+            except _AggregateOverflow as overflow:
+                logger.warning(
+                    "上游 %s 非流式聚合事件超过 %s 条（凭证 %s，按瞬态错误换号）",
+                    provider_id, overflow.limit, credential_id)
+                self._note_upstream_error(credential_id, ErrKind.SOFT,
+                                          provider_id, target.model)
+                last_error = UpstreamStreamError(Event(
+                    kind=EventKind.ERROR,
+                    error_message=(f"upstream complete exceeded "
+                                   f"{overflow.limit} events")))
             except Exception as error:  # noqa: BLE001
                 kind = _classify(error)
                 if kind is None:

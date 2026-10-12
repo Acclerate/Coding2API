@@ -165,7 +165,16 @@ class UpstreamProtocolViolation(ValueError):
     响应结构解析失败**不静默吞掉**。各渠道 `events.py` 现统一 `from
     provider.base import UpstreamProtocolViolation` 复用本类——此前每家有
     一份同名类，导致「按类型翻译探测失败原因」只能逐个渠道硬编码。
+
+    `public` 是**可安全回显给客户端**的文案（M2/M6）：异常文本会带上游原文或
+    内部端点 URL，只能进日志；HTTP 处理器改用 `public_message`，缺省等于
+    `str(self)`（多数文案本就不含上游数据），仅少数内嵌 URL/body 的调用点
+    显式传 `public=` 收紧。
     """
+
+    def __init__(self, message: str, *, public: str | None = None) -> None:
+        super().__init__(message)
+        self.public_message = message if public is None else public
 
 
 class UpstreamTransportError(ConnectionError):

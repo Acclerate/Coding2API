@@ -39,6 +39,9 @@ def users_file(users_file_path, monkeypatch):
     # root 是引导期 admin：B5 的鉴权从 DB 现读角色，不再看 env；
     # 这里提供 env 是为了让每个测试的库在 bootstrap 时把 root 提权。
     monkeypatch.setenv("ADMIN_USERNAMES", "root")
+    # TestClient 默认 Host=testserver：该主机名在生产默认不放行（M14，
+    # 防 DNS rebinding），测试显式开启。
+    monkeypatch.setenv("ALLOW_TEST_HOST", "true")
     return users_file_path
 
 

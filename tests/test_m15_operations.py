@@ -1521,6 +1521,32 @@ async def test_refresh_task_isolates_failures(repo):
     assert report.failed == 1
 
 
+async def test_refresh_task_skips_credential_deleted_before_lock(repo):
+    """等编辑锁期间凭证被删 → 持锁后重读为 None，记 skipped 而不是崩溃（M12）。"""
+    credentials, _db = repo
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "t", "refresh_token": "RT", "auth_source": "oauth",
+        "expires_at": 1})
+
+    class Vanishing(ProbeProvider):
+        async def refresh(self, _data):
+            raise AssertionError("凭证已删，不应发起刷新")
+
+    # 先占住编辑锁，让 run_once 在锁上等待；等它挂起后删掉凭证再放锁
+    lock = credentials.edit_lock(credential_id)
+    await lock.acquire()
+
+    async def release_after_delete() -> None:
+        await asyncio.sleep(0.01)
+        credentials.delete(credential_id)
+        lock.release()
+
+    task = RefreshTask(credentials, {"codebuddy": Vanishing()}, skew_seconds=3600,
+                       now=lambda: 1)
+    _, report = await asyncio.gather(release_after_delete(), task.run_once())
+    assert report.skipped == 1 and report.attempted == 1
+
+
 def test_needs_refresh_without_builder_returns_false():
     from src.tasks.refresh import _needs_refresh
 
@@ -2033,7 +2059,8 @@ def test_upstream_auth_start_supports_both_providers(admin_client):
     assert body["flow"] == "callback"
     assert body["callback_url"].endswith("/authorize")
     assert "auth_callback_url" in body["auth_url"]
-    assert app.state.pending_callback_state == body["state"]
+    # 按发起人（会话用户名）登记，值为 (started_at, state)
+    assert app.state.pending_callbacks["root"][1] == body["state"]
 
     assert client.post("/api/auth/upstream/start",
                        json={"provider": "unknown"}).status_code == 400
@@ -2096,6 +2123,29 @@ def test_credential_account_endpoints_unsupported_for_trae(admin_client):
     assert client.post(f"/api/credentials/{credential_id}/accounts/select",
                        json={"account_id": "a"}).status_code == 400
     assert client.get("/api/credentials/ghost/accounts").status_code == 400
+
+
+def test_select_account_rejects_vanished_credential(admin_client):
+    """provider 支持切换但持锁后凭证已消失 → 400，不拿 None 去打上游（M12）。"""
+    app, client = admin_client
+    credential_id = app.state.credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "t"})
+
+    class Stub:
+        endpoint = "https://e"
+
+        async def switch_account(self, _data, _account_id):  # pragma: no cover
+            raise AssertionError("凭证已消失，不应调用上游")
+
+    app.state.executor._deps.providers["codebuddy"] = Stub()
+    original = app.state.credentials.credential_data
+    app.state.credentials.credential_data = lambda _cid: None  # type: ignore[method-assign]
+    try:
+        response = client.post(f"/api/credentials/{credential_id}/accounts/select",
+                               json={"account_id": "a1"})
+    finally:
+        app.state.credentials.credential_data = original  # type: ignore[method-assign]
+    assert response.status_code == 400
 
 
 def test_stats_endpoints_scope_by_principal(admin_client):
@@ -2390,7 +2440,8 @@ def test_probe_endpoint_marks_failed_on_provider_error(admin_client):
     # 不能把 Python 类名当作 reason 暴露给用户
     assert body["reason"] == "unknown_error"
     assert "RuntimeError" not in body["reason"]
-    assert body["detail"] == "boom"
+    # 上游原文/异常文本不再回显给客户端（M2/M4），只回受控 reason
+    assert "detail" not in body
     assert app.state.credentials.candidates()[0].health is None
 
 
@@ -3901,7 +3952,7 @@ def test_authorize_reports_invalid_credential(tmp_path):
         client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
         client.post("/api/auth/upstream/start", json={"provider": "trae"})
         # 有 refreshToken 但状态串损坏 → complete_callback 抛协议违规
-        app.state.pending_callback_state = "broken"
+        app.state.pending_callbacks["root"] = (time.monotonic(), "broken")
         response = client.get("/authorize?refreshToken=RT&state=broken")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_credential"
@@ -5108,3 +5159,22 @@ def test_legacy_db_upgrade_adds_api_key_policy_columns(tmp_path):
 
     assert db.connect().execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     db.close()
+
+
+def test_credential_edit_lock_is_reused_per_id(repo):
+    """编辑锁按凭证 id 分键复用：同 id 返回同一把锁，不同 id 各自独立（M12）。"""
+    credentials, db = repo
+    first = credentials.edit_lock("cred_a")
+    assert credentials.edit_lock("cred_a") is first
+    assert credentials.edit_lock("cred_b") is not first
+    db.close()
+
+
+def test_authorize_without_trae_provider_is_rejected(tmp_path):
+    """registry 里没有 trae 渠道时，/authorize 直接 400（不崩）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    app = build_app(settings, providers={})
+    with TestClient(app) as client:
+        response = client.get("/authorize?refreshToken=RT")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"

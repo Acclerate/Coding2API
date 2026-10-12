@@ -5,16 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Coding2API 管理台</title>
-    <script>
-      // 挂载前读取主题，避免暗色下白屏闪烁；默认跟随系统偏好
-      (function () {
-        var stored = localStorage.getItem("theme");
-        var dark =
-          stored === "dark" ||
-          (!stored && window.matchMedia("(prefers-color-scheme: dark)").matches);
-        if (dark) document.documentElement.classList.add("dark");
-      })();
-    </script>
+    <!-- 主题初始化放在独立文件：内联脚本会逼 CSP 放开 script-src（见该文件注释） -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

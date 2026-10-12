@@ -576,8 +576,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 能力排行表：与 models_dev_catalog 同一形态挂在 app.state（运行数据，不是
     # 仓储/引擎依赖），刷新时就地换值，路由层每请求现读。
     app.state.model_benchmarks = model_benchmarks
-    app.state.pending_callback_state = None
-    app.state.pending_callback_user = None
+    # 待完成的 TRAE 回调登录：{用户名: (started_at_monotonic, state)}。
+    # 按发起人分键（M7）：单槽全局态会被两个管理员的并发登录互相覆盖，
+    # 把 A 的凭证记到 B 名下。回调不带 state，故用会话 Cookie 认发起人。
+    app.state.pending_callbacks = {}
     app.state.login_throttle = LoginThrottle()
 
     # 路由层共享依赖容器（TECHNICAL §2 deps.py）

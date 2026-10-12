@@ -477,6 +477,36 @@ async def test_alert_task_two_webhooks_both_fail_keeps_first_error(tmp_path):
     db.close()
 
 
+async def test_alert_task_redacts_webhook_secret_from_log_and_db(tmp_path, caplog):
+    """M5：webhook URL 的 path/query 常即密钥，日志与落库都不得带上整条 URL。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    secret_url = "https://hooks.example/T000/B000/super-secret-token"
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        webhook_url=lambda: secret_url, client=client, now=lambda: 5)
+    with caplog.at_level("WARNING"):
+        await task.run_once()
+    # 日志只留 host，不带密钥 path
+    assert "super-secret-token" not in caplog.text
+    assert "hooks.example" in caplog.text
+    # 落库的 delivery_error 同样不含密钥（httpx 异常文本会内嵌整条 URL）
+    error = alerts.recent()[0]["delivery_error"]
+    assert "super-secret-token" not in error
+    await client.aclose()
+    db.close()
+
+
+def test_redact_webhook_url_falls_back_for_opaque_value():
+    """非 URL 的 webhook 值（如误配成裸主机名）也一律脱敏为占位串。"""
+    from src.tasks.alerting import _redact_webhook_url
+
+    assert _redact_webhook_url("not-a-url") == "<webhook>"
+    assert _redact_webhook_url("https://hook.example/x") == "https://hook.example"
+
+
 async def test_alert_task_default_client_path(tmp_path, monkeypatch):
     """未注入 client 时走自建 httpx.AsyncClient（生产路径）。"""
     captured: list[dict] = []
@@ -677,6 +707,23 @@ def test_retention_without_alerts_reports_zero(repo):
     _credentials, db = repo
     report = RetentionTask(StatsCollector(db)).run_once()
     assert report["purged_alerts"] == 0
+
+
+def test_retention_prunes_growth_events(repo):
+    """成长中心运行记录按同一保留期清理（M9）：不回收会无界增长。"""
+    from src.db.repo import GrowthRepository
+    from src.provider.base import GrowthResult
+
+    _credentials, db = repo
+    growth = GrowthRepository(db)
+    growth.record(credential_id="cred_1", now=0,
+                  result=GrowthResult(report="旧", ok=True))
+    growth.record(credential_id="cred_1", now=int(time.time()),
+                  result=GrowthResult(report="新", ok=True))
+    report = RetentionTask(StatsCollector(db), retention_days=90,
+                           growth_events=growth).run_once()
+    assert report["purged_growth_events"] == 1
+    assert [e["report"] for e in growth.recent("cred_1")] == ["新"]
 
 
 # --------------------------------------------------------- /api/alerts

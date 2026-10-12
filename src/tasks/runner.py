@@ -173,7 +173,8 @@ class TaskRunner:
 
     async def _sync_growth(self) -> object:
         """成长中心一轮：领礼物 / 派 Buddy / 任务 / 补登 / 兑换 / 抽奖 / 盲盒。"""
-        assert self._growth is not None
+        if self._growth is None:
+            raise RuntimeError("growth task not configured")
         return await self._growth.run_once()
 
     async def _sync_activity(self) -> object:
@@ -181,7 +182,8 @@ class TaskRunner:
 
         「是否启用」每轮现读（B3.2）：关掉再打开不需要重启，也不必重建循环。
         """
-        assert self._activity is not None
+        if self._activity is None:
+            raise RuntimeError("activity task not configured")
         if not self._activity_enabled():
             return None
         if not self._activity.due():
@@ -195,7 +197,12 @@ class TaskRunner:
         return await self._checkin.run_once()
 
     async def _sync_retention(self) -> object:
-        return self._retention.run_once()
+        """明细清理：整表 GROUP BY / DELETE 是同步 SQLite，放线程池跑（M8）。
+
+        直接在事件循环里执行会把所有并发请求卡住（热更把
+        `context_compress_min_keep_messages` 调大后可达秒级）。
+        """
+        return await asyncio.to_thread(self._retention.run_once)
 
     async def _sync_alert(self) -> object:
         """运维告警一轮：评估四类规则、静默去重后落库 + 推送。
@@ -203,7 +210,8 @@ class TaskRunner:
         是否启用每轮现读（B3.2）：AlertTask.run_once 关着时返回 None，
         `_guarded` 不记运行态——页面显示「未运行」，而不是「刚跑过」。
         """
-        assert self._alert is not None
+        if self._alert is None:
+            raise RuntimeError("alert task not configured")
         return await self._alert.run_once()
 
     async def _loop(self, name: str, runner: Callable[[], Awaitable[object]],
@@ -399,7 +407,7 @@ def build_runner(credentials, providers: dict, stats_collector, config,
                             now=lambda: int(time.time()), pacer=pacer),
         retention=RetentionTask(stats_collector, credentials=credentials,
                                 credit_events=credit_events, audit=audit,
-                                alerts=alerts),
+                                alerts=alerts, growth_events=growth_events),
         quota_probe_minutes=lambda: config.quota_probe_minutes,
         refresh_interval_minutes=lambda: config.refresh_interval_minutes,
         growth_interval_minutes=lambda: config.growth_interval_minutes,

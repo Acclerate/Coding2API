@@ -1226,12 +1226,27 @@ def test_authorize_expires_stale_pending_login(client):
     任何人用自己的 refreshToken 完成兑换（凭证塞进池子）。过期即作废。"""
     import time as _time
 
-    client.app.state.pending_callback_state = "machine:device"
-    client.app.state.pending_callback_at = _time.monotonic() - 601
+    client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+    client.app.state.pending_callbacks["root"] = (_time.monotonic() - 601, "machine:device")
     response = client.get("/authorize?refreshToken=RT")
     assert response.status_code == 400
     assert "expired" in response.json()["error"]["message"]
-    assert client.app.state.pending_callback_state is None
+    assert "root" not in client.app.state.pending_callbacks
+
+
+def test_authorize_requires_initiating_session(client):
+    """回调必须由发起登录的本人完成（M7）：会话缺失 → 拒绝。
+
+    防止同网段的人用自己的 refreshToken 顶掉别人进行中的登录、把凭证塞进池子。
+    """
+    import time as _time
+
+    client.app.state.pending_callbacks["root"] = (_time.monotonic(), "machine:device")
+    response = client.get("/authorize?refreshToken=RT")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    # 未被消费：真正的发起人仍可完成
+    assert "root" in client.app.state.pending_callbacks
 
 
 def test_prepare_body_stringifies_tool_parameters():

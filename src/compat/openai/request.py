@@ -35,6 +35,53 @@ def require_positive_int(value: Any, name: str, *, maximum: int) -> int:
     return value
 
 
+# 采样参数：OpenAI 语义是 [-2, 2]，这里只做有限值 + 该范围校验。
+SAMPLING_PENALTY_KEYS = ("presence_penalty", "frequency_penalty")
+MAX_PENALTY_ABS = 2.0
+# `n`（生成候选数）上限：本网关不做多候选聚合，过大的值只会放大上游开销。
+MAX_CHOICES = 8
+
+
+def validate_numeric_fields(raw: dict[str, Any]) -> None:
+    """校验全部数值型顶层字段，拒绝 NaN/±Inf 与畸形值（M4）。
+
+    只在 `read_json_body` 的 `parse_constant` 之外补齐：`parse_constant` 只拦
+    字面量 `NaN`/`Infinity`，拦不住 JSON 溢出成 `inf` 的 `1e999`
+    （`json.loads('{"x":1e999}')` → `inf`）。这些值经本服务重新序列化会变成
+    非法 JSON `Infinity` 透传给上游，把本应 400 的输入变成上游 4xx。
+    """
+    for key in ("temperature", "top_p"):
+        if key in raw:
+            value = require_finite_number(raw[key], key)
+            if key == "temperature" and value > MAX_TEMPERATURE:
+                raise InvalidRequest(f"temperature must be <= {MAX_TEMPERATURE}")
+            raw[key] = value
+    for key in SAMPLING_PENALTY_KEYS:
+        if key in raw:
+            value = require_finite_number(raw[key], key)
+            if abs(value) > MAX_PENALTY_ABS:
+                raise InvalidRequest(f"{key} must be between -2 and 2")
+            raw[key] = value
+    if "seed" in raw:
+        # seed 是任意整数（可为负）；只拒绝 bool/非整数/NaN。
+        value = raw["seed"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidRequest("seed must be a number")
+        if not math.isfinite(value):
+            raise InvalidRequest("seed must be a finite number")
+        raw["seed"] = int(value)
+    if "n" in raw:
+        require_positive_int(raw["n"], "n", maximum=MAX_CHOICES)
+    if "logit_bias" in raw:
+        bias = raw["logit_bias"]
+        if not isinstance(bias, dict):
+            raise InvalidRequest("logit_bias must be an object")
+        for token, value in bias.items():
+            if not isinstance(token, str):
+                raise InvalidRequest("logit_bias keys must be strings")
+            require_finite_number(value, f"logit_bias[{token!r}]")
+
+
 @dataclass(slots=True)
 class ChatRequest:
     model: str
@@ -64,12 +111,7 @@ def parse_chat_request(body: Any) -> ChatRequest:
     # 这类合法 JSON 仍会透传到上游、污染凭证健康度与统计；与 Anthropic /
     # Responses 出口保持同一套边界。在 raw 副本上归一，不改动调用方 body。
     raw = dict(body)
-    for key in ("temperature", "top_p"):
-        if key in raw:
-            value = require_finite_number(raw[key], key)
-            if key == "temperature" and value > MAX_TEMPERATURE:
-                raise InvalidRequest(f"temperature must be <= {MAX_TEMPERATURE}")
-            raw[key] = value
+    validate_numeric_fields(raw)
     for key in ("max_tokens", "max_completion_tokens"):
         if key in raw and raw[key] is not None:
             require_positive_int(raw[key], key, maximum=MAX_OUTPUT_TOKENS)

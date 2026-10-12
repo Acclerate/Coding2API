@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from ..token_expiry import credential_expiry
 from .events import UpstreamProtocolViolation
+
+# 合法主机名（可带端口）：只允许字母数字、`-`、`.`、`:`。用 fullmatch，挡掉
+# CRLF / 空白 / 路径 / `@` 等会被塞进 Host 头的畸形值。
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9.\-]+(?::\d{1,5})?")
 
 
 @dataclass(slots=True)
@@ -105,6 +110,12 @@ def parse_credential(raw: bytes | dict[str, Any], *,
         raise UpstreamProtocolViolation("credential missing bearer token")
     credential = CodeBuddyCredential.from_dict(raw)
     credential.bearer_token = token.strip()
+    # domain 会直接进 `Host` / `X-Domain` 头：只接受合法主机名（字母数字、
+    # `-`、`.`，可带端口），挡掉 CRLF / 空格 / 路径等畸形值——否则凭证一旦
+    # 被写入畸形 domain，每次请求都会发出被改写的 Host（httpx 拒 CRLF，
+    # 但任意域名仍会改变上游路由与租户判定）。
+    if credential.domain and not _HOSTNAME_RE.fullmatch(credential.domain):
+        raise UpstreamProtocolViolation("credential domain is not a valid hostname")
     # AGENTS.md 约束：来源只能由可信创建入口显式写入。
     # - 字段缺失 → 由入口决定（手动导入 = manual）
     # - 字段存在但非法 → 保持 unknown，绝不能默认成 manual

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     # Host 白名单（防 DNS rebinding）：逗号分隔；空 = 本地默认 + PUBLIC_BASE_URL 主机
     allowed_hosts: str = ""
+    # 额外放行 FastAPI TestClient 的默认 Host `testserver`。**仅测试用**，默认
+    # 关闭：单标签主机名可能被本地 DNS 搜索域解析到本服务，等于给 DNS rebinding
+    # 留了一个免校验入口（M14）。测试由 conftest 的 autouse 夹具置 true。
+    allow_test_host: bool = False
     # 是否暴露 /docs 与 /openapi.json：默认关闭（匿名可拉全量 API 结构）。
     # 本地调试需要 Swagger 时置 true
     enable_docs: bool = False

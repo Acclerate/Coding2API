@@ -84,7 +84,9 @@ def create_router(services: Services) -> APIRouter:
         secondary = services.settings.quota_expiry_secondary_window_seconds
         return {"credentials": credentials.list_all(
                     expiring_window=window, expiring_secondary_window=secondary,
-                    sort=sort, order=order),
+                    sort=sort, order=order,
+                    # 昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见（M7）
+                    include_nickname=principal.is_operator),
                 "expiry_window_seconds": window,
                 "expiry_secondary_window_seconds": secondary,
                 # 到期预警阈值（B3.3）：前端进度条与 <1h 红字同源，避免两处各写一个数
@@ -185,7 +187,10 @@ def create_router(services: Services) -> APIRouter:
             credentials.mark_probe_failed(credential_id)
             reason = describe_probe_failure(error)
             logger.info("额度探测失败 %s: %s", credential_id, reason)
-            return {"probed": False, "reason": reason, "detail": str(error)[:200]}
+            # detail 只在**服务端日志**里带上游原文（可能是 2048 字的响应体摘要）；
+            # 对外只回受控 reason，避免上游回显请求头/正文时泄露凭证片段（M2/M4）。
+            logger.info("额度探测失败详情 %s: %s", credential_id, str(error)[:200])
+            return {"probed": False, "reason": reason}
         credentials.save_quota(credential_id, quota)
         return {"probed": True, "remaining": quota.remaining, "total": quota.total,
                 "cycle_end": quota.cycle_end}
@@ -329,11 +334,17 @@ def create_router(services: Services) -> APIRouter:
         require_operator(principal)
         provider_id = credentials.provider_of(credential_id)
         provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None or not hasattr(provider, "switch_account"):
+        if provider is None or not hasattr(provider, "switch_account"):
             raise InvalidRequest("credential does not support account switching")
-        switched = await provider.switch_account(data, str(payload.get("account_id") or ""))
-        credentials.save_credential_data(credential_id, switched)
+        # 编辑锁（M12）：与 RefreshTask 的「读 → await → 整份覆写」互斥，否则
+        # 刷新会把刚切好的账号覆盖回旧值（反之亦然）。
+        async with credentials.edit_lock(credential_id):
+            data = credentials.credential_data(credential_id)
+            if data is None:
+                raise InvalidRequest("credential does not support account switching")
+            switched = await provider.switch_account(
+                data, str(payload.get("account_id") or ""))
+            credentials.save_credential_data(credential_id, switched)
         logger.info("管理员 %s 切换凭证 %s 账号 -> %s", principal.username, credential_id,
                     payload.get("account_id"))
         services.audit.record(actor=principal.username,

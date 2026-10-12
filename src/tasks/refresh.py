@@ -52,24 +52,34 @@ class RefreshTask:
             # 打上游的写请求，不过节流会绕开全局频率风控对策
             if self._pacer is not None:
                 await self._pacer.wait_turn()
-            try:
-                refreshed = await provider.refresh(data)
-            except UpstreamReloginRequired as error:
-                # 续期凭据已作废：重试无意义，且重试只会继续污染凭证状态。
-                # 标记成需重新登录后本任务下轮直接跳过（candidates 的 disabled 分支），
-                # 不再每小时刷一条同样的 warning。
-                logger.warning(
-                    "refresh for %s needs re-login, disabling credential: %s",
-                    candidate.credential_id, error)
-                self._credentials.mark_relogin_required(candidate.credential_id, str(error))
-                report.failed += 1
-                continue
-            except Exception as error:  # noqa: BLE001
-                logger.warning("refresh failed for %s: %s", candidate.credential_id, error)
-                report.failed += 1
-                continue
-            # 先持久化轮换后的 token，再同步账号（AGENTS.md 顺序约束）
-            self._credentials.save_credential_data(candidate.credential_id, refreshed)
+            # 编辑锁（M12）：读 → await 上游 → 整份覆写必须与账号切换等写者互斥，
+            # 否则两边都用自己读到的旧快照写回，后写者覆盖先写者。
+            async with self._credentials.edit_lock(candidate.credential_id):
+                # 持锁后重读：等锁期间可能已被别的写者改过（如刚切了账号），
+                # 用旧 data 刷新会把那次改动覆盖掉。
+                data = self._credentials.credential_data(candidate.credential_id)
+                if data is None:
+                    report.skipped += 1
+                    continue
+                try:
+                    refreshed = await provider.refresh(data)
+                except UpstreamReloginRequired as error:
+                    # 续期凭据已作废：重试无意义，且重试只会继续污染凭证状态。
+                    # 标记成需重新登录后本任务下轮直接跳过（candidates 的 disabled
+                    # 分支），不再每小时刷一条同样的 warning。
+                    logger.warning(
+                        "refresh for %s needs re-login, disabling credential: %s",
+                        candidate.credential_id, error)
+                    self._credentials.mark_relogin_required(
+                        candidate.credential_id, str(error))
+                    report.failed += 1
+                    continue
+                except Exception as error:  # noqa: BLE001
+                    logger.warning("refresh failed for %s: %s", candidate.credential_id, error)
+                    report.failed += 1
+                    continue
+                # 先持久化轮换后的 token，再同步账号（AGENTS.md 顺序约束）
+                self._credentials.save_credential_data(candidate.credential_id, refreshed)
             report.succeeded += 1
         return report
 

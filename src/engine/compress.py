@@ -117,6 +117,12 @@ def _truncate_to_budget(messages: list[dict[str, Any]],
     """兜底：仍超预算时按内容长度从大到小逐条截断（system 不动）。
 
     每条只截一次；截完仍装不下就接受（上游还有硬上限兜着，这里只是尽力）。
+
+    复杂度：先算一次全量估算与每条的可削减量，循环里只做**增量**更新——
+    早期实现每轮重算 `estimate_messages(result)`，`min_keep_messages` 调大时
+    候选条数多、且截断收益为 0 的条目会耗尽循环，退化成 O(n²) 同步 CPU
+    （实测 400 条 × 8001 字符 = 60s，卡死事件循环）。截断收益为 0 时直接
+    跳出，避免对不可能再缩小的条目空转。
     """
     result = list(messages)
     candidates = sorted(
@@ -124,11 +130,16 @@ def _truncate_to_budget(messages: list[dict[str, Any]],
          for index, message in enumerate(result)
          if message.get("role") != "system"),
         key=lambda pair: pair[1], reverse=True)
+    total = estimate_messages(result)
     for index, _length in candidates:
-        if estimate_messages(result) <= budget:
+        if total <= budget:
             break
-        result[index] = {**result[index],
-                         "content": _truncate_content(result[index].get("content"))}
+        before = _message_tokens(result[index])
+        truncated = _truncate_content(result[index].get("content"))
+        if truncated is result[index].get("content"):
+            continue                      # 无可截断（已是最短形态）
+        result[index] = {**result[index], "content": truncated}
+        total -= before - _message_tokens(result[index])
     return result
 
 

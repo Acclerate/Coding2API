@@ -35,7 +35,7 @@ from ..auth.rbac import (
 from ..auth.users import create_password_hash
 from ..compat.openai.request import InvalidRequest
 from .admin_auth import ACTIVATION_TTL_SECONDS
-from .deps import Services, csrf_protected, principal_from_request
+from .deps import Services, csrf_protected, principal_from_request, request_ip
 
 # 激活令牌明文长度（URL 安全）。32 字节 ≈ 256 bit，足够。
 ACTIVATION_TOKEN_BYTES = 32
@@ -112,7 +112,7 @@ def create_router(services: Services) -> APIRouter:
             activation_expires_at=issued + ACTIVATION_TTL_SECONDS)
         services.audit.record(actor=principal.username, action=ACTION_USER_CREATE,
                               target=username, detail=f"角色 {role}",
-                              ip=request.client.host if request.client else None)
+                              ip=request_ip(request, services.settings) or None)
         # 明文令牌只在此回显一次
         return {"username": username, "role": role, "activate_token": token,
                 "expires_at": issued + ACTIVATION_TTL_SECONDS}
@@ -134,7 +134,7 @@ def create_router(services: Services) -> APIRouter:
         services.user_repo.update_role(username, role)
         services.audit.record(actor=principal.username, action=ACTION_USER_ROLE_CHANGE,
                               target=username, detail=f"角色 -> {role}",
-                              ip=request.client.host if request.client else None)
+                              ip=request_ip(request, services.settings) or None)
         return {"ok": True}
 
     @router.post("/api/users/{username}/disable")
@@ -150,7 +150,7 @@ def create_router(services: Services) -> APIRouter:
         services.user_repo.set_enabled(username, False)
         services.audit.record(actor=principal.username, action=ACTION_USER_DISABLE,
                               target=username,
-                              ip=request.client.host if request.client else None)
+                              ip=request_ip(request, services.settings) or None)
         return {"ok": True}
 
     @router.post("/api/users/{username}/enable")
@@ -163,7 +163,7 @@ def create_router(services: Services) -> APIRouter:
         services.user_repo.set_enabled(username, True)
         services.audit.record(actor=principal.username, action=ACTION_USER_ENABLE,
                               target=username,
-                              ip=request.client.host if request.client else None)
+                              ip=request_ip(request, services.settings) or None)
         return {"ok": True}
 
     @router.post("/api/users/{username}/reset-password")
@@ -185,7 +185,7 @@ def create_router(services: Services) -> APIRouter:
             issued + ACTIVATION_TTL_SECONDS, now=issued)
         services.audit.record(actor=principal.username,
                               action=ACTION_USER_PASSWORD_RESET, target=username,
-                              ip=request.client.host if request.client else None)
+                              ip=request_ip(request, services.settings) or None)
         return {"username": username, "activate_token": token,
                 "expires_at": issued + ACTIVATION_TTL_SECONDS}
 

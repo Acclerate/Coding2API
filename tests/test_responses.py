@@ -233,6 +233,7 @@ def test_stream_flag_flows_through():
     ({"input": []}, "at least one message"),
     ({"input": [{"type": "reasoning"}]}, "at least one message"),
     ({"input": "hi", "store": True}, "store=true"),
+    ({"input": "hi", "store": "true"}, "store must be a boolean"),
     ({"input": "hi", "previous_response_id": "resp_1"}, "previous_response_id"),
     ({"input": "hi", "background": True}, "background=true"),
     ({"input": "hi", "include": "x"}, "include must be an array"),

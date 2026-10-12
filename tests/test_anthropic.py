@@ -448,9 +448,10 @@ def test_usage_payload_cache_edge_cases():
     assert _usage_payload(
         Usage(input_tokens=3, output_tokens=1, cached_tokens=9)) == {
             "input_tokens": 0, "output_tokens": 1, "cache_read_input_tokens": 9}
-    # 缺 input/output 时按 0 兜底，命中仍照记
+    # 总输入未知（None）时不拆缓存：只报 input=0 会与 cache_read 配成
+    # 「整段提示全部命中缓存」，把用量算反——宁可不报命中，也不伪造。
     assert _usage_payload(Usage(cached_tokens=5)) == {
-        "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 5}
+        "input_tokens": 0, "output_tokens": 0}
 
 
 def test_translator_reuses_open_block_for_consecutive_same_kind():

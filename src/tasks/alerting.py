@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -44,6 +45,23 @@ _WEBHOOK_TIMEOUT = 10.0
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_WARNING = "warning"
+
+
+def _redact_webhook_url(url: str) -> str:
+    """webhook URL → 只留 scheme://host（Slack/飞书的 path 即密钥，M5）。"""
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return "<webhook>"
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _redact_webhook_error(error: Exception) -> str:
+    """httpx 异常文本里可能内嵌整条 URL（含密钥 path/query）：只留异常类名。
+
+    httpx 的 `RequestError.__str__` 会带上请求 URL，落库后经 `GET /api/alerts`
+    回显给管理台即等于把 webhook 密钥写进审计记录（M5）。
+    """
+    return f"{type(error).__name__}: webhook delivery failed"
 
 
 @dataclass(frozen=True)
@@ -257,8 +275,11 @@ class AlertTask:
             except Exception as exc:  # noqa: BLE001 - 单点失败不影响其余地址
                 ok = False
                 if error is None:
-                    error = str(exc)
-                logger.warning("告警 webhook 投递失败 %s: %s", url, exc)
+                    # webhook path/query 常即密钥（Slack/飞书），日志与落库都
+                    # 只留 host，绝不带上整条 URL 或 httpx 异常里的 URL（M5）。
+                    error = _redact_webhook_error(exc)
+                logger.warning("告警 webhook 投递失败 %s: %s",
+                               _redact_webhook_url(url), error)
         return ok, error
 
     async def _post(self, url: str, payload: dict[str, Any]) -> None:

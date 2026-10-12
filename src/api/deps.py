@@ -58,7 +58,7 @@ PASSWORD_CHANGE_ALLOWLIST = frozenset({
 class Services:
     """路由层共享依赖（只读仓储/引擎 + 能力方法）。
 
-    运行时可变状态（TRAE 回调登录的 pending_callback_state / user、
+    运行时可变状态（TRAE 回调登录的 pending_callbacks、
     pending_probes）仍挂 app.state——既有测试直接断言这些字段，
     统一迁移会扩大改动面而无实际收益。
     """

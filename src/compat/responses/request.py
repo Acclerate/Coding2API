@@ -250,7 +250,12 @@ def parse_responses_request(body: Any) -> ChatRequest:
     if not isinstance(body, dict):
         raise InvalidRequest("request body must be a JSON object")
 
-    if body.get("store") is True:
+    # `store` 只接受布尔：`"true"`（字符串）在旧实现里因 `is True` 判否而被静默
+    # 当成 false 放行——客户端以为开了存储、网关其实什么都没存。显式报错。
+    store = body.get("store")
+    if store is not None and not isinstance(store, bool):
+        raise InvalidRequest("store must be a boolean")
+    if store is True:
         raise InvalidRequest("store=true is not supported: this gateway is stateless")
     if "previous_response_id" in body and body["previous_response_id"] is not None:
         raise InvalidRequest(

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -27,6 +28,10 @@ from ..sorting import sort_rows, sql_order
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+# API Key `last_used_at` 的写库节流窗口（秒）：见 `ApiKeyRepository.authenticate`。
+_LAST_USED_THROTTLE_SECONDS = 60
 
 
 def _ladder_text(ladder: list[tuple[int, float]] | None) -> str | None:
@@ -159,6 +164,22 @@ class CredentialRepository:
     def __init__(self, db, cipher: CredentialCipher) -> None:
         self._db = db
         self._cipher = cipher
+        # 凭证级编辑锁（M12）：refresh / 账号切换都是「解密取整份 data → await
+        # 上游 → 整份覆写 data_enc」，两个写者在 await 点交错时，后写的会用自己
+        # 读到的旧快照覆盖先写的新值（典型：刷新把刚切好的账号覆盖回去）。
+        # 锁只按凭证 id 分键，不同凭证互不阻塞。
+        self._edit_locks: dict[str, asyncio.Lock] = {}
+
+    def edit_lock(self, credential_id: str) -> asyncio.Lock:
+        """取该凭证的编辑锁；调用方把「读 → await → 覆写」整段包在 `async with`。
+
+        单进程事件循环内即可互斥；凭证数有限，锁表不回收（每个 id 一个空锁）。
+        """
+        lock = self._edit_locks.get(credential_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._edit_locks[credential_id] = lock
+        return lock
 
     # ------------------------------------------------------------- 写入
 
@@ -479,12 +500,17 @@ class CredentialRepository:
     def list_all(
         self, *, expiring_window: int = 0, expiring_secondary_window: int = 0,
         now: int | None = None, sort: str | None = None, order: str | None = None,
+        include_nickname: bool = True,
     ) -> list[dict[str, Any]]:
         """管理台列表：绝不返回明文凭证。
 
         `sort` / `order`：列表排序（白名单见 `CREDENTIAL_SORT_KEYS`）；未知键 /
         非法方向回落 `created_at` 升序。派生字段（到期额度等）在此可见，故排序
         放在组装之后，而不是 SQL。
+
+        `include_nickname=False`：昵称来自全局共享池（常含邮箱/手机），只对
+        admin/operator 返回（与 `/api/stats/events`、`by-credential` 的 M7
+        约束同一口径）；viewer 只看得到自己的记录，昵称对它没有用途。
 
         附 `quota_expiring_credits`（主窗口内即将到期的积分，与调度排序第一级同源）；
         附 `quota_expiring_credits_secondary`（次窗口，主窗口打平时才参与排序的第二级）；
@@ -516,6 +542,8 @@ class CredentialRepository:
             rec = dict(row)
             # data_enc 只用于派生 token 时间，绝不进响应
             data_enc = rec.pop("data_enc", None)
+            if not include_nickname:
+                rec["nickname"] = ""
             # NULL = 老库升级后从未写回（按需从密文派生）；0 = 已写回但确实未知，
             # 不重复解密（否则每刷新一次列表就为同一批无从得知的凭证白解一遍）。
             if row["token_expires_at"] is None:
@@ -607,17 +635,28 @@ class ApiKeyRepository:
 
         命中即刷新 last_used_at：所有出口鉴权都走这里，避免再散落一处
         「用了 Key 但没记最后使用时间」。返回 None 表示 Key 不存在。
+
+        last_used_at 写库节流到分钟级：每次请求都写会给热路径加一次写事务
+        （`BEGIN IMMEDIATE` 后还会与留存汇总争写锁），而该字段展示精度只到
+        分钟。距上次记录不足 `_LAST_USED_THROTTLE_SECONDS` 就不写。
         """
         digest = digest_api_key(api_key)
         row = self._db.connect().execute(
             "SELECT id, username, provider_binding, allowed_ips, allowed_models, "
-            "expires_at FROM api_keys WHERE key_digest = ?", (digest,)).fetchone()
+            "expires_at, last_used_at FROM api_keys WHERE key_digest = ?",
+            (digest,)).fetchone()
         if row is None:
             return None
-        with self._db.transaction() as conn:
-            conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?",
-                         (int(time.time()), row["id"]))
-        return dict(row)
+        now = int(time.time())
+        last_used = row["last_used_at"]
+        if last_used is None or now - last_used >= _LAST_USED_THROTTLE_SECONDS:
+            with self._db.transaction() as conn:
+                conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+                             (now, row["id"]))
+        # 返回值形状与旧实现一致：last_used_at 只用于上面的节流判定
+        return {key: row[key] for key in
+                ("id", "username", "provider_binding", "allowed_ips",
+                 "allowed_models", "expires_at")}
 
     def verify(self, api_key: str) -> str | None:
         row = self.authenticate(api_key)
@@ -662,6 +701,17 @@ class GrowthRepository:
                  result.report, result.credit, result.energy, result.streak_days, trigger),
             )
         return event_id
+
+    def prune(self, *, keep_days: int, now: int | None = None) -> int:
+        """删除超过保留期的运行记录（与 usage_events 同一保留策略入口）。
+
+        每轮探测都可能落一行，不回收会无界增长（读侧有 LIMIT，但表本身会
+        一直变大）；保留期与请求明细一致，避免「成长中心记录比请求明细还久」。
+        """
+        cutoff = int(now if now is not None else time.time()) - keep_days * 86400
+        with self._db.transaction() as conn:
+            cursor = conn.execute("DELETE FROM growth_events WHERE ts < ?", (cutoff,))
+        return cursor.rowcount
 
     def latest_for(self, credential_id: str) -> dict[str, Any] | None:
         row = self._db.connect().execute(

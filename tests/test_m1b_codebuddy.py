@@ -137,6 +137,15 @@ def test_parse_credential_accepts_all_token_key_names():
         assert parse_credential({key: "v"}).bearer_token == "v"
 
 
+def test_parse_credential_validates_domain_as_hostname():
+    """domain 直接进 Host/X-Domain 头：畸形值必须被拒（LOW）。"""
+    ok = parse_credential({"token": "t", "domain": "copilot.tencent.com:443"})
+    assert ok.domain == "copilot.tencent.com:443"
+    for bad in ("evil.com/path", "a b.com", "host\r\nX-Evil: 1", "h@x.com", "a?b"):
+        with pytest.raises(UpstreamProtocolViolation, match="domain"):
+            parse_credential({"token": "t", "domain": bad})
+
+
 def test_auth_source_normalization():
     assert parse_credential({"token": "t", "auth_source": "oauth"}).auth_source == "oauth"
     assert parse_credential({"token": "t", "auth_source": "hacked"}).auth_source == "unknown"
@@ -2094,6 +2103,36 @@ async def test_fetch_models_parses_config_and_caches():
     assert calls["n"] == 1                      # 命中缓存
 
 
+async def test_fetch_models_cache_is_bounded():
+    """模型缓存有容量上限：先淘汰过期条目，仍满则整体清空（LOW）。"""
+    from src.provider.codebuddy.client import (
+        _MODEL_CACHE,
+        MODEL_CACHE_MAX_ENTRIES,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"models": [
+            {"id": "glm-5.2"}]}})
+
+    client = _client(handler)
+    # 缓存满且含过期条目 → 淘汰过期后写入新条目，不清空
+    _MODEL_CACHE.clear()
+    _MODEL_CACHE[("stale", "e")] = (0.0, [])
+    for i in range(MODEL_CACHE_MAX_ENTRIES - 1):
+        _MODEL_CACHE[(f"fresh{i}", "e")] = (time.time(), [])
+    assert len(_MODEL_CACHE) == MODEL_CACHE_MAX_ENTRIES
+    await client.fetch_models(CodeBuddyCredential(bearer_token="t"))
+    assert ("stale", "e") not in _MODEL_CACHE
+    assert len(_MODEL_CACHE) == MODEL_CACHE_MAX_ENTRIES
+
+    # 缓存满且全部新鲜 → 整体清空，只留本次写入
+    _MODEL_CACHE.clear()
+    for i in range(MODEL_CACHE_MAX_ENTRIES):
+        _MODEL_CACHE[(f"fresh{i}", "e")] = (time.time(), [])
+    await client.fetch_models(CodeBuddyCredential(bearer_token="t"))
+    assert len(_MODEL_CACHE) == 1
+
+
 async def test_fetch_models_parses_metadata():
     """模型元数据解析：倍率（credits 字符串）/ token 上限 / 支持性 / 推理档位。"""
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -3020,6 +3059,52 @@ async def test_complete_timeout_zero_disables_backstop(dual_repo):
         complete_timeout_seconds=0))
     result = await executor.complete(_request(), username="u")
     assert result["choices"][0]["message"]["content"] == "ok"
+
+
+async def test_complete_max_events_overflow_rotates(dual_repo):
+    """非流式聚合事件数超上限：按瞬态错误换号，不无界增长（M10）。"""
+    class EndlessFirst:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, _cred, _payload, _model):
+            self.calls += 1
+            if self.calls > 1:
+                yield Event(kind=EventKind.CONTENT, content="ok")
+                yield Event(kind=EventKind.FINISH, finish_reason="stop")
+                return
+            # 首个凭证持续吐 chunk 且不结束（模拟死循环输出）
+            for _ in range(50):
+                yield Event(kind=EventKind.CONTENT, content="x")
+
+    repo, _ = dual_repo
+    repo.add(provider="codebuddy", credential_data={"bearer_token": "a"})
+    repo.add(provider="codebuddy", credential_data={"bearer_token": "b"})
+    endless = EndlessFirst()
+    executor = Executor(ExecutorDeps(
+        providers={"codebuddy": endless}, credentials=repo,
+        scheduler=Scheduler(), default_model="m", complete_max_events=2))
+
+    result = await executor.complete(_request(), username="u")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert endless.calls == 2
+
+
+async def test_complete_max_events_zero_disables(dual_repo):
+    """≤0 关闭上限：事件再多也照常聚合（覆盖关闭分支）。"""
+    class ManyEvents:
+        async def stream_chat(self, _cred, _payload, _model):
+            for _ in range(10):
+                yield Event(kind=EventKind.CONTENT, content="x")
+            yield Event(kind=EventKind.FINISH, finish_reason="stop")
+
+    repo, _ = dual_repo
+    repo.add(provider="codebuddy", credential_data={"bearer_token": "a"})
+    executor = Executor(ExecutorDeps(
+        providers={"codebuddy": ManyEvents()}, credentials=repo,
+        scheduler=Scheduler(), default_model="m", complete_max_events=0))
+    result = await executor.complete(_request(), username="u")
+    assert result["choices"][0]["message"]["content"] == "x" * 10
 
 
 async def test_stream_chat_normalizes_developer_role():

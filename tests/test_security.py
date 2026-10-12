@@ -193,9 +193,27 @@ def test_security_headers_present(app):
     assert response.status_code == 200
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
-    assert response.headers["content-security-policy"] == (
-        "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; "
-        "form-action 'self'")
+    assert response.headers["referrer-policy"] == "same-origin"
+    csp = response.headers["content-security-policy"]
+    # 默认只允许同源脚本/连接，且不再为内联主题脚本放开 script-src
+    assert "default-src 'self'" in csp
+    assert "script-src 'self';" in csp
+    assert "connect-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp and "object-src 'none'" in csp
+    assert "base-uri 'self'" in csp and "form-action 'self'" in csp
+
+
+def test_csp_allows_jsdelivr_only_when_docs_enabled(tmp_path):
+    """Swagger UI 从 jsdelivr 拉资源：只有开 /docs 时才放行该 CDN。"""
+    from src.webapp.security import content_security_policy
+
+    off = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    assert "cdn.jsdelivr.net" not in content_security_policy(off)
+    on = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                  ENABLE_DOCS="true")
+    csp = content_security_policy(on)
+    assert "script-src 'self' https://cdn.jsdelivr.net" in csp
+    assert "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net" in csp
 
 
 def test_hsts_only_for_https_deployments(tmp_path):
@@ -377,3 +395,19 @@ def test_host_whitelist_allows_configured(tmp_path):
     with TestClient(application) as client:
         assert client.get("/health", headers={"Host": "api.example.com"}).status_code == 200
         assert client.get("/health", headers={"Host": "127.0.0.1"}).status_code == 400
+
+
+def test_host_allowed_excludes_testserver_unless_enabled():
+    """M14：testserver 只在显式开启 ALLOW_TEST_HOST 时放行。
+
+    单标签主机名可能被本地 DNS 搜索域解析到本服务，生产默认放行等于给
+    DNS rebinding 留免校验入口。
+    """
+    from src.config import Settings
+    from src.main import _host_allowed
+
+    off = Settings(_env_file=None, APP_SECRET=SECRET, ALLOW_TEST_HOST="false")
+    assert _host_allowed("testserver", off) is False
+    assert _host_allowed("localhost", off) is True          # 本地回环仍放行
+    on = Settings(_env_file=None, APP_SECRET=SECRET, ALLOW_TEST_HOST="true")
+    assert _host_allowed("testserver", on) is True

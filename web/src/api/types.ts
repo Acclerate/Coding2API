@@ -339,10 +339,7 @@ export interface ProbeResult {
   remaining?: number;
   total?: number;
   reason?: ProbeFailureReason;
-  /** 原始错误摘要，仅用于排查；界面不应直接展示给普通用户 */
-  detail?: string;
 }
-
 export interface CheckinStatus {
   active: boolean;
   today_checked_in: boolean;

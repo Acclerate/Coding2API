@@ -451,10 +451,8 @@ describe("CredentialsPage", () => {
     // 面向用户的是可操作的中文说明，不是枚举或异常类名
     expect(notice).toHaveTextContent("渠道响应格式与预期不符");
     expect(notice).not.toHaveTextContent("upstream_response_invalid");
-    // 原始错误另置于折叠区，便于排查
-    expect(screen.getByTestId("probe-detail")).toHaveTextContent(
-      "quota response missing Accounts",
-    );
+    // 上游原文不再回显给前端（M2/M4：可能含凭证/上游端点）
+    expect(screen.queryByTestId("probe-detail")).toBeNull();
   });
 
   it("探测失败的未知原因有兜底文案", async () => {

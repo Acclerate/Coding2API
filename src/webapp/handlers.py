@@ -55,8 +55,10 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(UpstreamProtocolViolation)
     async def _bad_credential(_request, error: UpstreamProtocolViolation):
+        # 用受控文案，绝不回显 str(error)：异常文本可能带上游原文或内部端点 URL
         return JSONResponse(status_code=400,
-                            content=error_payload(str(error), "invalid_credential", 400))
+                            content=error_payload(error.public_message,
+                                                  "invalid_credential", 400))
 
     @app.exception_handler(NoHealthyCredential)
     async def _no_health(_request, error: NoHealthyCredential):

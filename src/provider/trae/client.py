@@ -524,9 +524,13 @@ class TraeClient:
         try:
             data = response.json()
         except ValueError as error:
-            raise UpstreamProtocolViolation(f"non-JSON response from {url}") from error
+            raise UpstreamProtocolViolation(
+                f"non-JSON response from {url}",
+                public="upstream returned a non-JSON response") from error
         if not isinstance(data, dict):
-            raise UpstreamProtocolViolation(f"unexpected response shape from {url}")
+            raise UpstreamProtocolViolation(
+                f"unexpected response shape from {url}",
+                public="upstream returned an unexpected response shape")
         return data
 
 

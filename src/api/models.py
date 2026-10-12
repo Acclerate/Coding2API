@@ -492,9 +492,15 @@ def merged_entries(services: Services, connected: set[str]) -> list[dict[str, An
 
 
 def _publish(services: Services, entries: list[dict[str, Any]]) -> None:
-    """定稿好的条目 → 就地更新别名表（executor 的闭包引用同一个 dict 对象）。"""
+    """定稿好的条目 → 就地更新别名表（executor 的闭包引用同一个 dict 对象）。
+
+    先算好再 clear+update：`_build_aliases` 若抛错，不能让别名表停在「已清空、
+    未写入」的中间态（那会让所有扁平名请求失去候选收窄）。对象身份必须保留，
+    故不能整体替换 dict。
+    """
+    aliases = _build_aliases(entries)
     services.model_aliases.clear()
-    services.model_aliases.update(_build_aliases(entries))
+    services.model_aliases.update(aliases)
 
 
 def publish_aliases(services: Services, connected: set[str]) -> None:

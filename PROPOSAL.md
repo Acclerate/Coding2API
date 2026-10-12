@@ -268,7 +268,7 @@ v1 只接 OpenAI 出口，但上游 SSE 解析到「中立事件」这一步独�
 - **API Key 存摘要**：SHA-256，明文仅创建时返回一次
 - **凭证加密列**：`data_enc` 走 Fernet；调度状态（`health` / `cooling_until` / `err_count` / `pinned` / `quota_expiry_ladder`）落库，重启不丢冷却状态与到期阶梯
 - **用量脱敏**：`usage_events`（明细 90 天）+ `usage_hourly`（小时汇总永久），`credit`/`cached_tokens`/`cost_usd`/`cost_cny` 可空、仅辅助展示；成本为估算（Q70）
-- **成长中心**：`growth_events` 只存汇总行（一轮一行人话汇报 + 积分/能量/连签 + trigger），不存活动内部结构；`credentials.growth_last_run_at`/`growth_last_result` 供列表直接显示；活跃上报（B1.7）复用该表记一行，不新增表
+- **成长中心**：`growth_events` 只存汇总行（一轮一行人话汇报 + 积分/能量/连签 + trigger），不存活动内部结构；`credentials.growth_last_run_at`/`growth_last_result` 供列表直接显示；活跃上报（B1.7）复用该表记一行，不新增表。保留期同 `usage_events`（90 天，由 `RetentionTask` 统一回收）
 - **token 到期**（Q35）：`credentials.token_expires_at`（显式 `expires_at` 优先，缺失回落 JWT `exp`；0 = 未知）与 `token_issued_at`（JWT `iat`，仅落库供诊断）。派生逻辑在渠道中立的 `provider/token_expiry.py`，**不猜本地 TTL**
 - **积分流水**（Q36）：`credit_events` 记两次额度探测之间的净变化（含 `window_start` 与归因已知度 `source`）；**不是动作归因**——上游不打日志，diff 分不出分数是谁加的。保留期同 `usage_events`（90 天）
 - 签到去重、模型列表缓存（Q38 后台任务运行态同此）均进程内实现、**不建表**：跨重启的历史价值有限（业务留痕已有 `growth_events` / `credit_events` / `usage_events`），落库反而要新表 + 保留期清理 + 老库迁移

@@ -20,6 +20,8 @@ _API_PREFIXES = ("api/", "v1/")
 # 文件名会变，但浏览器若缓存了旧 index.html，就会加载上一版的 bundle——表现是
 # 「页面能打开、功能却是旧的」，与「新前端 + 旧后端」同属最难自查的一类假故障。
 # assets 反过来可以永久缓存：内容变了文件名就变，命中不了就是没变。
+# `web/public/` 下的文件（如 theme-init.js）是**原样拷贝、不带 hash**的，
+# 同样不能 immutable，否则改了主题脚本浏览器还按旧版缓存。
 _INDEX_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 _ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 
@@ -85,7 +87,13 @@ def register_spa_routes(app: FastAPI) -> None:
             return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)
         candidate = (dist / path).resolve()
         if path and candidate.is_file() and dist.resolve() in candidate.parents:
-            return FileResponse(candidate, headers=_ASSET_CACHE_HEADERS)
+            # 只有 `assets/` 下是 Vite 内容 hash 化的产物，可 immutable；入口
+            # 文档（index.html）与 `web/public/` 原样拷贝的文件（theme-init.js
+            # / favicon.svg）文件名不带 hash，必须每次回源校验（M13）。
+            relative = candidate.relative_to(dist.resolve())
+            headers = (_ASSET_CACHE_HEADERS if relative.parts[:1] == ("assets",)
+                       else _INDEX_CACHE_HEADERS)
+            return FileResponse(candidate, headers=headers)
         index = dist / "index.html"
         if not index.is_file():
             return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)

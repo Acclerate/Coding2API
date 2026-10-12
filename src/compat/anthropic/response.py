@@ -72,12 +72,16 @@ def _usage_payload(usage: Usage | None) -> dict[str, int]:
     """
     if usage is None:
         return {"input_tokens": 0, "output_tokens": 0}
-    input_tokens = usage.input_tokens or 0
+    input_tokens = usage.input_tokens
     payload: dict[str, int] = {
-        "input_tokens": input_tokens,
+        "input_tokens": input_tokens or 0,
         "output_tokens": usage.output_tokens or 0}
     cached = usage.cached_tokens
-    if cached:
+    # 只有 input_tokens **已知**时才拆出缓存命中：上游没报总输入却报了命中时，
+    # 若仍写 `cache_read_input_tokens`，就会与 `input_tokens=0` 配成
+    # 「整段提示全部命中缓存」（客户端据此显示近乎免费）。宁可不报命中，
+    # 也不伪造一个把用量算反的 0。
+    if cached and input_tokens is not None:
         payload["input_tokens"] = max(0, input_tokens - cached)
         payload["cache_read_input_tokens"] = cached
     return payload

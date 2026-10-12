@@ -43,7 +43,9 @@ async def with_keepalive(frames: AsyncIterator[bytes],
             ticker.cancel()
             yield SSE_COMMENT
     finally:
-        # 客户端断开 / 生成器关闭：清掉在途任务，避免 "Task was destroyed"
-        for task in (pending,):
-            if task is not None and not task.done():
-                task.cancel()
+        # 客户端断开 / 生成器关闭：清掉在途任务，避免 "Task was destroyed"。
+        # cancel() 只是「请求取消」，必须 await 到任务真正结束再退出——否则
+        # 生成器所在事件循环很快回收，任务以 pending 状态被销毁并打印告警。
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)

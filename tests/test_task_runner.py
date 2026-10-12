@@ -533,3 +533,15 @@ async def test_refresh_and_checkin_pace_upstream_calls(repo):
     assert refresh_report.succeeded == 1 and provider.refresh_calls == 1
     assert checkin_report.succeeded == 1 and provider.checkin_calls == 1
     assert pacer.turns == 2
+
+
+async def test_sync_helpers_raise_when_optional_tasks_unwired(repo):
+    """可选任务未装配时同步入口显式报错（不依赖 assert，-O 下也生效）。
+
+    `_sync_growth/_sync_activity/_sync_alert` 只在对应任务装配后才会被调度；
+    未装配时直接调用（测试/误接线）必须抛 RuntimeError，而不是把 None 当对象用。
+    """
+    runner, _ = _runner(repo, StubProvider())
+    for sync in (runner._sync_growth, runner._sync_activity, runner._sync_alert):
+        with pytest.raises(RuntimeError, match="not configured"):
+            await sync()

@@ -419,6 +419,31 @@ async def test_stream_no_fallback_after_first_frame_invalid_budget_spent(repo):
 
 
 @pytest.mark.asyncio
+async def test_stream_no_rotate_after_first_frame(repo):
+    """已出帧后绝不换号：同一渠道换凭证会把两段输出拼进同一条回复。
+
+    上游在吐出内容后回 ERROR（非 INVALID）→ 换号预算仍够，但已出帧就不该
+    再打下一个凭证：半截输出不可回滚，且上游两边都真实计费。
+    """
+    credentials, db = repo
+    _add(credentials, "codebuddy", "cb1")
+    _add(credentials, "codebuddy", "cb2")
+    cb = ScriptedProvider("codebuddy", [[
+        Event(kind=EventKind.CONTENT, content="AAA"),
+        Event(kind=EventKind.ERROR, error_code="500",
+              error_message="boom", error_kind=ErrKind.OTHER)]])
+    executor = _executor({"codebuddy": cb}, credentials,
+                         {"chat": ("glm-5.2", "glm-4.6")},
+                         _aliases("glm-5.2", "glm-4.6"))
+    frames = [f async for f in executor.stream(_request("glm-5.2"), username="u")]
+    joined = b"".join(frames).decode()
+    assert "AAA" in joined
+    assert cb.calls == 1                    # 已出帧 → 不换号
+    assert "no_healthy_credential" in joined
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_stream_no_healthy_credential_before_frame_falls_back(repo):
     """链首候选渠道无凭证（未出帧）→ 也回退到下一项。
 

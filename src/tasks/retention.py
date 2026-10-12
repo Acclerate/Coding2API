@@ -20,19 +20,24 @@ class RetentionTask:
 
     `alerts` 非 None 时按同一保留期清理运维告警：告警是周期性评估的产物，
     长期无界增长会让「站内告警记录」越拉越慢。
+
+    `growth_events` 非 None 时按同一保留期清理成长中心运行记录：每轮探测
+    都可能落一行，不回收同样无界增长。
     """
 
     def __init__(self, collector: StatsCollector, *, retention_days: int = 90,
                  credentials=None, credit_events=None, audit=None,
-                 alerts=None) -> None:
+                 alerts=None, growth_events=None) -> None:
         self._collector = collector
         self.retention_days = retention_days
         self._credentials = credentials
         self._credit_events = credit_events
         self._audit = audit
         self._alerts = alerts
+        self._growth_events = growth_events
 
     def run_once(self) -> dict[str, int]:
+        """同步执行一轮（CPU/IO 密集，调用方负责放到线程池，见 M8）。"""
         rolled = self._collector.rollup_hourly()
         purged = self._collector.purge_expired(self.retention_days)
         expired_coolings = (
@@ -47,8 +52,12 @@ class RetentionTask:
         purged_alerts = (
             self._alerts.prune(keep_days=self.retention_days)
             if self._alerts is not None else 0)
+        purged_growth = (
+            self._growth_events.prune(keep_days=self.retention_days)
+            if self._growth_events is not None else 0)
         return {"rolled_up": rolled, "purged": purged,
                 "expired_coolings": expired_coolings,
                 "purged_credit_events": purged_credit_events,
                 "purged_audit": purged_audit,
-                "purged_alerts": purged_alerts}
+                "purged_alerts": purged_alerts,
+                "purged_growth_events": purged_growth}

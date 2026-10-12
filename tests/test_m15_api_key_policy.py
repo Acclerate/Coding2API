@@ -183,6 +183,34 @@ def test_repository_defaults_to_unrestricted(keys):
     assert keys.verify("sk-nope") is None
 
 
+def test_authenticate_throttles_last_used_writes(keys):
+    """last_used_at 写库节流到分钟级：热路径不每请求写一次（LOW）。"""
+    created = keys.create("alice", now=1_000_000)
+    db = keys._db  # noqa: SLF001
+    assert db.connect().execute(
+        "SELECT last_used_at FROM api_keys WHERE id = ?",
+        (created["id"],)).fetchone()["last_used_at"] is None
+
+    def last_used() -> int | None:
+        return db.connect().execute(
+            "SELECT last_used_at FROM api_keys WHERE id = ?",
+            (created["id"],)).fetchone()["last_used_at"]
+
+    # 首次鉴权写入（旧值为 NULL）
+    keys.authenticate(created["api_key"])
+    first = last_used()
+    assert first is not None
+    # 窗口内再鉴权不写库（模拟时间未推进）
+    assert keys.authenticate(created["api_key"]) is not None
+    assert last_used() == first
+    # 超过窗口（把旧值改成很早）→ 重新写入
+    db.connect().execute("UPDATE api_keys SET last_used_at = 0 WHERE id = ?",
+                         (created["id"],))
+    db.connect().commit()
+    keys.authenticate(created["api_key"])
+    assert last_used() not in (0, None)
+
+
 # ------------------------------------------------------------------- HTTP
 
 def _settings(tmp_path, **overrides) -> Settings:

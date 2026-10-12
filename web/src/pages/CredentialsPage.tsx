@@ -272,14 +272,7 @@ export function CredentialsPage() {
             );
           } else {
             showNotice(
-              <>
-                {`探测失败：${probeFailureLabel(result.reason)}（健康度保持为「未探测」）`}
-                {result.detail && (
-                  <span className="mt-1 block text-xs text-muted-foreground" data-testid="probe-detail">
-                    原始错误：{result.detail}
-                  </span>
-                )}
-              </>,
+              `探测失败：${probeFailureLabel(result.reason)}（健康度保持为「未探测」）`,
             );
           }
           await refresh();

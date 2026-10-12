@@ -579,6 +579,19 @@ def test_static_cache_headers_keep_entry_fresh_and_assets_immutable(
     assert asset.status_code == 200
     assert "immutable" in asset.headers["cache-control"]
 
+    # 直接请求 /index.html（不是 catch-all 回落）也必须 no-cache（M13）：
+    # 它是入口文档而非 hash 化资源，immutable 会让浏览器缓存旧入口。
+    direct = client.get("/index.html")
+    assert direct.status_code == 200
+    assert direct.headers["cache-control"] == "no-cache"
+
+    # `web/public/` 原样拷贝、文件名不带 hash 的文件（theme-init.js）同样
+    # 不能 immutable，否则改了主题脚本浏览器还按旧版缓存。
+    (dist / "theme-init.js").write_text("console.log(1)", encoding="utf-8")
+    theme = client.get("/theme-init.js")
+    assert theme.status_code == 200
+    assert theme.headers["cache-control"] == "no-cache"
+
 
 # ---------------------------------------------------- #15 凭证恢复入口
 
@@ -1284,3 +1297,29 @@ def test_openai_chat_rejects_bad_numeric_fields():
     assert parsed.raw["temperature"] == 0.3 and parsed.raw["max_tokens"] == 128
     # 显式 null 上限视为未设置，不报错
     assert parse_chat_request({**base, "max_tokens": None}).raw["max_tokens"] is None
+
+
+def test_openai_chat_rejects_penalty_seed_n_and_logit_bias():
+    """M1：`1e999` 等溢出成 inf 的采样参数、越界 penalty、畸形 seed/n/logit_bias
+    都必须 400，而不是重新序列化成非法 JSON `Infinity` 透传给上游。"""
+    from src.compat.openai.request import InvalidRequest, parse_chat_request
+
+    base = {"messages": [{"role": "user", "content": "hi"}]}
+    inf = float("inf")
+    for bad in ({"presence_penalty": inf}, {"frequency_penalty": -inf},
+                {"presence_penalty": 3}, {"frequency_penalty": -3},
+                {"presence_penalty": True}, {"frequency_penalty": "x"},
+                {"seed": inf}, {"seed": True}, {"seed": "x"},
+                {"n": 0}, {"n": 99}, {"n": True},
+                {"logit_bias": "x"}, {"logit_bias": {1: 1}},
+                {"logit_bias": {"1": inf}}):
+        with pytest.raises(InvalidRequest):
+            parse_chat_request({**base, **bad})
+    # 合法值：penalty 归一为 float，seed 取整，n 通过，logit_bias 原样
+    parsed = parse_chat_request({**base, "presence_penalty": -1.5,
+                                 "frequency_penalty": 2, "seed": 42.9,
+                                 "n": 3, "logit_bias": {"1": -100}})
+    assert parsed.raw["presence_penalty"] == -1.5
+    assert parsed.raw["frequency_penalty"] == 2.0
+    assert parsed.raw["seed"] == 42 and parsed.raw["n"] == 3
+    assert parsed.raw["logit_bias"] == {"1": -100}

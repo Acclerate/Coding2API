@@ -40,7 +40,11 @@ DEFAULT_CALLBACK_PORT = 12800
 
 
 def _token_error_message(error: Exception) -> str:
-    """令牌端点错误 → 用户可读文案（带上游原文，便于定位）。"""
+    """令牌端点错误 → 用户可读文案（带上游原文，便于定位）。
+
+    只在**服务端日志**里用：上游原文可能回显请求参数（含 secret/code），
+    不能进对外响应，故调用点用 `public=` 另给受控文案（M2/M6）。
+    """
     body = getattr(error, "body", b"") or b""
     text = body.decode("utf-8", errors="replace").strip()
     return f"CodeArts token exchange rejected: {text[:200]}" if text \
@@ -194,7 +198,10 @@ class CodeArtsOAuth:
         except codearts_auth.TokenEndpointError as error:
             # ticket 通道对服务端常被判「无效 ticketId」——门户实际走回调通道，
             # 这里把上游原文转成受控 400，提示用户改走「粘贴回调链接」。
-            raise UpstreamProtocolViolation(_token_error_message(error)) from error
+            logger.info("CodeArts ticket poll 失败: %s", _token_error_message(error))
+            raise UpstreamProtocolViolation(
+                _token_error_message(error),
+                public="CodeArts token exchange rejected") from error
         if not tokens:
             return None                              # 等待用户在门户授权
         return await self._finish(auth_state, username, tokens, session)
@@ -232,7 +239,10 @@ class CodeArtsOAuth:
                 code_verifier=session.code_verifier, port=self.port,
                 dpop_private_jwk=session.dpop_private_jwk)
         except codearts_auth.TokenEndpointError as error:
-            raise UpstreamProtocolViolation(_token_error_message(error)) from error
+            logger.info("CodeArts code exchange 失败: %s", _token_error_message(error))
+            raise UpstreamProtocolViolation(
+                _token_error_message(error),
+                public="CodeArts token exchange rejected") from error
         return await self._finish(auth_state, username, exchange.tokens, session)
 
     async def _finish(self, auth_state: str, username: str, tokens: dict,

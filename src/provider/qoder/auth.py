@@ -256,9 +256,12 @@ class QoderOAuth:
         if response.status_code in PENDING_STATUS:
             return None
         if response.status_code != 200:
+            # 内部文案带上游正文片段仅供日志；对外只给受控 status（M2/M6）。
+            logger.info("Qoder device poll HTTP %s: %r", response.status_code,
+                        response.content[:160])
             raise UpstreamProtocolViolation(
-                f"device poll http {response.status_code}: "
-                f"{response.content[:160]!r}")
+                f"device poll http {response.status_code}",
+                public=f"device poll failed with http {response.status_code}")
         body = _json_object(response, "device poll")
         token = body.get("token") or body.get("device_token")
         if not isinstance(token, str) or not token.strip():

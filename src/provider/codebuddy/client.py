@@ -43,6 +43,8 @@ SHORT_TIMEOUT = httpx.Timeout(30.0)
 DEFAULT_MODELS: tuple[str, ...] = ("glm-5.2", "deepseek-v4-pro")
 EP_CONFIG = "/v3/config"
 MODEL_CACHE_TTL_SECONDS = 600
+# 模型缓存条目上限（LOW）：key 含 token 前缀，凭证轮换后旧条目永不命中。
+MODEL_CACHE_MAX_ENTRIES = 256
 
 # 上游内容风控（11128）已确认的指纹串：出现在 system/assistant 消息正文
 # （含行中）即整单拒绝。清单来自 2026-09 对真实上游的确定性复现实验。
@@ -409,6 +411,15 @@ class CodeBuddyClient:
             ))
         if not models:
             raise UpstreamProtocolViolation("config returned no valid model ids")
+        # 容量上限（LOW）：key 含 token 前缀，凭证轮换/删除后旧条目永不命中，
+        # 无界增长会长期占内存。超过上限时先清掉过期条目，仍超再整体清空
+        # （模型表是可重建的缓存，宁可多拉一次也不留无界字典）。
+        if len(_MODEL_CACHE) >= MODEL_CACHE_MAX_ENTRIES:
+            cutoff = now - MODEL_CACHE_TTL_SECONDS
+            for key in [k for k, v in _MODEL_CACHE.items() if v[0] < cutoff]:
+                del _MODEL_CACHE[key]
+            if len(_MODEL_CACHE) >= MODEL_CACHE_MAX_ENTRIES:
+                _MODEL_CACHE.clear()
         _MODEL_CACHE[cache_key] = (now, models)
         return models
 
@@ -422,9 +433,13 @@ class CodeBuddyClient:
         try:
             data = response.json()
         except ValueError as error:
-            raise UpstreamProtocolViolation(f"non-JSON response from {url}") from error
+            raise UpstreamProtocolViolation(
+                f"non-JSON response from {url}",
+                public="upstream returned a non-JSON response") from error
         if not isinstance(data, dict):
-            raise UpstreamProtocolViolation(f"unexpected response shape from {url}")
+            raise UpstreamProtocolViolation(
+                f"unexpected response shape from {url}",
+                public="upstream returned an unexpected response shape")
         return data
 
 

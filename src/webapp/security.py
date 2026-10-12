@@ -16,8 +16,10 @@ from ..config import Settings
 def host_allowed(host_header: str, settings: Settings) -> bool:
     """Host 白名单（防 DNS rebinding）。
 
-    ALLOWED_HOSTS 配置优先（逗号分隔）；未配置时放行本地回环、PUBLIC_BASE_URL
-    的主机与 testserver（FastAPI TestClient 默认 Host，仅测试场景）。
+    ALLOWED_HOSTS 配置优先（逗号分隔）；未配置时放行本地回环与 PUBLIC_BASE_URL
+    的主机。`testserver`（FastAPI TestClient 默认 Host）只在显式开启
+    `ALLOW_TEST_HOST` 时放行——单标签主机名可能被本地 DNS 搜索域解析到本服务，
+    生产默认放行等于给 DNS rebinding 留免校验入口（M14）。
     只比较主机名，忽略端口。
     """
     hostname = host_header.split(":", 1)[0].strip().lower().strip("[]")
@@ -25,7 +27,9 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
         allowed = {h.split(":", 1)[0].strip().lower().strip("[]")
                    for h in settings.allowed_hosts.split(",") if h.strip()}
         return hostname in allowed
-    allowed = {"localhost", "127.0.0.1", "::1", "testserver"}
+    allowed = {"localhost", "127.0.0.1", "::1"}
+    if settings.allow_test_host:
+        allowed.add("testserver")
     base = settings.public_base_url
     if base.startswith(("http://", "https://")):
         base = base.split("://", 1)[1]
@@ -33,6 +37,33 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
     if path_host:
         allowed.add(path_host)
     return hostname in allowed
+
+
+def content_security_policy(settings: Settings) -> str:
+    """CSP：默认只允许同源资源，顺带堵住 object/base-uri/form-action（L8）。
+
+    `script-src 'self'` 之所以能收这么紧：主题初始化已从内联脚本挪到
+    `web/public/theme-init.js`（同步脚本，渲染阻塞、不会闪烁），页面里再无内联
+    JS。`style-src` 保留 `'unsafe-inline'`——React 的 `style={}` 会写行内 style
+    属性，去掉会直接打断渲染。
+
+    `enable_docs` 打开时 Swagger UI 从 jsdelivr 拉资源，必须放行该 CDN，
+    否则 /docs 白屏（默认关闭，不影响生产策略）。
+    """
+    script_src = "'self'"
+    style_src = "'self' 'unsafe-inline'"
+    if settings.enable_docs:
+        script_src += " https://cdn.jsdelivr.net"
+        style_src += " https://cdn.jsdelivr.net"
+    return (
+        "default-src 'self'; "
+        f"script-src {script_src}; "
+        f"style-src {style_src}; "
+        "img-src 'self' data:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; "
+        "form-action 'self'")
 
 
 async def security_middleware(request: Request, call_next):
@@ -50,13 +81,12 @@ async def security_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
-    # CSP：除防嵌套外，补 object/base-uri/form-action 限制（L8 纵深防御）。
-    # 未加 script-src：index.html 用一段内联脚本在挂载前读取主题（避免暗色
-    # 白屏闪烁），收紧 script-src 需为其配 hash/nonce，收益与破坏面不成正比。
     response.headers.setdefault(
         "Content-Security-Policy",
-        "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; "
-        "form-action 'self'")
+        content_security_policy(request.app.state.settings))
+    # 只跨源剥离 Referer，同源保留：CSRF 校验依赖同源 Referer（`same-origin`
+    # 正好两者兼顾——`no-referrer` 会让同源写请求丢掉 Referer 而被误判跨源）。
+    response.headers.setdefault("Referrer-Policy", "same-origin")
     if request.app.state.settings.public_base_url.startswith("https://"):
         # 仅 https 部署下发 HSTS：明文部署发了无意义，还会预锁本地 http 访问
         response.headers.setdefault("Strict-Transport-Security",
