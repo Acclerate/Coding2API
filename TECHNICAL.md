@@ -581,11 +581,15 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 
 **为什么是独立渠道而不是「改 `CODEBUDDY_API_ENDPOINT` 切站点」**：endpoint 在本项目是**进程级单值**（`Settings` 单字段，装配时注入一个 client）。切过去会让所有存量国内站凭证立刻打到国际站——两站是各自注册的账号体系，额度与模型清单都不通用，表现为额度错配或 403。国际站作为并列渠道存在，两站凭证可同时在池里，各走各的端点、pacer 与登录流程。
 
-**协议零复制**：两站是**同一套后端**——同一 Keycloak realm（`copilot`）、同一组路径（`/v2/chat/completions`、`/v3/config`、`/v2/plugin/auth/*`、`/v2/billing/*`、`/billing/meter/*`），2026-10-12 匿名探针在两站得到完全一致的响应形态。故 `CodeBuddyIntlProvider` 是 `CodeBuddyProvider` 的**数据类子类**（`src/provider/codebuddy/intl.py`，9 行），只覆盖渠道 id 与三项能力；协议解析、凭证规范化、事件分类、签到、刷新全部共用国内站代码。
+**协议零复制**：两站是**同一套后端**——同一 Keycloak realm（`copilot`）、同一组路径（`/v2/chat/completions`、`/v3/config`、`/v2/plugin/auth/*`、`/v2/billing/*`、`/billing/meter/*`），2026-10-12 匿名探针在两站得到完全一致的响应形态。故 `CodeBuddyIntlProvider` 是 `CodeBuddyProvider` 的**数据类子类**（`src/provider/codebuddy/intl.py`，9 行），只覆盖渠道 id 与三项能力；协议解析、凭证规范化、事件分类、签到、刷新全部共用国内站代码。唯一需要分开的行为是聊天出站的 system 注入（见下）。
 
 **路由存在性的判据（实测方法）**：国际站网关对已注册路径回 `401`（openresty/APISIX 认证插件），对未注册路径回应用层 JSON `{"error_msg":"404 Route Not Found"}`。两者可区分，故能证明 `/billing/meter/daily-checkin`（401）存在而 `/billing/nope`（404）不存在。同法确认 `/v2/config`（回业务码 `12403 check ua`，即已进业务逻辑）、`/v3/config`、`/v2/plugin/auth/state` 均在。
 
+**唯一的行为差异：首条 system 强制注入**。国际站网关要求 `messages[0]` 是 system prompt，否则整单 `400` + `{"code":11128,"msg":"first message is not system prompt"}`（2026-10-12 用真实国际站凭证对照实测：同一请求体，无 system → 400；前置一条中性 system → 200 正常返回）。国内站（`copilot.tencent.com`）无此要求，存量凭证不带 system 也正常出站。处置是 client 构造参数 `require_leading_system`，**只在国际站装配时开**：`ensure_leading_system` 仅在首条非 system 时补一条 `DEFAULT_LEADING_SYSTEM = "You are a helpful assistant."`。三条约束：① 判首条必须在 `developer → system` 归一**之后**（PI 等客户端把 system 转成 developer，归一已满足要求，再补就成了重复首条）；② 客户端自带 system 时不注入、不覆盖、不重排（system 正文与位置是客户端的意图）；③ 正文取中性最小句且不带任何厂商指纹，否则撞 11128 内容风控。注入只改 deepcopy 出的出站副本，不穿透回 `request.raw`（会话粘性按原文算指纹，见 §3.2）。
+
 **能力边界：成长中心与活跃上报关闭**。国际站把整个 `/v2/activity/*` **前缀**挂在认证插件后——实测 `/v2/activity/nope`（不存在的子路径）也返回 401 而非 404，因此 401 无法证明 `growth/*` 与 `report` 子路由是否存在。而成长中心含抽奖 / 连登兑换 / 盲盒 / 消耗补登卡等**不可逆**动作，在一个未验证的端点上盲跑会真实消耗账号权益。处置：`growth` / `activity` / `activity_scope` 三个属性置 `None`——调用方一律用 `getattr(provider, "growth", None)` 探测能力（`tasks/growth.py`、`tasks/activity.py`），置 `None` 即自动跳过，**无需在任务层加渠道分支**；管理台的「成长中心 / 活跃上报」菜单项本就按 `credential.provider === "codebuddy"` 判定，对本渠道天然不出现。
+
+**签到已知不可用**：国际站登录后 `tasks/checkin` 每 10 分钟失败一次，日志为 `签到活动未开启或已过期`（2026-10-12 持续复现）。路径存在（`/billing/meter/checkin-activity-status` 回业务响应而非 404），但该账号的活动未开启——属账号侧状态，非渠道缺陷，故**不改代码**，失败告警保持现状。
 
 **白名单互不含**：`CODEBUDDY_INTL_ALLOWED_ENDPOINTS` 默认只有 `https://www.codebuddy.ai`，**不含**国内站主机（反之国内站那条白名单虽列了两站，但国际站的解析走自己那条校验、不会误用）。两站 Token 由不同网关签发，跨站发送即凭证泄露，故把国内站地址填进 `CODEBUDDY_INTL_API_ENDPOINT` 会在**启动时**抛 `ValueError`，而不是悄悄发出去。
 

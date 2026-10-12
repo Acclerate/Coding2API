@@ -6,12 +6,18 @@
 - Settings 新字段与**独立**白名单（混发两站 Token 即泄露，必须测到）
 - 端点解析的白名单拒绝路径
 - 独立 pacer 与独立 OAuth 设备码流程
+- **首条 system 强制注入**：国际站网关硬性要求 `messages[0]` 是 system prompt，
+  否则整单 400 / 11128（2026-10-12 真实国际站凭证实测：无 system → 400，
+  前置中性 system → 200）。国内站无此要求，出站 body 必须一个字节不变。
 - 能力边界：`growth` / `activity` / `activity_scope` 为 None（未验证的端点上
   不做含不可逆动作的领取）
 """
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from src.config import (
@@ -20,7 +26,13 @@ from src.config import (
     validate_endpoint_allowed,
 )
 from src.engine.model_resolver import KNOWN_PROVIDERS
-from src.provider.codebuddy.client import CodeBuddyClient, CodeBuddyProvider
+from src.provider.codebuddy.client import (
+    DEFAULT_LEADING_SYSTEM,
+    CodeBuddyClient,
+    CodeBuddyProvider,
+    ensure_leading_system,
+)
+from src.provider.codebuddy.credential import CodeBuddyCredential
 from src.provider.codebuddy.intl import CodeBuddyIntlProvider
 from src.runtime_settings import HOT_BY_KEY, RuntimeSettings
 from tests.conftest import SECRET
@@ -139,6 +151,19 @@ def test_intl_channel_has_its_own_pacer(tmp_path):
     app = main.build_app(_settings(data_dir=str(tmp_path)))
     registry = app.state.services.registry
     assert registry["codebuddy_intl"].pacer is not registry["codebuddy"].pacer
+
+
+def test_intl_requires_leading_system_but_cn_does_not(tmp_path):
+    """国际站网关硬性要求首条 system（实测 400/11128），国内站无此要求。
+
+    这条守卫挡的是「为了让国际站通而给 client 加全局注入」：那会让存量国内站
+    请求凭空多一条 system，客户端自带的 system 也可能被顶掉。
+    """
+    import src.main as main
+
+    registry = main.build_app(_settings(data_dir=str(tmp_path))).state.services.registry
+    assert registry["codebuddy_intl"].client.require_leading_system is True
+    assert registry["codebuddy"].client.require_leading_system is False
 
 
 def test_upstream_auth_registers_both_codebuddy_sites():
@@ -263,3 +288,118 @@ def test_intl_min_interval_is_hot_updatable():
     assert runtime.codebuddy_intl_chat_min_interval == 0
     # 与国内站各自独立：改一个不影响另一个
     assert runtime.codebuddy_chat_min_interval == 5
+
+
+# --------------------------------------------------- 首条 system 强制注入
+
+def _stream_client(handler, **kwargs) -> CodeBuddyClient:
+    """只接流式请求的 client（额度等短请求用不到，这里不构造）。"""
+    transport = httpx.MockTransport(handler)
+    return CodeBuddyClient(
+        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
+        short_client=httpx.AsyncClient(transport=transport, timeout=None),
+        **kwargs)
+
+
+@pytest.mark.parametrize("messages, expect_first_role", [
+    # 需要补：首条不是 system
+    ([{"role": "user", "content": "hi"}], "system"),
+    ([{"role": "user", "content": "a"},
+      {"role": "assistant", "content": "b"}], "system"),
+    # 不补：客户端自带 system（含多条、含 developer 归一后的情形）
+    ([{"role": "system", "content": "mine"}], "system"),
+    ([{"role": "system", "content": "mine"},
+      {"role": "user", "content": "hi"}], "system"),
+])
+async def test_stream_chat_prepends_system_when_absent(messages, expect_first_role):
+    sent: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, text="")
+
+    async for _ in _stream_client(handler, require_leading_system=True).stream_chat(
+            CodeBuddyCredential(bearer_token="t"), {"messages": messages}, "glm-5.2"):
+        pass
+    out = sent["messages"]
+    assert out[0]["role"] == expect_first_role
+    assert len(out) == len(messages) + (0 if messages[0]["role"] == "system" else 1)
+
+
+async def test_injected_system_keeps_original_messages_order():
+    """补的 system 只能落在最前：原消息顺序 / 正文一个字都不能动。"""
+    sent: dict = {}
+    messages = [{"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, text="")
+
+    async for _ in _stream_client(handler, require_leading_system=True).stream_chat(
+            CodeBuddyCredential(bearer_token="t"), {"messages": messages}, "glm-5.2"):
+        pass
+    assert sent["messages"][0] == {"role": "system", "content": DEFAULT_LEADING_SYSTEM}
+    assert sent["messages"][1:] == messages
+
+
+async def test_cn_stream_chat_leaves_user_first_payload_untouched():
+    """反向守卫：国内站开关关闭时不出站 body 一个字节都不变。"""
+    sent: dict = {}
+    payload = {"messages": [{"role": "user", "content": "u1"}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, text="")
+
+    async for _ in _stream_client(handler).stream_chat(
+            CodeBuddyCredential(bearer_token="t"), payload, "glm-5.2"):
+        pass
+    assert sent["messages"] == [{"role": "user", "content": "u1"}]
+
+
+async def test_developer_first_is_normalized_not_duplicated():
+    """PI 等客户端把 system 转成 developer：归一后已满足首条要求，不能再补一条。"""
+    sent: dict = {}
+    messages = [{"role": "developer", "content": "mine"}, {"role": "user", "content": "hi"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, text="")
+
+    async for _ in _stream_client(handler, require_leading_system=True).stream_chat(
+            CodeBuddyCredential(bearer_token="t"), {"messages": messages}, "glm-5.2"):
+        pass
+    assert sent["messages"] == [{"role": "system", "content": "mine"},
+                                {"role": "user", "content": "hi"}]
+
+
+async def test_injection_does_not_leak_back_into_request_payload():
+    """出站改写只作用于副本：注入不能穿透回 request.raw（会话粘性按原文算指纹）。"""
+    sent: dict = {}
+    messages = [{"role": "user", "content": "u1"}]
+    payload = {"messages": messages}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, text="")
+
+    async for _ in _stream_client(handler, require_leading_system=True).stream_chat(
+            CodeBuddyCredential(bearer_token="t"), payload, "glm-5.2"):
+        pass
+    assert len(sent["messages"]) == 2
+    assert payload["messages"] == [{"role": "user", "content": "u1"}]
+
+
+@pytest.mark.parametrize("body", [
+    {},                                            # 无 messages 键
+    {"messages": []},                              # 空列表
+    {"messages": "not-a-list"},                    # 非法类型
+    {"messages": ["bare-string"]},                 # 首条不是 dict
+])
+def test_ensure_leading_system_skips_unusable_message_lists(body):
+    """不可用形态一律不动：宁可让上游原样报错，也不在坏结构上乱插。"""
+    snapshot = dict(body)
+    assert ensure_leading_system(body) is False
+    assert body == snapshot

@@ -351,6 +351,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             client=CodeBuddyClient(
                 endpoint=_codebuddy_intl_endpoint(config),
                 sanitize_markers=config.codebuddy_sanitize_channel_markers,
+                # 国际站网关硬性要求首条 system（实测 400/11128），国内站无此要求
+                require_leading_system=True,
                 proxy=proxies.get("codebuddy_intl"),
             ), pacer=codebuddy_intl_pacer),
         "zen": ZenProvider(

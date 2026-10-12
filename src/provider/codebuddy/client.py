@@ -53,6 +53,32 @@ CHANNEL_MARKERS: tuple[str, ...] = (
 )
 _CHANNEL_MARKER_STANDIN = "[external-client-identity]"
 
+# 缺省首条 system 的占位正文。国际站网关**硬性要求** messages[0] 是
+# system prompt，否则整单 400 / 11128 `first message is not system prompt`
+# （2026-10-12 用真实国际站凭证实测：无 system → 400，同请求前置下面这句
+# → 200）。国内站（copilot.tencent.com）无此要求，存量凭证不带 system 也能
+# 正常出站，所以只在 `require_leading_system=True` 时注入。
+# 正文刻意取中性最小句：不带任何厂商指纹（否则撞 11128 内容风控），
+# 不覆盖客户端自带的 system（已有则不注入，见 `_ensure_leading_system`）。
+DEFAULT_LEADING_SYSTEM = "You are a helpful assistant."
+
+
+def ensure_leading_system(body: dict[str, Any]) -> bool:
+    """messages[0] 非 system 时补一条占位 system，返回是否真的补了。
+
+    只在 messages 是非空列表、且首条确实是 dict 时补；首条已是 system
+    （客户端自带）则原样返回 False——不覆盖、不合并、不重排，原有 system
+    正文与位置都是客户端的意图。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    first = messages[0]
+    if not isinstance(first, dict) or first.get("role") == "system":
+        return False
+    messages.insert(0, {"role": "system", "content": DEFAULT_LEADING_SYSTEM})
+    return True
+
 
 
 def _clean_history_tool_calls(body: dict[str, Any]) -> None:
@@ -162,12 +188,14 @@ class CodeBuddyClient:
         stream_client: httpx.AsyncClient | None = None,
         short_client: httpx.AsyncClient | None = None,
         sanitize_markers: bool = True,
+        require_leading_system: bool = False,
         proxy: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self._stream_client = stream_client
         self._short_client = short_client
         self.sanitize_markers = sanitize_markers
+        self.require_leading_system = require_leading_system
         self._proxy = proxy
 
     @property
@@ -209,6 +237,11 @@ class CodeBuddyClient:
             for message in messages:
                 if isinstance(message, dict) and message.get("role") == "developer":
                     message["role"] = "system"
+        # 必须在 developer→system 归一**之后**判首条：客户端带 developer 时
+        # 归一已把它变成 system，再注入就成了重复首条。国际站网关硬性要求
+        # 首条为 system（见 DEFAULT_LEADING_SYSTEM 注释），国内站不注入。
+        if self.require_leading_system:
+            ensure_leading_system(body)
         # 会话正文里的伪装客户端指纹同样触发 11128 内容风控（换号无效），
         # 出站前中和；只指出现在 system/assistant 的 content
         if self.sanitize_markers:
