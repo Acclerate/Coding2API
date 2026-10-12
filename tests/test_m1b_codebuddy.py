@@ -1500,6 +1500,105 @@ def test_models_name_merge_includes_zen_and_guards_colliding_names(tmp_path):
         "hy4-preview": "hy4-preview", "hy4-preview-x": "hy4-preview-x"}
 
 
+def test_models_merges_across_channels_when_duplicate_name_has_self_named_id(tmp_path):
+    """渠道内展示名重名时，若 id 自洽的那个仍要**跨渠道合并**（2026-10-12）。
+
+    上游把多个模型共用一个展示名是常态：CB 的 `hy4-preview` / `hy4-preview-x`
+    都叫「Hy4 preview」，`hy3` / `hy3-x` 都叫「Hy3」。原来一律退回渠道限定键，
+    代价是这些模型在**本渠道内**就断了跨渠道合并——国际站（无 `-x` 变体）的
+    `hy4-preview` 本该与国内站合成一条，却因撞上被挤出去，对外多出
+    `hy4-preview-codebuddy_intl` / `deepseek-v4.1-flash-codebuddy_intl` 这类后缀。
+
+    改后：重名时用 id 归一值当合并键（重名者 id 不同故自然分开），其中 id 自洽
+    的那个重新获得跨渠道合并能力；`-x` 变体保持独立条目，不会被合并掉。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
+
+    class Stub:
+        def __init__(self, pid: str, models):
+            self.id = pid
+            self._models = models
+
+        async def list_models(self, _data):
+            return list(self._models)
+
+        def import_credential(self, raw):  # pragma: no cover - 未使用
+            return raw
+
+    from src.provider.base import Model
+
+    app = build_app(settings, providers={
+        "codebuddy": Stub("codebuddy", [Model(id="hy4-preview", name="Hy4 preview"),
+                                        Model(id="hy4-preview-x", name="Hy4 preview")]),
+        "codebuddy_intl": Stub("codebuddy_intl", [Model(id="hy4-preview",
+                                                        name="Hy4 preview")]),
+    })
+    for provider_id in ("codebuddy", "codebuddy_intl"):
+        app.state.credentials.add(provider=provider_id, credential_data={"t": "x"})
+    key = app.state.api_keys.create("root")["api_key"]
+    with TestClient(app) as client:
+        entries = {m["id"]: m for m in client.get(
+            "/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]}
+
+    # 裸名一条，同时挂两站——不再出现 -codebuddy_intl 后缀
+    assert set(entries) == {"hy4-preview", "hy4-preview-x"}
+    assert entries["hy4-preview"]["providers"] == ["codebuddy", "codebuddy_intl"]
+    # -x 变体仍是国内站独有，不被合并掉
+    assert entries["hy4-preview-x"]["providers"] == ["codebuddy"]
+    # 两站都能按裸名定位到各自的原代号（国际站的原 id 恰同名）
+    aliases = app.state.services.model_aliases
+    assert aliases["codebuddy"]["hy4-preview"] == "hy4-preview"
+    assert aliases["codebuddy_intl"]["hy4-preview"] == "hy4-preview"
+
+
+def test_models_keeps_scoped_key_when_duplicate_names_have_no_self_named_id(tmp_path):
+    """上一条的边界：重名组里**没有任何** id 自洽的模型时，仍退回渠道限定键。
+
+    上游把两个不同模型都叫「Aquila」但 id 都与展示名无关（`orion` / `vega`），
+    此时没有可用的归一键可当合并键——退回限定键才不会互相覆盖，行为与
+    2026-10-12 改动前一致。
+    """
+    from src.api.models import _merge_key, _model_label, _scoped_key, normalize_model_key
+    from src.provider.base import Model
+
+    models = [Model(id="orion", name="Aquila"), Model(id="vega", name="Aquila")]
+    label_counts: dict[str, int] = {}
+    for model in models:
+        key = normalize_model_key(_model_label(model))
+        label_counts[key] = label_counts.get(key, 0) + 1
+    duplicates = {k for k, c in label_counts.items() if c > 1}
+    assert duplicates == {"aquila"}
+    id_keys = {normalize_model_key(m.id) for m in models}
+    # 两个 id 都与展示名归一键无关，故 id 自洽的候选不存在
+    assert "aquila" not in id_keys
+    for model in models:
+        key, name_keyed = _merge_key(model, "trae", duplicates, id_keys)
+        assert key == _scoped_key("trae", model.id)
+        assert name_keyed is False
+
+
+def test_models_id_named_model_in_duplicate_group_uses_id_key(tmp_path):
+    """重名组里 id 自洽的那个走 id 键（不是限定键），因此仍可跨渠道合并。
+
+    TRAE 实测口径：`sagitta` 与 `aquila` 都叫「Aquila」，其中 `aquila` 的 id
+    归一后等于展示名归一键，故它拿到合并键 `aquila`，而 `sagitta` 单独成键。
+    """
+    from src.api.models import _merge_key, _model_label, normalize_model_key
+    from src.provider.base import Model
+
+    models = [Model(id="sagitta", name="Aquila"), Model(id="aquila", name="Aquila")]
+    label_counts: dict[str, int] = {}
+    for model in models:
+        key = normalize_model_key(_model_label(model))
+        label_counts[key] = label_counts.get(key, 0) + 1
+    duplicates = {k for k, c in label_counts.items() if c > 1}
+    id_keys = {normalize_model_key(m.id) for m in models}
+    by_id = {m.id: _merge_key(m, "trae", duplicates, id_keys) for m in models}
+    assert by_id["aquila"] == ("aquila", False)      # id 自洽 → 用 id 键，不登记别名
+    assert by_id["sagitta"] == ("sagitta", False)
+
+
 def test_models_single_channel_outward_id_is_normalized(tmp_path):
     """单渠道条目的对外 id 也是归一键（Qoder `kmodel_latest` → `kimi-k3`）。
 

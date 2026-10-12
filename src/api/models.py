@@ -182,7 +182,8 @@ def _blocked(model: Model, patterns: tuple[str, ...]) -> bool:
 
 def _merge_key(model: Model,
                provider_id: str,
-               duplicate_labels: set[str]) -> tuple[str, bool]:
+               duplicate_labels: set[str],
+               provider_id_keys: set[str]) -> tuple[str, bool]:
     """一个模型计入哪个合并键，以及是否按展示名入的键。
 
     返回 `(键, 是否按名入键)`：第二个值必须由本函数判定，不能事后拿
@@ -200,23 +201,38 @@ def _merge_key(model: Model,
 
     以下情况用**渠道限定键**（`渠道\\0归一原 id`）隔离，绝不跨渠道合并：
 
-    * 归一键在本渠道内重复（如 CodeBuddy 的 `hy4-preview` / `hy4-preview-x`
-      都叫「Hy4 preview」）——否则其中一个会被同键覆盖而消失；
     * 展示名清洗后为空（上游名就是 `free` 之类）；
     * 展示名是**哨兵名**（`auto` / `default` 等，见 `_SENTINEL_LABELS`）：
       这些是各上游自己的「自动路由 / 默认模型」占位，语义只在本渠道内成立，
       跨渠道合并会把请求错误地路由到别的上游（kilo 的 `kilo-auto/free` 与
       Qoder 的 `auto` 都归一成 `auto`，却完全不是同一个东西）。
 
-    除上述三种外一律不退回原 id：原 id 是各渠道内部代号，跨渠道根本对不上，
+    **渠道内展示名重名时，先退回 id 归一键再考虑限定键**（2026-10-12）。上游
+    把多个不同模型共用一个展示名是常态：CodeBuddy 的 `hy4-preview` /
+    `hy4-preview-x` 都叫「Hy4 preview」，`hy3` / `hy3-x` 都叫「Hy3」。原来
+    一律退回渠道限定键，代价是这些模型**在本渠道内就断了跨渠道合并**——
+    国际站的 `hy4-preview`（无 `-x` 变体）本该与国内站合成一条，却因撞上被
+    国内的污染键而被迫独立成条，对外多出 `hy4-preview-codebuddy_intl`、
+    `deepseek-v4.1-flash-codebuddy_intl` 这类后缀。
+
+    改判据：展示名重名时，若本渠道内**存在某个 id 归一后等于该 label key 的
+    模型**，就用这个归一键当合并键（并按「未按名入键」处理，不登记别名）——
+    重名的那几个模型靠**不同的 id 归一值**自然分开，且其中 id 自洽的那个
+    重新获得了跨渠道合并能力。实测只有 TRAE 的 `sagitta` / `aquila`（展示名
+    相同且都没有同名 id）会退到限定键，行为与改动前一致。
+
+    除上述外一律不退回原 id：原 id 是各渠道内部代号，跨渠道根本对不上，
     退回等于放弃合并（`kmodel_latest` 就永远无法与 `kimi-k3` 对齐了）。
     """
     label_key = normalize_model_key(_model_label(model))
-    if not label_key or label_key in duplicate_labels:
+    if not label_key or label_key in _SENTINEL_LABELS:
         return _scoped_key(provider_id, model.id), False
-    if label_key in _SENTINEL_LABELS:
+    if label_key in duplicate_labels and label_key not in provider_id_keys:
         return _scoped_key(provider_id, model.id), False
-    return label_key, True
+    # 展示名在本渠道内撞车：用 id 归一值当键（重名者 id 不同故自然分开），
+    # 但不算「按名入键」——那个展示名有歧义，登记成别名会把请求路由到错的模型
+    return (label_key if label_key not in duplicate_labels
+            else normalize_model_key(model.id)), label_key not in duplicate_labels
 
 
 def _scoped_key(provider_id: str, raw_id: str) -> str:
@@ -238,15 +254,21 @@ def _merge_provider(grouped: dict[str, dict[str, Any]],
     （raw_ids，请求转发时按渠道映射回去），供前端按渠道展示倍率。
     合并键见 `_merge_key`，别名表在定稿阶段统一登记（见 `_register_aliases`）。
     """
-    # 先数本渠道内的重名（按清洗后的展示名归一键），用于把冲突项退回上游 id。
+    # 先数本渠道内的重名（按清洗后的展示名归一键），用于把冲突项退回 id 键。
     label_keys = [normalize_model_key(_model_label(model))
                   for model in models_by_lower.values()]
     label_counts: dict[str, int] = {}
     for label_key in label_keys:
         label_counts[label_key] = label_counts.get(label_key, 0) + 1
     duplicate_labels = {key for key, count in label_counts.items() if count > 1}
+    # 本渠道全部 id 的归一值：展示名重名时用它判断「有没有哪个模型的 id 自洽」
+    # （见 `_merge_key`）。用整个渠道的 id 集合而非只算重名组，因为 id 自洽的
+    # 那个模型本身的 label 可能不重名——判据是**存在**即可，不必同组。
+    provider_id_keys = {normalize_model_key(model.id)
+                        for model in models_by_lower.values()}
     for model in models_by_lower.values():
-        key, name_keyed = _merge_key(model, provider_id, duplicate_labels)
+        key, name_keyed = _merge_key(model, provider_id, duplicate_labels,
+                                      provider_id_keys)
         entry = grouped.setdefault(key, {"key": key, "providers": set(),
                                          "meta": dict.fromkeys(_META_FIELDS),
                                          "provider_meta": {}, "raw_ids": {},

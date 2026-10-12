@@ -9,9 +9,10 @@
 - **首条 system 强制注入**：国际站网关硬性要求 `messages[0]` 是 system prompt，
   否则整单 400 / 11128（2026-10-12 真实国际站凭证实测：无 system → 400，
   前置中性 system → 200）。国内站无此要求，出站 body 必须一个字节不变。
-- 能力边界：`growth` / `activity` / `activity_scope` / `checkin` / `checkin_scope` /
-  `checkin_status` 为 None——国际站在渠道侧就没有签到活动（`active: false` 且
-  活动字段全空），成长中心与活跃上报则**未验证**且含不可逆动作，都不做
+- 能力边界：`growth` 为 None（未验证且含不可逆动作），`checkin` /
+  `checkin_scope` / `checkin_status` 为 None（国际站在渠道侧就没有签到活动，
+  `active: false` 且活动字段全空）；**活跃上报启用**（`/v2/report` 实测存在，
+  与成长中心不是同一路径）
 """
 
 from __future__ import annotations
@@ -236,15 +237,13 @@ def test_login_start_endpoint_accepts_cn(admin_client):
 # --------------------------------------------------------------- 能力边界
 
 def test_intl_has_no_growth_or_activity():
-    """成长中心与活跃上报在国际站**未验证**，一律关闭。
+    """成长中心在国际站**未验证**，一律关闭。
 
     成长中心含抽奖 / 连登兑换 / 盲盒等不可逆动作；调用方一律用
     `getattr(provider, "growth", None)` 探测，置 None 即自动跳过。
     """
     provider = CodeBuddyIntlProvider(client=CodeBuddyClient())
     assert getattr(provider, "growth", None) is None
-    assert getattr(provider, "activity", None) is None
-    assert getattr(provider, "activity_scope", None) is None
 
 
 def test_cn_provider_keeps_growth_and_activity():
@@ -253,6 +252,47 @@ def test_cn_provider_keeps_growth_and_activity():
     assert callable(provider.growth)
     assert callable(provider.activity)
     assert callable(provider.activity_scope)
+
+
+def test_intl_keeps_activity_reporting():
+    """国际站**启用**活跃上报——端点实测存在，与成长中心不是同一路径。
+
+    2026-10-12 真实国际站凭证实测：`/v2/report` 带凭证回 `200 {"code":0}`，
+    同批探针里 `/v2/report-nope` 回应用层 `404 Route Not Found`（两者可区分，
+    故端点真实存在并接受上报）。早先「国际站无活跃上报」的判断只探过
+    `/v2/activity/*` 前缀、没探过 `/v2/report`，属探针覆盖不全，这里纠正。
+
+    与国内站同一套协议（`CodeBuddyActivity` 共用），`activity_scope` 带
+    endpoint 故两站不会互相占位。
+    """
+    provider = CodeBuddyIntlProvider(client=CodeBuddyClient())
+    assert callable(provider.activity)
+    assert callable(provider.activity_scope)
+
+
+def test_intl_activity_scope_is_scoped_by_endpoint():
+    """两站活跃上报隔离键必须含 endpoint：同账号多凭证也要各站各报一次。"""
+    import base64
+    import json as _json
+
+    from src.provider.codebuddy.client import CodeBuddyClient as _C
+
+    def jwt_with_sub(sub: str) -> str:
+        payload = base64.urlsafe_b64encode(
+            _json.dumps({"sub": sub}).encode()).decode().rstrip("=")
+        return f"header.{payload}.sig"
+
+    credential = {"bearer_token": jwt_with_sub("user-1")}
+    cn = CodeBuddyProvider(client=_C(endpoint="https://copilot.tencent.com"))
+    intl = CodeBuddyIntlProvider(client=_C(endpoint="https://www.codebuddy.ai"))
+    cn_scope = cn.activity_scope(credential)
+    intl_scope = intl.activity_scope(credential)
+    assert cn_scope == "https://copilot.tencent.com|user-1"
+    assert intl_scope == "https://www.codebuddy.ai|user-1"
+    # 同一渠道同一凭证稳定，否则同账号多凭证无法共桶（同日只报一次）
+    assert cn.activity_scope(credential) == cn_scope
+    # 身份取不到时返回空串由调用方回落到 credential_id，绝不编造 id 去上报
+    assert intl.activity_scope({"bearer_token": "not-a-jwt"}) == ""
 
 
 def test_intl_has_no_checkin():
@@ -284,7 +324,8 @@ def test_intl_keeps_chat_quota_models_refresh():
     """已验证存在的能力全部保留：与国内站同一套路径与协议。"""
     provider = CodeBuddyIntlProvider(client=CodeBuddyClient())
     for name in ("import_credential", "probe_quota", "list_models", "stream_chat",
-                 "refresh", "credential_from", "classify", "aclose", "host"):
+                 "refresh", "credential_from", "classify", "aclose", "host",
+                 "activity", "activity_scope"):
         assert callable(getattr(provider, name)), name
 
 

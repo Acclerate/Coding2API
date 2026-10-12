@@ -23,22 +23,20 @@ system prompt，否则整单 400 / 11128 `first message is not system prompt`
   而未注册路径返回应用层 JSON 404（`/billing/meter/daily-checkin` 实测 401，
   `/billing/nope` 实测 404，两者可区分）。
 - 签到 / 成长中心 / 活跃上报 —— **全部关闭**。
-  - 成长中心与活跃上报：国际站网关把整个 `/v2/activity/*` 前缀挂在认证插件
-    后面（实测 `/v2/activity/nope` 也返回 401，而非 404），因此 401 无法证明
-    子路由存在；而成长中心含抽奖 / 连登兑换 / 盲盒等**不可逆**动作，在未验证
-    的端点上盲跑会真实消耗账号权益。
-  - 签到：路径**存在**（`/billing/meter/checkin-activity-status` 带凭证回
-    `code=0`），但**活动本身在渠道侧就没有**——实测 `active: false`，且
-    `season` / `theme_name` / `start_time` / `end_time` / `activity_name` 全为空
-    （国内站同接口是 `season: 10` /「Buddy加油站」/ 有起止时间），CLAIM 回
-    `{"code":10001,"msg":"签到活动未开启或已过期"}`。这是渠道级缺席而非账号级
-    未开启，保留只会让后台任务每 10 分钟失败一次并触发 `task_failed` 噪音告警。
+  - 成长中心：国际站网关把整个 `/v2/activity/*` 前缀挂在认证插件后面（实测
+    `/v2/activity/nope` 也返回 401 而非 404），因此 401 无法证明子路由存在；
+    而成长中心含抽奖 / 连登兑换 / 盲盒等**不可逆**动作，在未验证的端点上
+    盲跑会真实消耗账号权益。
+  - 活跃上报：**启用**。活跃上报打的 `/v2/report` 与成长中心**不是同一路径**
+    ——2026-10-12 实测国际站 `/v2/report` 带凭证回 `200 {"code":0}`，而同批
+    探针里 `/v2/report-nope` 回应用层 `404 Route Not Found`，两者可区分，
+    即端点真实存在且接受上报。（早先「国际站无活跃上报」的判断只探过
+    `/v2/activity/*` 前缀，没探过 `/v2/report`，属探针覆盖不全。）
 
-  处置：`growth` / `activity` / `activity_scope` / `checkin` / `checkin_scope` /
-  `checkin_status` 一律置 `None`——任务层与 API 层都用
-  `getattr(provider, ..., None)` / `hasattr(provider, ...)` 探测能力，置 `None`
-  即自动跳过，**无需在任务层加渠道分支**；管理台的「成长中心」按钮本就按
-  `credential.provider === "codebuddy"` 判定、「签到」按钮按 `supportsCheckin()`
+  处置：`growth` / `checkin` / `checkin_scope` / `checkin_status` 置 `None`——
+  任务层与 API 层都用 `getattr(provider, ..., None)` / `hasattr(provider, ...)`
+  探测能力，置 `None` 即自动跳过，**无需在任务层加渠道分支**；管理台的
+  「签到」「成长中心」按钮按 `supportsCheckin()` / `provider === "codebuddy"`
   判定，对本渠道天然不出现。
 """
 
@@ -54,7 +52,8 @@ class CodeBuddyIntlProvider(CodeBuddyProvider):
     """国际站渠道；差异只由渠道 id 与下面几个 `None` 表达。
 
     保留 dataclass 字段覆盖而非另写一份实现：客户端、凭证解析、事件分类、
-    签到协议、刷新全部共用国内站代码，无此能力的调用点由 `None` 表达。
+    签到协议、活跃上报、刷新全部共用国内站代码，无此能力的调用点由 `None`
+    表达。
     """
 
     id: str = "codebuddy_intl"
@@ -62,8 +61,6 @@ class CodeBuddyIntlProvider(CodeBuddyProvider):
     # `getattr(provider, "growth", None)` 之类探测能力，置 None 就是
     # 「本渠道没有该能力」，无需在任务层加渠道分支。
     growth = None
-    activity = None
-    activity_scope = None
     # 签到三项（后台任务用 checkin_scope 探测，管理台用 checkin /
     # checkin_status 探测），渠道侧无此活动，一并关闭。
     checkin = None
