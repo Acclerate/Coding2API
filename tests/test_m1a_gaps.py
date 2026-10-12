@@ -22,7 +22,7 @@ from src.provider.trae.client import (
     prepare_body,
 )
 from src.provider.trae.events import UpstreamProtocolViolation
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 class _Provider:

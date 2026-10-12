@@ -26,7 +26,7 @@ from src.tasks.refresh import RefreshTask
 from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
 from src.tasks.status import TASK_BY_KEY, TASK_SPECS, TaskStatusStore
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture()

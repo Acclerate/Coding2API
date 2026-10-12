@@ -22,7 +22,7 @@ from src.provider.base import Quota
 from src.sorting import parse_sort_order, sort_rows, sql_order
 from src.stats.collector import StatsCollector
 from src.stats.query import StatsQuery
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 ALLOWED = {"a": "a", "b": "b"}
 

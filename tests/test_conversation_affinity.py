@@ -15,7 +15,7 @@ from src.engine.affinity import ConversationAffinity
 from src.engine.executor import Executor, ExecutorDeps
 from src.engine.scheduler import Candidate, Scheduler
 from src.provider.base import ErrKind, Event, EventKind, Usage
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 # ------------------------------------------------------ ConversationAffinity
 

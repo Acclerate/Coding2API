@@ -6,7 +6,6 @@ token 全空、已有 credit（上游真值 / 旧推算值）都不动。
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
@@ -17,16 +16,13 @@ from src.provider.codearts.backfill import (
     backfill_estimated_credit,
     benefit_models,
 )
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "backfill_codearts_credit.py"
+SCRIPT = script_path("backfill_codearts_credit")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("backfill_codearts_credit", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("backfill_codearts_credit")
 
 
 BACKFILL = _load()

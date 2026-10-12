@@ -24,7 +24,7 @@ from src.tasks.quota_probe import QuotaProbeTask
 from src.tasks.refresh import RefreshTask
 from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture()

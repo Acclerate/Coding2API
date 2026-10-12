@@ -23,7 +23,7 @@ from src.db.conn import Database
 from src.db.migrate import apply_schema
 from src.db.repo import UserRepository
 from src.main import build_app
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 def _app(tmp_path, monkeypatch, *, users):

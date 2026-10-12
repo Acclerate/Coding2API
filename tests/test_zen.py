@@ -804,7 +804,7 @@ def test_provider_default_client_uses_min_version():
 def test_zen_endpoint_rejects_unallowlisted_host():
     from src.config import Settings
     from src.main import _zen_endpoint
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET,
                         ZEN_API_ENDPOINT="https://evil.example.com")
@@ -815,7 +815,7 @@ def test_zen_endpoint_rejects_unallowlisted_host():
 def test_zen_endpoint_accepts_trailing_slash():
     from src.config import Settings
     from src.main import _zen_endpoint
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET,
                         ZEN_API_ENDPOINT="https://opencode.ai/")
@@ -828,7 +828,7 @@ def test_seed_zen_credential_is_idempotent(tmp_path):
     from src.db.migrate import apply_schema
     from src.db.repo import CredentialRepository
     from src.main import _seed_zen_credential
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     db = Database(tmp_path / "t.sqlite3")
     apply_schema(db.connect())
@@ -847,7 +847,7 @@ async def test_build_app_seeds_zen_and_resolves_forced_route(tmp_path):
     from src.config import Settings
     from src.engine.model_resolver import resolve
     from src.main import build_app
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
@@ -876,7 +876,7 @@ def test_zen_credential_can_be_restored_after_delete(tmp_path, monkeypatch):
     from src.auth.session import create_session_token
     from src.config import Settings
     from src.main import build_app
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     async def fake_fetch_models(self):
         return [Model(id="offline-free", name="Offline")]

@@ -26,7 +26,7 @@ from src.db.migrate import SCHEMA_VERSION, schema_version
 from src.engine.sse import SSE_COMMENT
 from src.main import BodySizeLimitMiddleware, _api_not_found, _codebuddy_endpoint, build_app
 from src.provider.base import Event, EventKind, Model, Quota, Usage
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture()

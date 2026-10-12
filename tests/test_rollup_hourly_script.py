@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
@@ -11,16 +10,13 @@ from src.db.conn import Database
 from src.db.migrate import apply_schema
 from src.stats.backfill import pending_hourly
 from src.stats.collector import StatsCollector
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "rollup_hourly.py"
+SCRIPT = script_path("rollup_hourly")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("rollup_hourly", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("rollup_hourly")
 
 
 ROLLUP = _load()

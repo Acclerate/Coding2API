@@ -25,7 +25,7 @@ from src.compat.openai.request import InvalidRequest
 from src.config import Settings
 from src.main import build_app
 from src.provider.base import Event, EventKind, Quota, Usage
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 def _events(text: str) -> list[tuple[str, dict]]:

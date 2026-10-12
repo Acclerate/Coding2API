@@ -54,7 +54,7 @@ from src.tasks.pacer import Pacer, stable_key
 from src.tasks.quota_probe import QuotaProbeTask
 from src.tasks.refresh import RefreshTask
 from src.tasks.retention import RetentionTask
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 # ---------------------------------------------------------------- Pacer
 

@@ -26,7 +26,7 @@ from src.compat.responses.response import (
 from src.config import Settings
 from src.main import build_app
 from src.provider.base import ErrKind, Event, EventKind, Quota, Usage
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 def _events(frame: bytes) -> tuple[str, dict]:

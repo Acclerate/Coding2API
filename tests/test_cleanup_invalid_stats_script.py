@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import sqlite3
 from pathlib import Path
 
@@ -15,16 +14,13 @@ import pytest
 from src.db.conn import Database
 from src.db.migrate import apply_schema
 from src.stats.collector import StatsCollector
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "cleanup_invalid_stats.py"
+SCRIPT = script_path("cleanup_invalid_stats")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("cleanup_invalid_stats", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("cleanup_invalid_stats")
 
 
 CLEANUP = _load()

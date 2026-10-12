@@ -27,7 +27,7 @@ from src.runtime_settings import (
     parse_value,
     validate_group,
 )
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 class MemoryStore:

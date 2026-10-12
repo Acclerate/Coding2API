@@ -16,7 +16,7 @@ from src.config import (
     validate_qoder_endpoint_allowed,
 )
 from src.runtime_settings import HOT_BY_KEY, RuntimeSettings
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 class _MemoryStore:

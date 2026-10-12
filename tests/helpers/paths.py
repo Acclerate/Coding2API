@@ -15,7 +15,15 @@ SCRIPTS = ROOT / "scripts"
 # 真实上游样本（SSE / JSON），契约测试用
 PROVIDER_FIXTURES = SRC / "provider" / "fixtures"
 
-__all__ = ["PROVIDER_FIXTURES", "ROOT", "SCRIPTS", "SRC"]
+__all__ = [
+    "PROVIDER_FIXTURES",
+    "ROOT",
+    "SCRIPTS",
+    "SRC",
+    "load_script",
+    "provider_fixture",
+    "script_path",
+]
 
 
 def script_path(name: str) -> Path:
@@ -27,3 +35,15 @@ def script_path(name: str) -> Path:
 def provider_fixture(provider: str, name: str) -> str:
     """读取某渠道的真实样本文件内容。"""
     return (PROVIDER_FIXTURES / provider / name).read_text(encoding="utf-8")
+
+
+def load_script(name: str):
+    """按文件路径加载 `scripts/` 下的脚本模块（脚本不是包，不能 import）。"""
+    import importlib.util
+
+    path = script_path(name)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module

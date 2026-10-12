@@ -35,7 +35,7 @@ from src.tasks.alerting import (
 from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
 from src.tasks.status import TASK_BY_KEY, TaskStatusStore
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 def _jwt(claims: dict) -> str:

@@ -24,7 +24,7 @@ from src.provider.trae import events as trae_events
 from src.provider.trae.callback import parse_callback_url
 from src.provider.trae.client import TraeClient, TraeCredential, TraeProvider
 from src.provider.trae.events import UpstreamProtocolViolation
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 # ------------------------------------------------------------------ repo
 

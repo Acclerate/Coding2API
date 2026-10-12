@@ -13,7 +13,7 @@ from src.auth.session import create_session_token
 from src.auth.throttle import LoginThrottle, ThrottleLimits
 from src.config import Settings
 from src.main import build_app
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture()

@@ -37,7 +37,7 @@ from src.provider.codebuddy.client import (
 from src.provider.codebuddy.credential import CodeBuddyCredential
 from src.provider.codebuddy.intl import CodeBuddyIntlProvider
 from src.runtime_settings import HOT_BY_KEY, RuntimeSettings
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 class _MemoryStore:

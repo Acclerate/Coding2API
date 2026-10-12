@@ -40,7 +40,7 @@ from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import _restore_model_list, build_app
 from src.provider.base import Model
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture()

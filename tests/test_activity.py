@@ -34,7 +34,7 @@ from src.provider.codebuddy.activity import (
 from src.provider.codebuddy.client import CodeBuddyCredential
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from src.tasks.activity import ActivityTask
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 def _jwt(claims: dict) -> str:

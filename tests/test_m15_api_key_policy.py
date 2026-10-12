@@ -30,7 +30,7 @@ from src.engine.executor import Executor, ExecutorDeps
 from src.engine.scheduler import Scheduler
 from src.main import build_app
 from src.provider.base import Event, EventKind
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
         Event(kind=EventKind.FINISH, finish_reason="stop")]

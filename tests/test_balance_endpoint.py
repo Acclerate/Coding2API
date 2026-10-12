@@ -16,7 +16,7 @@ from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import build_app
 from src.provider.base import Quota
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 PATH = "/v1/user/balance"
 

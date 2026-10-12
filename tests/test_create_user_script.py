@@ -2,24 +2,18 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 from src.auth.users import verify_password
 from src.db.conn import Database
 from src.db.repo import AuditRepository, UserRepository
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "create_user.py"
+SCRIPT = script_path("create_user")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("create_user", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("create_user")
 
 
 SCRIPT_MODULE = _load()

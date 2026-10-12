@@ -2,23 +2,18 @@
 
 from __future__ import annotations
 
-import importlib.util
 import stat
-from pathlib import Path
 
 import pytest
 
 from src.auth.users import verify_password
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "hash_password.py"
+SCRIPT = script_path("hash_password")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("hash_password", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("hash_password")
 
 
 SCRIPT_MODULE = _load()

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import httpx
 import pytest
@@ -53,13 +52,14 @@ from src.provider.trae.client import (
 )
 from src.provider.trae.events import UpstreamProtocolViolation
 from src.tasks.pacer import stable_key
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
+from tests.helpers.paths import PROVIDER_FIXTURES, provider_fixture
 
-FIXTURES = Path(__file__).parent.parent / "src" / "provider" / "fixtures" / "trae"
+FIXTURES = PROVIDER_FIXTURES / "trae"
 
 
 def fixture(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
+    return provider_fixture("trae", name)
 
 
 # ---------------------------------------------------------------- SSE 解析

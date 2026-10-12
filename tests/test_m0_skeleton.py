@@ -41,7 +41,7 @@ from src.provider.base import (
     Quota,
     health_score,
 )
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 # --------------------------------------------------------------------- 配置
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent  # noqa: PTH — 部署测试须自证仓库根，勿依赖 helpers
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "docker-compose.yml"
 DOCKERIGNORE = ROOT / ".dockerignore"

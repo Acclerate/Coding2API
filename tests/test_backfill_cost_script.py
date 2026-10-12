@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
@@ -10,17 +9,14 @@ import pytest
 from src.benchmarks import save_catalog
 from src.db.conn import Database
 from src.db.migrate import apply_schema
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "backfill_cost.py"
+SCRIPT = script_path("backfill_cost")
 TABLE = {"glm-5.2": (1.0, 2.0, 0.5), "deepseek-v4.1-flash": (0.5, 1.5, 0.05)}
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("backfill_cost", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("backfill_cost")
 
 
 BACKFILL = _load()

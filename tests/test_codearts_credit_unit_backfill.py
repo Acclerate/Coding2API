@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
@@ -17,16 +16,13 @@ from src.provider.codearts.backfill import (
     convert_codearts_credit_unit,
     pending,
 )
+from tests.helpers.paths import load_script, script_path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "convert_codearts_credit_unit.py"
+SCRIPT = script_path("convert_codearts_credit_unit")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("convert_codearts_credit_unit", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_script("convert_codearts_credit_unit")
 
 
 CONVERT = _load()

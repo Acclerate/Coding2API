@@ -559,7 +559,7 @@ async def test_provider_stream_chat_releases_pacer_on_error():
 def test_kilo_endpoint_rejects_unallowlisted_host():
     from src.config import Settings
     from src.main import _kilo_endpoint
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET,
                         KILO_API_ENDPOINT="https://evil.example.com")
@@ -570,7 +570,7 @@ def test_kilo_endpoint_rejects_unallowlisted_host():
 def test_kilo_endpoint_accepts_default():
     from src.config import Settings
     from src.main import _kilo_endpoint
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET)
     assert _kilo_endpoint(settings) == KILO_HOST
@@ -578,7 +578,7 @@ def test_kilo_endpoint_accepts_default():
 
 def test_kilo_allowed_parses_comma_separated_endpoints():
     from src.config import Settings, validate_kilo_endpoint_allowed
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET,
                         KILO_ALLOWED_ENDPOINTS="https://api.kilo.ai/api/gateway/, https://alt.example.com")
@@ -594,7 +594,7 @@ def test_seed_kilo_credential_is_idempotent(tmp_path):
     from src.db.migrate import apply_schema
     from src.db.repo import CredentialRepository
     from src.main import _seed_kilo_credential
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     db = Database(tmp_path / "t.sqlite3")
     apply_schema(db.connect())
@@ -613,7 +613,7 @@ async def test_build_app_seeds_kilo_and_resolves_forced_route(tmp_path):
     from src.config import Settings
     from src.engine.model_resolver import resolve
     from src.main import build_app
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
@@ -637,7 +637,7 @@ def test_kilo_credential_can_be_restored_after_delete(tmp_path, monkeypatch):
     from src.auth.session import create_session_token
     from src.config import Settings
     from src.main import build_app
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     async def fake_fetch_models(self):
         return [Model(id="offline/free", name="Kilo")]
@@ -682,7 +682,7 @@ async def test_stream_429_cools_only_that_model(tmp_path):
     from src.db.repo import CredentialRepository
     from src.engine.executor import Executor, ExecutorDeps
     from src.engine.scheduler import Scheduler
-    from tests.conftest import SECRET
+    from tests.helpers.constants import SECRET
 
     db = Database(tmp_path / "kilo429.sqlite3")
     apply_schema(db.connect())

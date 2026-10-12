@@ -15,7 +15,7 @@ import pytest
 from src.config import Settings
 from src.main import build_app
 from src.webapp.logging import DATE_FORMAT, LOG_FORMAT, _RootHandler, configure_logging
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 
 @pytest.fixture(autouse=True)

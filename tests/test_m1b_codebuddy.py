@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from pathlib import Path
 
 import httpx
 import pytest
@@ -39,9 +38,10 @@ from src.provider.codebuddy.client import (
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from src.provider.codebuddy.headers import QUOTA_RANGE_END, encode_department, host_of
 from src.tasks.pacer import stable_key
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
+from tests.helpers.paths import PROVIDER_FIXTURES, provider_fixture
 
-FIXTURES = Path(__file__).parent.parent / "src" / "provider" / "fixtures" / "codebuddy"
+FIXTURES = PROVIDER_FIXTURES / "codebuddy"
 
 
 def _quota_body(accounts: object) -> dict:
@@ -52,7 +52,7 @@ def _quota_body(accounts: object) -> dict:
 
 
 def fixture(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
+    return provider_fixture("codebuddy", name)
 
 
 @pytest.fixture(autouse=True)

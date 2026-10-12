@@ -17,7 +17,7 @@ from src.engine.model_resolver import (
 )
 from src.engine.scheduler import Scheduler
 from src.provider.base import ErrKind, Event, EventKind
-from tests.conftest import SECRET
+from tests.helpers.constants import SECRET
 
 # ------------------------------------------------------------ 纯函数：组解析
 
