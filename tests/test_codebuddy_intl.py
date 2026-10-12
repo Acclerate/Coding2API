@@ -154,6 +154,59 @@ def test_upstream_auth_registers_both_codebuddy_sites():
     assert flows["codebuddy"] is not flows["codebuddy_intl"]
 
 
+@pytest.fixture()
+def admin_client(tmp_path):
+    """真实 registry 的 admin 客户端（不注入替身 OAuth）。"""
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+    from src.main import build_app
+
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    client = TestClient(app)
+    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+    with client:
+        yield app, client
+
+
+def test_login_start_endpoint_accepts_intl(admin_client, monkeypatch):
+    """端到端：管理台「登录 CodeBuddy 国际版」必须走 poll 轨道。
+
+    这条测的是**真实装配**的 registry，不注入替身 OAuth——只测
+    `_upstream_auth` 的返回值会漏掉「注册表里没有该渠道」这类断线，
+    表现为登录按钮点了就报 `does not support login`。
+    """
+    from src.auth.session import create_session_token  # noqa: F401
+    from src.provider.base import AuthSession
+
+    app, client = admin_client
+    assert "codebuddy_intl" in app.state.upstream_auth
+
+    async def fake_start(self, username):
+        return AuthSession(flow="poll", state=f"state-{username}",
+                           auth_url=f"{self.endpoint}/v2/plugin/auth/state",
+                           interval=5)
+
+    monkeypatch.setattr(
+        "src.provider.codebuddy.oauth.CodeBuddyOAuth.start", fake_start)
+    response = client.post("/api/auth/upstream/start",
+                           json={"provider": "codebuddy_intl"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["flow"] == "poll"
+    assert body["auth_url"].startswith("https://www.codebuddy.ai/")
+    # 登录域名必须是国际站，不能是国内站
+    assert "copilot.tencent.com" not in body["auth_url"]
+
+
+def test_login_start_endpoint_accepts_cn(admin_client):
+    """对照：国内站渠道未被国际站的接线带坏。"""
+    app, _client = admin_client
+    assert "codebuddy" in app.state.upstream_auth
+
+
 # --------------------------------------------------------------- 能力边界
 
 def test_intl_has_no_growth_or_activity():
