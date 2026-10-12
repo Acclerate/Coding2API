@@ -100,6 +100,16 @@ MODELS_CACHE_TTL_SECONDS = 1800.0
 STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
 SHORT_TIMEOUT = httpx.Timeout(30.0)
 
+# 403 门禁抖动重试（实测 2026-10-09/12 共 7 次）：上游**偶发**对同一请求回
+# FreeTierError 403，数秒后的同请求即 200（门禁条件每次都满足，抖动来自上游）。
+# 403 归 ErrKind.REQUEST → 不冷却也不跳过渠道，但 zen 只有一条虚拟凭证，
+# 轮换候选随即耗尽 → 对外 503「无可用凭证」（表现为「每次第一次请求都报错」）。
+# 故抖动先在客户端内部消化：退避 GATE_403_RETRY_DELAY 后换新 session、关旧连接
+# 重发一次；重试仍 403 才上抛，走引擎既有轮换语义（若上游改为持续拒绝，
+# 只多一次往返，不会变成重试风暴）。只对 403 重试：其余状态码语义不变。
+GATE_403_RETRIES = 1
+GATE_403_RETRY_DELAY = 1.0
+
 # session id 的 base62 字母表（12 位 hex + 14 位 base62，共 26 位）
 _SESSION_ALPHABET = string.ascii_letters + string.digits
 
@@ -337,25 +347,37 @@ class ZenClient:
         # 有实际（保留或改写）tool_call 时才允许 finish_reason=tool_calls；
         # 全是无法映射的伪工具调用时收敛为 stop，避免客户端收到空的收尾。
         kept_tool_calls = False
-        async with self._stream().stream(
-            "POST", f"{self.host}{EP_CHAT}", json=body,
-            headers=gate_headers(version=self.version),
-        ) as response:
-            if response.status_code >= 400:
-                raw = await base.read_body_bounded(response)
-                raise UpstreamHTTPError(response.status_code, raw)
-            async for frame in iter_frames(response.aiter_bytes()):
-                for event in zen_events.parse_all_events(frame):
-                    if event.kind is EventKind.TOOL_CALLS and event.tool_calls:
-                        kept = tool_filter.keep(event.tool_calls)
-                        if not kept:
-                            continue
-                        kept_tool_calls = True
-                        event = Event(kind=EventKind.TOOL_CALLS, tool_calls=kept)
-                    elif (event.kind is EventKind.FINISH
-                          and event.finish_reason == "tool_calls" and not kept_tool_calls):
-                        event = Event(kind=EventKind.FINISH, finish_reason="stop")
-                    yield event
+        attempt = 0
+        while True:
+            async with self._stream().stream(
+                "POST", f"{self.host}{EP_CHAT}", json=body,
+                headers=gate_headers(version=self.version),
+            ) as response:
+                if response.status_code == 403 and attempt < GATE_403_RETRIES:
+                    # 门禁抖动重试：正文**不读**直接退避——httpx 退出 context 时
+                    # 关掉该连接，重发走新连接 + 新 session id（见 GATE_403_RETRIES）
+                    attempt += 1
+                    logger.warning(
+                        "zen 上游 403（FreeTierError 抖动），%.1fs 后重试（第 %d 次）",
+                        GATE_403_RETRY_DELAY, attempt)
+                    await asyncio.sleep(GATE_403_RETRY_DELAY)
+                    continue
+                if response.status_code >= 400:
+                    raw = await base.read_body_bounded(response)
+                    raise UpstreamHTTPError(response.status_code, raw)
+                async for frame in iter_frames(response.aiter_bytes()):
+                    for event in zen_events.parse_all_events(frame):
+                        if event.kind is EventKind.TOOL_CALLS and event.tool_calls:
+                            kept = tool_filter.keep(event.tool_calls)
+                            if not kept:
+                                continue
+                            kept_tool_calls = True
+                            event = Event(kind=EventKind.TOOL_CALLS, tool_calls=kept)
+                        elif (event.kind is EventKind.FINISH
+                              and event.finish_reason == "tool_calls" and not kept_tool_calls):
+                            event = Event(kind=EventKind.FINISH, finish_reason="stop")
+                        yield event
+                return
 
     async def fetch_models(self) -> list[Model]:
         """GET /zen/v1/models，只返回**探活可用**的免费模型。

@@ -485,13 +485,61 @@ async def test_stream_chat_keeps_real_tool_calls():
     assert finishes[0].finish_reason == "tool_calls"
 
 
-async def test_stream_chat_raises_classified_http_error():
-    def handler(_request: httpx.Request) -> httpx.Response:
+async def test_stream_chat_raises_classified_http_error(monkeypatch):
+    """403 抖动重试用尽后仍上抛，分类保持 REQUEST（重试不改错误语义）。"""
+    from src.provider.zen import client as zen_client
+
+    monkeypatch.setattr(zen_client, "GATE_403_RETRY_DELAY", 0.0)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
         return httpx.Response(403, content=b'{"error":"forbidden"}')
 
     with pytest.raises(UpstreamHTTPError) as caught:
         [e async for e in _client(handler).stream_chat({"messages": []}, "m")]
     assert caught.value.kind() is ErrKind.REQUEST
+    # 首次 + 重试一次（GATE_403_RETRIES=1）后放弃
+    assert len(calls) == zen_client.GATE_403_RETRIES + 1
+
+
+async def test_stream_chat_retries_gate_403_then_succeeds(monkeypatch):
+    """门禁 403 抖动：退避后换新 session 重发，第二次 200 → 对下游完全不可见。"""
+    from src.provider.zen import client as zen_client
+
+    monkeypatch.setattr(zen_client, "GATE_403_RETRY_DELAY", 0.0)
+    sessions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sessions.append(request.headers["x-opencode-session"])
+        if len(sessions) == 1:
+            return httpx.Response(403, content=b'{"error":"FreeTierError"}')
+        return httpx.Response(200, text=_sse(
+            chunk({"content": "hi"}, finish="stop"),
+            chunk({}, choices=[], usage={"prompt_tokens": 1, "completion_tokens": 1}),
+        ))
+
+    events = [e async for e in _client(handler).stream_chat({"messages": []}, "m")]
+    assert len(sessions) == 2
+    # 重试走新 session（门禁只校验格式，但换 session 是重试语义的一部分）
+    assert sessions[0] != sessions[1]
+    assert all(SESSION_RE.match(s) for s in sessions)
+    assert [e.kind for e in events] == [EventKind.CONTENT, EventKind.FINISH,
+                                        EventKind.USAGE]
+
+
+async def test_stream_chat_non_403_http_error_is_not_retried():
+    """只对 403 重试：其余状态码一次上抛，不增加额外往返。"""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500, content=b'{"error":"boom"}')
+
+    with pytest.raises(UpstreamHTTPError) as caught:
+        [e async for e in _client(handler).stream_chat({"messages": []}, "m")]
+    assert caught.value.kind() is ErrKind.OTHER
+    assert len(calls) == 1
 
 
 async def test_fetch_models_keeps_only_live_free_candidates():
