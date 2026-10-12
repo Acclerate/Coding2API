@@ -618,6 +618,30 @@ describe("渠道登录入口", () => {
     expect(screen.getByTestId("checkin-qd")).toBeInTheDocument();
   });
 
+  it("CodeBuddy 国际版无签到活动：探测保留、签到入口隐藏", async () => {
+    // 上游 /billing/meter/checkin-activity-status 回 active:false 且活动
+    // 字段全空（渠道侧无此活动，非账号级未开启），后端相应把 checkin* 置
+    // None，签到按钮必须同步消失——否则就是一个必然失败的出口。
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "ci", provider: "codebuddy_intl" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    expect(screen.getByTestId("probe-ci")).toBeInTheDocument();
+    expect(screen.queryByTestId("checkin-ci")).not.toBeInTheDocument();
+  });
+
+  it("国内 CodeBuddy 签到入口仍在（上一条的对照）", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "cb", provider: "codebuddy" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    expect(screen.getByTestId("checkin-cb")).toBeInTheDocument();
+  });
+
   it("CodeBuddy 走 poll：打开授权页并轮询渠道", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const opened: string[] = [];

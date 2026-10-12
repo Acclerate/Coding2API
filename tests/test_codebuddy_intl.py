@@ -9,8 +9,9 @@
 - **首条 system 强制注入**：国际站网关硬性要求 `messages[0]` 是 system prompt，
   否则整单 400 / 11128（2026-10-12 真实国际站凭证实测：无 system → 400，
   前置中性 system → 200）。国内站无此要求，出站 body 必须一个字节不变。
-- 能力边界：`growth` / `activity` / `activity_scope` 为 None（未验证的端点上
-  不做含不可逆动作的领取）
+- 能力边界：`growth` / `activity` / `activity_scope` / `checkin` / `checkin_scope` /
+  `checkin_status` 为 None——国际站在渠道侧就没有签到活动（`active: false` 且
+  活动字段全空），成长中心与活跃上报则**未验证**且含不可逆动作，都不做
 """
 
 from __future__ import annotations
@@ -254,12 +255,36 @@ def test_cn_provider_keeps_growth_and_activity():
     assert callable(provider.activity_scope)
 
 
-def test_intl_keeps_chat_quota_models_checkin_refresh():
+def test_intl_has_no_checkin():
+    """国际站渠道侧就没有签到活动，三项能力一并关闭。
+
+    实测（2026-10-12 真实国际站凭证）：`/billing/meter/checkin-activity-status`
+    回 `code=0` 但 `active: false`，且 `season` / `theme_name` / `start_time` /
+    `end_time` / `activity_name` **全为空**（国内站同接口是 `season: 10` /
+    「Buddy加油站」/ 有起止时间），CLAIM 回 `{"code":10001,"msg":"签到活动未开启
+    或已过期"}`——是渠道级缺席而非账号级未开启。保留会让后台任务每 10 分钟失败
+    一次并触发 `task_failed` 噪音告警。
+
+    三个探测点都要关：后台任务探 `checkin_scope`（tasks/checkin.py），
+    管理台探 `checkin` / `checkin_status`（api/admin_credentials.py）。
+    """
+    provider = CodeBuddyIntlProvider(client=CodeBuddyClient())
+    for name in ("checkin", "checkin_scope", "checkin_status"):
+        assert getattr(provider, name, None) is None, name
+
+
+def test_cn_provider_keeps_checkin():
+    """反向守卫：上一条的对照，国内站签到不能被误关。"""
+    provider = CodeBuddyProvider(client=CodeBuddyClient())
+    for name in ("checkin", "checkin_scope", "checkin_status"):
+        assert callable(getattr(provider, name)), name
+
+
+def test_intl_keeps_chat_quota_models_refresh():
     """已验证存在的能力全部保留：与国内站同一套路径与协议。"""
     provider = CodeBuddyIntlProvider(client=CodeBuddyClient())
     for name in ("import_credential", "probe_quota", "list_models", "stream_chat",
-                 "checkin", "checkin_status", "checkin_scope", "refresh",
-                 "credential_from", "classify", "aclose", "host"):
+                 "refresh", "credential_from", "classify", "aclose", "host"):
         assert callable(getattr(provider, name)), name
 
 

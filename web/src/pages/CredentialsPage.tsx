@@ -76,12 +76,14 @@ import {
 /**
  * 渠道是否支持每日签到。
  *
- * 目前全部渠道都有签到：CodeArts 自 Q72 起接入 `/v1/ops/delivery`
- * （此前「上游没有签到接口」的结论已推翻）。保留函数是为了将来某个渠道
- * 下线签到时不至于把按钮散落在 JSX 里，也便于测试单点断言。
+ * CodeArts 自 Q72 起接入 `/v1/ops/delivery`（此前「上游没有签到接口」的结论
+ * 已推翻）。CodeBuddy 国际站（`codebuddy_intl`）**不支持**：上游
+ * `/billing/meter/checkin-activity-status` 回 `active: false` 且活动字段全空
+ * （渠道侧无此活动，非账号级未开启），后端相应把该渠道的 `checkin*` 置 None，
+ * 这里同步隐藏按钮，避免给一个必然失败的操作出口。
  */
-function supportsCheckin(_provider: Credential["provider"]): boolean {
-  return true;
+function supportsCheckin(provider: Credential["provider"]): boolean {
+  return provider !== "codebuddy_intl";
 }
 
 /** 套餐到期日：只要日期，时分秒对"哪个包先过期"没用。 */
