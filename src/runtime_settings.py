@@ -175,8 +175,8 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "后台任务相邻上游请求的最大间隔，必须不小于下限。", minimum=0.0,
                group="pacer"),
     HotSetting("activity_report_enabled", bool, "活跃上报",
-               "是否为 CodeBuddy 账号补发对话事件以续连连登天数。官方条款禁止"
-               "脚本篡改活动数据，开启前请自行评估账号风险。", task="activity"),
+               "是否为 CodeBuddy（含国际版）账号补发对话事件以续连连登天数。官方"
+               "条款禁止脚本篡改活动数据，开启前请自行评估账号风险。", task="activity"),
     # 与开关配对：开着但时点不对等于没开，只热更开关会让用户以为改坏了。
     HotSetting("activity_report_hour", int, "活跃上报时点（0-23）",
                "本地（北京）时间整点窗口；该小时内每 10 分钟检查一次，每号每天"

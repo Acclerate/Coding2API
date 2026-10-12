@@ -86,6 +86,19 @@ function supportsCheckin(provider: Credential["provider"]): boolean {
   return provider !== "codebuddy_intl";
 }
 
+/**
+ * 渠道是否支持活跃上报（手动补发一条对话事件）。
+ *
+ * 后端按能力探测（`getattr(provider, "activity", None)`），国际站已启用——
+ * 活跃上报打的 `/v2/report` 与成长中心的 `/v2/activity/*` 不是同一路径，
+ * 实测国际站回 `200 {"code":0}`，故 `intl.py` 不再把 `activity` 置 None。
+ * 前端据此不能用 `provider === "codebuddy"` 写死：那会让国际版菜单项消失，
+ * 而后端其实可以跑（用户报的正是这个错配）。
+ */
+function supportsActivity(provider: Credential["provider"]): boolean {
+  return provider === "codebuddy" || provider === "codebuddy_intl";
+}
+
 /** 套餐到期日：只要日期，时分秒对"哪个包先过期"没用。 */
 function packageExpiry(epoch: number | null): string {
   return epoch === null ? "—" : new Date(epoch * 1000).toLocaleDateString("zh-CN");
@@ -431,7 +444,7 @@ export function CredentialsPage() {
                               active={sort === "growth_last_run_at"} direction={order}
                               onToggle={toggle} testId="sort-growth_last_run_at"
                               hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时单行截断，悬浮看全文。" />} />
-                {canWrite && <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻按钮。更多操作（⋯）：成长中心、活跃上报（均仅 CodeBuddy）、指定、暂停/恢复、删除。积分记录入口在额度列数字后的下箭头。" /></span></TableHead>}
+                {canWrite && <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻按钮。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录入口在额度列数字后的下箭头。" /></span></TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -828,7 +841,7 @@ function Row({
                         <Sparkles className="size-4" /> 成长中心
                       </DropdownMenuItem>
                     )}
-                    {credential.provider === "codebuddy" && (
+                    {supportsActivity(credential.provider) && (
                       <DropdownMenuItem onSelect={() => actions.activity(credential)}>
                         <Radio className="size-4" /> 活跃上报
                       </DropdownMenuItem>

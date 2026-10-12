@@ -126,7 +126,7 @@ coding2api/
 │   │   ├── quota_probe.py       # 启动立即一轮 + 每 QUOTA_PROBE_MINUTES
 │   │   ├── checkin.py           # 全天每 10 分钟；成功即当日封账
 │   │   ├── growth.py            # 成长中心（仅 CB），落 growth_events
-│   │   ├── activity.py          # 活跃上报（仅 CB，默认关闭）
+│   │   ├── activity.py          # 活跃上报（CB / CB 国际版，默认关闭）
 │   │   ├── refresh.py           # 每 REFRESH_INTERVAL_MINUTES（默认 30）；REFRESH_SKEW_HOURS 窗口内预刷新
 │   │   ├── retention.py         # 每 5 分钟：小时汇总重算 + 90 天前明细清理
 │   │   ├── alerting.py          # 运维告警（P1-7）：四类规则评估 + webhook + 落库
@@ -332,7 +332,7 @@ def health(q: Quota | None) -> HealthScore:
 
 ### 3.6 活跃上报（B1.7，默认关闭）
 
-CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端对话事件；账号只被网关自动调用时会断连登。`ACTIVITY_REPORT_ENABLED=true` 时 `src/tasks/activity.py` 每天在 `ACTIVITY_REPORT_HOUR`（默认 10 点，北京时间）整点窗口内为每个上游账号补发**一条** `chat_request_send`；按「endpoint + userId」隔离，当日成功即封账（内存态），失败下轮重试。协议在 `src/provider/codebuddy/activity.py`。
+CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端对话事件；账号只被网关自动调用时会断连登。`ACTIVITY_REPORT_ENABLED=true` 时 `src/tasks/activity.py` 每天在 `ACTIVITY_REPORT_HOUR`（默认 10 点，北京时间）整点窗口内为每个上游账号补发**一条** `chat_request_send`；按「endpoint + userId」隔离，当日成功即封账（内存态），失败下轮重试。协议在 `src/provider/codebuddy/activity.py`。**渠道范围**：CodeBuddy 与 CodeBuddy 国际版（国际站的 `/v2/report` 实测可用，`intl.py` 已恢复继承 `activity`；成长中心仍关闭）。
 实测（2026-09-21，直连 CN 上游，端到端点亮连登 1→2）：
 
 | 项 | 实测结论 |
@@ -897,7 +897,7 @@ class Scheduler:
 | token 预刷新（refresh.py） | 每 `REFRESH_INTERVAL_MINUTES`（默认 30）分钟 | 到期前 `REFRESH_SKEW_HOURS`（默认 24h）窗口内轮换 refresh token；到期时间同上（CB 实测无显式字段）。短寿命渠道自行封顶该窗口（CodeArts `refresh_skew_cap_seconds=2700`，见 §3.17）——封顶值必须**严格宽于**本周期，否则窗口整轮漏过、凭证拖到到期才刷。上游明确回「续期凭据已作废」（`UpstreamReloginRequired`）时不重试，改标记「需重新登录」并硬禁用 |
 | 每日签到（checkin.py） | 每 10 分钟（全天） | 成功即封账该凭证（`日期:scope` → 截止时刻，进程内内存态，跨天清理）；默认封到本地当日结束，渠道可回填 `CheckinResult.seal_until` 封到自己的签到窗口结束（Qoder 每日 10:00 换窗口，见 §3.16）；失败持续重试 |
 | 成长中心（growth.py） | 每 `GROWTH_INTERVAL_MINUTES`（默认 60，下限 5） | 仅 CodeBuddy：7 类领取；结果落 `growth_events` + 回写 `credentials.growth_last_result` |
-| 活跃上报（activity.py，默认关闭） | 每 10 分钟醒一次，仅 `ACTIVITY_REPORT_HOUR`（默认 10 点，北京时间）窗口内执行 | 仅 CodeBuddy：补发一条 `chat_request_send` 续连登；按「endpoint + userId」隔离、当日封账；成功落一行 `growth_events` |
+| 活跃上报（activity.py，默认关闭） | 每 10 分钟醒一次，仅 `ACTIVITY_REPORT_HOUR`（默认 10 点，北京时间）窗口内执行 | CodeBuddy 与 CodeBuddy 国际版：补发一条 `chat_request_send` 续连登；按「endpoint + userId」隔离、当日封账；成功落一行 `growth_events` |
 | 明细清理（retention.py） | 每 5 分钟 | `usage_events` 全量重算小时汇总（幂等 upsert，与 record 的增量双写对账）+ 90 天前明细清理；同期限回收 `credit_events`（§3.10）、`audit_events`（§3.13）与 `alert_events`（§3.22） |
 | 渠道模型列表刷新（`api/models.py::list_models`，注入式） | 每 `MODEL_CATALOG_MINUTES`（默认 30，下限 5） | 兜底重拉各渠道模型表（走同一条 `list_models`：TTL 门禁 + 逐渠道 publish + 落盘快照）。周期 30 分钟是跟着 zen 免费模型判活缓存（`MODELS_CACHE_TTL_SECONDS`，30 分钟）对齐——更密不会让 zen 多探一次，只是白打其余渠道的 `/models` |
 | 模型目录刷新（OpenRouter）（`benchmarks.fetch_openrouter_models`，注入式） | 每 `OPENROUTER_CATALOG_MINUTES`（默认 1440，下限 60） | 拉 `openrouter.ai/api/v1/models` → `build_price_table` / `build_model_catalog` / `build_benchmark_table` → 落盘 `DATA_DIR/openrouter_catalog.json`（三表一体），并就地换入 `StatsCollector` 持有的同一份价表 dict 与 `app.state.models_dev_catalog` / `app.state.model_benchmarks`。上游变动很少，默认每日一次；返回空价表视为失败（保留旧三表），异常由 `_guarded` 记日志不影响聊天 |

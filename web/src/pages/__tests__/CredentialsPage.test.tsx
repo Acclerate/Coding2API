@@ -632,6 +632,21 @@ describe("渠道登录入口", () => {
     expect(screen.queryByTestId("checkin-ci")).not.toBeInTheDocument();
   });
 
+  it("CodeBuddy 国际版有活跃上报入口、无成长中心入口", async () => {
+    // 后端 intl.py 只把 growth 置 None，activity 已恢复继承国内站实现
+    // （/v2/report 实测可用），前端判定必须跟能力走：写死 codebuddy 会让
+    // 国际版明明能跑却看不到菜单项。
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "ci", provider: "codebuddy_intl" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await userEvent.click(screen.getByTestId("actions-ci"));
+
+    expect(screen.getByRole("menuitem", { name: "活跃上报" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "成长中心" })).not.toBeInTheDocument();
+  });
+
   it("国内 CodeBuddy 签到入口仍在（上一条的对照）", async () => {
     mockFetch({
       "/api/credentials": listBody([makeCredential({ id: "cb", provider: "codebuddy" })]),
