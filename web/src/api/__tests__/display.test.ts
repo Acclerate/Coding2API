@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { makeCredential } from "@/test-utils";
 import {
   creditEventLabel,
   expiringQuotaLabel,
@@ -12,6 +13,17 @@ import {
   QUOTA_UNIT,
   taskReportLabel,
   tokenExpiryView,
+  activeModelCooldowns,
+  credentialState,
+  formatDuration,
+  formatNumber,
+  formatTime,
+  hasQuotaProbe,
+  healthView,
+  modelCooldownLabel,
+  probeFailureLabel,
+  quotaSemantics,
+  usageErrorLabel,
 } from "../display";
 
 describe("formatCredit", () => {
@@ -282,5 +294,137 @@ describe("taskReportLabel", () => {
   it("无报告给破折号；空对象说「无明细」而不是空白", () => {
     expect(taskReportLabel(null)).toBe("—");
     expect(taskReportLabel({})).toBe("无明细");
+  });
+});
+
+describe("display helpers", () => {
+  it("健康度四态互不混淆", () => {
+    expect(healthView(null)).toMatchObject({ kind: "unknown", label: "未探测", tone: "muted" });
+    expect(healthView(-1)).toMatchObject({ kind: "exhausted", label: "已耗尽", tone: "danger" });
+    expect(healthView(0)).toMatchObject({ kind: "known", percent: 0, tone: "danger" });
+    expect(healthView(30)).toMatchObject({ kind: "known", tone: "warn" });
+    expect(healthView(90)).toMatchObject({ kind: "known", tone: "ok" });
+  });
+
+  it("undefined 也视为未探测", () => {
+    expect(healthView(undefined as unknown as null).kind).toBe("unknown");
+  });
+
+  it("免费层（zen / kilo）的 null 归「无探测」，付费渠道归「未探测」", () => {
+    expect(healthView(null, "zen")).toMatchObject({ kind: "noprobe", label: "无探测" });
+    expect(healthView(null, "kilo")).toMatchObject({ kind: "noprobe", label: "无探测" });
+    expect(healthView(null, "codebuddy")).toMatchObject({ kind: "unknown", label: "未探测" });
+    // 已知额度不受渠道影响
+    expect(healthView(62, "zen")).toMatchObject({ kind: "known", label: "62%" });
+    expect(hasQuotaProbe("zen")).toBe(false);
+    expect(hasQuotaProbe("kilo")).toBe(false);
+    expect(hasQuotaProbe("trae")).toBe(true);
+    // Qoder / CodeArts 都有额度接口，属「需探测」
+    expect(hasQuotaProbe("qoder")).toBe(true);
+    expect(hasQuotaProbe("codearts")).toBe(true);
+  });
+
+  it("周期语义按渠道类型判定，而不是看 cycle_end 是否存在", () => {
+    // CodeBuddy 有重置时间
+    const cycle = quotaSemantics(makeCredential({
+      provider: "codebuddy", quota_cycle_end: 1_800_000_000 }) as never);
+    expect(cycle).toContain("本周期剩余，");
+    expect(cycle).toContain("重置");
+
+    // CodeBuddy 未探测：cycle_end 为 null，但绝不能显示成 TRAE 的语义
+    const unprobed = quotaSemantics(makeCredential({
+      provider: "codebuddy", quota_cycle_end: null }) as never);
+    expect(unprobed).toContain("本周期剩余");
+    expect(unprobed).not.toContain("单调递减");
+
+    // TRAE 永远是单调递减
+    const balance = quotaSemantics(makeCredential({
+      provider: "trae", quota_cycle_end: null }) as never);
+    expect(balance).toBe("账户剩余（单调递减）");
+
+    // Kilo 与 Zen 同为免费层：无额度接口
+    const kilo = quotaSemantics(makeCredential({
+      provider: "kilo", quota_cycle_end: null }) as never);
+    expect(kilo).toBe("免费层（无额度接口）");
+
+    // Qoder 与 CodeBuddy 同属周期重置（未探测到重置时间时退化口径）
+    const qoder = quotaSemantics(makeCredential({
+      provider: "qoder", quota_cycle_end: null }) as never);
+    expect(qoder).toContain("本周期剩余");
+    expect(qoder).not.toContain("单调递减");
+
+    // CodeArts 是每日 token 池折算的额度池（0 点清零），不看 cycle_end，也不套用周期口径
+    const codearts = quotaSemantics(makeCredential({
+      provider: "codearts", quota_cycle_end: 1_800_000_000 }) as never);
+    expect(codearts).toBe("每日额度池（token 折算，当日 0 点清零）");
+
+    // 国际版 Qoder 无旧签到接口，但额度语义不变（不在此断言）
+  });
+
+  it("凭证状态机覆盖全部状态", () => {
+    expect(credentialState(makeCredential() as never, 0)).toBe("ready");
+    expect(credentialState(makeCredential({ disabled: 1 }) as never, 0)).toBe("disabled");
+    expect(credentialState(makeCredential({ enabled: 0 }) as never, 0)).toBe("off");
+    expect(credentialState(makeCredential({ cooling_until: 500 }) as never, 100)).toBe("cooling");
+    expect(credentialState(makeCredential({ health: -1 }) as never, 0)).toBe("exhausted");
+    // 冷却已过期 → 不再是 cooling
+    expect(credentialState(makeCredential({ cooling_until: 50 }) as never, 100)).toBe("ready");
+  });
+
+  it("时长格式化覆盖秒/分/时/天与零值", () => {
+    expect(formatDuration(0)).toBe("—");
+    expect(formatDuration(-5)).toBe("—");
+    expect(formatDuration(30)).toBe("30 秒");
+    expect(formatDuration(120)).toBe("2 分钟");
+    expect(formatDuration(7200)).toBe("2.0 小时");
+    expect(formatDuration(172800)).toBe("2.0 天");
+  });
+
+  it("探测失败原因有中文文案，且未知值有兜底", () => {
+    expect(probeFailureLabel("credential_rejected")).toContain("重新登录");
+    expect(probeFailureLabel("upstream_unavailable")).toContain("与本账号凭证无关");
+    expect(probeFailureLabel("network_unreachable")).toContain("连不上渠道服务器");
+    expect(probeFailureLabel(undefined)).toBe("未知错误");
+    expect(probeFailureLabel("something_new" as never)).toBe("未知错误");
+  });
+
+  it("明细失败类型翻成中文，未知值不进主提示但保留原文", () => {
+    expect(usageErrorLabel("rate_limit")).toBe("额度耗尽");
+    expect(usageErrorLabel("client_disconnect")).toBe("客户端中断");
+    expect(usageErrorLabel(null)).toBe("失败");
+    expect(usageErrorLabel(undefined)).toBe("失败");
+    // 后端新增枚举时前端不能显示空白：兜底文案带原值便于对照排查
+    expect(usageErrorLabel("brand_new_reason")).toBe("失败（brand_new_reason）");
+  });
+
+  it("时间与数字格式化处理空值", () => {
+    expect(formatTime(null)).toBe("—");
+    expect(formatTime(1_700_000_000)).not.toBe("—");
+    expect(formatNumber(null)).toBe("—");
+    expect(formatNumber(1234)).toBe("1,234");
+  });
+
+  it("模型级冷却只展示生效中的条目，按剩余时长升序", () => {
+    const now = 1_000_000;
+    const credential = makeCredential({
+      model_cooldowns: [
+        { model: "late", cooling_until: now + 600, hits: 1, reason: "model" },
+        { model: "stale", cooling_until: now - 600, hits: 1, reason: "model" },
+        { model: "soon", cooling_until: now + 60, hits: 2, reason: "blocked" },
+      ],
+    });
+    expect(activeModelCooldowns(credential as never, now).map((item) => item.model)).toEqual([
+      "soon",
+      "late",
+    ]);
+    // 无冷却（老后端不返回该字段）时为空数组，不抛错
+    expect(activeModelCooldowns(makeCredential() as never, now)).toEqual([]);
+  });
+
+  it("模型冷却文案区分「模型限流」与「该账号无此模型」", () => {
+    expect(modelCooldownLabel(
+      { model: "m", cooling_until: 1, hits: 1, reason: "model" })).toContain("其它模型不受影响");
+    expect(modelCooldownLabel(
+      { model: "m", cooling_until: 1, hits: 1, reason: "blocked" })).toContain("无此模型");
   });
 });

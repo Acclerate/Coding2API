@@ -1,0 +1,209 @@
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { App } from "../App";
+import { Layout } from "../Layout";
+
+function renderWithProviders(ui: React.ReactNode) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>{ui}</MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe("Layout", () => {
+  it("管理员用户菜单显示角色与退出，且导航全量", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    // 导航始终可见
+    expect(screen.getByText("凭证管理")).toBeInTheDocument();
+    expect(screen.getByText("Playground")).toBeInTheDocument();
+    // 角色与退出收在用户菜单（触发器只显示用户名+箭头）
+    expect(screen.queryByText(/管理员/)).not.toBeInTheDocument();
+    const trigger = screen.getByRole("button", { name: "用户菜单" });
+    expect(trigger).not.toHaveTextContent("管理员");
+    await userEvent.click(trigger);
+    const menu = await screen.findByRole("menu");
+    expect(menu).toHaveTextContent("root · 管理员");
+    expect(menu).toHaveTextContent("退出");
+  });
+
+  it("普通用户展开用户菜单显示只读标记", async () => {
+    renderWithProviders(<Layout session={{
+      username: "guest", is_operator: false, is_admin: false, role: "viewer", must_change_password: false,
+    }} />);
+    await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
+    const menu = await screen.findByRole("menu");
+    expect(menu).toHaveTextContent("guest · 只读");
+  });
+
+  it("操作员角色显示操作员，且看不到管理员导航", async () => {
+    renderWithProviders(<Layout session={{
+      username: "op", is_operator: true, is_admin: false, role: "operator", must_change_password: false,
+    }} />);
+    // 凭证管理对操作员可见
+    expect(screen.getByText("凭证管理")).toBeInTheDocument();
+    // 用户管理/审计/配置为 admin-only
+    expect(screen.queryByText("用户管理")).not.toBeInTheDocument();
+    expect(screen.queryByText("审计日志")).not.toBeInTheDocument();
+    expect(screen.queryByText("运维告警")).not.toBeInTheDocument();
+    expect(screen.queryByText("任务与配置")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
+    expect(await screen.findByRole("menu")).toHaveTextContent("op · 操作员");
+  });
+
+  it("管理员可在侧边栏看到管理类入口", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    // 管理类入口直接展示在侧边栏「管理」分组下（不再收进下拉）
+    const nav = screen.getByRole("navigation", { name: "主导航" });
+    expect(within(nav).getByText("用户管理")).toBeInTheDocument();
+    expect(within(nav).getByText("审计日志")).toBeInTheDocument();
+    expect(within(nav).getByText("运维告警")).toBeInTheDocument();
+    expect(within(nav).getByText("任务与配置")).toBeInTheDocument();
+    // 仓库入口已移出侧栏，改到顶栏图标按钮
+    expect(within(nav).queryByText("项目仓库")).not.toBeInTheDocument();
+  });
+
+  it("项目仓库入口在顶栏，是带无障碍名的外链图标按钮", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    const link = screen.getByRole("link", { name: "项目仓库" });
+    expect(link).toHaveAttribute("href", "https://github.com/RobbsLuo/coding2api");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("用户菜单可打开修改密码对话框", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
+    await userEvent.click(await screen.findByTestId("menu-change-password"));
+    expect(await screen.findByTestId("change-password-dialog")).toBeInTheDocument();
+  });
+
+  it("退出：POST /api/auth/logout 后跳登录页", async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.stubGlobal("location", { href: "/" });
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
+    await userEvent.click(await screen.findByTestId("menu-logout"));
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/api/auth/logout");
+    expect((init.headers as Record<string, string>)["X-Requested-With"]).toBe("XMLHttpRequest");
+    expect((globalThis as { location: { href: string } }).location.href).toBe("/login");
+  });
+
+  it("移动端抽屉：汉堡打开导航，Esc 关闭", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    // 初始不渲染抽屉
+    expect(screen.queryByTestId("nav-drawer")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    const drawer = screen.getByTestId("nav-drawer");
+    expect(within(drawer).getByText("任务与配置")).toBeInTheDocument();
+    // 抽屉里的关闭按钮
+    await userEvent.click(screen.getByRole("button", { name: "关闭导航" }));
+    await waitFor(() => expect(screen.queryByTestId("nav-drawer")).not.toBeInTheDocument());
+    // Esc 关闭
+    await userEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    expect(screen.getByTestId("nav-drawer")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("nav-drawer")).not.toBeInTheDocument());
+  });
+
+  it("移动端抽屉：点击遮罩关闭", async () => {
+    renderWithProviders(<Layout session={{
+      username: "root", is_operator: true, is_admin: true, role: "admin", must_change_password: false,
+    }} />);
+    await userEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    const drawer = screen.getByTestId("nav-drawer");
+    // 遮罩是抽屉的父容器，直接点父容器触发关闭
+    await userEvent.click(drawer.parentElement as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId("nav-drawer")).not.toBeInTheDocument());
+  });
+});
+describe("App 路由守卫", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("未登录时重定向到登录页", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { code: "unauthorized" } }), { status: 401 }),
+      ),
+    );
+    renderWithProviders(<App />);
+    expect(await screen.findByTestId("login-username")).toBeInTheDocument();
+  });
+
+  it("已登录时渲染凭证管理（首页）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/auth/session") {
+          return new Response(JSON.stringify({ username: "root", is_admin: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ credentials: [], viewer: "root", is_admin: true }), {
+          status: 200,
+        });
+      }),
+    );
+    renderWithProviders(<App />);
+    expect(await screen.findByTestId("credentials-page")).toBeInTheDocument();
+  });
+
+  it("会话加载中显示载入提示", () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
+    renderWithProviders(<App />);
+    expect(screen.getByText("载入中…")).toBeInTheDocument();
+  });
+
+  it("首登未改密时只给强制改密对话框", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({
+          username: "alice", is_operator: true, is_admin: false, role: "operator", must_change_password: true,
+        }), { status: 200 }),
+      ),
+    );
+    renderWithProviders(<App />);
+    expect(await screen.findByTestId("change-password-dialog")).toBeInTheDocument();
+  });
+
+  it("未登录访问 /activate 直接渲染激活页（令牌即凭证）", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/auth/session")) {
+        return new Response(JSON.stringify({ error: { code: "unauthorized" } }), { status: 401 });
+      }
+      return new Response(JSON.stringify({ username: "alice", valid: true }), { status: 200 });
+    }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/activate?token=t"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("activate-page")).toBeInTheDocument();
+    expect(await screen.findByText("alice")).toBeInTheDocument();
+  });
+});

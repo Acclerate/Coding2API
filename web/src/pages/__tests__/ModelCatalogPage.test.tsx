@@ -1,7 +1,7 @@
 import { fireEvent, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ModelCatalogPage } from "../ModelCatalogPage";
-import { renderPage, settle } from "./helpers";
+import { renderPage, settle } from "@/test-utils";
 
 function stubFetch(body: unknown, status = 200) {
   const spy = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>

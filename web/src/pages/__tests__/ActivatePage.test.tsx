@@ -2,7 +2,7 @@ import { screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ActivatePage } from "../ActivatePage";
 import { ChangePasswordDialog } from "../../components/ChangePasswordDialog";
-import { jsonResponse, renderStandalone, userEvent } from "./helpers";
+import { jsonResponse, renderStandalone, userEvent } from "@/test-utils";
 import { Routes, Route } from "react-router-dom";
 
 /** 让 useSearchParams 拿到 token：包一层带查询串的路由。 */

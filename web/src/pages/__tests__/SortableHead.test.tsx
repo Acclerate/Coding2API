@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { SortableHead } from "../../components/SortableHead";
-import { mockFetch, renderPage, settle, userEvent } from "./helpers";
+import { mockFetch, renderPage, settle, userEvent } from "@/test-utils";
 import { AlertsPage } from "../AlertsPage";
 
 /** 渲染一个最小表格，用 SortableHead 表头，验证 aria-sort 与点击回调。 */

@@ -1,7 +1,7 @@
 import { screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UsersPage } from "../UsersPage";
-import { jsonResponse, renderPage, settle, userEvent } from "./helpers";
+import { jsonResponse, renderPage, settle, userEvent } from "@/test-utils";
 
 /** 按「METHOD path」分派；条目顺序即匹配优先级（长的写前面）。 */
 function stubFetch(routes: Record<string, () => Response>) {

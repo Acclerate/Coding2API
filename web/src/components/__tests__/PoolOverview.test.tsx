@@ -1,7 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { PoolOverview } from "../PoolOverview";
-import { makeCredential, renderPage } from "../../pages/__tests__/helpers";
+import { makeCredential, renderPage } from "@/test-utils";
 import type { Credential } from "../../api/types";
 
 function renderOverview(credentials: Credential[]) {

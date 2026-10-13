@@ -1,7 +1,7 @@
 import { screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AuditPage } from "../AuditPage";
-import { jsonResponse, renderPage, settle, userEvent } from "./helpers";
+import { jsonResponse, renderPage, settle, userEvent } from "@/test-utils";
 
 const LABELS = { login_success: "登录成功", user_disable: "禁用用户" };
 

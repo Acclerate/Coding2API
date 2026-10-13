@@ -4,8 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { vi } from "vitest";
-import { Layout } from "../../Layout";
-import type { SessionInfo } from "../../api/types";
+import { Layout } from "@/Layout";
+import type { SessionInfo } from "@/api/types";
 
 export function makeClient() {
   return new QueryClient({

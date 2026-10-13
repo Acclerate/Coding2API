@@ -2,7 +2,7 @@ import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AddCredentialDialog } from "../AddCredentialDialog";
-import { jsonResponse, renderPage } from "../../pages/__tests__/helpers";
+import { jsonResponse, renderPage } from "@/test-utils";
 
 function renderDialog(overrides: Partial<Parameters<typeof AddCredentialDialog>[0]> = {}) {
   const props = {

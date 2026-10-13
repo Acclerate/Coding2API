@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PlaygroundPage } from "../PlaygroundPage";
-import { jsonResponse, mockFetch, renderPage, userEvent } from "./helpers";
+import { jsonResponse, mockFetch, renderPage, userEvent } from "@/test-utils";
 
 const MODELS = {
   object: "list",
