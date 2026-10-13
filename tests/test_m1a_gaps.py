@@ -1118,7 +1118,8 @@ async def test_suggestion_callback_failure_does_not_break_400():
     from src.engine.executor import Executor, ExecutorDeps
     from src.engine.scheduler import Scheduler
     from src.provider.codebuddy.client import CodeBuddyProvider
-    from tests.test_m1b_codebuddy import _client, _request
+    from tests.api.test_chat import _request
+    from tests.provider.codebuddy.test_client import _client
 
     db = Database(str(_tmpdir() / "s.sqlite3"))
     apply_schema(db.connect())
@@ -1160,7 +1161,7 @@ async def test_stream_finish_frames_yielded_when_upstream_never_sent_done():
     """上游没发 done 就正常结束 → finish() 补帧（executor 147-148）。"""
     from src.provider.base import Event as E
     from src.provider.base import EventKind as EK
-    from tests.test_m1b_codebuddy import _RejectProvider, _request
+    from tests.api.test_chat import _RejectProvider, _request
 
     class _NoDoneProvider(_RejectProvider):
         """正常输出 content 但不发 FINISH。"""

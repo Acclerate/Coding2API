@@ -1,0 +1,115 @@
+"""OpenAI 出口适配：流式翻译与非流式聚合。"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from src.compat.openai.errors import UpstreamStreamError, error_payload
+from src.compat.openai.response import StreamTranslator, aggregate
+from src.engine.sse import SSE_DONE, parse_frames
+from src.provider.base import Event, EventKind, Usage
+from src.provider.trae import events as trae_events
+from tests.helpers.paths import provider_fixture
+
+
+def fixture(name: str) -> str:
+    return provider_fixture("trae", name)
+
+def test_stream_translator_emits_role_then_content_then_done():
+    """首块补 role:assistant（与 codebuddy2api 的 OpenAIStreamNormalizer 语义一致）。"""
+    t = StreamTranslator("glm-5.2")
+    frames = list(t.translate(Event(kind=EventKind.CONTENT, content="你")))
+    frames += list(t.translate(Event(kind=EventKind.FINISH, finish_reason="stop")))
+    first = json.loads(frames[0].decode()[6:])
+    assert first["choices"][0]["delta"] == {"role": "assistant", "content": "你"}
+    assert json.loads(frames[1].decode()[6:])["choices"][0]["finish_reason"] == "stop"
+    assert frames[2] == SSE_DONE
+
+def test_stream_translator_usage_is_not_a_frame():
+    t = StreamTranslator("m")
+    assert list(t.translate(Event(kind=EventKind.USAGE, usage=Usage(1, 2)))) == []
+
+def test_stream_translator_reasoning_and_tools():
+    t = StreamTranslator("m")
+    list(t.translate(Event(kind=EventKind.CONTENT, content="x")))
+    frames = list(t.translate(Event(kind=EventKind.REASONING, content="think")))
+    frames += list(t.translate(Event(kind=EventKind.TOOL_CALLS,
+                                     tool_calls=[{"id": "c1", "function": {"name": "f"}}])))
+    reasoning = json.loads(frames[0].decode()[6:])
+    tools = json.loads(frames[1].decode()[6:])
+    assert reasoning["choices"][0]["delta"] == {"reasoning_content": "think"}
+    assert tools["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
+
+def test_stream_translator_missing_tool_index_gets_stable_position():
+    t = StreamTranslator("m")
+    list(t.translate(Event(kind=EventKind.CONTENT, content="x")))
+    frames = list(t.translate(Event(kind=EventKind.TOOL_CALLS,
+                                    tool_calls=[{"id": "a", "function": {}},
+                                                {"id": "b", "function": {}}])))
+    indices = [tc["index"] for tc in json.loads(frames[0].decode()[6:])
+               ["choices"][0]["delta"]["tool_calls"]]
+    assert indices == [0, 1]
+
+def test_stream_translator_error_frame():
+    t = StreamTranslator("m")
+    frames = list(t.translate(Event(kind=EventKind.ERROR, error_code=1005,
+                                    error_message="quota")))
+    payload = json.loads(frames[0].decode()[6:])
+    assert payload["error"]["code"] == 1005
+    assert b"[DONE]" not in frames[0]
+
+def test_stream_translator_finish_without_upstream_done():
+    t = StreamTranslator("m")
+    frames = list(t.finish())
+    assert json.loads(frames[0].decode()[6:])["choices"][0]["finish_reason"] == "stop"
+    assert frames[1] == SSE_DONE
+
+def test_stream_translator_finish_after_done_emits_nothing():
+    t = StreamTranslator("m")
+    list(t.translate(Event(kind=EventKind.FINISH, finish_reason="stop")))
+    assert list(t.finish()) == []             # DONE 已随 _close 发出，不重复
+
+def test_stream_translator_empty_delta_is_skipped():
+    t = StreamTranslator("m")
+    assert list(t.translate(Event(kind=EventKind.CONTENT, content=None))) == []
+
+def test_aggregate_builds_completion_from_fixture_events():
+    events = [e for e in (trae_events.parse_frame(f)
+                          for f in parse_frames(fixture("chat-basic.sse"))) if e]
+    result = aggregate(events, "glm-5.2")
+    choice = result["choices"][0]
+    assert choice["message"]["content"] == "中国的首都是北京。"
+    assert choice["finish_reason"] == "stop"
+    assert result["usage"]["prompt_tokens"] == 21
+    assert result["usage"]["total_tokens"] == 163
+    assert result["usage"]["completion_tokens_details"]["reasoning_tokens"] == 135
+
+def test_aggregate_merges_tool_call_arguments_and_reasoning():
+    events = [
+        Event(kind=EventKind.REASONING, content="想"),
+        Event(kind=EventKind.TOOL_CALLS,
+              tool_calls=[{"id": "c1", "index": 0,
+                           "function": {"name": "f", "arguments": '{"a"'}}]),
+        Event(kind=EventKind.TOOL_CALLS,
+              tool_calls=[{"id": "c1", "index": 0, "function": {"arguments": ":1}"}}]),
+        Event(kind=EventKind.FINISH, finish_reason="tool_calls"),
+    ]
+    message = aggregate(events, "m")["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["reasoning_content"] == "想"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+
+def test_aggregate_without_usage_reports_nulls():
+    result = aggregate([Event(kind=EventKind.CONTENT, content="x")], "m")
+    assert result["usage"]["prompt_tokens"] is None
+    assert result["usage"]["total_tokens"] is None
+
+def test_aggregate_raises_on_stream_error():
+    with pytest.raises(UpstreamStreamError):
+        aggregate([Event(kind=EventKind.ERROR, error_code=1005, error_message="quota")], "m")
+
+def test_error_payload_shape():
+    payload = error_payload("msg", "code", 400)
+    assert payload["error"]["message"] == "msg" and payload["error"]["status"] == 400
