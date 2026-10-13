@@ -52,7 +52,7 @@ _NOISE_MARK_ALT = "|".join(sorted(NOISE_MARKS))     # 正则用的 alternation
 # `DeepSeek-V4.1-Flash` 是同一个 DeepSeek V4.1 Flash），仅靠清洗规则对不上，
 # 合并会把同一模型拆成两条、用户得选对渠道才路由得通。本表把「异名 → 规范」，
 # `normalize_model_key` 与 `display_model_name` 都过它，键与展示名一起收敛，
-# 合并在 `_merge_key` 层自然发生（无需改 `api/models.py`）。
+# 合并在 `_merge_key` 层自然发生（无需改 `api/model_merge.py`）。
 # 上游给的名字常常不带版本号（Qoder 的 `dfmodel` 只叫 `DeepSeek-Flash`），
 # 故映射是**身份声明**、由人工核实后登记；命中后一律走右侧的规范键与展示名。
 # 只登记已确认的同模型异名，不做模糊匹配（避免把 v4-flash 误并进 v4.1-flash）。
@@ -197,7 +197,7 @@ def normalize_model_key(raw: str) -> str:
 
     最后过「同模型异名」规范表（`MODEL_SYNONYMS`）：上游对同一模型给不同名
     （Qoder `dfmodel` 只叫 `DeepSeek-Flash`，别家叫 `DeepSeek-V4.1-Flash`）时
-    收敛到同一个规范键，合并在 `api.models._merge_key` 层自然发生。
+    收敛到同一个规范键，合并在 `api.model_merge._merge_key` 层自然发生。
     """
     slug = _base_key(raw)
     slug = slug or raw.strip().lower()

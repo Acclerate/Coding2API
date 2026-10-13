@@ -258,7 +258,12 @@ def test_models_keeps_scoped_key_when_duplicate_names_have_no_self_named_id(tmp_
     此时没有可用的归一键可当合并键——退回限定键才不会互相覆盖，行为与
     2026-10-12 改动前一致。
     """
-    from src.api.models import _merge_key, _model_label, _scoped_key, normalize_model_key
+    from src.api.model_merge import (
+        _merge_key,
+        _model_label,
+        _scoped_key,
+        normalize_model_key,
+    )
     from src.provider.base import Model
 
     models = [Model(id="orion", name="Aquila"), Model(id="vega", name="Aquila")]
@@ -282,7 +287,7 @@ def test_models_id_named_model_in_duplicate_group_uses_id_key(tmp_path):
     TRAE 实测口径：`sagitta` 与 `aquila` 都叫「Aquila」，其中 `aquila` 的 id
     归一后等于展示名归一键，故它拿到合并键 `aquila`，而 `sagitta` 单独成键。
     """
-    from src.api.models import _merge_key, _model_label, normalize_model_key
+    from src.api.model_merge import _merge_key, _model_label, normalize_model_key
     from src.provider.base import Model
 
     models = [Model(id="sagitta", name="Aquila"), Model(id="aquila", name="Aquila")]
@@ -476,7 +481,7 @@ def test_models_outward_id_collision_falls_back_to_channel_suffix():
     entry 的对外 id 与主渠道原代号归一键都被先定稿的条目占掉时，退回加渠道名
     后缀的候选，保证对外 id 唯一。
     """
-    from src.api.models import _disambiguate
+    from src.api.model_merge import _disambiguate
 
     entries = [
         {"id": "x", "key": "kx", "providers": ["p1"], "raw_ids": {"p1": "x"}},
@@ -490,7 +495,7 @@ def test_models_outward_id_collision_falls_back_to_channel_suffix():
 
 def test_models_outward_id_collision_falls_back_to_numeric_suffix():
     """候选全被占时追加数字后缀（`_unique_suffix` 兜底），保证对外 id 唯一。"""
-    from src.api.models import _disambiguate
+    from src.api.model_merge import _disambiguate
 
     entries = [
         {"id": "x", "key": "kx", "providers": ["p1"], "raw_ids": {"p1": "x"}},
