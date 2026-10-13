@@ -1,0 +1,332 @@
+"""执行引擎：统计埋点、用量记账与错误类型映射。"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from src.db.conn import Database
+from src.db.crypto import CredentialCipher
+from src.db.migrate import apply_schema
+from src.db.repo import CredentialRepository
+from src.engine.executor import NoHealthyCredential
+from src.provider.base import ErrKind, Event, EventKind, Quota, Usage
+from tests.helpers.constants import SECRET
+
+
+@pytest.fixture()
+def repo(tmp_path):
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    yield CredentialRepository(db, CredentialCipher(SECRET)), db
+    db.close()
+
+def _disabled_outcome():
+    from src.engine.scheduler import Candidate, Scheduler
+
+    return Scheduler().note_error(Candidate(credential_id="c", provider="codebuddy"),
+                                  ErrKind.DEAD, 0)
+
+class RecordingCollector:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self.boom = False
+
+    def record(self, **fields) -> None:
+        if self.boom:
+            raise RuntimeError("stats backend down")
+        self.events.append(fields)
+
+def _exec_with_stats(repo_tuple, script, collector, **kw):
+    credentials, _db = repo_tuple
+    from src.engine.executor import Executor, ExecutorDeps
+    from src.engine.scheduler import Scheduler
+
+    class Streaming:
+        id = "codebuddy"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, _data, _payload, _model):
+            index = min(self.calls, len(script) - 1)
+            self.calls += 1
+            for item in script[index]:
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+
+        def list_models(self, _data):  # pragma: no cover
+            return []
+
+    executor = Executor(ExecutorDeps(
+        providers={"codebuddy": Streaming()}, credentials=credentials,
+        scheduler=Scheduler(**kw), default_model="glm-5.2", stats=collector))
+    return executor
+
+GOOD_EVENTS = [Event(kind=EventKind.CONTENT, content="hi"),
+               Event(kind=EventKind.USAGE, usage=Usage(11, 22, 3)),
+               Event(kind=EventKind.FINISH, finish_reason="stop")]
+
+@pytest.fixture(autouse=True)
+def _clear_model_cache():
+    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
+    from src.provider.codebuddy.client import _MODEL_CACHE
+
+    _MODEL_CACHE.clear()
+    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
+    global _DAYS_BASE
+    _DAYS_BASE = None
+    yield
+    _MODEL_CACHE.clear()
+
+async def test_stream_records_success_with_usage_and_username(repo):
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="alice"):
+        pass
+
+    event = collector.events[-1]
+    assert event["ok"] is True and event["username"] == "alice"
+    assert event["provider"] == "codebuddy" and event["model"] == "glm-5.2"
+    assert event["input_tokens"] == 11 and event["output_tokens"] == 22
+    assert event["reasoning_tokens"] == 3
+    assert event["latency_ms"] is not None
+    assert event["ttfb_ms"] is not None
+
+async def test_stream_without_usage_frame_records_null_tokens(repo):
+    """上游没给 usage 时统计字段为 None，不能崩也不能写 0。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    executor = _exec_with_stats(
+        repo, [[Event(kind=EventKind.CONTENT, content="hi"),
+                Event(kind=EventKind.FINISH, finish_reason="stop")]], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True})):
+        pass
+    assert collector.events[-1]["input_tokens"] is None
+
+async def test_stream_prefers_credential_expiring_soon(repo):
+    """到期积分指标贯通到真实选号：低健康度但快过期积分多的号先被选中。"""
+    credentials, _db = repo
+    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
+    burn_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "b"})
+    now = int(time.time())
+    credentials.save_quota(steady_id, Quota(remaining=95, total=100,
+                                            cycle_end=now + 48 * 3600, probed_at=now))
+    credentials.save_quota(burn_id, Quota(remaining=10, total=100, cycle_end=now + 600,
+                                           expiry_ladder=[(now + 600, 100.0),
+                                                          (now + 700, 50.0)],
+                                           probed_at=now))
+    cands = {c.credential_id: c for c in credentials.candidates()}
+    assert cands[burn_id].expiry_ladder == [(now + 600, 100.0), (now + 700, 50.0)]
+    assert cands[steady_id].expiry_ladder is None
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="alice"):
+        pass
+
+    assert collector.events[-1]["credential_id"] == burn_id
+
+async def test_stream_expiry_window_zero_keeps_health_order(repo):
+    """窗口关闭后退回健康度排序（到期指标全员 0 分）。"""
+    credentials, _db = repo
+    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
+    burn_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "b"})
+    now = int(time.time())
+    credentials.save_quota(steady_id, Quota(remaining=95, total=100, probed_at=now))
+    credentials.save_quota(burn_id, Quota(remaining=10, total=100,
+                                           expiry_ladder=[(now + 600, 100.0)],
+                                           probed_at=now))
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector, expiry_window=0)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="alice"):
+        pass
+
+    assert collector.events[-1]["credential_id"] == steady_id
+
+async def test_stream_secondary_expiry_breaks_tie(repo):
+    """两级窗口贯通到真实选号：36h 内都没到期积分时，7 天内会过期者优先。"""
+    credentials, _db = repo
+    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
+    week_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "w"})
+    now = int(time.time())
+    credentials.save_quota(steady_id, Quota(remaining=95, total=100, probed_at=now))
+    credentials.save_quota(week_id, Quota(remaining=50, total=100,
+                                          expiry_ladder=[(now + 3 * 86400, 140.0)],
+                                          probed_at=now))
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="alice"):
+        pass
+
+    assert collector.events[-1]["credential_id"] == week_id
+
+async def test_stream_records_failure_when_credentials_exhausted(repo):
+    credentials, _db = repo
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="bob"):
+        pass
+    event = collector.events[-1]
+    assert event["ok"] is False and event["error_type"] == "no_healthy_credential"
+    assert event["username"] == "bob"
+
+async def test_complete_records_success_and_failure(repo):
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    await executor.complete(parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}]}), username="alice")
+    assert collector.events[-1]["ok"] is True
+    assert collector.events[-1]["input_tokens"] == 11
+    # 非流式也记首字延迟（上游首个事件时刻）
+    assert collector.events[-1]["ttfb_ms"] is not None
+
+    credentials.save_error(credentials.candidates()[0].credential_id, _disabled_outcome())
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}))
+    assert collector.events[-1]["error_type"] == "no_healthy_credential"
+
+async def test_stats_failure_never_breaks_chat(repo):
+    """统计后端不可用时聊天必须照常返回。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    collector.boom = True
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    result = await executor.complete(parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}]}))
+    assert result["choices"][0]["message"]["content"] == "hi"
+
+def test_executor_without_stats_collector_is_noop(repo):
+    credentials, _db = repo
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], None)
+    assert executor._deps.stats is None
+    executor._deps.record(username="x", provider="y", model="z", ok=True)  # 不崩
+
+async def test_upstream_http_failure_records_error_type(repo):
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+
+    class Dead(Exception):
+        def __init__(self) -> None:
+            super().__init__("session dead")
+
+        def kind(self):
+            return ErrKind.DEAD
+
+    executor = _exec_with_stats(repo, [[Dead()]], collector)
+    from src.compat.openai.request import parse_chat_request
+
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}))
+    # 会话失效 → 硬禁用，轮换耗尽后归类为无可用凭证
+    assert collector.events[-1]["error_type"] == "no_healthy_credential"
+    assert credentials.candidates()[0].disabled is True
+
+def test_error_type_mapping_covers_all_kinds():
+    from src.engine.executor import _error_type_for
+    from src.provider.base import ErrKind
+
+    assert _error_type_for(ErrKind.PLAN) == "rate_limit"
+    assert _error_type_for(ErrKind.MODEL) == "rate_limit"
+    assert _error_type_for(ErrKind.CONCURRENCY) == "rate_limit"
+    assert _error_type_for(ErrKind.DEAD) == "credential_unavailable"
+    assert _error_type_for(ErrKind.SOFT) == "upstream_error"
+    assert _error_type_for(ErrKind.OTHER) == "upstream_error"
+
+def test_usage_field_tolerates_missing_usage():
+    from src.engine.executor import _usage_field
+    from src.provider.base import Usage
+
+    assert _usage_field(None, "input_tokens") is None
+    assert _usage_field(Usage(5, 6, 7), "output_tokens") == 6
+    assert _usage_field(Usage(), "credit") is None
+
+async def test_plan_error_records_rate_limit_error_type(repo):
+    """权益耗尽 → 统计记为 rate_limit（受控错误类型白名单内）。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+
+    class Plan(Exception):
+        def __init__(self) -> None:
+            super().__init__("plan exhausted")
+
+        def kind(self):
+            return ErrKind.PLAN
+
+    executor = _exec_with_stats(repo, [[Plan()]], collector)
+    from src.compat.openai.request import parse_chat_request
+
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}))
+    assert collector.events[-1]["error_type"] == "no_healthy_credential"
+    assert credentials.candidates()[0].cooling_until is not None
+
+async def test_stream_plan_error_records_failure(repo):
+    """流式路径的权益耗尽同样要落统计。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+
+    class Plan(Exception):
+        def __init__(self) -> None:
+            super().__init__("plan exhausted")
+
+        def kind(self):
+            return ErrKind.PLAN
+
+    executor = _exec_with_stats(repo, [[Plan()]], collector, max_rotate=1)
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="carol"):
+        pass
+    assert collector.events[-1]["ok"] is False
+    assert collector.events[-1]["username"] == "carol"
