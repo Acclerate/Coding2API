@@ -84,13 +84,17 @@ def _text_content(value: Any) -> str:
 def _arguments_to_json(value: Any) -> str:
     """chat 的 tool_calls.function.arguments 是 JSON 字符串。
 
-    历史里的 function_call 只有 `arguments` 字符串（有就原样用），
-    没有则回落成空对象字面量——上游要求该键存在。
+    历史里的 function_call 只有 `arguments` 字符串（有就原样用）；**缺失与空串
+    一视同仁，都回落成空串**（`responses` 流对无参数调用本就发 `""`，
+    `compat/responses/response.py` 也用它做占位）。此前实现只认「缺失」，把显式
+    `arguments: ""` 直接抛 InvalidRequest：同一语义（无参数）在「省略键」与
+    「给空串」两种写法下结果不同，还会把本服务自己发出的历史回传时判为非法，
+    带工具调用的对话无法续轮。
     """
-    if isinstance(value, str) and value:
-        return value
-    if value is None:
+    if value is None or value == "":
         return ""
+    if isinstance(value, str):
+        return value
     raise InvalidRequest("function_call.arguments must be a string")
 
 

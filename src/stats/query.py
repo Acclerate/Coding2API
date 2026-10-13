@@ -52,6 +52,12 @@ EVENT_SORT_COLUMNS: dict[str, str] = {
 }
 
 
+# 分组键白名单：`_group_hourly` / `_group_events` 把 key 直接拼进 SQL（列名无法
+# 参数绑定），调用点全是本模块内的字面量。留一份显式白名单并在入口断言，未来
+# 若有人把外部输入当 key 传进来，会当场炸而不是拼出注入语句。
+_GROUP_KEYS = frozenset({"provider", "model", "username", "credential_id"})
+
+
 def _group_order(sort: str | None, order: str | None) -> str:
     """分组统计的 `ORDER BY`：主列随 sort，并列时分组键升序（稳定次序）。"""
     key, desc = parse_sort_order(sort, order, GROUP_SORT_COLUMNS,
@@ -187,6 +193,7 @@ class StatsQuery:
                       since: int | None = None, sort: str | None = None,
                       order: str | None = None) -> list[dict[str, Any]]:
         """在小时汇总上按 `key` 列聚合（渠道 / 模型 / 用户三个维度共用）。"""
+        assert key in _GROUP_KEYS, f"非法分组键: {key!r}"
         where, params = self._where(username=username, since=since, since_col="hour_utc")
         rows = self._db.connect().execute(
             f"""
@@ -220,6 +227,7 @@ class StatsQuery:
         画渠道 icon 并与请求明细显示同一个名字。昵称取自**全局共享池**（常含
         邮箱/手机），只对 admin/operator 返回（与 `events()` 的 M7 约束一致）。
         """
+        assert key in _GROUP_KEYS, f"非法分组键: {key!r}"
         where, params = self._where(username=username, since=since, since_col="ts",
                                     alias="e.")
         # 分组键为空的行（无凭证的预热失败等）没有可归属对象，不参与分组；

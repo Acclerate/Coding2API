@@ -7,9 +7,9 @@ import json
 import pytest
 
 from src.compat.openai.response import aggregate
-from src.engine.sse import parse_frames
 from src.provider.base import ErrKind, EventKind, Usage
 from src.provider.trae import events as trae_events
+from tests.helpers.sse import parse_frames
 from tests.provider.trae._support import fixture
 
 

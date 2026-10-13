@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -42,6 +43,15 @@ logger = logging.getLogger(__name__)
 
 # webhook 单次投递超时（秒）。远端挂掉时不能拖住后台循环。
 _WEBHOOK_TIMEOUT = 10.0
+
+# 一条告警的所有 webhook 地址共享的总投递预算（秒）：并发下最坏等单次超时，
+# 这一层兜住「地址极多 / 自建 client 路径累积超时」把后台循环拖死的情况。
+_WEBHOOK_TOTAL_BUDGET = 15.0
+
+# 外发 webhook 的 detail 里需要脱敏的字段：`nickname` 是用户自定义标签，
+# 实践中常填邮箱 / 手机号，站内记录留原文、外发一律打码（M5 同源问题）。
+_PII_DETAIL_KEYS = ("nickname",)
+_PII_MASK = "***"
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_WARNING = "warning"
@@ -64,6 +74,20 @@ def _redact_webhook_error(error: Exception) -> str:
     return f"{type(error).__name__}: webhook delivery failed"
 
 
+def _public_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    """外发 webhook 的 detail：把 PII 字段打码，站内记录不受影响。
+
+    `nickname` 是用户自填标签，实践中常是邮箱/手机号。站内 `alert_events`
+    属本机管理面，保留原文便于定位；一旦外发到第三方（Slack/飞书群）就该
+    最小化，非空值一律替换为掩码，空值保持空串以免多出噪声字段。
+    """
+    public = dict(detail)
+    for key in _PII_DETAIL_KEYS:
+        if public.get(key):
+            public[key] = _PII_MASK
+    return public
+
+
 @dataclass(frozen=True)
 class Alert:
     """一条待投递的告警（规则判定结果，尚未落库/推送）。"""
@@ -73,10 +97,20 @@ class Alert:
     scope: str            # 具体对象：pool / 任务 key / 凭证 id
     message: str
     detail: dict[str, Any] = field(default_factory=dict)
+    # 文案里内嵌的 PII 片段（如昵称）：站内记录留原文，外发 webhook 前打码。
+    pii: tuple[str, ...] = ()
 
     @property
     def dedup_key(self) -> str:
         return f"{self.rule}:{self.scope}"
+
+    def public_message(self) -> str:
+        """外发文案：把 `pii` 里的片段替换为掩码。"""
+        message = self.message
+        for secret in self.pii:
+            if secret:
+                message = message.replace(secret, _PII_MASK)
+        return message
 
 
 def _humanize(seconds: int) -> str:
@@ -131,14 +165,17 @@ def evaluate_alerts(
 
     for row in expiring:
         expires_at = int(row["token_expires_at"])
-        label = row.get("nickname") or row["id"]
+        nickname = row.get("nickname") or ""
+        label = nickname or row["id"]
         alerts.append(Alert(
             rule="token_expiring", severity=SEVERITY_WARNING, scope=row["id"],
             message=(f"凭证「{label}」的 token 将在 {_humanize(int(row['remaining']))} 后"
                      f"到期（{time.strftime('%Y-%m-%d %H:%M', time.localtime(expires_at))}）"),
             detail={"credential_id": row["id"], "provider": row.get("provider", ""),
-                    "nickname": row.get("nickname", ""), "token_expires_at": expires_at,
+                    "nickname": nickname, "token_expires_at": expires_at,
                     "remaining": int(row["remaining"])},
+            # 文案里的昵称片段外发时打码（detail 由 _public_detail 处理）。
+            pii=(nickname,) if nickname else (),
         ))
 
     requests, failed = error_counts
@@ -258,29 +295,46 @@ class AlertTask:
 
         投递失败只告警不抛错：一条 webhook 不能把后台任务判失败，否则
         「webhook 挂了」会被误报成「告警任务连续失败」，制造假信号。
+
+        多个地址**并发**投递并套一层总预算：串行时 N 个地址最坏要等
+        N × 单次超时，地址一多就能把后台循环拖到「连续失败」。并发下最坏
+        只等单次超时；总预算再兜一层，防止 `_post` 的自建 client 路径
+        （其 timeout 是每请求的）在地址很多时累积超时。
         """
         urls = [u.strip() for u in self._webhook_url().split(",") if u.strip()]
         if not urls:
             return False, None
         payload = {
             "service": "coding2api", "rule": alert.rule, "severity": alert.severity,
-            "scope": alert.scope, "message": alert.message,
-            "detail": alert.detail, "ts": now,
+            "scope": alert.scope, "message": alert.public_message(),
+            "detail": _public_detail(alert.detail), "ts": now,
         }
-        ok = True
-        error: str | None = None
-        for url in urls:
-            try:
-                await self._post(url, payload)
-            except Exception as exc:  # noqa: BLE001 - 单点失败不影响其余地址
-                ok = False
-                if error is None:
-                    # webhook path/query 常即密钥（Slack/飞书），日志与落库都
-                    # 只留 host，绝不带上整条 URL 或 httpx 异常里的 URL（M5）。
-                    error = _redact_webhook_error(exc)
-                logger.warning("告警 webhook 投递失败 %s: %s",
-                               _redact_webhook_url(url), error)
-        return ok, error
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(self._deliver_one(url, payload) for url in urls)),
+                timeout=_WEBHOOK_TOTAL_BUDGET,
+            )
+        except TimeoutError:
+            logger.warning("告警 webhook 投递超过总预算 %.0f 秒，本轮放弃",
+                           _WEBHOOK_TOTAL_BUDGET)
+            return False, "TimeoutError: webhook delivery budget exceeded"
+        errors = [error for error in results if error is not None]
+        return (not errors), (errors[0] if errors else None)
+
+    async def _deliver_one(self, url: str, payload: dict[str, Any]) -> str | None:
+        """投递单个地址；失败只记日志并返回脱敏后的错误串，不抛出。
+
+        webhook path/query 常即密钥（Slack/飞书），日志与落库都只留 host，
+        绝不带上整条 URL 或 httpx 异常里内嵌的 URL（M5）。
+        """
+        try:
+            await self._post(url, payload)
+        except Exception as exc:  # noqa: BLE001 - 单点失败不影响其余地址
+            error = _redact_webhook_error(exc)
+            logger.warning("告警 webhook 投递失败 %s: %s",
+                           _redact_webhook_url(url), error)
+            return error
+        return None
 
     async def _post(self, url: str, payload: dict[str, Any]) -> None:
         if self._client is not None:

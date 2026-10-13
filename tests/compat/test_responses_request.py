@@ -65,6 +65,16 @@ def test_function_call_falls_back_to_id_and_empty_arguments():
     assert call["id"] == "fc_9"
     assert call["function"]["arguments"] == ""
 
+def test_function_call_explicit_empty_arguments_accepted():
+    """显式 `arguments: ""`（本服务流对无参数调用的回传形状）不得判非法。
+
+    与「省略键」同语义，此前会抛 InvalidRequest，导致带工具调用的对话续轮 400。
+    """
+    request = parse_responses_request({"input": [
+        {"type": "function_call", "name": "f", "call_id": "c1", "arguments": ""}]})
+    call = request.raw["messages"][0]["tool_calls"][0]
+    assert call["function"]["arguments"] == ""
+
 def test_reasoning_history_becomes_reasoning_content():
     request = parse_responses_request({"input": [
         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "a"}],

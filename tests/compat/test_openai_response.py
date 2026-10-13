@@ -8,10 +8,11 @@ import pytest
 
 from src.compat.openai.errors import UpstreamStreamError, error_payload
 from src.compat.openai.response import StreamTranslator, aggregate
-from src.engine.sse import SSE_DONE, parse_frames
+from src.engine.sse import SSE_DONE
 from src.provider.base import Event, EventKind, Usage
 from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
+from tests.helpers.sse import parse_frames
 
 
 def test_stream_translator_emits_role_then_content_then_done():

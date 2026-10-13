@@ -434,6 +434,3 @@ def load_catalog_snapshot(
         return {}, {}, {}, None
 
 
-def load_benchmarks(data_dir: str, *, now: float | None = None) -> BenchmarkTable:
-    """只读能力表（快照其余部分不要）；口径与 `load_catalog_snapshot` 一致。"""
-    return load_catalog_snapshot(data_dir, now=now)[1]

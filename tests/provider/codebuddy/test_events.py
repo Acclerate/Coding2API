@@ -6,11 +6,11 @@ import json
 
 import pytest
 
-from src.engine.sse import parse_frames
 from src.provider.base import EventKind
 from src.provider.codebuddy import events as cb_events
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from tests.helpers.paths import provider_fixture
+from tests.helpers.sse import parse_frames
 
 
 def fixture(name: str) -> str:

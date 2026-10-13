@@ -17,7 +17,7 @@ from src.db.repo import (
 )
 from src.engine.executor import Executor, ExecutorDeps, NoHealthyCredential
 from src.engine.scheduler import Scheduler
-from src.engine.sse import iter_frames, parse_frames
+from src.engine.sse import iter_frames
 from src.main import build_app
 from src.provider.base import Event, EventKind, Quota, Usage
 from src.provider.trae import events as trae_events
@@ -25,6 +25,7 @@ from src.provider.trae.callback import parse_callback_url
 from src.provider.trae.client import TraeClient, TraeCredential, TraeProvider
 from src.provider.trae.events import UpstreamProtocolViolation
 from tests.helpers.constants import SECRET
+from tests.helpers.sse import parse_frames
 
 # ------------------------------------------------------------------ repo
 

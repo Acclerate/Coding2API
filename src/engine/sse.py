@@ -73,20 +73,6 @@ class FrameAssembler:
         return frame
 
 
-def parse_frames(text: str) -> list[SSEFrame]:
-    """把一段 SSE 文本解析为帧列表（测试与聚合路径用）。"""
-    assembler = FrameAssembler()
-    frames: list[SSEFrame] = []
-    for line in text.split("\n"):
-        frame = assembler.feed_line(line)
-        if frame is not None:
-            frames.append(frame)
-    tail = assembler.flush()
-    if tail is not None:
-        frames.append(tail)
-    return frames
-
-
 async def iter_frames(chunks: AsyncIterator[bytes]) -> AsyncIterator[SSEFrame]:
     """流式解析：增量 UTF-8 解码，按行缓冲，遇空行成帧。
 

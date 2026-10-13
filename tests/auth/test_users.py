@@ -33,7 +33,7 @@ def test_users_file_store(tmp_path):
     assert store.verify("alice", "pw1")
     assert not store.verify("alice", "nope")
     assert not store.verify("bob", "pw1")
-    assert store.has("carol") and not store.has("bob")
+    assert "carol" in store.list_usernames() and "bob" not in store.list_usernames()
     assert set(store.list_usernames()) == {"alice", "carol"}
     store.validate()
 

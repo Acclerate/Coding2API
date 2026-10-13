@@ -807,14 +807,20 @@ class Executor:
 
     def _pick(self, target: ModelTarget, tried: set[str],
               affinity_id: str | None = None):
-        credential_id = self._select(target, tried, affinity_id)
-        if credential_id is None:
-            return None
-        credential_data = self._deps.credentials.credential_data(credential_id)
-        if credential_data is None:  # 并发删除
-            tried.add(credential_id)
-            return self._pick(target, tried, affinity_id)
-        return credential_id, credential_data
+        """选一个「仓库里还在」的凭证；被并发删除就换下一个。
+
+        循环而不是递归：候选池理论上无上限，`tried` 又只在删一个后加一项，
+        极端情况下（大量凭证被并发删除）递归深度能顶到 Python 的递归上限。
+        循环写法没有这个上限，也省掉每次递归的栈开销。
+        """
+        while True:
+            credential_id = self._select(target, tried, affinity_id)
+            if credential_id is None:
+                return None
+            credential_data = self._deps.credentials.credential_data(credential_id)
+            if credential_data is not None:
+                return credential_id, credential_data
+            tried.add(credential_id)  # 并发删除：标记后重选
 
     def _sticky(self, candidates: list, tried: set[str],
                 affinity_id: str | None) -> str | None:

@@ -163,7 +163,6 @@ class ApiKeyPrincipal:
     """
 
     username: str
-    key_id: str
     provider_binding: str = ""      # '' = 不限定渠道
     allowed_models: str = ""        # '' = 不限定模型（fnmatch glob，逗号分隔）
 
@@ -180,7 +179,7 @@ def _api_key_principal(services: Services, request: Request,
     source = request_ip(request, services.settings)
     if not ip_allowed(source, record.get("allowed_ips") or ""):
         raise ForbiddenError("source ip not allowed for this api key")
-    return ApiKeyPrincipal(username=record["username"], key_id=record["id"],
+    return ApiKeyPrincipal(username=record["username"],
                            provider_binding=record.get("provider_binding") or "",
                            allowed_models=record.get("allowed_models") or "")
 

@@ -153,14 +153,35 @@ def test_migrate_reraises_non_duplicate_errors():
         def executescript(self, _script):
             pass
 
-        def execute(self, _sql):
+        def execute(self, sql):
+            if sql.startswith("PRAGMA user_version"):
+                return _FakeRow()
             raise sqlite3.OperationalError("no such table")
 
         def commit(self):
             pass
 
+    class _FakeRow:
+        def fetchone(self):
+            return (0,)
+
     with _pytest.raises(sqlite3.OperationalError):
         apply_schema(_FakeConn())
+
+def test_apply_schema_rejects_newer_db(tmp_path):
+    """版本回退护栏：库版本高于本程序时拒绝执行，且不改动版本号/数据。"""
+    import pytest as _pytest
+
+    from src.db.migrate import SCHEMA_VERSION
+
+    db = Database(tmp_path / "future.sqlite3")
+    db.connect().execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    db.connect().commit()
+    with _pytest.raises(RuntimeError, match="高于本程序支持的"):
+        apply_schema(db.connect())
+    # 拒绝时不得把版本号写回本代
+    assert db.connect().execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    db.close()
 
 def test_legacy_db_upgrade_adds_token_columns(tmp_path):
     """老库升级：credentials 无 token 两列时幂等补列。"""

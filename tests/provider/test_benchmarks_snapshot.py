@@ -14,7 +14,6 @@ from src.benchmarks import (
     build_benchmark_table,
     build_model_catalog,
     build_price_table,
-    load_benchmarks,
     load_catalog_snapshot,
     save_catalog,
 )
@@ -39,7 +38,7 @@ def test_save_and_load_catalog_roundtrip(tmp_path):
     assert loaded_bench == benchmarks
     assert loaded_cat == catalog
     assert saved_at is not None and before <= saved_at <= time.time()
-    assert load_benchmarks(str(tmp_path)) == benchmarks
+    assert load_catalog_snapshot(str(tmp_path))[1] == benchmarks
 
 def test_catalog_path_filename(tmp_path):
     from src.benchmarks import catalog_path
@@ -48,7 +47,7 @@ def test_catalog_path_filename(tmp_path):
 
 def test_load_catalog_missing_file_is_empty(tmp_path):
     assert load_catalog_snapshot(str(tmp_path)) == ({}, {}, {}, None)
-    assert load_benchmarks(str(tmp_path)) == {}
+    assert load_catalog_snapshot(str(tmp_path))[1] == {}
 
 def test_load_catalog_version_mismatch_is_empty(tmp_path, caplog):
     save_catalog(str(tmp_path), {"m": (1.0, 2.0, 0.5)}, {}, {})

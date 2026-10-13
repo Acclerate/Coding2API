@@ -8,7 +8,7 @@ import time
 import pytest
 
 from src import main
-from src.benchmarks import load_benchmarks, save_catalog
+from src.benchmarks import load_catalog_snapshot, save_catalog
 from src.config import Settings
 from src.db.conn import Database
 from src.db.crypto import CredentialCipher
@@ -43,7 +43,7 @@ async def test_refresh_openrouter_catalog_roundtrip(tmp_path, monkeypatch):
     # 明细目录也换入了（与价表同一次抓取）
     assert app.state.models_dev_catalog["z-ai/glm-5.3"]["context"] is None
     # 落盘快照与回灌一致（下次启动零上游请求）
-    assert load_benchmarks(str(tmp_path)) == app.state.model_benchmarks
+    assert load_catalog_snapshot(str(tmp_path))[1] == app.state.model_benchmarks
 
 async def test_refresh_openrouter_catalog_rejects_empty(tmp_path, monkeypatch):
     """拉到空价表视为失败：不把已有的数据清空，只记运行态。"""

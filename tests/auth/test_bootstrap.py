@@ -131,7 +131,6 @@ def test_db_user_store_reads(tmp_path):
     assert store.verify("alice", "pw") is True
     assert store.verify("alice", "no") is False
     assert store.verify("ghost", "pw") is False
-    assert store.has("alice") is True and store.has("ghost") is False
     assert store.is_active("alice") is True and store.is_active("ghost") is False
     assert store.role_of("alice") == ROLE_OPERATOR and store.role_of("ghost") is None
     assert store.session_epoch("alice") == 0 and store.session_epoch("ghost") is None
@@ -147,8 +146,7 @@ def test_db_user_store_rejects_disabled(tmp_path):
     repo.create("alice", create_password_hash("pw"), enabled=False, now=1)
     store = DbUserStore(repo)
     assert store.verify("alice", "pw") is False
-    assert store.has("alice") is True          # 存在
-    assert store.is_active("alice") is False   # 但不可用
+    assert store.is_active("alice") is False   # 存在但被禁用 → 非活跃
     db.close()
 
 

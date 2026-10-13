@@ -223,8 +223,18 @@ class TaskRunner:
         """
         delay = live(interval)
         while True:
+            # 间隔取值本身也可能抛错（热更取值器读配置 / 解析失败）。它必须在
+            # 守卫之外单独兜住：`_guarded` 只保护 runner 本体，取值若在循环里
+            # 裸奔抛异常，整个任务循环就永久退出——一次配置读取失败会让该任务
+            # 从此不再运行，且页面上只是「停止更新」。失败时退回 60 秒再试。
             try:
-                await asyncio.sleep(delay())
+                seconds = delay()
+            except Exception as error:  # noqa: BLE001 - 后台任务不能拖垮服务
+                logger.warning("后台任务「%s」读取间隔失败: %s，60 秒后重试",
+                               name, error)
+                seconds = 60.0
+            try:
+                await asyncio.sleep(seconds)
             except asyncio.CancelledError:
                 raise
             await self._guarded(runner(), name, key=key)

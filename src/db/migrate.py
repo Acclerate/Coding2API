@@ -96,6 +96,15 @@ def schema_version(conn) -> int:
 
 
 def apply_schema(conn) -> None:
+    # 版本回退护栏：本程序只认「本代或更老」的库。老二进制打开新库时若照常执行，
+    # 末尾的 `PRAGMA user_version = SCHEMA_VERSION` 会把版本号**写回**旧值——运维
+    # 据此判断「库是哪一代」即被误导，且老代码可能不认识新列而写坏数据。宁可启动
+    # 失败并让人显式处理（升级程序或换回对应版本的库）。
+    current = schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"数据库 schema 版本 {current} 高于本程序支持的 {SCHEMA_VERSION}；"
+            "请升级程序，或使用与该版本匹配的数据库备份")
     conn.executescript(_read_schema())
     for table, column in _MIGRATION_COLUMNS:
         try:

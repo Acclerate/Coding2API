@@ -115,10 +115,6 @@ class UsersFileStore:
             return False
         return verify_password(password, record.password_hash)
 
-    def has(self, username: str) -> bool:
-        self._load_if_needed()
-        return username in self._cache
-
     def list_usernames(self) -> tuple[str, ...]:
         self._load_if_needed()
         return tuple(self._cache)
@@ -155,9 +151,6 @@ class DbUserStore:
         if row is None or not row["enabled"]:
             return False
         return verify_password(password, row["password_hash"])
-
-    def has(self, username: str) -> bool:
-        return self._repo.get(username) is not None
 
     def is_active(self, username: str) -> bool:
         """存在且未禁用。鉴权走这个：禁用的用户其旧会话与 API Key 都必须失效。"""

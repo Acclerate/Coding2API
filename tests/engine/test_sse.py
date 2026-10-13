@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 
-from src.engine.sse import SSE_DONE, format_openai_frame, iter_frames, parse_frames
+from src.engine.sse import SSE_DONE, format_openai_frame, iter_frames
 from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
+from tests.helpers.sse import parse_frames
 
 
 def test_parse_frames_from_real_fixture():

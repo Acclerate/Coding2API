@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -201,6 +202,92 @@ async def test_alert_task_expiring_off_skips_lookup(tmp_path):
                               token_expiry_hours=lambda: 0, now=lambda: 1000)
     assert (await task.run_once())["evaluated"] == 0
     db.close()
+
+async def test_alert_task_webhook_redacts_pii_nickname(tmp_path):
+    """nickname 常被填成邮箱/手机号：站内留原文，外发 webhook 必须打码。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    expiring = [{"id": "c1", "provider": "trae", "nickname": "user@example.com",
+                 "token_expires_at": 1300}]
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(expiring=expiring),
+        token_expiry_hours=lambda: 1,
+        webhook_url=lambda: "https://hook.example/a", client=client, now=lambda: 1000)
+    report = await task.run_once()
+    assert report["delivered"] == 1
+    # 站内记录保留原文，便于定位
+    assert "user@example.com" in json.loads(alerts.recent()[0]["detail"])["nickname"]
+    # 外发 payload 的 message / detail 都不得含 PII
+    assert "user@example.com" not in json.dumps(seen[0], ensure_ascii=False)
+    assert seen[0]["detail"]["nickname"] == "***"
+    await client.aclose()
+    db.close()
+
+
+async def test_alert_task_empty_nickname_not_masked_in_payload(tmp_path):
+    """昵称为空时不产生 `***` 噪声（保持空串）。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    expiring = [{"id": "c1", "provider": "trae", "nickname": "",
+                 "token_expires_at": 1300}]
+    task, _alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(expiring=expiring),
+        token_expiry_hours=lambda: 1,
+        webhook_url=lambda: "https://hook.example/a", client=client, now=lambda: 1000)
+    await task.run_once()
+    assert seen[0]["detail"]["nickname"] == ""
+    await client.aclose()
+    db.close()
+
+
+async def test_alert_task_webhook_total_budget_exceeded(tmp_path, monkeypatch):
+    """多地址总投递超预算：本轮判失败，不把后台循环拖死。"""
+    monkeypatch.setattr("src.tasks.alerting._WEBHOOK_TOTAL_BUDGET", 0.01)
+
+    class _SlowClient:
+        async def post(self, url, json=None):
+            await asyncio.sleep(1)
+            return httpx.Response(200)
+
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        webhook_url=lambda: "https://hook.example/a", client=_SlowClient(),
+        now=lambda: 5)
+    report = await task.run_once()
+    assert report["delivered"] == 0
+    assert alerts.recent()[0]["delivery_error"] is not None
+    db.close()
+
+
+def test_public_detail_masks_only_present_pii():
+    from src.tasks.alerting import _public_detail
+
+    assert _public_detail({"nickname": "a@b.c", "provider": "trae"}) == {
+        "nickname": "***", "provider": "trae"}
+    assert _public_detail({"nickname": "", "provider": "trae"}) == {
+        "nickname": "", "provider": "trae"}
+
+
+def test_alert_public_message_masks_pii_fragments():
+    from src.tasks.alerting import Alert
+
+    alert = Alert(rule="token_expiring", severity=SEVERITY_WARNING, scope="c1",
+                  message="凭证「a@b.c」即将到期", pii=("a@b.c",))
+    assert alert.public_message() == "凭证「***」即将到期"
+    # 空片段不参与替换（避免把整条文案打散）
+    assert Alert(rule="r", severity=SEVERITY_WARNING, scope="s",
+                 message="x", pii=("",)).public_message() == "x"
+
 
 def test_alert_task_spec_registered():
     assert TASK_BY_KEY["alert"].name == "运维告警"

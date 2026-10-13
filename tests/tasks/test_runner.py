@@ -374,6 +374,27 @@ async def test_loop_executes_runner_after_interval(repo):
     assert calls, "循环体未执行"
 
 
+async def test_loop_interval_getter_failure_falls_back(repo, caplog):
+    """间隔取值器抛错不能终止循环：记一条 warning 后退回 60 秒继续（runner 230-235）。"""
+    runner, _collector = _runner(repo, StubProvider())
+
+    def broken_interval() -> float:
+        raise ValueError("配置读取失败")
+
+    async def runner_body():
+        return None
+
+    with caplog.at_level("WARNING"):
+        task = asyncio.create_task(runner._loop("坏间隔", runner_body, broken_interval))
+        await asyncio.sleep(0.02)
+        # 循环没被异常终止：仍挂在 sleep 里（退回的 60 秒），而非已结束
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert any("读取间隔失败" in r.getMessage() for r in caplog.records)
+
+
 async def test_checkin_task_soft_failure_retries_same_day(repo, monkeypatch):
     """claim 软失败（ok=False）→ 计入 failed 且当日不封账，下轮还能重试。"""
     import time as _time
