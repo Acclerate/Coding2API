@@ -126,6 +126,24 @@ def _body_limit(path: str) -> int:
     return _limits._body_limit(path)
 
 
+def _resolve_endpoint(config: Settings, *, attr: str, validator, env_name: str,
+                      allowed_name: str, strip_slash: bool = False) -> str:
+    """解析并白名单校验一个上游端点（7 个渠道共用一套逻辑）。
+
+    端点走白名单是安全约束而非风格问题：这些值决定真实 Token 发往哪个主机，
+    配错即泄露。此前 7 份几乎逐字相同的实现，改一处（如错误文案）要改七遍。
+
+    `env_name` 是配置项名（报错前缀），`allowed_name` 是对应白名单名；
+    两者不总是同前缀（如 QODER_GATEWAY_ENDPOINT 属于 QODER_ALLOWED_ENDPOINTS）。
+    """
+    endpoint = getattr(config, attr).strip()
+    if strip_slash:
+        endpoint = endpoint.rstrip("/")
+    if not validator(endpoint, config):
+        raise ValueError(f"{env_name} {endpoint!r} is not in {allowed_name}")
+    return endpoint
+
+
 def _codebuddy_endpoint(config: Settings) -> str:
     """解析 CodeBuddy 上游地址，并强制白名单校验。
 
@@ -133,11 +151,10 @@ def _codebuddy_endpoint(config: Settings) -> str:
     改这个值对实际请求无效，属于隐蔽的配置陷阱。白名单校验确保
     真实 Token 不会被发往未授权主机。
     """
-    endpoint = config.codebuddy_api_endpoint.strip()
-    if not validate_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"CODEBUDDY_API_ENDPOINT {endpoint!r} is not in CODEBUDDY_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="codebuddy_api_endpoint",
+                             validator=validate_endpoint_allowed,
+                             env_name="CODEBUDDY_API_ENDPOINT",
+                             allowed_name="CODEBUDDY_ALLOWED_ENDPOINTS")
 
 
 def _codebuddy_intl_endpoint(config: Settings) -> str:
@@ -145,57 +162,51 @@ def _codebuddy_intl_endpoint(config: Settings) -> str:
 
     与国内站的白名单刻意互不包含：两站 Token 由不同网关签发，混发即泄露。
     """
-    endpoint = config.codebuddy_intl_api_endpoint.strip().rstrip("/")
-    if not validate_codebuddy_intl_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"CODEBUDDY_INTL_API_ENDPOINT {endpoint!r} is not in "
-            "CODEBUDDY_INTL_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="codebuddy_intl_api_endpoint",
+                             validator=validate_codebuddy_intl_endpoint_allowed,
+                             env_name="CODEBUDDY_INTL_API_ENDPOINT",
+                             allowed_name="CODEBUDDY_INTL_ALLOWED_ENDPOINTS",
+                             strip_slash=True)
 
 
 def _zen_endpoint(config: Settings) -> str:
     """解析 Zen 端点并强制白名单校验（防把请求发往未授权主机）。"""
-    endpoint = config.zen_api_endpoint.strip()
-    if not validate_zen_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"ZEN_API_ENDPOINT {endpoint!r} is not in ZEN_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="zen_api_endpoint",
+                             validator=validate_zen_endpoint_allowed,
+                             env_name="ZEN_API_ENDPOINT",
+                             allowed_name="ZEN_ALLOWED_ENDPOINTS")
 
 
 def _kilo_endpoint(config: Settings) -> str:
     """解析 Kilo 端点并强制白名单校验（防把请求发往未授权主机）。"""
-    endpoint = config.kilo_api_endpoint.strip()
-    if not validate_kilo_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"KILO_API_ENDPOINT {endpoint!r} is not in KILO_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="kilo_api_endpoint",
+                             validator=validate_kilo_endpoint_allowed,
+                             env_name="KILO_API_ENDPOINT",
+                             allowed_name="KILO_ALLOWED_ENDPOINTS")
 
 
 def _qoder_host(config: Settings) -> str:
     """解析 Qoder openapi 端点并强制白名单校验。"""
-    endpoint = config.qoder_api_endpoint.strip()
-    if not validate_qoder_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"QODER_API_ENDPOINT {endpoint!r} is not in QODER_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="qoder_api_endpoint",
+                             validator=validate_qoder_endpoint_allowed,
+                             env_name="QODER_API_ENDPOINT",
+                             allowed_name="QODER_ALLOWED_ENDPOINTS")
 
 
 def _qoder_gateway(config: Settings) -> str:
     """解析 Qoder 推理网关端点并强制白名单校验。"""
-    endpoint = config.qoder_gateway_endpoint.strip()
-    if not validate_qoder_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"QODER_GATEWAY_ENDPOINT {endpoint!r} is not in QODER_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="qoder_gateway_endpoint",
+                             validator=validate_qoder_endpoint_allowed,
+                             env_name="QODER_GATEWAY_ENDPOINT",
+                             allowed_name="QODER_ALLOWED_ENDPOINTS")
 
 
 def _codearts_endpoint(config: Settings) -> str:
     """解析 CodeArts 端点并强制白名单校验。"""
-    endpoint = config.codearts_api_endpoint.strip()
-    if not validate_codearts_endpoint_allowed(endpoint, config):
-        raise ValueError(
-            f"CODEARTS_API_ENDPOINT {endpoint!r} is not in CODEARTS_ALLOWED_ENDPOINTS")
-    return endpoint
+    return _resolve_endpoint(config, attr="codearts_api_endpoint",
+                             validator=validate_codearts_endpoint_allowed,
+                             env_name="CODEARTS_API_ENDPOINT",
+                             allowed_name="CODEARTS_ALLOWED_ENDPOINTS")
 
 
 def _seed_free_credential(credentials: CredentialRepository, *, provider: str,
