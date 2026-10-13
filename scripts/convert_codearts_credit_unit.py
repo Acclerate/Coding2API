@@ -24,14 +24,12 @@ token 落库；改为统一「积分」（1 积分 = 10000 token，每日池满�
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
-import time
-from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from scripts._common import DbAdapter, backup  # noqa: E402
 from src.db.conn import Database  # noqa: E402
 from src.provider.codearts.backfill import (  # noqa: E402
     convert_codearts_credit_unit,
@@ -44,34 +42,6 @@ _LABELS = {
     "usage_hourly": "小时汇总（usage_hourly.credit_sum）",
     "credit_events": "积分变动流水（credit_events）",
 }
-
-
-class _DbAdapter:
-    """把裸连接包装成 Database 的形态（折算只用 transaction）。"""
-
-    def __init__(self, conn) -> None:
-        self._conn = conn
-
-    @contextmanager
-    def transaction(self):
-        """与 Database.transaction 同语义：正常提交、异常回滚。"""
-        try:
-            yield self._conn
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._conn.commit()
-
-
-def backup(db_path: Path) -> Path:
-    """写库前备份主库文件到同目录（.bak-<时间戳>），失败即中止。"""
-    target = db_path.with_name(f"{db_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    source = sqlite3.connect(str(db_path))
-    try:
-        source.backup(sqlite3.connect(str(target)))
-    finally:
-        source.close()
-    return target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     target = backup(db_path)
-    updated = convert_codearts_credit_unit(_DbAdapter(conn))
+    updated = convert_codearts_credit_unit(DbAdapter(conn))
     for key, count in updated.items():
         print(f"  {_LABELS[key]:<32} 已折算 {count}")
     print(f"完成（备份: {target}）")

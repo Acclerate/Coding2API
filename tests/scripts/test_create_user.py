@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from src.auth.users import verify_password
@@ -63,8 +65,38 @@ def test_list_users_includes_imported_marker(db_path, capsys):
 
 
 def test_list_empty(db_path, capsys):
+    repos(db_path)                      # 建库（--list 本身不再建表/迁移）
     assert SCRIPT_MODULE.main(["--list", "--db", str(db_path)]) == 0
     assert "（无用户）" in capsys.readouterr().out
+
+
+def test_list_requires_existing_db_and_does_not_migrate(tmp_path, capsys):
+    """--list 是只读意图：库不存在直接报错，不隐式建表/迁移。"""
+    missing = tmp_path / "nope.sqlite3"
+    with pytest.raises(SystemExit):
+        SCRIPT_MODULE.main(["--list", "--db", str(missing)])
+    assert not missing.exists()
+
+
+def test_password_stdin_avoids_argv(db_path, monkeypatch):
+    """--password-stdin 从 stdin 读密码（不进 argv）。"""
+    monkeypatch.setattr(SCRIPT_MODULE.sys, "stdin", io.StringIO("secret-pw\n"))
+    assert SCRIPT_MODULE.main(["alice", "--password-stdin",
+                               "--db", str(db_path)]) == 0
+    users, _audit = repos(db_path)
+    assert verify_password("secret-pw", users.get("alice")["password_hash"])
+
+
+def test_password_stdin_empty_rejected(db_path, monkeypatch):
+    monkeypatch.setattr(SCRIPT_MODULE.sys, "stdin", io.StringIO("\n"))
+    with pytest.raises(SystemExit):
+        SCRIPT_MODULE.main(["alice", "--password-stdin", "--db", str(db_path)])
+
+
+def test_username_with_control_chars_rejected(db_path):
+    """换行/回车会污染审计与日志，create_user 拒绝（冒号在 DB 用户名里合法）。"""
+    with pytest.raises(SystemExit):
+        SCRIPT_MODULE.main(["a\nb", "--password", "pw", "--db", str(db_path)])
 
 
 def test_delete_requires_force(db_path):

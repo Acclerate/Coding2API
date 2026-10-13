@@ -23,14 +23,12 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
-import time
-from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from scripts._common import DbAdapter, backup  # noqa: E402
 from src.db.conn import Database  # noqa: E402
 from src.stats.collector import StatsCollector  # noqa: E402
 
@@ -67,7 +65,7 @@ def delete_stale(conn, stale: list[tuple[str, str, int]]) -> int:
 
 def sync_hourly(conn) -> None:
     """小时汇总与明细对齐：全量重算 + 清孤儿行。"""
-    StatsCollector(_DbAdapter(conn)).rollup_hourly()
+    StatsCollector(DbAdapter(conn)).rollup_hourly()
     conn.execute(
         "DELETE FROM usage_hourly WHERE NOT EXISTS ("
         "  SELECT 1 FROM usage_events e"
@@ -75,37 +73,6 @@ def sync_hourly(conn) -> None:
         "    AND e.username = usage_hourly.username"
         "    AND e.provider = usage_hourly.provider"
         "    AND e.model = usage_hourly.model)")
-
-
-class _DbAdapter:
-    """把裸连接包装成 Database 的形态（rollup 只用 connect/transaction）。"""
-
-    def __init__(self, conn) -> None:
-        self._conn = conn
-
-    def connect(self):
-        return self._conn
-
-    @contextmanager
-    def transaction(self):
-        """与 Database.transaction 同语义：正常提交、异常回滚。"""
-        try:
-            yield self._conn
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._conn.commit()
-
-
-def backup(db_path: Path) -> Path:
-    """删除前备份主库文件到同目录（.bak-<时间戳>），失败即中止。"""
-    target = db_path.with_name(f"{db_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    source = sqlite3.connect(str(db_path))
-    try:
-        source.backup(sqlite3.connect(str(target)))
-    finally:
-        source.close()
-    return target
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -52,6 +52,34 @@ def test_main_rejects_bad_input(argv, tmp_path):
         SCRIPT_MODULE.main([*argv, "--output", str(tmp_path / "u.txt")])
 
 
+@pytest.mark.parametrize("username", ["a:b", "a\nb", "a\rb"])
+def test_main_rejects_username_with_separator_or_control_chars(username, tmp_path):
+    """用户名会写进 `名:hash` 行：冒号/换行会截断或注入记录。"""
+    with pytest.raises(SystemExit):
+        SCRIPT_MODULE.main([username, "--output", str(tmp_path / "u.txt"),
+                            "--password", "pw"])
+
+
+def test_main_password_stdin(tmp_path, monkeypatch):
+    """--password-stdin：从 stdin 读密码，不进 argv。"""
+    import io
+
+    monkeypatch.setattr(SCRIPT_MODULE.sys, "stdin", io.StringIO("stdin-pw\n"))
+    path = tmp_path / "u.txt"
+    assert SCRIPT_MODULE.main(["alice", "--output", str(path),
+                               "--password-stdin"]) == 0
+    assert verify_password("stdin-pw", path.read_text(encoding="utf-8").split(":", 1)[1].strip())
+
+
+def test_main_password_stdin_empty_rejected(tmp_path, monkeypatch):
+    import io
+
+    monkeypatch.setattr(SCRIPT_MODULE.sys, "stdin", io.StringIO("\n"))
+    with pytest.raises(SystemExit):
+        SCRIPT_MODULE.main(["alice", "--output", str(tmp_path / "u.txt"),
+                            "--password-stdin"])
+
+
 def test_main_rejects_empty_password(tmp_path):
     with pytest.raises(SystemExit):
         SCRIPT_MODULE.main(["alice", "--output", str(tmp_path / "u.txt"), "--password", ""])

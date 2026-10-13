@@ -27,29 +27,17 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from scripts._common import backup  # noqa: E402
 from src.config import load_settings  # noqa: E402
 from src.db.conn import Database  # noqa: E402
 from src.stats.backfill import pending_hourly  # noqa: E402
 from src.stats.collector import StatsCollector  # noqa: E402
-
-
-def backup(db_path: Path) -> Path:
-    """写库前备份主库文件到同目录（.bak-<时间戳>），失败即中止。"""
-    target = db_path.with_name(f"{db_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    source = sqlite3.connect(str(db_path))
-    try:
-        source.backup(sqlite3.connect(str(target)))
-    finally:
-        source.close()
-    return target
 
 
 def _stamp(value: int | None) -> str:

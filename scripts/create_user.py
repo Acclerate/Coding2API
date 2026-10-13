@@ -43,10 +43,12 @@ def resolve_db_path(explicit: str | None) -> Path:
     return Path(load_settings().db_path)
 
 
-def open_repos(db_path: Path) -> tuple[UserRepository, AuditRepository]:
+def open_repos(db_path: Path, *, migrate: bool = True,
+               ) -> tuple[UserRepository, AuditRepository, Database]:
     database = Database(db_path)
-    apply_schema(database.connect())
-    return UserRepository(database), AuditRepository(database)
+    if migrate:
+        apply_schema(database.connect())
+    return UserRepository(database), AuditRepository(database), database
 
 
 def list_users(users: UserRepository) -> int:
@@ -60,6 +62,29 @@ def list_users(users: UserRepository) -> int:
         print(f"{row['username']:<20} {row['role']:<10} {state:<8} "
               f"{row['created_by'] or '引导导入'}")
     return 0
+
+
+def read_password(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    """取密码：`--password-stdin` 优先，其次 `--password`，否则交互输入。
+
+    `--password` 会让密码进 argv（`ps` / shell 历史可见），因此提供
+    `--password-stdin` 作为非交互场景的推荐方式（CI / 部署脚本）。
+    """
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            parser.error("从 stdin 读到空密码")
+        return password
+    if args.password is not None:
+        if not args.password:
+            parser.error("密码不能为空")
+        return args.password
+    password = getpass.getpass("请输入密码: ")
+    if password != getpass.getpass("请再次输入密码: "):
+        parser.error("两次输入的密码不一致")
+    if not password:
+        parser.error("密码不能为空")
+    return password
 
 
 def create(users: UserRepository, audit: AuditRepository, *, username: str,
@@ -101,38 +126,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("username", nargs="?", help="用户名（--list 时可省略）")
     parser.add_argument("--db", help="SQLite 路径（默认 DATA_DIR/coding2api.sqlite3）")
     parser.add_argument("--role", default="viewer", choices=sorted(ROLES))
-    parser.add_argument("--password", help="非交互模式使用（默认交互输入，不回显）")
+    parser.add_argument("--password", help="非交互模式使用（会进 argv，优先用 --password-stdin）")
+    parser.add_argument("--password-stdin", action="store_true",
+                        help="从 stdin 读一行作为密码（避免进 argv / shell 历史）")
     parser.add_argument("--list", action="store_true", help="列出全部用户后退出")
     parser.add_argument("--delete", action="store_true", help="硬删用户（需 --force）")
     parser.add_argument("--force", action="store_true", help="确认硬删不可逆")
     args = parser.parse_args(argv)
 
-    users, audit = open_repos(resolve_db_path(args.db))
+    db_path = resolve_db_path(args.db)
 
+    # --list 是只读意图：不建表、不迁移（避免误改库）；库不存在就报错退出。
     if args.list:
-        return list_users(users)
+        if not db_path.is_file():
+            parser.error(f"数据库不存在: {db_path}")
+        users, _audit, database = open_repos(db_path, migrate=False)
+        try:
+            return list_users(users)
+        finally:
+            database.close()
 
-    username = (args.username or "").strip()
-    if not username:
-        parser.error("缺少用户名（或用 --list）")
-    if username != args.username:
-        parser.error("用户名不能包含首尾空白")
+    users, audit, database = open_repos(db_path)
+    try:
+        username = (args.username or "").strip()
+        if not username:
+            parser.error("缺少用户名（或用 --list）")
+        if username != args.username:
+            parser.error("用户名不能包含首尾空白")
+        if any(ch in username for ch in ("\n", "\r")):
+            parser.error("用户名不能包含换行/回车")
 
-    if args.delete:
-        if not args.force:
-            parser.error("硬删不可逆，需同时加 --force")
-        return delete(users, audit, username=username)
+        if args.delete:
+            if not args.force:
+                parser.error("硬删不可逆，需同时加 --force")
+            return delete(users, audit, username=username)
 
-    if args.password is None:
-        password = getpass.getpass("请输入密码: ")
-        if password != getpass.getpass("请再次输入密码: "):
-            parser.error("两次输入的密码不一致")
-    else:
-        password = args.password
-    if not password:
-        parser.error("密码不能为空")
-
-    return create(users, audit, username=username, role=args.role, password=password)
+        password = read_password(parser, args)
+        return create(users, audit, username=username, role=args.role,
+                      password=password)
+    finally:
+        database.close()
 
 
 if __name__ == "__main__":
