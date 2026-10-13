@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent  # noqa: PTH — 部署测试须自证仓库根，勿依赖 helpers
+ROOT = Path(__file__).resolve().parents[2]  # noqa: PTH123 — 部署测试须自证仓库根，勿依赖 helpers
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "docker-compose.yml"
 DOCKERIGNORE = ROOT / ".dockerignore"
@@ -489,7 +489,7 @@ def test_version_is_single_sourced_everywhere():
 
     from src.version import FALLBACK_VERSION, app_version
 
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parents[2]
     with (root / "pyproject.toml").open("rb") as handle:
         canonical = tomllib.load(handle)["project"]["version"]
     assert app_version() == canonical

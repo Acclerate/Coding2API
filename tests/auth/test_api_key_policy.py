@@ -1,10 +1,4 @@
-"""B3.5 多 Key 出口测试：/healthz 池计数、provider_binding、allowed_ips。
-
-分三层：
-- `src/auth/access.py` 纯函数（IP 解析/判定/来源推断）直测；
-- 仓储 + SDK 直调（`ApiKeyRepository.create/authenticate` 的策略列）；
-- HTTP 端到端（TestClient 真发请求，验证 400/403 与绑定真的收窄上游）。
-"""
+"""API Key 策略：IP / 模型白名单、仓储与绑定收窄。"""
 
 from __future__ import annotations
 
@@ -35,8 +29,62 @@ from tests.helpers.constants import SECRET
 GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
         Event(kind=EventKind.FINISH, finish_reason="stop")]
 
+@pytest.fixture()
+def keys(tmp_path):
+    db = Database(tmp_path / "keys.sqlite3")
+    apply_schema(db.connect())
+    yield ApiKeyRepository(db)
+    db.close()
 
-# ---------------------------------------------------------------- IP 纯函数
+def _settings(tmp_path, **overrides) -> Settings:
+    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                    ADMIN_USERNAMES="root", **overrides)
+
+@pytest.fixture()
+def client(tmp_path):
+    app = build_app(_settings(tmp_path))
+    with TestClient(app) as http:
+        http.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        yield http
+
+def _create_key(client, **payload) -> dict:
+    response = client.post("/api/api-keys", json={"name": "t", **payload})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+class _Provider:
+    def __init__(self, provider_id: str) -> None:
+        self.id = provider_id
+        self.calls = 0
+
+    async def stream_chat(self, _credential_data, _payload, _model):
+        self.calls += 1
+        for event in GOOD:
+            yield event
+
+@pytest.fixture()
+def dual(tmp_path):
+    db = Database(tmp_path / "dual.sqlite3")
+    apply_schema(db.connect())
+    repo = CredentialRepository(db, CredentialCipher(SECRET))
+    repo.add(provider="codebuddy", credential_data={"bearer_token": "cb"})
+    repo.add(provider="trae", credential_data={"accessToken": "trae"})
+    yield repo
+    db.close()
+
+def _executor(repo, aliases):
+    assert repo is not None
+    cb, trae = _Provider("codebuddy"), _Provider("trae")
+    return (Executor(ExecutorDeps(providers={"codebuddy": cb, "trae": trae},
+                                  credentials=repo, scheduler=Scheduler(),
+                                  default_model="glm-5.2", model_aliases=aliases)),
+            cb, trae)
+
+def _chat(model="glm-5.2"):
+    from src.compat.openai.request import parse_chat_request
+
+    return parse_chat_request({"model": model,
+                               "messages": [{"role": "user", "content": "hi"}]})
 
 def test_split_entries_trims_and_drops_blanks():
     assert split_entries(None) == []
@@ -44,18 +92,15 @@ def test_split_entries_trims_and_drops_blanks():
     assert split_entries(" 10.0.0.1 , , 192.168.1.0/24 ") == [
         "10.0.0.1", "192.168.1.0/24"]
 
-
 def test_normalize_allowed_ips_canonicalizes_and_dedupes():
     assert normalize_allowed_ips("10.0.0.1") == "10.0.0.1/32"
     assert normalize_allowed_ips("10.0.0.1/32,10.0.0.1") == "10.0.0.1/32"
     assert normalize_allowed_ips(" 192.168.1.5/24 ") == "192.168.1.0/24"
     assert normalize_allowed_ips("") == ""
 
-
 def test_normalize_allowed_ips_rejects_garbage():
     with pytest.raises(ValueError, match="非法 IP/CIDR"):
         normalize_allowed_ips("not-an-ip")
-
 
 def test_normalize_allowed_ips_enforces_entry_cap():
     many = ",".join(f"10.0.{i}.0/24" for i in range(MAX_IP_ENTRIES + 1))
@@ -65,18 +110,15 @@ def test_normalize_allowed_ips_enforces_entry_cap():
     assert normalize_allowed_ips(
         ",".join(f"10.0.{i}.0/24" for i in range(MAX_IP_ENTRIES))) != ""
 
-
 def test_ip_allowed_empty_means_unrestricted():
     assert ip_allowed("1.2.3.4", "") is True
     assert ip_allowed("1.2.3.4", None) is True
-
 
 def test_ip_allowed_matches_single_and_network():
     assert ip_allowed("10.0.0.1", "10.0.0.1/32") is True
     assert ip_allowed("10.0.0.2", "10.0.0.1/32") is False
     assert ip_allowed("10.1.2.3", "10.0.0.0/8") is True
     assert ip_allowed("2001:db8::1", "2001:db8::/32") is True
-
 
 def test_ip_allowed_rejects_when_ip_or_entry_unusable():
     # 拿不到对端地址 → 拒绝（不能默认放行）
@@ -87,10 +129,8 @@ def test_ip_allowed_rejects_when_ip_or_entry_unusable():
     # 整份白名单不可解析 → 拒绝（fail closed，不因脏数据敞开）
     assert ip_allowed("10.0.0.1", "garbage") is False
 
-
 def test_ip_allowed_never_crosses_address_families():
     assert ip_allowed("::1", "10.0.0.0/8") is False
-
 
 def test_client_ip_ignores_xff_unless_trusted():
     assert client_ip("10.0.0.9", "1.2.3.4", trust_proxy=False) == "10.0.0.9"
@@ -100,14 +140,10 @@ def test_client_ip_ignores_xff_unless_trusted():
     # 开了但头是空的 → 回落对端
     assert client_ip("127.0.0.1", " , ", trust_proxy=True) == "127.0.0.1"
 
-
-# ------------------------------------------------------- 模型白名单纯函数（P0-3）
-
 def test_normalize_allowed_models_trims_and_dedupes():
     assert normalize_allowed_models(None) == ""
     assert normalize_allowed_models("") == ""
     assert normalize_allowed_models(" glm-* , kimi-k3 , GLM-* ") == "glm-*,kimi-k3"
-
 
 def test_normalize_allowed_models_rejects_overlong_and_too_many():
     with pytest.raises(ValueError, match="过长"):
@@ -117,18 +153,15 @@ def test_normalize_allowed_models_rejects_overlong_and_too_many():
         normalize_allowed_models(many)
     assert normalize_allowed_models(",".join(f"m{i}" for i in range(128))) != ""
 
-
 def test_model_allowed_empty_means_unrestricted():
     assert model_allowed("glm-5.2", "") is True
     assert model_allowed("glm-5.2", None) is True
-
 
 def test_model_allowed_matches_glob_case_insensitively():
     assert model_allowed("glm-5.2", "glm-*") is True
     assert model_allowed("GLM-5.2", "glm-*") is True
     assert model_allowed("kimi-k3", "glm-*") is False
     assert model_allowed("kimi-k3", "glm-*,kimi-k3") is True
-
 
 def test_model_allowed_handles_provider_suffix_and_default_model():
     # @provider 后缀不参与匹配，但整体写法也允许被 glob 命中
@@ -140,17 +173,6 @@ def test_model_allowed_handles_provider_suffix_and_default_model():
     # 没有可判定的模型名：交给引擎默认，放行
     assert model_allowed("", "glm-*", default_model="") is True
     assert model_allowed("auto", "glm-*") is True
-
-
-# ------------------------------------------------------------------- 仓储
-
-@pytest.fixture()
-def keys(tmp_path):
-    db = Database(tmp_path / "keys.sqlite3")
-    apply_schema(db.connect())
-    yield ApiKeyRepository(db)
-    db.close()
-
 
 def test_repository_round_trips_policy_columns(keys):
     created = keys.create("alice", "laptop", provider_binding="trae",
@@ -171,7 +193,6 @@ def test_repository_round_trips_policy_columns(keys):
     assert listed["allowed_models"] == "glm-*"
     assert listed["expires_at"] == 4_100_000_000
 
-
 def test_repository_defaults_to_unrestricted(keys):
     created = keys.create("alice")
     row = keys.authenticate(created["api_key"])
@@ -181,7 +202,6 @@ def test_repository_defaults_to_unrestricted(keys):
     assert keys.verify(created["api_key"]) == "alice"
     assert keys.authenticate("sk-nope") is None
     assert keys.verify("sk-nope") is None
-
 
 def test_authenticate_throttles_last_used_writes(keys):
     """last_used_at 写库节流到分钟级：热路径不每请求写一次（LOW）。"""
@@ -210,78 +230,15 @@ def test_authenticate_throttles_last_used_writes(keys):
     keys.authenticate(created["api_key"])
     assert last_used() not in (0, None)
 
-
-# ------------------------------------------------------------------- HTTP
-
-def _settings(tmp_path, **overrides) -> Settings:
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root", **overrides)
-
-
-@pytest.fixture()
-def client(tmp_path):
-    app = build_app(_settings(tmp_path))
-    with TestClient(app) as http:
-        http.cookies.set("coding2api_session", create_session_token("root", SECRET))
-        yield http
-
-
-def _create_key(client, **payload) -> dict:
-    response = client.post("/api/api-keys", json={"name": "t", **payload})
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def test_healthz_reports_pool_counts(client):
-    response = client.get("/healthz")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok" and body["service"] == "coding2api"
-    assert body["version"]
-    counts = body["credentials"]
-    # 默认装配会种子 zen / kilo 两条无凭证虚拟凭证（可选中 → ready）
-    assert counts == {"total": 2, "ready": 2, "cooling": 0, "paused": 0, "disabled": 0}
-    # 老端点保留
-    assert client.get("/health").json() == {"status": "ok"}
-
-
-def test_healthz_counts_partition_the_pool(tmp_path):
-    """四类计数互斥且合计 = total；口径与调度器 is_selectable 一致。"""
-    import sqlite3
-
-    settings = _settings(tmp_path)
-    app = build_app(settings)
-    repo = app.state.credentials
-    repo.add(provider="trae", credential_data={"accessToken": "a"})
-    paused = repo.add(provider="trae", credential_data={"accessToken": "b"})
-    cooling = repo.add(provider="trae", credential_data={"accessToken": "c"})
-    broken = repo.add(provider="trae", credential_data={"accessToken": "d"})
-    repo.set_enabled(paused, False)
-    # 硬禁用/冷却没有公开 setter（生产路径由 save_error 驱动），直接改库构造状态
-    conn = sqlite3.connect(settings.db_path)
-    conn.execute("UPDATE credentials SET disabled = 1 WHERE id = ?", (broken,))
-    conn.execute("UPDATE credentials SET cooling_until = ? WHERE id = ?",
-                 (2 ** 31 - 1, cooling))
-    conn.commit()
-    conn.close()
-    with TestClient(app) as http:
-        counts = http.get("/healthz").json()["credentials"]
-    # 4 条 trae + 种子的一条 zen、一条 kilo（都 ready）
-    assert counts == {"total": 6, "ready": 3, "cooling": 1, "paused": 1,
-                      "disabled": 1}
-
-
 def test_create_key_rejects_unknown_binding(client):
     response = client.post("/api/api-keys", json={"name": "t", "provider_binding": "ghost"})
     assert response.status_code == 400
     assert "provider_binding" in response.json()["error"]["message"]
 
-
 def test_create_key_rejects_bad_allowed_ips(client):
     response = client.post("/api/api-keys", json={"name": "t", "allowed_ips": "nope"})
     assert response.status_code == 400
     assert "非法 IP/CIDR" in response.json()["error"]["message"]
-
 
 def test_create_key_normalizes_and_lists_policy(client):
     created = _create_key(client, provider_binding=" TRAE ", allowed_ips="10.0.0.1",
@@ -296,13 +253,11 @@ def test_create_key_normalizes_and_lists_policy(client):
     assert listed["allowed_models"] == "glm-*,kimi-k3"
     assert listed["expires_at"] == 4102444800
 
-
 def test_create_key_rejects_bad_allowed_models(client):
     response = client.post("/api/api-keys", json={"name": "t",
                                                   "allowed_models": "x" * 200})
     assert response.status_code == 400
     assert "过长" in response.json()["error"]["message"]
-
 
 def test_create_key_rejects_bad_expires_at(client):
     for bad in ("soon", 0, -5, True):
@@ -310,12 +265,10 @@ def test_create_key_rejects_bad_expires_at(client):
         assert response.status_code == 400, bad
         assert "expires_at" in response.json()["error"]["message"]
 
-
 def test_create_key_accepts_float_and_empty_expiry(client):
     created = _create_key(client, expires_at=4102444800.9)
     assert created["expires_at"] == 4102444800
     assert _create_key(client, name="forever", expires_at="")["expires_at"] is None
-
 
 def test_model_allowlist_blocks_chat_and_responses(client):
     key = _create_key(client, allowed_models="glm-*")["api_key"]
@@ -330,14 +283,12 @@ def test_model_allowlist_blocks_chat_and_responses(client):
     assert responses.status_code == 400
     assert "not allowed" in responses.json()["error"]["message"]
 
-
 def test_expired_key_is_rejected(client):
     key = _create_key(client, expires_at=1)["api_key"]
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert response.status_code == 401
     # 统一鉴权失败文案（不泄露「Key 存在但已过期」这类可枚举信息）
     assert response.json()["error"]["code"] == "invalid_api_key"
-
 
 def test_key_expired_helper_boundaries():
     from src.auth.api_key import key_expired
@@ -350,13 +301,11 @@ def test_key_expired_helper_boundaries():
     # 不传 now 时用当前时间（取一个远过去的到期点必然过期）
     assert key_expired(1) is True
 
-
 def test_allowed_ips_blocks_foreign_source(client):
     key = _create_key(client, allowed_ips="10.0.0.1/32")["api_key"]
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert response.status_code == 403
     assert response.json()["error"]["message"] == "source ip not allowed for this api key"
-
 
 def test_allowed_ips_allows_matching_source(client):
     # TestClient 的对端是 "testclient"（非 IP）→ 用不加限制的 Key 才通得过；
@@ -364,7 +313,6 @@ def test_allowed_ips_allows_matching_source(client):
     key = _create_key(client, allowed_ips="")["api_key"]
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert response.status_code == 200
-
 
 def test_trust_proxy_honors_forwarded_for(tmp_path):
     """TRUST_PROXY 开启时按 XFF 末条判定；关闭时忽略该头。"""
@@ -381,7 +329,6 @@ def test_trust_proxy_honors_forwarded_for(tmp_path):
             "X-Forwarded-For": "1.2.3.4"})
         assert blocked.status_code == 403
 
-
 def test_forwarded_for_ignored_without_trust_proxy(tmp_path):
     app = build_app(_settings(tmp_path, TRUST_PROXY=False))
     key = app.state.api_keys.create("root", allowed_ips="203.0.113.0/24")["api_key"]
@@ -392,47 +339,6 @@ def test_forwarded_for_ignored_without_trust_proxy(tmp_path):
             "X-Forwarded-For": "203.0.113.9"})
     assert response.status_code == 403
 
-
-# ------------------------------------------------- 绑定收窄（executor 直测）
-
-class _Provider:
-    def __init__(self, provider_id: str) -> None:
-        self.id = provider_id
-        self.calls = 0
-
-    async def stream_chat(self, _credential_data, _payload, _model):
-        self.calls += 1
-        for event in GOOD:
-            yield event
-
-
-@pytest.fixture()
-def dual(tmp_path):
-    db = Database(tmp_path / "dual.sqlite3")
-    apply_schema(db.connect())
-    repo = CredentialRepository(db, CredentialCipher(SECRET))
-    repo.add(provider="codebuddy", credential_data={"bearer_token": "cb"})
-    repo.add(provider="trae", credential_data={"accessToken": "trae"})
-    yield repo
-    db.close()
-
-
-def _executor(repo, aliases):
-    assert repo is not None
-    cb, trae = _Provider("codebuddy"), _Provider("trae")
-    return (Executor(ExecutorDeps(providers={"codebuddy": cb, "trae": trae},
-                                  credentials=repo, scheduler=Scheduler(),
-                                  default_model="glm-5.2", model_aliases=aliases)),
-            cb, trae)
-
-
-def _chat(model="glm-5.2"):
-    from src.compat.openai.request import parse_chat_request
-
-    return parse_chat_request({"model": model,
-                               "messages": [{"role": "user", "content": "hi"}]})
-
-
 async def test_binding_narrows_to_bound_provider(dual):
     """绑定 TRAE：只打 TRAE，即使 CB 排序更优。"""
     executor, cb, trae = _executor(dual, {"codebuddy": {"glm-5.2": "glm-5.2"},
@@ -440,7 +346,6 @@ async def test_binding_narrows_to_bound_provider(dual):
     result = await executor.complete(_chat(), username="u", provider_binding="trae")
     assert result["choices"][0]["message"]["content"] == "ok"
     assert (trae.calls, cb.calls) == (1, 0)
-
 
 async def test_binding_rejects_model_owned_by_other_provider(dual):
     """模型目录证明该模型只属于 CB，但 Key 绑定 TRAE → 400，零上游调用。"""
@@ -451,7 +356,6 @@ async def test_binding_rejects_model_owned_by_other_provider(dual):
         await executor.complete(_chat("cb-only"), username="u", provider_binding="trae")
     assert "not available on provider 'trae'" in str(exc_info.value)
     assert (cb.calls, trae.calls) == (0, 0)
-
 
 async def test_binding_conflicts_with_forced_provider(dual):
     """@codebuddy 与绑定 trae 冲突 → 400（明确意图冲突，不静默改道）。
@@ -467,7 +371,6 @@ async def test_binding_conflicts_with_forced_provider(dual):
     assert "restricted to 'trae'" in str(exc_info.value)
     assert (cb.calls, trae.calls) == (0, 0)
 
-
 async def test_binding_defers_when_catalog_not_ready(dual):
     """目录未就绪（空映射）→ 不做归属判断，按绑定渠道直接放行。"""
     executor, cb, trae = _executor(dual, {})
@@ -476,13 +379,11 @@ async def test_binding_defers_when_catalog_not_ready(dual):
     assert result["choices"][0]["message"]["content"] == "ok"
     assert (cb.calls, trae.calls) == (1, 0)
 
-
 async def test_binding_keeps_forced_target_when_consistent(dual):
     """@trae 与绑定 trae 一致 → 正常执行（forced 分支的放行支）。"""
     executor, cb, trae = _executor(dual, {})
     await executor.complete(_chat("glm-5.2@trae"), username="u", provider_binding="trae")
     assert (trae.calls, cb.calls) == (1, 0)
-
 
 async def test_preflight_applies_binding(dual):
     """流式前置校验同样生效：不能等 200 响应头发出后才报 400。"""
@@ -491,7 +392,6 @@ async def test_preflight_applies_binding(dual):
     executor, _cb, _trae = _executor(dual, {"codebuddy": {"cb-only": "cb-only"}})
     with pytest.raises(InvalidRequest):
         executor.preflight(_chat("cb-only"), provider_binding="trae")
-
 
 def test_http_binding_end_to_end(tmp_path):
     """走完整 HTTP：绑定 Key 请求属别家渠道的模型 → 400 且提示绑定渠道。"""
@@ -509,7 +409,6 @@ def test_http_binding_end_to_end(tmp_path):
     listed = app.state.api_keys.list_for("root")[0]
     assert listed["provider_binding"] == "trae"
 
-
 def test_http_binding_rejects_foreign_model_via_catalog(tmp_path):
     """目录证明模型归属别家渠道时 400，文案给出实际归属。
 
@@ -524,7 +423,6 @@ def test_http_binding_rejects_foreign_model_via_catalog(tmp_path):
     with pytest.raises(InvalidRequest) as exc_info:
         ex.preflight(_chat("cb-only"), "trae")
     assert "not available on provider 'trae'" in str(exc_info.value)
-
 
 def test_http_binding_stream_preflight(tmp_path):
     """流式：绑定冲突必须在 200 SSE 头之前以 400 拒绝。"""
