@@ -7,22 +7,11 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import build_app
 from src.provider.trae.client import TraeProvider
 from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 async def test_poll_pending_returns_status_pending(admin_client):
     """轮询 pending → {"status": "pending"}（main 237-238）。"""

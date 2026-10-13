@@ -9,6 +9,7 @@ import pytest
 
 from src.provider.base import ErrKind, EventKind, Model
 from src.provider.trae.client import TraeClient, TraeCredential, prepare_body
+from tests.provider.trae._support import client as _trae_client
 
 
 def _mock_client(handler) -> TraeClient:
@@ -16,11 +17,6 @@ def _mock_client(handler) -> TraeClient:
     return TraeClient(stream_client=httpx.AsyncClient(transport=transport, timeout=None),
                       short_client=httpx.AsyncClient(transport=transport, timeout=None))
 
-def _trae_client(handler) -> TraeClient:
-
-    transport = httpx.MockTransport(handler)
-    return TraeClient(stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-                      short_client=httpx.AsyncClient(transport=transport, timeout=None))
 
 def test_prepare_body_function_choice_without_name_is_dropped():
     body = prepare_body({"messages": [], "tool_choice": {"type": "function",

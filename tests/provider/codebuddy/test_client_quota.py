@@ -8,10 +8,11 @@ import time
 import httpx
 import pytest
 
-from src.provider.codebuddy.client import CodeBuddyClient, CodeBuddyCredential, _cycle_end_epoch
+from src.provider.codebuddy.client import CodeBuddyCredential, _cycle_end_epoch
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from src.provider.codebuddy.headers import QUOTA_RANGE_END
-from tests.helpers.paths import provider_fixture
+from tests.provider.codebuddy._support import client as _client
+from tests.provider.codebuddy._support import fixture
 
 
 def _quota_body(accounts: object) -> dict:
@@ -20,8 +21,6 @@ def _quota_body(accounts: object) -> dict:
             "data": {"Response": {"Data": {"Accounts": accounts},
                                   "RequestId": "<redacted>"}}}
 
-def fixture(name: str) -> str:
-    return provider_fixture("codebuddy", name)
 
 @pytest.fixture(autouse=True)
 def _clear_model_cache():
@@ -35,11 +34,6 @@ def _clear_model_cache():
     yield
     _MODEL_CACHE.clear()
 
-def _client(handler) -> CodeBuddyClient:
-    transport = httpx.MockTransport(handler)
-    return CodeBuddyClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None))
 
 def _days(offset: int) -> str:
     """相对基准时刻的偏移，返回上游格式的时间串（有符号，负数=过去）。

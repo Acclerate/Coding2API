@@ -2,23 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.provider.codebuddy.client import CodeBuddyCredential, build_headers
 from src.provider.codebuddy.headers import encode_department, host_of
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
 
 def test_host_and_domain_derived_from_same_endpoint():
     headers = build_headers(CodeBuddyCredential(bearer_token="t"), "https://copilot.tencent.com")

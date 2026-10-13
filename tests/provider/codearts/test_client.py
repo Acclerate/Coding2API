@@ -10,7 +10,6 @@ import pytest
 
 from src.provider.base import ErrKind, Event, EventKind, UpstreamReloginRequired, Usage
 from src.provider.codearts import auth as codearts_auth
-from src.provider.codearts import dpop
 from src.provider.codearts import events as codearts_events
 from src.provider.codearts.client import (
     CodeArtsClient,
@@ -30,42 +29,12 @@ from src.provider.codearts.client import (
     sdk_date,
     short_headers,
 )
-from src.provider.codearts.credential import CodeArtsCredential
+from tests.helpers.http import sse_text as _sse
+from tests.provider.codearts._support import client as _client
+from tests.provider.codearts._support import cred as _cred
+from tests.provider.codearts._support import jwk as _jwk
+from tests.provider.codearts._support import token_response as _token_response
 
-
-def _cred(**over) -> CodeArtsCredential:
-    base = {
-        "uid": "u1", "user_name": "alice",
-        "access_key_id": "AK", "secret_access_key": "SK", "security_token": "TOK",
-        "expiration": int(time.time()) + 7200,
-    }
-    base.update(over)
-    return CodeArtsCredential.from_dict(base)
-
-def _jwk() -> dict[str, str]:
-    return dpop.new_private_jwk()
-
-def _client(handler, **kw) -> CodeArtsClient:
-    transport = httpx.MockTransport(handler)
-    kw.setdefault("endpoint", "https://snap.test")
-    kw.setdefault("benefit_host", "https://gw.test")
-    kw.setdefault("sts_host", "https://sts.test")
-    return CodeArtsClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None), **kw)
-
-def _sse(*payloads: object) -> str:
-    """CodeArts SSE：逐行 `data:`（真实流每行后有空行，逐行读取两者皆可）。"""
-    return "".join(f"data: {json.dumps(p)}\n" for p in payloads)
-
-def _token_response(**over) -> dict:
-    payload = {
-        "credentials": {"access_key_id": "AK2", "secret_access_key": "SK2",
-                        "security_token": "TOK2", "expiration": 1999999999},
-        "refresh_token": "rt2", "user_id": "u2", "user_name": "bob",
-    }
-    payload.update(over)
-    return payload
 
 def test_client_sdk_date_and_chat_id():
     assert sdk_date(0) == "19700101T000000Z"

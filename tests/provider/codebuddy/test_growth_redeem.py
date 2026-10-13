@@ -14,34 +14,10 @@ from src.provider.codebuddy.growth import (
     EP_TRAVEL_CLAIM,
     EP_TRAVEL_CONFIG,
     EP_TRAVEL_STATUS,
-    CodeBuddyGrowth,
 )
-from src.provider.codebuddy.growth_runner import GrowthRunner
+from tests.provider.codebuddy._growth_support import STREAK_BODY, TRAVEL_ARRIVED, TRAVEL_IDLE
+from tests.provider.codebuddy._growth_support import runner as _runner
 
-TRAVEL_ARRIVED = {"code": 0, "msg": "OK", "data": {
-    "state": "arrived", "buddy_id": 7485932, "record_id": 277990,
-    "location": {"id": 1, "code": "coffee", "name": "咖啡馆", "duration_hours": 3},
-    "depart_at": 1785255159, "arrive_at": 1785265959, "server_now": 1789820066,
-    "daily_limit_reached": False, "duration_hours": 3, "reward_credit": 10}}
-
-TRAVEL_IDLE = {"code": 0, "data": {
-    "state": "idle", "location": {"id": 1, "name": "咖啡馆"},
-    "daily_limit_reached": False}}
-
-STREAK_BODY = {"code": 0, "data": {
-    "streak": {"days": 0, "month_total_days": 3, "makeup_dates": []},
-    "makeup_cards": {"balance": 0, "max": 4},
-    "redemption_status": {"tier_7d_status": "locked", "tier_14d_status": "locked",
-                          "tier_28d_status": "locked"}}}
-
-def _client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
-
-def _scripted(handler) -> CodeBuddyGrowth:
-    return CodeBuddyGrowth("https://e", client=_client(handler))
-
-def _runner(handler, *, allow_irreversible: bool = True) -> GrowthRunner:
-    return GrowthRunner(_scripted(handler), allow_irreversible=allow_irreversible)
 
 async def _run(handler, *, allow_irreversible: bool = True):
     runner = _runner(handler, allow_irreversible=allow_irreversible)

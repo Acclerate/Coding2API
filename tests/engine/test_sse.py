@@ -9,11 +9,8 @@ from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
 
 
-def fixture(name: str) -> str:
-    return provider_fixture("trae", name)
-
 def test_parse_frames_from_real_fixture():
-    frames = parse_frames(fixture("chat-basic.sse"))
+    frames = parse_frames(provider_fixture("trae", "chat-basic.sse"))
     assert [f.event for f in frames] == [
         "metadata", "timing_cost", "output", "output", "extra_info",
         "token_usage", "done",
@@ -36,7 +33,7 @@ def test_parse_frames_ignores_data_less_events():
     assert parse_frames("event: ping\n\n") == []
 
 async def test_iter_frames_streaming_matches_sync_parse():
-    raw = fixture("chat-basic.sse").encode()
+    raw = provider_fixture("trae", "chat-basic.sse").encode()
     chunks = [raw[i:i + 7] for i in range(0, len(raw), 7)]
 
     async def gen():
@@ -44,7 +41,7 @@ async def test_iter_frames_streaming_matches_sync_parse():
             yield chunk
 
     streamed = [f async for f in iter_frames(gen())]
-    assert streamed == parse_frames(fixture("chat-basic.sse"))
+    assert streamed == parse_frames(provider_fixture("trae", "chat-basic.sse"))
 
 def test_format_openai_frame_and_done():
     assert format_openai_frame('{"a":1}') == b'data: {"a":1}\n\n'

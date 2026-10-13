@@ -11,22 +11,11 @@ from src.provider.codebuddy.growth import (
     EP_TASKS,
     EP_TRAVEL_CONFIG,
     EP_TRAVEL_STATUS,
-    CodeBuddyGrowth,
 )
-from src.provider.codebuddy.growth_runner import ACCEPT_BATCH_SIZE, GrowthRunner
+from src.provider.codebuddy.growth_runner import ACCEPT_BATCH_SIZE
+from tests.provider.codebuddy._growth_support import TRAVEL_IDLE
+from tests.provider.codebuddy._growth_support import runner as _runner
 
-TRAVEL_IDLE = {"code": 0, "data": {
-    "state": "idle", "location": {"id": 1, "name": "咖啡馆"},
-    "daily_limit_reached": False}}
-
-def _client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
-
-def _scripted(handler) -> CodeBuddyGrowth:
-    return CodeBuddyGrowth("https://e", client=_client(handler))
-
-def _runner(handler, *, allow_irreversible: bool = True) -> GrowthRunner:
-    return GrowthRunner(_scripted(handler), allow_irreversible=allow_irreversible)
 
 async def _run(handler, *, allow_irreversible: bool = True):
     runner = _runner(handler, allow_irreversible=allow_irreversible)

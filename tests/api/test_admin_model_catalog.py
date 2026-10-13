@@ -43,12 +43,6 @@ from src.provider.base import Model
 from tests.helpers.constants import SECRET
 
 
-@pytest.fixture()
-def settings(tmp_path):
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root")
-
-
 def _catalog(stub) -> Model:
     return stub
 
@@ -318,7 +312,6 @@ async def test_periodic_refresh_reports_only_model_count(settings):
 
 def test_build_runner_without_refresh_keeps_task_hidden(settings, tmp_path):
     """不注入刷新协程时不装配这条循环（老调用方/测试保持原行为）。"""
-    from src.config import Settings
     from src.db.conn import Database
     from src.db.crypto import CredentialCipher
     from src.db.migrate import apply_schema

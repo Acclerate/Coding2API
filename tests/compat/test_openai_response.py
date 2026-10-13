@@ -14,9 +14,6 @@ from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
 
 
-def fixture(name: str) -> str:
-    return provider_fixture("trae", name)
-
 def test_stream_translator_emits_role_then_content_then_done():
     """首块补 role:assistant（与 codebuddy2api 的 OpenAIStreamNormalizer 语义一致）。"""
     t = StreamTranslator("glm-5.2")
@@ -77,7 +74,7 @@ def test_stream_translator_empty_delta_is_skipped():
 
 def test_aggregate_builds_completion_from_fixture_events():
     events = [e for e in (trae_events.parse_frame(f)
-                          for f in parse_frames(fixture("chat-basic.sse"))) if e]
+                          for f in parse_frames(provider_fixture("trae", "chat-basic.sse"))) if e]
     result = aggregate(events, "glm-5.2")
     choice = result["choices"][0]
     assert choice["message"]["content"] == "中国的首都是北京。"

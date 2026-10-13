@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 
 from src.provider.codebuddy.client import CodeBuddyProvider
+from tests.helpers.constants import SWITCH_PATH
 
-SWITCH_PATH = "/v2/plugin/login/enterprise"
 
 def _refresh_client_provider(handler) -> object:
     from src.provider.codebuddy.client import CodeBuddyClient

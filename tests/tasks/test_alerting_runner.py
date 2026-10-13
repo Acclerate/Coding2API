@@ -4,59 +4,18 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from src.config import Settings
 from src.db.conn import Database
-from src.db.crypto import CredentialCipher
 from src.db.migrate import apply_schema
-from src.db.repo import AlertRepository, CredentialRepository
+from src.db.repo import AlertRepository
 from src.stats.collector import StatsCollector
-from src.tasks.alerting import AlertTask
 from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
 from src.tasks.status import TaskStatusStore
 from tests.helpers.constants import SECRET
+from tests.tasks._alerting_support import StubCredentials as _StubCredentials
+from tests.tasks._alerting_support import make_alert_task as _task
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-class _StubCredentials:
-    def __init__(self, counts=None, expiring=None):
-        self._counts = counts or {"total": 1, "ready": 1, "cooling": 0,
-                                  "paused": 0, "disabled": 0}
-        self._expiring = expiring or []
-
-    def pool_counts(self, now=None):
-        return self._counts
-
-    def expiring_tokens(self, *, within_seconds, now=None):
-        return self._expiring
-
-class _StubStats:
-    def __init__(self, counts=(0, 0)):
-        self._counts = counts
-
-    def window_error_rate(self, *, since):
-        return self._counts
-
-def _task(tmp_path, *, credentials=None, stats=None, status=None, **kwargs):
-    db = Database(tmp_path / "alert.sqlite3")
-    apply_schema(db.connect())
-    alerts = AlertRepository(db)
-    task = AlertTask(
-        credentials or _StubCredentials(),
-        alerts,
-        stats or _StubStats(),
-        task_status=status or TaskStatusStore(),
-        **kwargs,
-    )
-    return task, alerts, db
 
 class _StubProvider:
     id = "codebuddy"

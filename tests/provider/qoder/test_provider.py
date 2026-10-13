@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 
 import httpx
 import pytest
@@ -12,64 +11,11 @@ from src.engine.sse import SSEFrame
 from src.provider.base import ErrKind, EventKind
 from src.provider.qoder import events as qoder_events
 from src.provider.qoder.client import QoderClient, UpstreamHTTPError
-from src.provider.qoder.credential import QoderCredential
 from src.provider.qoder.events import UpstreamProtocolViolation
+from tests.provider.qoder._support import campaign as _campaign
+from tests.provider.qoder._support import campaigns as _campaigns
+from tests.provider.qoder._support import cred, handler_for, inner, sse
 
-GATEWAY = "https://gateway.test"
-
-OPENAPI = "https://openapi.test"
-
-def cred(**overrides) -> QoderCredential:
-    base = {"access_token": "dt-token-1", "uid": "u-1", "realm": "cn",
-            "refresh_token": "drt-1", "auth_source": "oauth",
-            "nickname": "Tester", "expires_at": int(time.time()) + 86400}
-    base.update(overrides)
-    return QoderCredential(**base)
-
-def envelope(body: object, status: int = 200) -> str:
-    payload = {"headers": {}, "body": body if isinstance(body, str) else json.dumps(body),
-               "statusCodeValue": status}
-    return f"data: {json.dumps(payload)}\n\n"
-
-def inner(delta: dict, *, finish: str | None = None, usage: dict | None = None,
-          choices: list | None = None) -> dict:
-    payload: dict = {"id": "c1", "object": "chat.completion.chunk"}
-    if choices is None:
-        payload["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
-    else:
-        payload["choices"] = choices
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
-
-def sse(*payloads: object) -> str:
-    return "".join(envelope(p) for p in payloads) + envelope("[DONE]")
-
-def handler_for(handler, **kwargs) -> QoderClient:
-    transport = httpx.MockTransport(handler)
-    kwargs.setdefault("gateway_fallbacks", (GATEWAY,))
-    return QoderClient(
-        host=OPENAPI, gateway=GATEWAY,
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None),
-        **kwargs)
-
-def _campaign(campaign_id: str = "c-1", *, action: str = "CLAIM_BENEFIT",
-              status: str = "CLAIMABLE", amount: object = 100,
-              kind: object = "CREDITS", end_at: object = 1_795_111_140) -> dict:
-    benefit: dict = {}
-    if kind is not None:
-        benefit["kind"] = kind
-    if amount is not None:
-        benefit["amount"] = amount
-    item: dict = {"campaignId": campaign_id, "campaignKey": "act-1",
-                  "actionType": action, "claimStatus": status, "benefit": benefit}
-    if end_at is not None:
-        item["endAt"] = end_at
-    return item
-
-def _campaigns(*items: dict) -> dict:
-    return {"showCampaign": bool(items), "campaigns": list(items)}
 
 async def test_provider_classify_import_and_credential_from():
     from src.provider.qoder import QoderProvider

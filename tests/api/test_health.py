@@ -2,25 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
-from src.auth.session import create_session_token
-from src.config import Settings
 from src.main import build_app
-from tests.helpers.constants import SECRET
+from tests.helpers.auth import isolated_settings as _settings
 
-
-def _settings(tmp_path, **overrides) -> Settings:
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root", **overrides)
-
-@pytest.fixture()
-def client(tmp_path):
-    app = build_app(_settings(tmp_path))
-    with TestClient(app) as http:
-        http.cookies.set("coding2api_session", create_session_token("root", SECRET))
-        yield http
 
 def test_healthz_reports_pool_counts(client):
     response = client.get("/healthz")

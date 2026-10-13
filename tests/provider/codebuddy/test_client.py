@@ -16,29 +16,9 @@ from src.provider.codebuddy.client import (
     UpstreamHTTPError,
 )
 from src.provider.codebuddy.events import UpstreamProtocolViolation
-from tests.helpers.paths import provider_fixture
+from tests.provider.codebuddy._support import client as _client
+from tests.provider.codebuddy._support import fixture
 
-
-def fixture(name: str) -> str:
-    return provider_fixture("codebuddy", name)
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-def _client(handler) -> CodeBuddyClient:
-    transport = httpx.MockTransport(handler)
-    return CodeBuddyClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None))
 
 @pytest.mark.parametrize(("status", "expected"), [
     (401, ErrKind.DEAD), (403, ErrKind.DEAD), (404, ErrKind.SOFT), (429, ErrKind.SOFT),

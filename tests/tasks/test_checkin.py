@@ -4,64 +4,11 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
-from src.provider.base import ErrKind, Quota
 from src.provider.codebuddy.checkin import CheckinResult
-from src.provider.codebuddy.client import CodeBuddyCredential
 from src.tasks.checkin import CheckinTask
-from tests.helpers.constants import SECRET
+from tests.helpers.scheduler import disabled_outcome as _disabled_outcome
+from tests.tasks._support import ProbeProvider
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-class ProbeProvider:
-    id = "codebuddy"
-
-    def __init__(self, quota=None, error=None, checkin_ok=True, refresh_new=None):
-        self.quota = quota or Quota(remaining=8, total=10, probed_at=1)
-        self.error = error
-        self.checkin_ok = checkin_ok
-        self.refresh_new = refresh_new
-        self.checkin_calls = 0
-        self.refresh_calls = 0
-        self.seen_scopes: list[str] = []
-
-    async def probe_quota(self, _data):
-        if self.error is not None:
-            raise self.error
-        return self.quota
-
-    async def checkin(self, _data):
-        self.checkin_calls += 1
-        return CheckinResult(ok=self.checkin_ok, credit=10 if self.checkin_ok else None)
-
-    def checkin_scope(self, data):
-        scope = f"acct:{data.get('account_uid', '')}"
-        self.seen_scopes.append(scope)
-        return scope
-
-    def credential_from(self, data):
-        return CodeBuddyCredential.from_dict(data)
-
-    async def refresh(self, data):
-        self.refresh_calls += 1
-        return {**data, "bearer_token": self.refresh_new or "NEW"}
-
-def _disabled_outcome():
-    from src.engine.scheduler import Candidate, Scheduler
-
-    return Scheduler().note_error(Candidate(credential_id="c", provider="codebuddy"),
-                                  ErrKind.DEAD, 0)
 
 async def test_checkin_empty_scope_falls_back_to_credential_id(repo):
     """身份未知（provider 返回空 scope）时绝不共享：两个账号必须各签一次。

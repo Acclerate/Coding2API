@@ -9,31 +9,13 @@ import pytest
 
 from src.provider.codebuddy.client import (
     DEFAULT_MODELS,
-    CodeBuddyClient,
     CodeBuddyCredential,
     CodeBuddyProvider,
     UpstreamHTTPError,
 )
 from src.provider.codebuddy.events import UpstreamProtocolViolation
+from tests.provider.codebuddy._support import client as _client
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-def _client(handler) -> CodeBuddyClient:
-    transport = httpx.MockTransport(handler)
-    return CodeBuddyClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None))
 
 async def test_fetch_models_parses_config_and_caches():
     """/v3/config 动态拉取：data.models[].id，按 token+endpoint 缓存。"""

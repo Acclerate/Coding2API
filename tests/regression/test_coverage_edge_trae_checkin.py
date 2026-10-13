@@ -2,25 +2,14 @@
 
 from __future__ import annotations
 
-import pathlib
-
 import httpx
 import pytest
 
-from src.provider.trae.client import TraeClient, TraeCredential
+from src.provider.trae.client import TraeCredential
 from tests.helpers.constants import SECRET
+from tests.helpers.paths import tmpdir as _tmpdir
+from tests.provider.trae._support import client as _trae_client
 
-
-def _trae_client(handler) -> TraeClient:
-
-    transport = httpx.MockTransport(handler)
-    return TraeClient(stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-                      short_client=httpx.AsyncClient(transport=transport, timeout=None))
-
-def _tmpdir():
-    import tempfile
-
-    return pathlib.Path(tempfile.mkdtemp())
 
 async def test_trae_checkin_status_and_claim_use_ug_headers():
     """签到两端点必须走 ug_headers（含 X-User-Region），且用 POST。"""

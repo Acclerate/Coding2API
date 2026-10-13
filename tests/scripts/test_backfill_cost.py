@@ -7,8 +7,6 @@ from pathlib import Path
 import pytest
 
 from src.benchmarks import save_catalog
-from src.db.conn import Database
-from src.db.migrate import apply_schema
 from tests.helpers.paths import load_script, script_path
 
 SCRIPT = script_path("backfill_cost")
@@ -40,14 +38,6 @@ def _set_rate(db, value: str) -> None:
         conn.execute(
             "INSERT INTO runtime_settings (key, value, updated_at) VALUES ('usd_cny_rate', ?, 0)",
             (value,))
-
-
-@pytest.fixture()
-def db(tmp_path):
-    database = Database(tmp_path / "t.sqlite3")
-    apply_schema(database.connect())
-    yield database
-    database.close()
 
 
 def test_pending_lists_only_changed_priced_rows(db):

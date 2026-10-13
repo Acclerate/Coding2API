@@ -101,16 +101,6 @@ def test_load_settings_explicit_env_dict():
     assert s.port == 9999 and s.default_model == "glm-5.3"
 
 
-# ----------------------------------------------------------------------- db
-
-@pytest.fixture()
-def db(tmp_path):
-    database = Database(tmp_path / "t.sqlite3")
-    apply_schema(database.connect())
-    yield database
-    database.close()
-
-
 def test_database_applies_pragmas(db):
     conn = db.connect()
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"

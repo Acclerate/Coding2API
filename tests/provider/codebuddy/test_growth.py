@@ -22,39 +22,13 @@ from src.provider.codebuddy.growth import (
     parse_travel_status,
 )
 from src.provider.codebuddy.growth_runner import _eta, _fmt, _report
+from tests.provider.codebuddy._growth_support import (
+    REDEEM_LOCKED,
+    STREAK_BODY,
+    TASKS_BODY,
+    TRAVEL_ARRIVED,
+)
 
-TRAVEL_ARRIVED = {"code": 0, "msg": "OK", "data": {
-    "state": "arrived", "buddy_id": 7485932, "record_id": 277990,
-    "location": {"id": 1, "code": "coffee", "name": "咖啡馆", "duration_hours": 3},
-    "depart_at": 1785255159, "arrive_at": 1785265959, "server_now": 1789820066,
-    "daily_limit_reached": False, "duration_hours": 3, "reward_credit": 10}}
-
-TASKS_BODY = {"code": 0, "data": {"tasks": [
-    # 未领取：必须先 accept 一次（进度从领取才计）
-    {"task_code": "t_new", "title": "新任务", "accept_status": "",
-     "progress": {"current": 0, "target": 1}, "reward_credit": 300, "locked": False},
-    # 已接单未完成：跳过，不重复领取
-    {"task_code": "t_doing", "title": "进行中", "accept_status": "accepted",
-     "progress": {"current": 0, "target": 3}},
-    # 已接单且完成：领奖
-    {"task_code": "t_done", "title": "已完成", "accept_status": "accepted",
-     "progress": {"current": 1, "target": 1}, "reward_credit": 50, "reward_energy": 5},
-    # 已领奖 / 锁定：跳过
-    {"task_code": "t_claimed", "title": "已领", "accept_status": "claimed"},
-    {"task_code": "t_locked", "title": "锁定", "accept_status": "", "locked": True},
-    # progress 缺失：target 按 1，current 0 → 未完成
-    {"task_code": "t_bare", "title": "无进度", "accept_status": ""},
-]}}
-
-STREAK_BODY = {"code": 0, "data": {
-    "streak": {"days": 0, "month_total_days": 3, "makeup_dates": []},
-    "makeup_cards": {"balance": 0, "max": 4},
-    "redemption_status": {"tier_7d_status": "locked", "tier_14d_status": "locked",
-                          "tier_28d_status": "locked"}}}
-
-REDEEM_LOCKED = {"code": 0, "data": {
-    "starter_status": "locked", "advanced_status": "locked", "legendary_status": "locked",
-    "starter_count": 0, "total_consumed": 0}}
 
 def test_dig_and_as_int_tolerate_junk():
     """信封查找与宽松数值转换：坏数据不能抛异常（上游会返回 Infinity）。"""

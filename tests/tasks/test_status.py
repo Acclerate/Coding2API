@@ -8,14 +8,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.auth.session import create_session_token
 from src.config import Settings
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.provider.base import Quota
 from src.stats.collector import StatsCollector
 from src.tasks import TaskReport
@@ -27,14 +21,6 @@ from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
 from src.tasks.status import TASK_BY_KEY, TASK_SPECS, TaskStatusStore
 from tests.helpers.constants import SECRET
-
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
 
 
 class StubProvider:
@@ -280,30 +266,15 @@ def test_every_hot_setting_task_owner_is_a_real_task():
 
 # ------------------------------------------------------------- /api/tasks 端点
 
-@pytest.fixture()
-def admin_app(tmp_path):
-    from fastapi.testclient import TestClient
-
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, ADMIN_USERNAMES="root",
-                        DATA_DIR=str(tmp_path))
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
-
-
-def test_tasks_requires_admin(admin_app):
-    _app, client = admin_app
+def test_tasks_requires_admin(admin_client):
+    _app, client = admin_client
     client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
     assert client.get("/api/tasks").status_code == 403
 
 
-def test_tasks_returns_runtime_snapshot(admin_app):
+def test_tasks_returns_runtime_snapshot(admin_client):
     """端点返回已装配任务的运行态 + server_time；启动首轮探测已入账。"""
-    _app, client = admin_app
+    _app, client = admin_client
     body = client.get("/api/tasks").json()
     assert isinstance(body["server_time"], int) and body["server_time"] > 0
     keys = [item["key"] for item in body["tasks"]]

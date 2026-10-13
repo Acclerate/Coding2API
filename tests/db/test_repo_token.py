@@ -10,23 +10,10 @@ from src.db.crypto import CredentialCipher
 from src.db.migrate import apply_schema
 from src.db.repo import CredentialRepository
 from src.provider.codebuddy.client import CodeBuddyCredential
+from tests.helpers.chat import b64url as _b64
+from tests.helpers.chat import jwt_token as _jwt
 from tests.helpers.constants import SECRET
 
-
-def _jwt(exp: int, *, iat: int | None = None,
-         header: dict | None = None, payload_extra: dict | None = None) -> str:
-    """构造测试用 JWT（不签名；本地只解码不验签）。"""
-    body: dict = {"exp": exp}
-    if iat is not None:
-        body["iat"] = iat
-    body.update(payload_extra or {})
-    return f"{_b64(header or {'alg': 'RS256', 'typ': 'JWT'})}.{_b64(body)}.sig"
-
-def _b64(obj: object) -> str:
-    """base64url 编码任意可 JSON 序列化对象（含数组，用于负例）。"""
-    import base64
-
-    return base64.urlsafe_b64encode(json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
 
 def jwt_expiry_of(token: str) -> int:
     from src.provider.token_expiry import jwt_expiry

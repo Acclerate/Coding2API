@@ -4,25 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from src.config import Settings
-from tests.helpers.constants import SECRET
-
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    """带 admin 会话的 TestClient（局部定义：本文件不复用他处 fixture）。"""
-    from fastapi.testclient import TestClient
-
-    from src.auth.session import create_session_token
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 class _IdentityClient:
     """登录补身份的替身：caller_identity / current_user 各可配返回值或异常。"""

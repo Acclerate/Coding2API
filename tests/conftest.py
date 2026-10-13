@@ -14,14 +14,114 @@ ADMIN_USERNAMES 用 monkeypatch 全局设成 root：B5 里它只在引导期生�
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
+from src.auth.session import create_session_token
 from src.auth.users import create_password_hash
+from src.config import Settings
+from src.db.conn import Database
+from src.db.crypto import CredentialCipher
+from src.db.migrate import apply_schema
+from src.db.repo import CredentialRepository, GrowthRepository
+from src.main import build_app
 from tests.helpers.constants import SECRET, USERS
 
 # 常量迁到 tests/helpers/constants.py；此处 re-export 以兼容既有
 # `from tests.conftest import SECRET` 调用点（新代码请直接 import helpers）。
 
 __all__ = ["SECRET", "USERS"]
+
+
+@pytest.fixture()
+def repo(tmp_path):
+    """`(CredentialRepository, Database)` 临时库夹具。
+
+    13 个文件曾各写一份逐字节等价的实现；收敛到这里后，测试模块直接以
+    形参 `repo` 注入即可。调用方负责在用例结束时关闭（夹具负责）。
+    """
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    yield CredentialRepository(db, CredentialCipher(SECRET)), db
+    db.close()
+
+
+@pytest.fixture()
+def db(tmp_path):
+    """建表后的裸 `Database` 临时库夹具（5 处逐字节等价的副本收敛到此）。"""
+    database = Database(tmp_path / "t.sqlite3")
+    apply_schema(database.connect())
+    yield database
+    database.close()
+
+
+@pytest.fixture()
+def dual_repo(tmp_path):
+    """`(CredentialRepository, Database)`，文件名固定 `dual.sqlite3`。
+
+    4 个文件曾各写一份逐字节等价的实现（含双上游用例），收敛到这里。
+    """
+    db = Database(tmp_path / "dual.sqlite3")
+    apply_schema(db.connect())
+    yield CredentialRepository(db, CredentialCipher(SECRET)), db
+    db.close()
+
+
+@pytest.fixture()
+def growth_repo(tmp_path):
+    """`(CredentialRepository, GrowthRepository)` 临时库夹具。
+
+    3 个文件（api / provider / tasks）曾各写一份逐字节等价的实现，收敛到这里。
+    """
+    db = Database(tmp_path / "growth.sqlite3")
+    apply_schema(db.connect())
+    yield CredentialRepository(db, CredentialCipher(SECRET)), GrowthRepository(db)
+    db.close()
+
+
+@pytest.fixture()
+def admin_client(tmp_path):
+    """`(app, client)`：带 admin 会话 Cookie 的 TestClient。
+
+    5 个文件曾各写一份逐字节等价的实现，收敛到这里；需要替身 provider 或
+    自定义 Settings 的文件仍保留自己的局部 `admin_client`（会覆盖本夹具）。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    client = TestClient(app)
+    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+    with client:
+        yield app, client
+
+
+@pytest.fixture()
+def client(tmp_path):
+    """带 admin 会话 Cookie 的 TestClient（只需 client、不需要 app 的用例用）。
+
+    `tests/api/test_health.py` / `tests/auth/test_api_key_policy.py` 曾各写一份
+    逐字节等价的实现；需要 `(app, client)` 的用例用 `admin_client`。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as test_client:
+        test_client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        yield test_client
+
+
+@pytest.fixture(autouse=True)
+def reset_model_cache():
+    """按测试清空 CodeBuddy 的模块级模型缓存。
+
+    15 个测试模块曾各写一份逐字节等价的 autouse 夹具；收敛成一份全局夹具。
+    `tests/provider/codebuddy/test_client_quota.py` 另需重置 `_DAYS_BASE`
+    基准时刻，保留其局部同名夹具（它会覆盖本夹具，语义等价）。
+    """
+    from src.provider.codebuddy.client import _MODEL_CACHE
+
+    _MODEL_CACHE.clear()
+    yield
+    _MODEL_CACHE.clear()
 
 
 @pytest.fixture(scope="session")

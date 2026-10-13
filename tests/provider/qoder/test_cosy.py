@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import time
 
 import pytest
 
@@ -25,16 +24,8 @@ from src.provider.qoder.cosy import (
     qoder_encode,
     sign_path,
 )
-from src.provider.qoder.credential import QoderCredential
+from tests.provider.qoder._support import GATEWAY, cred
 
-GATEWAY = "https://gateway.test"
-
-def cred(**overrides) -> QoderCredential:
-    base = {"access_token": "dt-token-1", "uid": "u-1", "realm": "cn",
-            "refresh_token": "drt-1", "auth_source": "oauth",
-            "nickname": "Tester", "expires_at": int(time.time()) + 86400}
-    base.update(overrides)
-    return QoderCredential(**base)
 
 def test_qoder_encode_roundtrip_and_custom_alphabet():
     for plain in (b"", b"a", b"ab", b"abc", b"hello world!" * 7):

@@ -4,46 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from src.config import Settings, validate_codearts_endpoint_allowed, validate_qoder_endpoint_allowed
+from src.config import validate_codearts_endpoint_allowed, validate_qoder_endpoint_allowed
 from src.runtime_settings import HOT_BY_KEY, RuntimeSettings
-from tests.helpers.constants import SECRET
-
-
-class _MemoryStore:
-    """最小 SettingsStore：只实现读写三动作。"""
-
-    def __init__(self, initial: dict[str, str] | None = None) -> None:
-        self.rows: dict[str, str] = dict(initial or {})
-
-    def load(self) -> dict[str, str]:
-        return dict(self.rows)
-
-    def set(self, key: str, value: str, now: int | None = None) -> None:
-        self.rows[key] = value
-
-    def delete(self, key: str) -> None:
-        self.rows.pop(key, None)
-
-def _settings(**overrides) -> Settings:
-    defaults = {"_env_file": None, "APP_SECRET": SECRET, "DATA_DIR": "./data"}
-    defaults.update(overrides)
-    return Settings(**defaults)  # type: ignore[arg-type]
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    """带 admin 会话的 TestClient（局部定义：本文件不复用他处 fixture）。"""
-    from fastapi.testclient import TestClient
-
-    from src.auth.session import create_session_token
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
+from tests.helpers.auth import settings_with as _settings
+from tests.helpers.stores import MemoryStore as _MemoryStore
 
 # --------------------------------------------------------------- Settings 字段
 

@@ -8,12 +8,10 @@ import httpx
 import pytest
 
 from src.provider.codearts import auth as codearts_auth
-from src.provider.codearts import dpop
 from src.provider.codearts import events as codearts_events
+from tests.provider.codearts._support import jwk as _jwk
+from tests.provider.codearts._support import token_response as _token_response
 
-
-def _jwk() -> dict[str, str]:
-    return dpop.new_private_jwk()
 
 def _login_config() -> codearts_auth.LoginConfig:
     return codearts_auth.LoginConfig(
@@ -21,14 +19,6 @@ def _login_config() -> codearts_auth.LoginConfig:
         snap_manager="https://snap.test/snap-manager",
         sts_host="https://sts.test")
 
-def _token_response(**over) -> dict:
-    payload = {
-        "credentials": {"access_key_id": "AK2", "secret_access_key": "SK2",
-                        "security_token": "TOK2", "expiration": 1999999999},
-        "refresh_token": "rt2", "user_id": "u2", "user_name": "bob",
-    }
-    payload.update(over)
-    return payload
 
 def test_auth_new_ticket_identity_is_hex32():
     ticket, secret = codearts_auth.new_ticket_identity()

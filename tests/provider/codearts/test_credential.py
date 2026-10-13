@@ -6,7 +6,6 @@ import time
 
 import pytest
 
-from src.provider.codearts import dpop
 from src.provider.codearts import events as codearts_events
 from src.provider.codearts.credential import (
     CodeArtsCredential,
@@ -15,28 +14,10 @@ from src.provider.codearts.credential import (
     merge_refreshed,
     parse_credentials,
 )
+from tests.provider.codearts._support import cred as _cred
+from tests.provider.codearts._support import jwk as _jwk
+from tests.provider.codearts._support import token_response as _token_response
 
-
-def _cred(**over) -> CodeArtsCredential:
-    base = {
-        "uid": "u1", "user_name": "alice",
-        "access_key_id": "AK", "secret_access_key": "SK", "security_token": "TOK",
-        "expiration": int(time.time()) + 7200,
-    }
-    base.update(over)
-    return CodeArtsCredential.from_dict(base)
-
-def _jwk() -> dict[str, str]:
-    return dpop.new_private_jwk()
-
-def _token_response(**over) -> dict:
-    payload = {
-        "credentials": {"access_key_id": "AK2", "secret_access_key": "SK2",
-                        "security_token": "TOK2", "expiration": 1999999999},
-        "refresh_token": "rt2", "user_id": "u2", "user_name": "bob",
-    }
-    payload.update(over)
-    return payload
 
 def test_credential_expiry_and_needs_refresh():
     assert _cred(expiration=0).token_expires_at() == 0

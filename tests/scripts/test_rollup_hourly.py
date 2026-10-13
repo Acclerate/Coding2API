@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from src.db.conn import Database
-from src.db.migrate import apply_schema
 from src.stats.backfill import pending_hourly
 from src.stats.collector import StatsCollector
 from tests.helpers.paths import load_script, script_path
@@ -31,14 +29,6 @@ def _insert(db, *, id, ts=1_700_000_000, username="u", provider="trae",
             " VALUES (?,?,?,?,NULL,?,?,?,?,?)",
             (id, ts, username, provider, model, ok, input_tokens, output_tokens,
              cached_tokens))
-
-
-@pytest.fixture()
-def db(tmp_path):
-    database = Database(tmp_path / "t.sqlite3")
-    apply_schema(database.connect())
-    yield database
-    database.close()
 
 
 def test_pending_hourly_reports_missing_and_mismatch(db):

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pathlib
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,6 +14,7 @@ from src.main import build_app
 from src.provider.base import ErrKind, Event, EventKind, Model, Usage
 from src.provider.trae.events import UpstreamProtocolViolation
 from tests.helpers.constants import SECRET
+from tests.helpers.paths import tmpdir as _tmpdir
 
 
 class _Provider:
@@ -95,10 +94,6 @@ def _model_cool(credentials, credential_id, model, *, reason="model"):
     entry = ModelCooldown(cooling_until=int(time.time()) + 600, hits=1, reason=reason)
     credentials.save_error(credential_id, ErrorOutcome(model_cooldowns={model: entry}))
 
-def _tmpdir():
-    import tempfile
-
-    return pathlib.Path(tempfile.mkdtemp())
 
 async def test_stream_error_then_second_credential_succeeds(tmp_path):
     """第一次 SOFT 失败 → 换号 → 成功；覆盖 rotate 后继续的分支。"""

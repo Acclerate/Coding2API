@@ -4,25 +4,11 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.engine.scheduler import ErrorOutcome
 from src.provider.base import ErrKind
 from src.stats.collector import StatsCollector
 from src.tasks.retention import RetentionTask
-from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
 
 def test_repo_persists_model_cooldowns_separately_from_account(repo):
     """模型级冷却只写独立表：账号级 cooling_until 必须保持为空。"""

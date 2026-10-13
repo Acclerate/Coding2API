@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 
 import httpx
 import pytest
@@ -12,32 +11,13 @@ import pytest
 from src.provider.base import ErrKind, EventKind
 from src.provider.zen import events as zen_events
 from src.provider.zen.client import EP_CHAT, EP_MODELS, UpstreamHTTPError, ZenClient
+from tests.helpers.http import chunk_payload as chunk
+from tests.helpers.http import sse_text_done as _sse
+from tests.provider.zen._support import SESSION_RE
+from tests.provider.zen._support import client as _client
 
 pytestmark = pytest.mark.real_upstream("zen")
 
-SESSION_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
-
-def chunk(delta: dict, *, finish: str | None = None, usage: dict | None = None,
-          choices: list | None = None) -> dict:
-    payload: dict = {"id": "x", "object": "chat.completion.chunk"}
-    if choices is None:
-        payload["choices"] = [{"index": 0, "delta": delta,
-                               "finish_reason": finish}]
-    else:
-        payload["choices"] = choices
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
-
-def _sse(*payloads: object) -> str:
-    body = "".join(f"data: {json.dumps(p)}\n\n" for p in payloads)
-    return body + "data: [DONE]\n\n"
-
-def _client(handler, **kw) -> ZenClient:
-    transport = httpx.MockTransport(handler)
-    return ZenClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None), **kw)
 
 async def test_stream_chat_yields_named_events():
     def handler(request: httpx.Request) -> httpx.Response:

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from src.provider.zen.client import (
@@ -14,10 +12,9 @@ from src.provider.zen.client import (
     new_session_id,
     prepare_body,
 )
+from tests.provider.zen._support import SESSION_RE
 
 pytestmark = pytest.mark.real_upstream("zen")
-
-SESSION_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
 def test_new_session_id_matches_gate_regex():
     session = new_session_id()

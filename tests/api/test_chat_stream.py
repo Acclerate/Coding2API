@@ -9,88 +9,22 @@ import time
 import httpx
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.engine.executor import Executor, ExecutorDeps, NoHealthyCredential
 from src.engine.scheduler import Scheduler
 from src.provider.base import ErrKind, Event, EventKind
 from src.provider.codebuddy.client import (
-    CodeBuddyClient,
     CodeBuddyCredential,
     CodeBuddyProvider,
     UpstreamHTTPError,
 )
 from src.provider.qoder.credential import QoderCredential
 from src.tasks.pacer import stable_key
-from tests.helpers.constants import SECRET
-from tests.helpers.paths import provider_fixture
-
-
-def fixture(name: str) -> str:
-    return provider_fixture("codebuddy", name)
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-def _client(handler) -> CodeBuddyClient:
-    transport = httpx.MockTransport(handler)
-    return CodeBuddyClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None))
-
-@pytest.fixture()
-def dual_repo(tmp_path):
-    db = Database(tmp_path / "dual.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-class DualProvider:
-    """同一脚本双 provider：验证调度层对两个上游行为一致。"""
-
-    def __init__(self, provider_id: str, script) -> None:
-        self.id = provider_id
-        self.script = script
-        self.calls = 0
-
-    async def stream_chat(self, _credential_data, _payload, _model):
-        index = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        for item in self.script[index]:
-            if isinstance(item, Exception):
-                raise item
-            yield item
-
-    def list_models(self, _credential_data):
-        return []
-
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-def _dual_executor(credentials, trae_script, cb_script, **kw):
-    trae = DualProvider("trae", trae_script)
-    codebuddy = DualProvider("codebuddy", cb_script)
-    executor = Executor(ExecutorDeps(
-        providers={"trae": trae, "codebuddy": codebuddy}, credentials=credentials,
-        scheduler=Scheduler(**kw), default_model="glm-5.2"))
-    return executor, trae, codebuddy
-
-def _request(model="glm-5.2"):
-    from src.compat.openai.request import parse_chat_request
-
-    return parse_chat_request({"messages": [{"role": "user", "content": "hi"}],
-                               "model": model})
+from tests.helpers.chat import chat_request as _request
+from tests.helpers.events import GOOD
+from tests.helpers.executor import DualProvider
+from tests.helpers.executor import dual_executor as _dual_executor
+from tests.provider.codebuddy._support import client as _client
+from tests.provider.codebuddy._support import fixture
 
 _CB_11128_BODY = (
     b'{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}')

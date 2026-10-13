@@ -6,21 +6,10 @@ import time
 
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.engine.executor import NoHealthyCredential
 from src.provider.base import ErrKind, Event, EventKind, Quota, Usage
-from tests.helpers.constants import SECRET
+from tests.helpers.events import GOOD_EVENTS
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
 
 def _disabled_outcome():
     from src.engine.scheduler import Candidate, Scheduler
@@ -64,22 +53,6 @@ def _exec_with_stats(repo_tuple, script, collector, **kw):
         providers={"codebuddy": Streaming()}, credentials=credentials,
         scheduler=Scheduler(**kw), default_model="glm-5.2", stats=collector))
     return executor
-
-GOOD_EVENTS = [Event(kind=EventKind.CONTENT, content="hi"),
-               Event(kind=EventKind.USAGE, usage=Usage(11, 22, 3)),
-               Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
 
 async def test_stream_records_success_with_usage_and_username(repo):
     credentials, _db = repo
@@ -280,7 +253,6 @@ def test_error_type_mapping_covers_all_kinds():
 
 def test_usage_field_tolerates_missing_usage():
     from src.engine.executor import _usage_field
-    from src.provider.base import Usage
 
     assert _usage_field(None, "input_tokens") is None
     assert _usage_field(Usage(5, 6, 7), "output_tokens") == 6

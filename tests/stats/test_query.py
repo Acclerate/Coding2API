@@ -4,43 +4,16 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.auth.session import create_session_token
 from src.config import Settings
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.main import build_app
 from src.stats.collector import StatsCollector
 from src.stats.query import StatsQuery
 from src.tasks.retention import RetentionTask
 from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-@pytest.fixture()
-def stats(repo):
-    _credentials, db = repo
-    yield StatsCollector(db), StatsQuery(db)
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 def test_stats_overview_global_for_admin(stats):
     collector, query = stats

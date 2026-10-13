@@ -14,8 +14,6 @@ from src.auth.access import (
     normalize_allowed_models,
     split_entries,
 )
-from src.auth.session import create_session_token
-from src.config import Settings
 from src.db.conn import Database
 from src.db.crypto import CredentialCipher
 from src.db.migrate import apply_schema
@@ -23,11 +21,10 @@ from src.db.repo import ApiKeyRepository, CredentialRepository
 from src.engine.executor import Executor, ExecutorDeps
 from src.engine.scheduler import Scheduler
 from src.main import build_app
-from src.provider.base import Event, EventKind
+from tests.helpers.auth import isolated_settings as _settings
 from tests.helpers.constants import SECRET
+from tests.helpers.events import GOOD
 
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
 
 @pytest.fixture()
 def keys(tmp_path):
@@ -36,16 +33,7 @@ def keys(tmp_path):
     yield ApiKeyRepository(db)
     db.close()
 
-def _settings(tmp_path, **overrides) -> Settings:
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root", **overrides)
 
-@pytest.fixture()
-def client(tmp_path):
-    app = build_app(_settings(tmp_path))
-    with TestClient(app) as http:
-        http.cookies.set("coding2api_session", create_session_token("root", SECRET))
-        yield http
 
 def _create_key(client, **payload) -> dict:
     response = client.post("/api/api-keys", json={"name": "t", **payload})

@@ -18,14 +18,8 @@ from src.provider.qoder.credential import (
     parse_credential,
 )
 from src.provider.qoder.events import UpstreamProtocolViolation
+from tests.provider.qoder._support import cred
 
-
-def cred(**overrides) -> QoderCredential:
-    base = {"access_token": "dt-token-1", "uid": "u-1", "realm": "cn",
-            "refresh_token": "drt-1", "auth_source": "oauth",
-            "nickname": "Tester", "expires_at": int(time.time()) + 86400}
-    base.update(overrides)
-    return QoderCredential(**base)
 
 def test_credential_roundtrip_and_realm_detection():
     raw = {"access_token": "t", "uid": "u", "realm": "intl",

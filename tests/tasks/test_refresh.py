@@ -6,32 +6,14 @@ import time
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
-from src.auth.session import create_session_token
-from src.config import Settings
-from src.main import build_app
 from src.provider.base import Quota, UpstreamReloginRequired
 from src.provider.codebuddy.client import CodeBuddyCredential
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from src.provider.codebuddy.refresh import Account, CodeBuddyRefresh
-from tests.helpers.constants import SECRET
+from tests.helpers.constants import SWITCH_PATH
+from tests.helpers.http import mock_async_client as _refresh_client
 
-
-def _refresh_client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
-
-SWITCH_PATH = "/v2/plugin/login/enterprise"
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 async def test_refresh_updates_token_and_reports_rotation():
     async def handler(request: httpx.Request) -> httpx.Response:

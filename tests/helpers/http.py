@@ -19,6 +19,7 @@ __all__ = [
     "mock_async_client",
     "sse_frame",
     "sse_text",
+    "sse_text_done",
 ]
 
 
@@ -36,6 +37,20 @@ def client_with_handler(factory, handler, **kw):
     return factory(stream_client=client, short_client=client, **kw)
 
 
+def provider_client(factory, handler, **kw):
+    """构造共享同一 `MockTransport` 的流/短双客户端（provider 测试通用样板）。
+
+    与 `client_with_handler` 的差别：这里保留「两个 `AsyncClient` 共用一个
+    transport」的既有形状，行为与各 provider 测试里手写的 `_client` 逐字节等价。
+    """
+    transport = httpx.MockTransport(handler)
+    return factory(
+        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
+        short_client=httpx.AsyncClient(transport=transport, timeout=None),
+        **kw,
+    )
+
+
 def sse_frame(data: object, *, event: str = "") -> SSEFrame:
     """构造一个 SSE 帧；非字符串 data 自动 JSON 序列化。"""
     return SSEFrame(event=event, data=data if isinstance(data, str) else json.dumps(data))
@@ -44,6 +59,12 @@ def sse_frame(data: object, *, event: str = "") -> SSEFrame:
 def sse_text(*payloads: object) -> str:
     """把若干 payload 拼成 SSE 文本（每个 `data:` 一行）。"""
     return "".join(f"data: {json.dumps(p)}\n" for p in payloads)
+
+
+def sse_text_done(*payloads: object) -> str:
+    """同上，但每个 payload 后跟空行并以 `data: [DONE]` 收尾（OpenAI 风格）。"""
+    body = "".join(f"data: {json.dumps(p)}\n\n" for p in payloads)
+    return body + "data: [DONE]\n\n"
 
 
 def chunk_payload(

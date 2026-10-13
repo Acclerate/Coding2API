@@ -12,65 +12,15 @@ from src.db.repo import ApiKeyRepository, CredentialRepository
 from src.engine.executor import Executor, ExecutorDeps, NoHealthyCredential, NoProviderForModel
 from src.engine.scheduler import Scheduler
 from src.engine.sse import SSE_DONE
-from src.provider.base import ErrKind, Event, EventKind, Model, Usage
-from src.provider.trae.events import UpstreamProtocolViolation
+from src.provider.base import ErrKind, Event, EventKind, Usage
+from tests.helpers.chat import chat_request as _request
 from tests.helpers.constants import SECRET
+from tests.helpers.events import GOOD
+from tests.helpers.events import TRAE_GOOD as GOOD_trae
+from tests.helpers.executor import DualProvider
+from tests.helpers.executor import dual_executor as _dual_executor
+from tests.helpers.providers import ScriptedProvider as FakeProvider
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-@pytest.fixture()
-def dual_repo(tmp_path):
-    db = Database(tmp_path / "dual.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-class DualProvider:
-    """同一脚本双 provider：验证调度层对两个上游行为一致。"""
-
-    def __init__(self, provider_id: str, script) -> None:
-        self.id = provider_id
-        self.script = script
-        self.calls = 0
-
-    async def stream_chat(self, _credential_data, _payload, _model):
-        index = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        for item in self.script[index]:
-            if isinstance(item, Exception):
-                raise item
-            yield item
-
-    def list_models(self, _credential_data):
-        return []
-
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-def _dual_executor(credentials, trae_script, cb_script, **kw):
-    trae = DualProvider("trae", trae_script)
-    codebuddy = DualProvider("codebuddy", cb_script)
-    executor = Executor(ExecutorDeps(
-        providers={"trae": trae, "codebuddy": codebuddy}, credentials=credentials,
-        scheduler=Scheduler(**kw), default_model="glm-5.2"))
-    return executor, trae, codebuddy
-
-def _request(model="glm-5.2"):
-    from src.compat.openai.request import parse_chat_request
-
-    return parse_chat_request({"messages": [{"role": "user", "content": "hi"}],
-                               "model": model})
 
 class Boom(Exception):
     def __init__(self, kind: ErrKind, message: str = "upstream error") -> None:
@@ -86,32 +36,6 @@ def repo_trae(tmp_path):
     apply_schema(db.connect())
     yield CredentialRepository(db, CredentialCipher(SECRET)), ApiKeyRepository(db), db
     db.close()
-
-class FakeProvider:
-    id = "trae"
-
-    def __init__(self, script: list) -> None:
-        self.script = script
-        self.calls = 0
-
-    async def stream_chat(self, credential_data, payload, model):
-        index = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        for item in self.script[index]:
-            if isinstance(item, Exception):
-                raise item
-            yield item
-
-    async def list_models(self, _credential_data):
-        return [Model(id="glm-5.2")]
-
-    def import_credential(self, raw):
-        if not raw.get("accessToken"):
-            raise UpstreamProtocolViolation("credential missing accessToken")
-        return dict(raw)
-
-    def classify(self, status, body=b""):
-        return ErrKind.OTHER
 
 class UpstreamError(Exception):
     def __init__(self, kind: ErrKind) -> None:
@@ -130,10 +54,6 @@ def build_executor(repo_tuple, script, **kwargs):
 
 def add_credential(credentials, **kw):
     return credentials.add(provider="trae", credential_data={"accessToken": "a"}, **kw)
-
-GOOD_trae = [Event(kind=EventKind.CONTENT, content="hi"),
-        Event(kind=EventKind.USAGE, usage=Usage(1, 2, 0)),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
 
 async def test_executor_complete_success(repo_trae, tmp_path):
     add_credential(repo_trae[0])

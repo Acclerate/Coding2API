@@ -19,29 +19,9 @@ from src.benchmarks import (
     save_catalog,
 )
 from src.pricing import estimate_cost_usd
+from tests.provider._benchmarks_support import OR_PAYLOAD as _OR_PAYLOAD
 
 pytestmark = pytest.mark.real_upstream("openrouter")
-
-_OR_PAYLOAD = {
-    "data": [
-        {"id": "z-ai/glm-5.3", "name": "Z.ai: GLM 5.3",
-         "pricing": {"prompt": "0.000001", "completion": "0.000002"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": 44.8, "coding_index": 74.8,
-             "agentic_index": 53.1}}},
-        {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3",
-         "pricing": {"prompt": "0.0000005", "completion": "0.000001"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": 43.6, "coding_index": 76.2,
-             "agentic_index": None}}},
-        {"id": "xai/grok-no-score", "name": "Grok",
-         "pricing": {"prompt": "0.000002"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": None, "coding_index": None,
-             "agentic_index": None}}},
-        {"id": "broken/no-benchmarks", "name": "Broken"},
-    ],
-}
 
 # --------------------------------------------------------- 落盘快照（三表一体）
 

@@ -8,7 +8,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.deps import Services
-from src.auth.session import create_session_token
 from src.compat.openai.response import StreamTranslator
 from src.config import Settings
 from src.db.crypto import MIN_SECRET_LENGTH, CredentialCipher, WeakSecretError
@@ -18,18 +17,6 @@ from src.main import BodySizeLimitMiddleware, _codebuddy_endpoint, build_app
 from src.provider.base import Quota
 from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def settings(tmp_path):
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root")
-
-@pytest.fixture()
-def client(settings):
-    app = build_app(settings)
-    with TestClient(app) as c:
-        c.cookies.set("coding2api_session", create_session_token("root", SECRET))
-        yield c
 
 def _translator_frame_check():
     """StreamTranslator.keepalive 返回的注释帧形状。"""

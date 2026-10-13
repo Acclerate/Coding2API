@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from src.db.conn import Database
-from src.db.migrate import apply_schema
 from tests.helpers.paths import load_script, script_path
 
 SCRIPT = script_path("backfill_trae_credit")
@@ -29,14 +27,6 @@ def _insert(db, *, id, ts, provider, model, input_tokens, output_tokens,
             " VALUES (?,?,?,?,?,?,1,?,?,?,?,?)",
             (id, ts, "u", provider, None, model, input_tokens, output_tokens,
              cached_tokens, credit, estimated))
-
-
-@pytest.fixture()
-def db(tmp_path):
-    database = Database(tmp_path / "t.sqlite3")
-    apply_schema(database.connect())
-    yield database
-    database.close()
 
 
 def test_pending_lists_only_priced_trae_rows(db):

@@ -17,18 +17,6 @@ from src.provider.base import Model
 from tests.helpers.constants import SECRET
 
 
-@pytest.fixture()
-def settings(tmp_path):
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root")
-
-@pytest.fixture()
-def client(settings):
-    app = build_app(settings)
-    with TestClient(app) as c:
-        c.cookies.set("coding2api_session", create_session_token("root", SECRET))
-        yield c
-
 def _drain_model_refresh(client, services):
     """等 stale-while-revalidate 的后台刷新跑完（否则调用计数断言会与事件循环赛跑）。"""
     tasks = [t for t in services.pending_model_refreshes if not t.done()]

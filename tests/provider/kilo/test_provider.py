@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -16,33 +14,12 @@ from src.provider.kilo.client import (
     Model,
     UpstreamHTTPError,
 )
+from tests.helpers.http import chunk_payload as chunk
+from tests.helpers.http import sse_text_done as _sse
+from tests.provider.kilo._support import client as _client
 
 pytestmark = pytest.mark.real_upstream("kilo")
 
-def chunk(delta: dict, *, finish: str | None = None, usage: dict | None = None,
-          choices: list | None = None) -> dict:
-    payload: dict = {"id": "x", "object": "chat.completion.chunk"}
-    if choices is None:
-        payload["choices"] = [{"index": 0, "delta": delta,
-                               "finish_reason": finish}]
-    else:
-        payload["choices"] = choices
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
-
-def _sse(*payloads: object) -> str:
-    body = "".join(f"data: {json.dumps(p)}\n\n" for p in payloads)
-    return body + "data: [DONE]\n\n"
-
-def _client(handler, **kw) -> KiloClient:
-    transport = httpx.MockTransport(handler)
-    # 默认用无路径的测试主机：request.url.path 直接是 /chat/completions、
-    # /models，便于按端点常量断言；host 覆盖（含带路径/尾斜杠）行为单独测。
-    kw.setdefault("host", "https://kilo.test")
-    return KiloClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None), **kw)
 
 async def test_provider_probe_quota_is_unknown_not_exhausted():
     quota = await KiloProvider().probe_quota({})

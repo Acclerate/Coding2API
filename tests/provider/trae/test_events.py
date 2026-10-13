@@ -10,11 +10,8 @@ from src.compat.openai.response import aggregate
 from src.engine.sse import parse_frames
 from src.provider.base import ErrKind, EventKind, Usage
 from src.provider.trae import events as trae_events
-from tests.helpers.paths import provider_fixture
+from tests.provider.trae._support import fixture
 
-
-def fixture(name: str) -> str:
-    return provider_fixture("trae", name)
 
 def test_real_fixture_maps_to_neutral_events():
     events = [e for e in (trae_events.parse_frame(f)

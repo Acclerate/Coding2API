@@ -7,12 +7,9 @@ from fastapi.testclient import TestClient
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import build_app
-from src.provider.base import Event, EventKind, Usage
 from tests.helpers.constants import SECRET
+from tests.helpers.events import GOOD_EVENTS
 
-GOOD_EVENTS = [Event(kind=EventKind.CONTENT, content="hi"),
-               Event(kind=EventKind.USAGE, usage=Usage(11, 22, 3)),
-               Event(kind=EventKind.FINISH, finish_reason="stop")]
 
 class _PlaygroundProvider:
     id = "trae"

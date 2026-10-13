@@ -5,28 +5,16 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.provider.codebuddy.checkin import CodeBuddyCheckin
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 from src.provider.codebuddy.oauth import AuthProgress, AuthStateStore, CodeBuddyOAuth
 from src.provider.codebuddy.refresh import CodeBuddyRefresh
-from tests.helpers.constants import SECRET
 
 
 def _oauth_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
 
 START_OK = {"code": 0, "data": {"authUrl": "https://auth.example/x", "state": "up-state"}}
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
 
 async def test_oauth_start_returns_session_with_upstream_state():
     async def handler(request: httpx.Request) -> httpx.Response:

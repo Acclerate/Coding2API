@@ -10,9 +10,8 @@ import pytest
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.db.conn import Database
-from src.db.crypto import CredentialCipher
 from src.db.migrate import apply_schema
-from src.db.repo import AlertRepository, CredentialRepository
+from src.db.repo import AlertRepository
 from src.stats.collector import StatsCollector
 from tests.helpers.constants import SECRET
 
@@ -20,27 +19,6 @@ from tests.helpers.constants import SECRET
 def _jwt(claims: dict) -> str:
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return f"header.{payload}.sig"
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-@pytest.fixture()
-def admin_app(tmp_path):
-    from fastapi.testclient import TestClient
-
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, ADMIN_USERNAMES="root",
-                        DATA_DIR=str(tmp_path))
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 # ------------------------------------------------- CredentialRepository.expiring_tokens
 
@@ -153,13 +131,13 @@ def test_alert_repository_records_delivery_failure(tmp_path):
     assert row["delivered"] == 0 and row["delivery_error"] == "boom"
     db.close()
 
-def test_alerts_requires_admin(admin_app):
-    _app, client = admin_app
+def test_alerts_requires_admin(admin_client):
+    _app, client = admin_client
     client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
     assert client.get("/api/alerts").status_code == 403
 
-def test_alerts_returns_recent(admin_app):
-    app, client = admin_app
+def test_alerts_returns_recent(admin_client):
+    app, client = admin_client
     app.state.services.alerts.record(
         rule="task_failed", severity="warning", scope="growth",
         message="挂了", now=123)
@@ -167,8 +145,8 @@ def test_alerts_returns_recent(admin_app):
     assert len(body["alerts"]) == 1
     assert body["alerts"][0]["rule"] == "task_failed"
 
-def test_settings_snapshot_carries_alert_owner(admin_app):
-    _app, client = admin_app
+def test_settings_snapshot_carries_alert_owner(admin_client):
+    _app, client = admin_client
     by_key = {item["key"]: item for item in client.get("/api/settings").json()["settings"]}
     assert by_key["alert_enabled"]["task"] == "alert"
     assert by_key["alert_webhook_url"]["task"] == "alert"
@@ -195,7 +173,6 @@ def test_alert_settings_hot_update(tmp_path):
 
 def test_alert_webhook_rejects_non_http_scheme_and_too_many(tmp_path):
     """M6：webhook 只接受 http/https，且条目数有上限。"""
-    import pytest
 
     from src.db.repo import RuntimeSettingsRepository
     from src.runtime_settings import InvalidSetting, load_runtime_settings

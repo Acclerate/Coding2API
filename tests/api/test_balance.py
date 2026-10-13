@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.auth.session import create_session_token
-from src.config import Settings
 from src.main import build_app
 from src.provider.base import Quota
 from tests.helpers.constants import SECRET
@@ -21,10 +19,6 @@ from tests.helpers.constants import SECRET
 PATH = "/v1/user/balance"
 
 
-@pytest.fixture()
-def settings(tmp_path):
-    return Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                    ADMIN_USERNAMES="root")
 
 
 def _client(settings):

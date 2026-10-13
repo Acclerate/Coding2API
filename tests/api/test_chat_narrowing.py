@@ -6,68 +6,14 @@ import time
 
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.engine.executor import Executor, ExecutorDeps, NoHealthyCredential
 from src.engine.scheduler import ErrorOutcome, ModelCooldown, Scheduler
-from src.provider.base import Event, EventKind, Model
-from tests.helpers.constants import SECRET
+from src.provider.base import Model
+from tests.api._support import RejectProvider as _RejectProvider
+from tests.api._support import http_400 as _http_400
+from tests.helpers.chat import chat_request as _request
+from tests.helpers.events import GOOD
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-@pytest.fixture()
-def dual_repo(tmp_path):
-    db = Database(tmp_path / "dual.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-def _request(model="glm-5.2"):
-    from src.compat.openai.request import parse_chat_request
-
-    return parse_chat_request({"messages": [{"role": "user", "content": "hi"}],
-                               "model": model})
-
-class _RejectProvider:
-    """可脚本化的 provider：按调用次序抛指定异常或返回事件。"""
-
-    def __init__(self, provider_id: str, outcomes: list) -> None:
-        self.id = provider_id
-        self.outcomes = outcomes
-        self.calls = 0
-
-    async def stream_chat(self, _credential_data, _payload, _model):
-        index = min(self.calls, len(self.outcomes) - 1)
-        self.calls += 1
-        item = self.outcomes[index]
-        if isinstance(item, Exception):
-            raise item
-        for event in item:
-            yield event
-
-    def list_models(self, _credential_data):
-        return []
-
-def _http_400() -> Exception:
-    from src.provider.codebuddy.client import UpstreamHTTPError
-
-    return UpstreamHTTPError(400, b'{"code":1002,"msg":"model not found"}')
 
 async def test_flat_exclusive_model_skips_other_upstream(dual_repo):
     """CodeBuddy 独有模型（目录可证归属）→ 只打 CB；TRAE 零调用、零统计记录。"""

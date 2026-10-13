@@ -7,10 +7,8 @@ import json
 import pytest
 
 from src.provider.codearts import dpop
+from tests.provider.codearts._support import jwk as _jwk
 
-
-def _jwk() -> dict[str, str]:
-    return dpop.new_private_jwk()
 
 def test_dpop_private_jwk_roundtrip_and_public_strip():
     jwk = _jwk()

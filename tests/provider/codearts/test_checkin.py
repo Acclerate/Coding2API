@@ -3,33 +3,15 @@
 from __future__ import annotations
 
 import json
-import time
 
 import httpx
 
 from src.provider.codearts import CodeArtsProvider
 from src.provider.codearts import events as codearts_events
-from src.provider.codearts.client import BENEFIT_SEED, CodeArtsClient
-from src.provider.codearts.credential import CodeArtsCredential
+from src.provider.codearts.client import BENEFIT_SEED
+from tests.provider.codearts._support import client as _client
+from tests.provider.codearts._support import cred as _cred
 
-
-def _cred(**over) -> CodeArtsCredential:
-    base = {
-        "uid": "u1", "user_name": "alice",
-        "access_key_id": "AK", "secret_access_key": "SK", "security_token": "TOK",
-        "expiration": int(time.time()) + 7200,
-    }
-    base.update(over)
-    return CodeArtsCredential.from_dict(base)
-
-def _client(handler, **kw) -> CodeArtsClient:
-    transport = httpx.MockTransport(handler)
-    kw.setdefault("endpoint", "https://snap.test")
-    kw.setdefault("benefit_host", "https://gw.test")
-    kw.setdefault("sts_host", "https://sts.test")
-    return CodeArtsClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None), **kw)
 
 def _delivery(campaign: dict | None = None, *, extra_items: list | None = None) -> dict:
     items = list(extra_items or [])

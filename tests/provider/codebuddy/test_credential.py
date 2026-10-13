@@ -8,18 +8,6 @@ from src.provider.codebuddy.client import CodeBuddyCredential, parse_credential
 from src.provider.codebuddy.events import UpstreamProtocolViolation
 
 
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
 def test_credential_parse_rejects_non_object_after_json():
     from src.provider.codebuddy.credential import parse_credential
 

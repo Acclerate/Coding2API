@@ -3,34 +3,18 @@
 from __future__ import annotations
 
 import httpx
-import pytest
 
 from src.config import Settings
 from src.db.conn import Database
-from src.db.crypto import CredentialCipher
 from src.db.migrate import SCHEMA_VERSION, apply_schema
-from src.db.repo import CredentialRepository, GrowthRepository
 from src.main import build_app
 from src.provider.base import GrowthResult, GrowthStep, StepStatus
 from src.provider.codebuddy.client import CodeBuddyProvider
 from src.provider.codebuddy.growth import EP_ENERGY, EP_TASKS, EP_TRAVEL_CONFIG, EP_TRAVEL_STATUS
+from tests.helpers.constants import SECRET
+from tests.provider.codebuddy._growth_support import TRAVEL_IDLE
+from tests.provider.codebuddy._growth_support import client as _client
 
-SECRET = "test-secret-0123456789"
-
-TRAVEL_IDLE = {"code": 0, "data": {
-    "state": "idle", "location": {"id": 1, "name": "咖啡馆"},
-    "daily_limit_reached": False}}
-
-def _client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
-
-@pytest.fixture
-def repo(tmp_path):
-    db = Database(tmp_path / "growth.sqlite3")
-    apply_schema(db.connect())
-    cipher = CredentialCipher(SECRET)
-    yield CredentialRepository(db, cipher), GrowthRepository(db)
-    db.close()
 
 def _admin_client(tmp_path):
     from fastapi.testclient import TestClient
@@ -133,9 +117,9 @@ def test_growth_history_limit_and_empty(tmp_path):
         events = client.get(f"/api/credentials/{credential_id}/growth?limit=2").json()["events"]
     assert [event["report"] for event in events] == ["第 2 轮", "第 1 轮"]
 
-def test_growth_repository_recent_clamps_limit(repo):
+def test_growth_repository_recent_clamps_limit(growth_repo):
     """limit 下限保护：<=0 时仍返回至少一行（否则界面永远空着像坏了）。"""
-    credentials, events = repo
+    credentials, events = growth_repo
     credential_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     events.record(credential_id=credential_id, result=GrowthResult(report="x"), now=1)
     assert len(events.recent(credential_id, limit=0)) == 1

@@ -6,27 +6,8 @@ import time
 
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
-from src.stats.collector import StatsCollector
-from src.stats.query import StatsQuery
 from src.tasks.retention import RetentionTask
-from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-@pytest.fixture()
-def stats(repo):
-    _credentials, db = repo
-    yield StatsCollector(db), StatsQuery(db)
 
 def test_stats_records_and_redacts(stats):
     collector, query = stats

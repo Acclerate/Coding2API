@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.auth.session import create_session_token
@@ -14,17 +13,8 @@ from src.main import build_app
 from src.provider.base import Quota
 from src.provider.codebuddy.checkin import CheckinResult
 from src.provider.codebuddy.refresh import Account
+from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 class _StubCodeBuddy:
     """探测 / 签到桩 provider：本用例只验证端点接线，绝不出网。
@@ -41,7 +31,6 @@ class _StubCodeBuddy:
     async def checkin(self, _data):
         return CheckinResult(ok=True, credit=5, code=0, message="ok")
 
-SECRET = "test-secret-0123456789"
 
 def test_upstream_auth_start_supports_both_providers(admin_client):
     """CodeBuddy 走 poll 轨道，TRAE 走 callback 轨道，unknown provider 报 400。"""

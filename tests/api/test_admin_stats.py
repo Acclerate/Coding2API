@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.auth.session import create_session_token
@@ -10,16 +9,6 @@ from src.config import Settings
 from src.main import build_app
 from tests.helpers.constants import SECRET
 
-
-@pytest.fixture()
-def admin_client(tmp_path):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings)
-    client = TestClient(app)
-    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
-    with client:
-        yield app, client
 
 def test_stats_endpoints_scope_by_principal(admin_client):
     app, client = admin_client

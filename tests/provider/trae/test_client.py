@@ -20,11 +20,8 @@ from src.provider.trae.client import (
     UpstreamHTTPError,
 )
 from src.tasks.pacer import stable_key
-from tests.helpers.paths import provider_fixture
+from tests.provider.trae._support import fixture
 
-
-def fixture(name: str) -> str:
-    return provider_fixture("trae", name)
 
 def _client(handler, **kw) -> TraeClient:
     transport = httpx.MockTransport(handler)

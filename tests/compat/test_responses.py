@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from src.config import Settings
 from src.main import build_app
 from src.provider.base import ErrKind, Event, EventKind, Quota, Usage
+from tests.compat._support import build_compat_app
 from tests.helpers.constants import SECRET
 
 
@@ -47,11 +48,7 @@ class _Provider:
         return None
 
 def _app(tmp_path, provider=None):
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-    app = build_app(settings, providers={"codebuddy": provider or _Provider()})
-    app.state.credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
-    return app
+    return build_compat_app(tmp_path, provider or _Provider())
 
 def _auth(app) -> dict:
     return {"Authorization": f"Bearer {app.state.api_keys.create('root')['api_key']}"}

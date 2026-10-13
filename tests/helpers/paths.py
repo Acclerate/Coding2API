@@ -23,7 +23,15 @@ __all__ = [
     "load_script",
     "provider_fixture",
     "script_path",
+    "tmpdir",
 ]
+
+
+def tmpdir() -> Path:
+    """新建一个临时目录并返回（`tempfile.mkdtemp`，调用方自行清理）。"""
+    import tempfile
+
+    return Path(tempfile.mkdtemp())
 
 
 def script_path(name: str) -> Path:

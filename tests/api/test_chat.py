@@ -6,107 +6,19 @@ import httpx
 import pytest
 
 from src.config import Settings
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.engine.executor import Executor, ExecutorDeps
 from src.engine.scheduler import Scheduler
 from src.main import build_app
-from src.provider.base import ErrKind, Event, EventKind, Model, Usage
-from src.provider.codebuddy.client import CodeBuddyClient, CodeBuddyProvider
-from src.provider.trae.events import UpstreamProtocolViolation
+from src.provider.codebuddy.client import CodeBuddyProvider
+from tests.api._support import RejectProvider as _RejectProvider
+from tests.api._support import http_400 as _http_400
+from tests.helpers.chat import chat_request as _request
 from tests.helpers.constants import SECRET
+from tests.helpers.events import GOOD
+from tests.helpers.events import TRAE_GOOD as GOOD_trae
+from tests.helpers.providers import ScriptedProvider as FakeProvider
+from tests.provider.codebuddy._support import client as _client
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
-
-def _client(handler) -> CodeBuddyClient:
-    transport = httpx.MockTransport(handler)
-    return CodeBuddyClient(
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None))
-
-@pytest.fixture()
-def dual_repo(tmp_path):
-    db = Database(tmp_path / "dual.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-def _request(model="glm-5.2"):
-    from src.compat.openai.request import parse_chat_request
-
-    return parse_chat_request({"messages": [{"role": "user", "content": "hi"}],
-                               "model": model})
-
-class _RejectProvider:
-    """可脚本化的 provider：按调用次序抛指定异常或返回事件。"""
-
-    def __init__(self, provider_id: str, outcomes: list) -> None:
-        self.id = provider_id
-        self.outcomes = outcomes
-        self.calls = 0
-
-    async def stream_chat(self, _credential_data, _payload, _model):
-        index = min(self.calls, len(self.outcomes) - 1)
-        self.calls += 1
-        item = self.outcomes[index]
-        if isinstance(item, Exception):
-            raise item
-        for event in item:
-            yield event
-
-    def list_models(self, _credential_data):
-        return []
-
-def _http_400() -> Exception:
-    from src.provider.codebuddy.client import UpstreamHTTPError
-
-    return UpstreamHTTPError(400, b'{"code":1002,"msg":"model not found"}')
-
-class FakeProvider:
-    id = "trae"
-
-    def __init__(self, script: list) -> None:
-        self.script = script
-        self.calls = 0
-
-    async def stream_chat(self, credential_data, payload, model):
-        index = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        for item in self.script[index]:
-            if isinstance(item, Exception):
-                raise item
-            yield item
-
-    async def list_models(self, _credential_data):
-        return [Model(id="glm-5.2")]
-
-    def import_credential(self, raw):
-        if not raw.get("accessToken"):
-            raise UpstreamProtocolViolation("credential missing accessToken")
-        return dict(raw)
-
-    def classify(self, status, body=b""):
-        return ErrKind.OTHER
-
-GOOD_trae = [Event(kind=EventKind.CONTENT, content="hi"),
-        Event(kind=EventKind.USAGE, usage=Usage(1, 2, 0)),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
 
 @pytest.fixture()
 def client(tmp_path):

@@ -11,13 +11,25 @@ from src.config import Settings
 
 from .constants import SECRET
 
-__all__ = ["admin_session_cookie", "login", "set_session_cookie", "test_settings"]
+__all__ = ["admin_session_cookie", "login", "set_session_cookie", "settings_with",
+           "isolated_settings"]
 
 
-def test_settings(tmp_path, **overrides) -> Settings:
+def isolated_settings(tmp_path, **overrides) -> Settings:
     """构造隔离的 `Settings`：显式传值，绝不依赖本地 `.env`（CI 无 `.env`）。"""
     defaults: dict = {"_env_file": None, "APP_SECRET": SECRET,
                       "DATA_DIR": str(tmp_path), "ADMIN_USERNAMES": "root"}
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def settings_with(**overrides) -> Settings:
+    """构造 `Settings`（DATA_DIR 默认 `./data`，用于不落盘的纯配置断言）。
+
+    与 `isolated_settings` 的区别：不需要 tmp_path、不设 ADMIN_USERNAMES，
+    适合只校验字段解析/白名单的用例（2 个文件曾各写一份等价实现）。
+    """
+    defaults: dict = {"_env_file": None, "APP_SECRET": SECRET, "DATA_DIR": "./data"}
     defaults.update(overrides)
     return Settings(**defaults)
 

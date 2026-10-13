@@ -2,25 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.config import Settings
 from src.main import build_app
 from tests.helpers.constants import SECRET
 
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
 
 def test_models_name_passthrough_backfill_and_omit(tmp_path):
     """`name`（上游人类可读名）透传给前端；空名不占位、不产出空字段。

@@ -3,82 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from typing import Any
 
 import pytest
 
 from src import main
-from src.benchmarks import BenchmarkTable, load_benchmarks, save_catalog
+from src.benchmarks import load_benchmarks, save_catalog
 from src.config import Settings
 from src.db.conn import Database
 from src.db.crypto import CredentialCipher
 from src.db.migrate import apply_schema
 from src.db.repo import CredentialRepository
 from tests.helpers.constants import SECRET
+from tests.provider._benchmarks_support import benchmarks_app as _benchmarks_app
+from tests.provider._benchmarks_support import price_app as _price_app
 
 pytestmark = pytest.mark.real_upstream("openrouter")
-
-_OR_PAYLOAD = {
-    "data": [
-        {"id": "z-ai/glm-5.3", "name": "Z.ai: GLM 5.3",
-         "pricing": {"prompt": "0.000001", "completion": "0.000002"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": 44.8, "coding_index": 74.8,
-             "agentic_index": 53.1}}},
-        {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3",
-         "pricing": {"prompt": "0.0000005", "completion": "0.000001"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": 43.6, "coding_index": 76.2,
-             "agentic_index": None}}},
-        {"id": "xai/grok-no-score", "name": "Grok",
-         "pricing": {"prompt": "0.000002"},
-         "benchmarks": {"artificial_analysis": {
-             "intelligence_index": None, "coding_index": None,
-             "agentic_index": None}}},
-        {"id": "broken/no-benchmarks", "name": "Broken"},
-    ],
-}
-
-def _benchmarks_app(tmp_path, monkeypatch, *, table: BenchmarkTable | None,
-                    raw: Any = _OR_PAYLOAD):
-    """带真实装配的 app，并直接把能力分表塞进 app.state（不打上游）。
-
-    `raw` 是 OpenRouter 抓取的替身返回：默认给带两个分数的正常表，传 `` 模拟
-    「上游不可用」（此时启动预热与后台刷新都拿不到分数，表保持空）。
-    """
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root")
-
-    async def fake_fetch(_url):
-        return json.loads(json.dumps(raw))
-
-    monkeypatch.setattr(main, "fetch_openrouter_models", fake_fetch)
-    app = build_app(settings, providers={})
-    # 就地换值而不是重新绑定：`build_app` 里的刷新协程持有的是**同一个 dict
-    # 引用**，重新绑定会让它写到旧对象上（与生产「换引用会让路由读到旧表」
-    # 同一个坑）。
-    app.state.model_benchmarks.clear()
-    app.state.model_benchmarks.update(table or {})
-    return app
-
-class _PriceStub:
-    """最小 provider：只满足启动预热对 list_models 的调用。"""
-
-    id = "kilo"
-
-    async def list_models(self, _data):
-        return []
-
-def _price_app(tmp_path, **env):
-    from src.main import build_app
-
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                        ADMIN_USERNAMES="root", **env)
-    return build_app(settings, providers={"kilo": _PriceStub()})
 
 # ---------------------------------------------------- 后台刷新（单一任务三表）
 

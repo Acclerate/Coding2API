@@ -2,20 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-
-@pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """模块级模型缓存必须按测试清空，否则用例间互相污染。"""
-    from src.provider.codebuddy.client import _MODEL_CACHE
-
-    _MODEL_CACHE.clear()
-    # `_days()` 的基准时刻同理：按测试重置，避免整套跑时基准越来越旧
-    global _DAYS_BASE
-    _DAYS_BASE = None
-    yield
-    _MODEL_CACHE.clear()
 
 def test_sanitize_channel_markers_neutralizes_prompt_roles_only():
     """system/assistant 正文替换为占位符；user/tool 与非正文位置不动。"""

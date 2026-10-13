@@ -9,28 +9,11 @@ import pytest
 
 from src.provider.qoder import events as qoder_events
 from src.provider.qoder import status_to_dict
-from src.provider.qoder.client import CHECKIN_UNAVAILABLE_STATUS, QoderClient, UpstreamHTTPError
-from src.provider.qoder.credential import QoderCredential
+from src.provider.qoder.client import CHECKIN_UNAVAILABLE_STATUS, UpstreamHTTPError
+from tests.provider.qoder._support import campaign as _campaign
+from tests.provider.qoder._support import campaigns as _campaigns
+from tests.provider.qoder._support import cred, handler_for
 
-GATEWAY = "https://gateway.test"
-
-OPENAPI = "https://openapi.test"
-
-def cred(**overrides) -> QoderCredential:
-    base = {"access_token": "dt-token-1", "uid": "u-1", "realm": "cn",
-            "refresh_token": "drt-1", "auth_source": "oauth",
-            "nickname": "Tester", "expires_at": int(time.time()) + 86400}
-    base.update(overrides)
-    return QoderCredential(**base)
-
-def handler_for(handler, **kwargs) -> QoderClient:
-    transport = httpx.MockTransport(handler)
-    kwargs.setdefault("gateway_fallbacks", (GATEWAY,))
-    return QoderClient(
-        host=OPENAPI, gateway=GATEWAY,
-        stream_client=httpx.AsyncClient(transport=transport, timeout=None),
-        short_client=httpx.AsyncClient(transport=transport, timeout=None),
-        **kwargs)
 
 def _status_payload(status: str, *, last: int | None = None) -> dict:
     payload = {"status": status, "currentStreakDays": 3, "rewardCredits": 100,
@@ -39,22 +22,7 @@ def _status_payload(status: str, *, last: int | None = None) -> dict:
         payload["lastClaimedAt"] = last
     return payload
 
-def _campaign(campaign_id: str = "c-1", *, action: str = "CLAIM_BENEFIT",
-              status: str = "CLAIMABLE", amount: object = 100,
-              kind: object = "CREDITS", end_at: object = 1_795_111_140) -> dict:
-    benefit: dict = {}
-    if kind is not None:
-        benefit["kind"] = kind
-    if amount is not None:
-        benefit["amount"] = amount
-    item: dict = {"campaignId": campaign_id, "campaignKey": "act-1",
-                  "actionType": action, "claimStatus": status, "benefit": benefit}
-    if end_at is not None:
-        item["endAt"] = end_at
-    return item
 
-def _campaigns(*items: dict) -> dict:
-    return {"showCampaign": bool(items), "campaigns": list(items)}
 
 def _assert_campaign_headers(request: httpx.Request) -> None:
     assert request.headers["Cosy-ClientType"] == qoder_events.COSY_CLIENT_TYPE

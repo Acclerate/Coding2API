@@ -5,10 +5,6 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
 from src.provider.codebuddy.checkin import (
     CheckinResult,
     CodeBuddyCheckin,
@@ -18,18 +14,8 @@ from src.provider.codebuddy.checkin import (
 )
 from src.provider.codebuddy.client import CodeBuddyCredential
 from src.provider.codebuddy.events import UpstreamProtocolViolation
-from tests.helpers.constants import SECRET
+from tests.helpers.http import mock_async_client as _refresh_client
 
-
-def _refresh_client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=None)
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "t.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
 
 @pytest.mark.parametrize(("body", "ok"), [
     ({"code": 0, "data": {"credit": 100}}, True),

@@ -37,30 +37,9 @@ from src.provider.codebuddy.client import (
 from src.provider.codebuddy.credential import CodeBuddyCredential
 from src.provider.codebuddy.intl import CodeBuddyIntlProvider
 from src.runtime_settings import HOT_BY_KEY, RuntimeSettings
+from tests.helpers.auth import settings_with as _settings
 from tests.helpers.constants import SECRET
-
-
-class _MemoryStore:
-    """最小 SettingsStore：只实现读写三动作。"""
-
-    def __init__(self, initial: dict[str, str] | None = None) -> None:
-        self.rows: dict[str, str] = dict(initial or {})
-
-    def load(self) -> dict[str, str]:
-        return dict(self.rows)
-
-    def set(self, key: str, value: str, now: int | None = None) -> None:
-        self.rows[key] = value
-
-    def delete(self, key: str) -> None:
-        self.rows.pop(key, None)
-
-
-def _settings(**overrides) -> Settings:
-    defaults = {"_env_file": None, "APP_SECRET": SECRET, "DATA_DIR": "./data"}
-    defaults.update(overrides)
-    return Settings(**defaults)  # type: ignore[arg-type]
-
+from tests.helpers.stores import MemoryStore as _MemoryStore
 
 # --------------------------------------------------------------- Settings 字段
 

@@ -2,30 +2,16 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from src.engine.sse import SSEFrame
 from src.provider.base import ErrKind, EventKind
 from src.provider.zen import events as zen_events
+from tests.helpers.http import chunk_payload as chunk
+from tests.helpers.http import sse_frame as frame
 
 pytestmark = pytest.mark.real_upstream("zen")
 
-def frame(data: object) -> SSEFrame:
-    return SSEFrame(event="", data=data if isinstance(data, str) else json.dumps(data))
-
-def chunk(delta: dict, *, finish: str | None = None, usage: dict | None = None,
-          choices: list | None = None) -> dict:
-    payload: dict = {"id": "x", "object": "chat.completion.chunk"}
-    if choices is None:
-        payload["choices"] = [{"index": 0, "delta": delta,
-                               "finish_reason": finish}]
-    else:
-        payload["choices"] = choices
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
 
 def test_parse_frame_returns_none_for_done_and_empty():
     assert zen_events.parse_frame(SSEFrame(event="", data="")) is None

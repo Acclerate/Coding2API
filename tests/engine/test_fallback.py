@@ -4,86 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from src.compat.openai.request import InvalidRequest, parse_chat_request
-from src.db.conn import Database
-from src.db.crypto import CredentialCipher
-from src.db.migrate import apply_schema
-from src.db.repo import CredentialRepository
-from src.engine.executor import Executor, ExecutorDeps
+from src.compat.openai.request import InvalidRequest
 from src.engine.model_resolver import ModelTarget
-from src.engine.scheduler import Scheduler
 from src.provider.base import ErrKind, Event, EventKind
-from tests.helpers.constants import SECRET
-
-GOOD = [Event(kind=EventKind.CONTENT, content="ok"),
-        Event(kind=EventKind.FINISH, finish_reason="stop")]
-
-INVALID = [Event(kind=EventKind.ERROR, error_code="11102",
-                 error_message="service info not found", error_kind=ErrKind.INVALID)]
+from tests.engine._fallback_support import GOOD, INVALID, ModelAwareProvider, ScriptedProvider
+from tests.engine._fallback_support import add_credential as _add
+from tests.engine._fallback_support import aliases as _aliases
+from tests.engine._fallback_support import make_executor as _executor
+from tests.helpers.chat import chat_request as _request
 
 TRANSIENT = [Event(kind=EventKind.ERROR, error_code="500",
                    error_message="boom", error_kind=ErrKind.OTHER)]
-
-@pytest.fixture()
-def repo(tmp_path):
-    db = Database(tmp_path / "fallback.sqlite3")
-    apply_schema(db.connect())
-    yield CredentialRepository(db, CredentialCipher(SECRET)), db
-    db.close()
-
-class ScriptedProvider:
-    """每次调用按顺序回放 `script` 里的事件列表（越界后重复最后一个）。"""
-
-    def __init__(self, provider_id: str, script: list[list[Event]] | None = None) -> None:
-        self.id = provider_id
-        self.script = script or [GOOD]
-        self.calls = 0
-        self.models_seen: list[str] = []
-
-    async def stream_chat(self, _credential_data, _payload, model):
-        index = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        self.models_seen.append(model)
-        for event in self.script[index]:
-            yield event
-
-    def list_models(self, _credential_data):
-        return []
-
-def _add(credentials, provider: str, token: str) -> None:
-    credentials.add(provider=provider, credential_data={"bearer_token": token})
-
-def _request(model="glm-5.2"):
-    return parse_chat_request({"messages": [{"role": "user", "content": "hi"}],
-                               "model": model})
-
-def _aliases(primary_model: str, fallback_model: str) -> dict[str, dict[str, str]]:
-    return {"codebuddy": {primary_model.lower(): primary_model},
-            "trae": {fallback_model.lower(): fallback_model}}
-
-def _executor(providers, credentials, groups, aliases=None, **scheduler_kw):
-    return Executor(ExecutorDeps(
-        providers=providers, credentials=credentials,
-        scheduler=Scheduler(**scheduler_kw), default_model="glm-5.2",
-        model_aliases=aliases or {}, fallback_groups=groups))
-
-class ModelAwareProvider:
-    """只接受白名单里的模型，其余回 INVALID（贴近真实上游）。"""
-
-    def __init__(self, provider_id: str, good_models: set[str]) -> None:
-        self.id = provider_id
-        self.good_models = {m.lower() for m in good_models}
-        self.calls = 0
-        self.models_seen: list[str] = []
-
-    async def stream_chat(self, _credential_data, _payload, model):
-        self.calls += 1
-        self.models_seen.append(model)
-        for event in (GOOD if model.lower() in self.good_models else INVALID):
-            yield event
-
-    def list_models(self, _credential_data):
-        return []
 
 @pytest.mark.asyncio
 async def test_complete_falls_back_when_primary_all_invalid(repo):
