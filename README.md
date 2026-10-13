@@ -59,6 +59,7 @@ python3 scripts/create_user.py alice --role admin   # 交互输入密码
 python3 scripts/create_user.py --list
 python3 scripts/create_user.py alice --delete --force   # 硬删，不可逆
 python3 scripts/create_user.py --db data/x.sqlite3 ...  # 指定库
+echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-stdin  # 密码不进 argv / shell 历史
 ```
 
 `ADMIN_USERNAMES` 与 `secrets/users.txt` 只在**引导期**起作用（首个管理员、老部署升级）：启动时把 `users.txt` 里的用户导入 DB（已存在的用户名不覆盖），再把 `ADMIN_USERNAMES` 点名的人提权为 `admin`；此后两者都不再是角色来源。
@@ -311,7 +312,7 @@ CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端�
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `APP_SECRET` | **必填** | 凭证加密密钥，≥16 字符；丢失 = 凭证全部作废，无密钥轮换 |
+| `APP_SECRET` | **必填** | 凭证加密密钥，≥16 字符；丢失 = 凭证全部作废，无密钥轮换。启动时拒绝低熵值（全同字符 / 周期重复 / 字符集过小） |
 | `ADMIN_USERNAMES` | 空 | **仅引导期**：逗号分隔的用户名，首次启动时被提权为 `admin`。DB 里已有角色后不再生效——日常改角色在管理台「用户管理」页做（见下文「用户与角色」） |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | 浏览器可达地址；TRAE 登录回调依赖它 |
 | `DEFAULT_MODEL` | `glm-5.2` | 模型为空/`auto` 时的默认 |
@@ -329,7 +330,7 @@ CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端�
 | `ACTIVITY_REPORT_ENABLED` | `false` | 活跃上报（CodeBuddy 与 CodeBuddy 国际版）：每天为账号补发一条对话事件续连登。**默认关闭**——官方条款禁止脚本篡改活动数据（处罚为取消资格并追回礼品），上游改版即失效，不作为可靠性功能（见上文「活跃上报」） |
 | `ACTIVITY_REPORT_HOUR` | `10` | 活跃上报的本地（北京）时间整点窗口；仅在 `ACTIVITY_REPORT_ENABLED=true` 时生效 |
 | `ALERT_ENABLED` | `true` | 运维告警开关：后台周期评估四类风险（池耗尽 / 任务连续失败 / token 临近到期 / 上游错误率骤升），命中落 `alert_events` 供管理台「运维告警」页回看。关闭后不评估、不落库、不推送 |
-| `ALERT_WEBHOOK_URL` | 空 | 告警 Webhook 地址：命中时 POST JSON，多个用逗号分隔（≤16 个，仅 `http(s)`），全部成功才算投递成功；留空 = 只在管理台留站内记录、不外推 |
+| `ALERT_WEBHOOK_URL` | 空 | 告警 Webhook 地址：命中时 POST JSON，多个用逗号分隔（≤16 个，仅 `http(s)`，且拒内网/回环/链路本地/保留地址防 SSRF），并发投递、全部成功才算成功（总预算 15s）；留空 = 只在管理台留站内记录、不外推 |
 | `ALERT_INTERVAL_MINUTES` | `5` | 运维告警评估周期（下限 1 分钟） |
 | `ALERT_SILENCE_MINUTES` | `30` | 同一 `(规则, 对象)` 的静默窗：窗口内只落库 / 推送一次，避免持续状态每轮刷屏；`0` 关闭静默（每轮都报） |
 | `ALERT_POOL_READY_MIN` | `1` | 池耗尽阈值：可用凭证数少于该值时告警（服务活着但用不了）；`0` 关闭该规则 |
@@ -486,7 +487,9 @@ M0–M3 及后续迭代全部完成，`main` 分支可运行，当前版本 v0.4
 
 **B8 智能路由（P1）**：跨渠道 fallback 兼容组（`MODEL_FALLBACK_GROUPS`，主渠道全不可用时按组顺序回退、仅在未出帧前切换）。**B9 运维告警（P1）**：后台周期评估四类风险（凭证池耗尽 / 后台任务连续失败 / token 临近到期 / 上游错误率骤升），命中落 `alert_events` 并在管理台「运维告警」页回看，可选推送 webhook（`ALERT_WEBHOOK_URL`），同一告警在静默窗内只报一次。**B10 按渠道代理（P1）**：`PROVIDER_PROXIES` 为每个渠道单独指定出站代理（HTTP/SOCKS5），作用于该渠道全部出站请求（聊天 / 额度 / 模型 / 后台任务 / OAuth 登录）；留空直连，默认行为不变。**B11 安全审查加固**：全项目 code review + 安全扫描后的修复批次——热更 float 拒绝 NaN/±inf、字符串类长度上限、告警 webhook 限 `http(s)`；INVALID 跳过的上游不再占满换号预算（跨渠道 fallback 恢复）；SSE 单行/单帧与非 2xx 错误体有界；对外错误文案不再回流上游正文；三个出站协议补齐入站数值/JSON 校验；`/api/stats/events` 凭证昵称仅 admin/operator 可见；续写中途断开的用量记账；OAuth 弹窗 scheme 校验 + `opener` 置空；CSP 补 `object-src`/`base-uri`/`form-action`。
 
-**B12 二轮审查加固**（全项目 review + 安全扫描第二轮）：流式路径首帧后不再换号（H1，避免同一请求内两套回复）；OpenAI 出口补齐 `presence_penalty`/`frequency_penalty`/`seed`/`n`/`logit_bias` 数值边界（`1e999` 溢出为 `inf` 会被重新序列化成非法 JSON 透传上游）；上下文压缩预算改增量估算（超长对话由分钟级降到亚秒级）；TRAE 回调登录按**发起人会话**绑定 pending（单槽全局态会被两个管理员的并发登录互相覆盖）；凭证整份覆写加**凭证级编辑锁**（refresh 与账号切换交错会互相覆盖）；SQLite 写事务显式 `BEGIN IMMEDIATE`（deferred 下读改写会丢更新）；非流式聚合加事件数上限（上游死循环输出会无界增长到 OOM）；明细清理整轮移出事件循环；`growth_events` 纳入保留期回收；凭证昵称在列表出口按 operator 过滤；`/index.html` 不再发 immutable 缓存头（旧入口会加载上一版 bundle）；`testserver` 移出生产 Host 白名单（改由 `ALLOW_TEST_HOST` 显式开启）；CSP 收紧到 `default-src 'self'` + `script-src 'self'`（主题初始化改为独立文件）+ `Referrer-Policy`；API Key `last_used_at` 写库节流到分钟级；CodeBuddy `domain` 凭证校验为合法主机名；Anthropic `input_tokens` 未知时不再伪造 0 命中；`/v1/responses` 的 `store` 只接受布尔；SSE 心跳任务 `cancel()` 后 `await` 收尾。
+**B12 二轮审查加固**（全项目 review + 安全扫描第二轮，`fec6a9e`…`880866d`）：流式路径首帧后不再换号（H1，避免同一请求内两套回复）；OpenAI 出口补齐 `presence_penalty`/`frequency_penalty`/`seed`/`n`/`logit_bias` 数值边界（`1e999` 溢出为 `inf` 会被重新序列化成非法 JSON 透传上游）；上下文压缩预算改增量估算（超长对话由分钟级降到亚秒级）；TRAE 回调登录按**发起人会话**绑定 pending（单槽全局态会被两个管理员的并发登录互相覆盖）；凭证整份覆写加**凭证级编辑锁**（refresh 与账号切换交错会互相覆盖）；SQLite 写事务显式 `BEGIN IMMEDIATE`（deferred 下读改写会丢更新）；非流式聚合加事件数上限（上游死循环输出会无界增长到 OOM）；明细清理整轮移出事件循环；`growth_events` 纳入保留期回收；凭证昵称在列表出口按 operator 过滤；`/index.html` 不再发 immutable 缓存头（旧入口会加载上一版 bundle）；`testserver` 移出生产 Host 白名单（改由 `ALLOW_TEST_HOST` 显式开启）；CSP 收紧到 `default-src 'self'` + `script-src 'self'`（主题初始化改为独立文件）+ `Referrer-Policy`；API Key `last_used_at` 写库节流到分钟级；CodeBuddy `domain` 凭证校验为合法主机名；Anthropic `input_tokens` 未知时不再伪造 0 命中；`/v1/responses` 的 `store` 只接受布尔；SSE 心跳任务 `cancel()` 后 `await` 收尾。
+
+**B12 后续批次**（同轮审查的「安全全量 + 规范 smell」，逐条见 PROPOSAL Q77）：非 ASCII 会话 Cookie 曾触发未认证 500 → 归一为「签名非法」；**登录与 `/authorize` 改走 `origin_protected`**（无会话 Cookie 时 `csrf_protected` 会跳过，跨站表单可强制把受害者登录进攻击者账号 = login CSRF）；模型白名单在无法判定模型名时 **fail closed**；登录限流失败键加上限与淘汰（堵内存 DoS）；`APP_SECRET` 拒绝低熵密钥（KDF 仍是无盐 SHA-256，换 HKDF 属数据迁移）；**告警 webhook 地址做 SSRF 校验**（拒内网/回环/保留等）且外发载荷对 `nickname` 打码（站内记录留原文），多地址并发投递 + 总预算 15s；库 `user_version` 高于本程序时 `apply_schema` 拒绝执行（不再把版本写回旧值）；provider 层 7 处错误路径改有界读取；OAuth state store 的 owner/consume 补 TTL 判定；`scripts/hash_password`/`create_user` 支持 `--password-stdin`（密码不进 argv / shell 历史）。**规范**：三个 `/v1` 出口收敛到 `api/endpoints.dispatch_compat`，`api/models.py`（733 行）拆为 `model_merge.py`（纯合并规则）+ `models.py`（拉取/缓存/SWR），`scripts/_common.py` 去重备份与 DB 适配器副本，7 个上游端点解析器表驱动化。
 
 规划与实测收窄的完整记录见 `PROPOSAL.md`（Q1–Q74）与 `TECHNICAL.md`（§3.1–§3.23、§6.1–§6.4）。
 
