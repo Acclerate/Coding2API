@@ -1,4 +1,4 @@
-"""上下文压缩接线（P0-2，Q60 修订：按实际服务渠道取窗口）。
+"""上下文压缩接线（按实际服务渠道取窗口）。
 
 `src/engine/compress.py` 是纯函数；本模块构造「按渠道查输入上限 → 压缩」的
 闭包，注入执行引擎（`ExecutorDeps.context_compress`）。压缩点在**选号之后、
@@ -56,7 +56,7 @@ def build_context_compressor(
     """构造 `(provider_id, model, payload) → payload` 的压缩闭包。
 
     `settings` 传运行态覆盖层（`RuntimeSettings`）：开关与四个参数每轮
-    请求现读，管理台热更即生效（B3.2）。装配侧（main.py）把它注入
+    请求现读，管理台热更即生效。装配侧（main.py）把它注入
     `ExecutorDeps.context_compress`；executor 在选号后按实际渠道调用。
     """
     def compress(provider_id: str, model: str, payload: dict) -> dict:

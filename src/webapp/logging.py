@@ -18,7 +18,7 @@ handler，文件与轮转全交给平台。
 uvicorn 的默认 `LOGGING_CONFIG` 只配置 `uvicorn` 与 `uvicorn.access`
 两个 logger（且 `propagate=false`），**从不配置 root**，而 root 默认
 `level=WARNING` 且无 handler。后果是应用里 `logging.getLogger(__name__)`
-的 INFO 被静默丢弃——`PROPOSAL §8` 要求的凭证审计日志（增删改/pin/
+的 INFO 被静默丢弃——`PROPOSAL §6` 要求的凭证审计日志（增删改/pin/
 账号切换）首当其冲，一条都不会落盘。
 """
 
@@ -33,7 +33,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # 第三方库降噪：root 升到 INFO 后 httpx/httpcore 会给每个上游请求打一条
-# INFO，带完整 URL（可能含 query 参数，与 PROPOSAL §8「日志脱敏」冲突），
+# INFO，带完整 URL（可能含 query 参数，与 PROPOSAL §6「日志脱敏」冲突），
 # 且量级与请求数线性增长、把审计日志淡出视野。只保留它们的 WARNING+。
 _NOISY_LOGGERS = ("httpx", "httpcore")
 

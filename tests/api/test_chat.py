@@ -130,7 +130,7 @@ def test_authorize_expires_stale_pending_login(client):
     assert "root" not in client.app.state.pending_callbacks
 
 def test_authorize_requires_initiating_session(client):
-    """回调必须由发起登录的本人完成（M7）：会话缺失 → 拒绝。
+    """回调必须由发起登录的本人完成：会话缺失 → 拒绝。
 
     防止同网段的人用自己的 refreshToken 顶掉别人进行中的登录、把凭证塞进池子。
     """

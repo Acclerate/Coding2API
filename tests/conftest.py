@@ -1,11 +1,11 @@
 """全局测试夹具。
 
-用户来源（B5 起）：启动时从 users.txt 一次性导入 SQLite。为保持「整个测试
+用户来源：启动时从 users.txt 一次性导入 SQLite。为保持「整个测试
 会话只哈希一次」的既有优化，三用户的 users.txt 仍按 session 生成一次，每个
 测试只是换一个 DATA_DIR，于是每个测试都要重新导入一次——所以这里同时给出
 admin 的引导配置。
 
-ADMIN_USERNAMES 用 monkeypatch 全局设成 root：B5 里它只在引导期生效（把已存在
+ADMIN_USERNAMES 用 monkeypatch 全局设成 root： 里它只在引导期生效（把已存在
 的用户提权为 admin），对未显式传 ADMIN_USERNAMES 的 Settings 也一律可见。
 实测这样全量跑仍是 1335 passed / 100% 覆盖：既有断言里只有 root 被判为 admin，
 而没有任何测试断言 root 不是 admin（guest/alice 的 is_admin 断言不受影响）。
@@ -137,11 +137,11 @@ def users_file_path(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def users_file(users_file_path, monkeypatch):
     monkeypatch.setenv("USERS_FILE", str(users_file_path))
-    # root 是引导期 admin：B5 的鉴权从 DB 现读角色，不再看 env；
+    # root 是引导期 admin：鉴权从 DB 现读角色，不再看 env；
     # 这里提供 env 是为了让每个测试的库在 bootstrap 时把 root 提权。
     monkeypatch.setenv("ADMIN_USERNAMES", "root")
-    # TestClient 默认 Host=testserver：该主机名在生产默认不放行（M14，
-    # 防 DNS rebinding），测试显式开启。
+    # TestClient 默认 Host=testserver：该主机名在生产默认不放行
+    # （防 DNS rebinding），测试显式开启。
     monkeypatch.setenv("ALLOW_TEST_HOST", "true")
     return users_file_path
 
@@ -150,7 +150,7 @@ def users_file(users_file_path, monkeypatch):
 def data_dir(tmp_path, monkeypatch):
     """把「没显式传 DATA_DIR」的 Settings 隔离到 tmp_path。
 
-    模型目录快照（Q53：`DATA_DIR/model_catalog.json`）是**默认值 `./data` 也会
+    模型目录快照（`DATA_DIR/model_catalog.json`）是**默认值 `./data` 也会
     真写盘**的一处产物。不隔离的话，任何用默认 DATA_DIR 建 app 的用例会往仓库
     `data/` 写一份测试版模型表，覆盖生产快照——表现为本地服务重启后只恢复了测试
     里那两三个渠道（实测踩过：快照里只剩 codebuddy + trae）。显式传 DATA_DIR 的

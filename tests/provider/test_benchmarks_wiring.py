@@ -121,6 +121,45 @@ def test_model_catalog_endpoint_merges_benchmarks(tmp_path, monkeypatch):
     assert "benchmarks" not in rows["other/model"]
     assert payload["saved_at"] is not None
 
+def test_model_catalog_sorts_by_intelligence_index(tmp_path, monkeypatch):
+    """`sort=intelligence` 按综合智能指数排，无分数的行排最后（不冒充 0 分）。
+
+    目录里有分数的两条（glm-5.3 智 44.8 / kimi-k3 智 43.6）与没分数的两条
+    （xai/grok-no-score 三项全 null → 不入表；broken/no-benchmarks 无块）。
+    """
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+        "moonshotai/kimi-k3": {"id": "moonshotai/kimi-k3", "name": "Kimi K3",
+                               "provider": "moonshotai", "input": 0.5, "output": 1.0,
+                               "cache_read": 0.05},
+        "broken/no-benchmarks": {"id": "broken/no-benchmarks", "name": "Broken",
+                                 "provider": "broken", "input": 1.0, "output": 1.0,
+                                 "cache_read": 0.1},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch,
+                          table=build_benchmark_table(_OR_PAYLOAD), raw={})
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        # 默认 id 升序（无 sort 参数）
+        default_ids = [row["id"] for row in
+                       client.get("/api/model-catalog").json()["models"]]
+        # 智降序：44.8 → 43.6 → 无分
+        desc_ids = [row["id"] for row in
+                    client.get("/api/model-catalog",
+                               params={"sort": "intelligence", "order": "desc"}).json()["models"]]
+        # 智升序：43.6 → 44.8 → 无分（无分恒在末尾，不因方向翻到最前）
+        asc_ids = [row["id"] for row in
+                   client.get("/api/model-catalog",
+                              params={"sort": "intelligence", "order": "asc"}).json()["models"]]
+    assert default_ids == ["broken/no-benchmarks", "moonshotai/kimi-k3", "z-ai/glm-5.3"]
+    assert desc_ids == ["z-ai/glm-5.3", "moonshotai/kimi-k3", "broken/no-benchmarks"]
+    assert asc_ids == ["moonshotai/kimi-k3", "z-ai/glm-5.3", "broken/no-benchmarks"]
+
 def test_model_catalog_endpoint_lists_sorted_catalog(tmp_path):
     """带登录可读全量模型目录：按模型 id 升序，含汇率与快照时间。"""
     save_catalog(str(tmp_path), {}, {}, {
@@ -140,7 +179,63 @@ def test_model_catalog_endpoint_lists_sorted_catalog(tmp_path):
     assert [row["id"] for row in payload["models"]] == ["a-model", "glm-5.2"]
     assert payload["models"][1] == {
         "id": "glm-5.2", "name": "GLM 5.2", "provider": "zhipuai",
-        "context": 200000, "input": 1.0, "output": 2.0, "cache_read": 0.1}
+        "context": 200000, "input": 1.0, "output": 2.0, "cache_read": 0.1,
+        "available": False}      # 未接入任何渠道：全部标不可用
+
+def test_model_catalog_marks_availability_from_connected_channels(tmp_path, monkeypatch):
+    """`available` 命中当前渠道提供的模型才 true（与 /v1/models 同口径）。
+
+    `z-ai/glm-5.3`（OpenRouter id）与渠道侧 `glm-5.3`（归一键）写法不同，
+    靠候选键匹配对上；没接入的模型（`other/model`）标 false。
+    """
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    catalog = {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3",
+                         "provider": "z-ai", "input": 1.0, "output": 2.0,
+                         "cache_read": 0.1},
+        "other/model": {"id": "other/model", "name": "No Channel", "provider": "p",
+                        "input": 0.5, "output": 1.0, "cache_read": 0.05},
+    }
+    save_catalog(str(tmp_path), {}, {}, catalog)
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    _seed_models(app.state.services, models={"glm-5.3": "GLM 5.3"})
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        rows = {row["id"]: row for row in client.get("/api/model-catalog").json()["models"]}
+    assert rows["z-ai/glm-5.3"]["available"] is True
+    assert rows["other/model"]["available"] is False
+
+def test_model_catalog_availability_ignores_channel_without_credentials(tmp_path,
+                                                                        monkeypatch):
+    """渠道表在缓存里但**没有可用凭证**（暂停 / 未接入）时不算 available。"""
+    from fastapi.testclient import TestClient
+
+    from src.api import models as models_api
+    from src.auth.session import create_session_token
+    from src.provider.base import Model
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    services = app.state.services
+    services.model_list_cache["trae"] = {"glm-5.3": Model(id="glm-5.3",
+                                                          name="GLM 5.3")}
+    models_api.publish_aliases(services, {"trae"})
+    # 未加凭证：credential_providers 为空，即便缓存里有表也不标 available
+    assert "trae" not in models_api.credential_providers(services)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        rows = {row["id"]: row for row in client.get("/api/model-catalog").json()["models"]}
+    assert rows["z-ai/glm-5.3"]["available"] is False
 
 def test_model_catalog_endpoint_empty_table(tmp_path, monkeypatch):
     """无快照时回空表 + saved_at=None（页面显示空态，不是错误）。"""

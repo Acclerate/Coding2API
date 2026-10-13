@@ -14,7 +14,7 @@
       "url": "git@github.com:RobbsLuo/Coding2API.git",
       "provider": "github",
       "link_mode": "local-only",
-      "revision": "7b818bcdec8a4fa16e52060589fe09d4181d80fc"
+      "revision": "64ba0a4a883486ce5c1c658750e2012eb8d8783a"
     },
     "views": [
       {
@@ -26,19 +26,21 @@
           "engine",
           "registry",
           "cb",
+          "cb-intl",
           "trae",
           "zen",
           "kilo",
           "qoder",
           "codearts",
           "cb-up",
+          "cb-intl-up",
           "trae-up",
           "zen-up",
           "kilo-up",
           "qoder-up",
           "codearts-up"
         ],
-        "note": "客户端请求经协议层（chat / responses / messages）规范化，由执行引擎按健康度与到期选号后流式转发到六家上游。"
+        "note": "客户端请求经协议层（chat / responses / messages）规范化，由执行引擎按健康度与到期选号后流式转发到七家上游。"
       },
       {
         "id": "admin-plane",
@@ -60,6 +62,7 @@
           "bg",
           "registry",
           "cb",
+          "cb-intl",
           "trae",
           "zen",
           "kilo",
@@ -68,7 +71,7 @@
           "alerts",
           "webhook"
         ],
-        "note": "9 类循环（额度探测 / 预刷新 / 签到 / 成长 / 活跃 / 明细清理 / 渠道模型列表 / 模型列表（models.dev） / 运维告警）与请求面共用同一 Provider 注册表，经各渠道客户端触达上游，运行态汇总到「任务与配置」页。"
+        "note": "9 类循环（额度探测 / 预刷新 / 签到 / 成长 / 活跃 / 明细清理 / 渠道模型列表 / 模型目录刷新（OpenRouter + Ultrabench） / 运维告警）与请求面共用同一 Provider 注册表，经各渠道客户端触达上游，运行态汇总到「任务与配置」页。"
       },
       {
         "id": "identity-plane",
@@ -106,7 +109,7 @@
         },
         {
           "path": "src/api/deps.py",
-          "line": 188,
+          "line": 187,
           "label": "api_key_user"
         }
       ]
@@ -127,7 +130,7 @@
       "sources": [
         {
           "path": "web/src/App.tsx",
-          "line": 24,
+          "line": 35,
           "label": "App"
         },
         {
@@ -158,7 +161,7 @@
         },
         {
           "path": "src/api/admin_credentials.py",
-          "line": 72,
+          "line": 104,
           "label": "GET /api/credentials"
         }
       ]
@@ -206,7 +209,7 @@
       "sources": [
         {
           "path": "src/api/chat.py",
-          "line": 47,
+          "line": 44,
           "label": "/v1/chat/completions"
         }
       ]
@@ -228,15 +231,15 @@
       "sources": [
         {
           "path": "src/api/chat.py",
-          "line": 47
+          "line": 44
         },
         {
           "path": "src/api/responses.py",
-          "line": 39
+          "line": 35
         },
         {
           "path": "src/api/messages.py",
-          "line": 46
+          "line": 42
         }
       ]
     },
@@ -257,7 +260,7 @@
       "sources": [
         {
           "path": "src/engine/executor.py",
-          "line": 115,
+          "line": 135,
           "label": "Executor"
         },
         {
@@ -267,7 +270,7 @@
         },
         {
           "path": "src/engine/model_resolver.py",
-          "line": 38,
+          "line": 39,
           "label": "ordered_fallback_chain"
         }
       ]
@@ -288,7 +291,7 @@
       "sources": [
         {
           "path": "src/tasks/alerting.py",
-          "line": 73,
+          "line": 125,
           "label": "evaluate_alerts"
         },
         {
@@ -319,7 +322,7 @@
       "sources": [
         {
           "path": "src/tasks/alerting.py",
-          "line": 268,
+          "line": 343,
           "label": "webhook 投递"
         }
       ]
@@ -328,7 +331,7 @@
       "id": "registry",
       "type": "backend",
       "label": "Provider 适配层",
-      "sublabel": "六渠道 · 出站代理",
+      "sublabel": "七渠道 · 出站代理",
       "pos": [
         558,
         440
@@ -337,16 +340,16 @@
         140,
         64
       ],
-      "tag": "6 渠道",
+      "tag": "7 渠道",
       "sources": [
         {
           "path": "src/main.py",
-          "line": 319,
+          "line": 352,
           "label": "registry"
         },
         {
           "path": "src/provider/base.py",
-          "line": 379,
+          "line": 388,
           "label": "Provider 协议"
         },
         {
@@ -383,7 +386,7 @@
         },
         {
           "path": "src/db/repo.py",
-          "line": 95,
+          "line": 172,
           "label": "CredentialRepository"
         }
       ]
@@ -405,7 +408,7 @@
       "sources": [
         {
           "path": "src/tasks/runner.py",
-          "line": 331,
+          "line": 350,
           "label": "build_runner"
         },
         {
@@ -415,7 +418,7 @@
         },
         {
           "path": "src/tasks/alerting.py",
-          "line": 142,
+          "line": 197,
           "label": "AlertTask"
         }
       ]
@@ -436,8 +439,34 @@
       "sources": [
         {
           "path": "src/provider/codebuddy/client.py",
-          "line": 579,
+          "line": 637,
           "label": "CodeBuddyProvider"
+        }
+      ]
+    },
+    {
+      "id": "cb-intl",
+      "type": "backend",
+      "label": "CodeBuddy Intl",
+      "sublabel": "国际站 · 同协议",
+      "pos": [
+        330,
+        620
+      ],
+      "size": [
+        125,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/provider/codebuddy/intl.py",
+          "line": 51,
+          "label": "CodeBuddyIntlProvider"
+        },
+        {
+          "path": "src/main.py",
+          "line": 361,
+          "label": "registry 条目"
         }
       ]
     },
@@ -447,7 +476,7 @@
       "label": "TRAE",
       "sublabel": "回调 / 刷新 / 额度",
       "pos": [
-        340,
+        470,
         620
       ],
       "size": [
@@ -457,7 +486,7 @@
       "sources": [
         {
           "path": "src/provider/trae/client.py",
-          "line": 606,
+          "line": 611,
           "label": "TraeProvider"
         }
       ]
@@ -468,7 +497,7 @@
       "label": "OpenCode Zen",
       "sublabel": "免费层 · 虚拟凭证",
       "pos": [
-        490,
+        610,
         620
       ],
       "size": [
@@ -479,7 +508,7 @@
       "sources": [
         {
           "path": "src/provider/zen/client.py",
-          "line": 451,
+          "line": 474,
           "label": "ZenProvider"
         }
       ]
@@ -490,7 +519,7 @@
       "label": "Kilo Gateway",
       "sublabel": "免费层 · 虚拟凭证",
       "pos": [
-        640,
+        750,
         620
       ],
       "size": [
@@ -501,7 +530,7 @@
       "sources": [
         {
           "path": "src/provider/kilo/client.py",
-          "line": 196,
+          "line": 197,
           "label": "KiloProvider"
         }
       ]
@@ -512,7 +541,7 @@
       "label": "Qoder",
       "sublabel": "设备码 PKCE / COSY",
       "pos": [
-        790,
+        890,
         620
       ],
       "size": [
@@ -533,7 +562,7 @@
       "label": "CodeArts",
       "sublabel": "AK/SK 签名",
       "pos": [
-        940,
+        1030,
         620
       ],
       "size": [
@@ -570,12 +599,33 @@
       ]
     },
     {
+      "id": "cb-intl-up",
+      "type": "external",
+      "label": "CodeBuddy Intl 上游",
+      "sublabel": "www.codebuddy.ai",
+      "pos": [
+        330,
+        760
+      ],
+      "size": [
+        125,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/config.py",
+          "line": 15,
+          "label": "_CODEBUDDY_INTL"
+        }
+      ]
+    },
+    {
       "id": "trae-up",
       "type": "external",
       "label": "TRAE 上游",
       "sublabel": "trae-api-cn.mchost.guru",
       "pos": [
-        340,
+        470,
         760
       ],
       "size": [
@@ -596,7 +646,7 @@
       "label": "Zen 上游",
       "sublabel": "opencode.ai/zen",
       "pos": [
-        490,
+        610,
         760
       ],
       "size": [
@@ -606,7 +656,7 @@
       "sources": [
         {
           "path": "src/config.py",
-          "line": 48,
+          "line": 60,
           "label": "zen_api_endpoint"
         }
       ]
@@ -617,7 +667,7 @@
       "label": "Kilo 上游",
       "sublabel": "api.kilo.ai/gateway",
       "pos": [
-        640,
+        750,
         760
       ],
       "size": [
@@ -638,7 +688,7 @@
       "label": "Qoder 上游",
       "sublabel": "openapi.qoder.com.cn",
       "pos": [
-        790,
+        890,
         760
       ],
       "size": [
@@ -648,7 +698,7 @@
       "sources": [
         {
           "path": "src/config.py",
-          "line": 58,
+          "line": 70,
           "label": "qoder_api_endpoint"
         }
       ]
@@ -659,7 +709,7 @@
       "label": "CodeArts 上游",
       "sublabel": "snap-access.myhuaweicloud",
       "pos": [
-        940,
+        1030,
         760
       ],
       "size": [
@@ -669,7 +719,7 @@
       "sources": [
         {
           "path": "src/config.py",
-          "line": 67,
+          "line": 79,
           "label": "codearts_api_endpoint"
         }
       ]
@@ -684,6 +734,7 @@
         "engine",
         "registry",
         "cb",
+        "cb-intl",
         "trae",
         "zen",
         "kilo",
@@ -746,6 +797,23 @@
       ]
     },
     {
+      "id": "registry-to-cbintl",
+      "from": "registry",
+      "to": "cb-intl",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          628.0,
+          560
+        ],
+        [
+          392.5,
+          560
+        ]
+      ]
+    },
+    {
       "id": "registry-to-trae",
       "from": "registry",
       "to": "trae",
@@ -757,7 +825,7 @@
           560
         ],
         [
-          402.5,
+          532.5,
           560
         ]
       ]
@@ -774,7 +842,7 @@
           560
         ],
         [
-          552.5,
+          672.5,
           560
         ]
       ]
@@ -791,7 +859,7 @@
           560
         ],
         [
-          702.5,
+          812.5,
           560
         ]
       ]
@@ -808,7 +876,7 @@
           560
         ],
         [
-          852.5,
+          952.5,
           560
         ]
       ]
@@ -825,7 +893,7 @@
           560
         ],
         [
-          1002.5,
+          1092.5,
           560
         ]
       ]
@@ -834,6 +902,13 @@
       "id": "cb-to-cbup",
       "from": "cb",
       "to": "cb-up",
+      "label": "SSE",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cbintl-to-cbintlup",
+      "from": "cb-intl",
+      "to": "cb-intl-up",
       "label": "SSE",
       "variant": "emphasis"
     },
@@ -966,7 +1041,7 @@
       "items": [
         "选号：pin → 粘性 → 到期积分 → 三态健康度",
         "模型级冷却隔离到单个模型；跨渠道 fallback 兼容组（未出帧前回退）",
-        "六渠道同池调度；9 类后台任务汇总「任务与配置」"
+        "七渠道同池调度；9 类后台任务汇总「任务与配置」"
       ]
     },
     {
@@ -982,7 +1057,7 @@
       "dot": "rose",
       "title": "数据与安全",
       "items": [
-        "SQLite WAL 11 表；38 项配置热更",
+        "SQLite WAL 11 表；39 项配置热更",
         "三角色 RBAC + 会话 epoch 吊销；审计留痕（90 天）",
         "凭证加密 + 统计脱敏；API Key 摘要"
       ]

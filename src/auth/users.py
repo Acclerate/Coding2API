@@ -1,9 +1,9 @@
-"""users.txt：PBKDF2-SHA256 用户存储（B5 起降级为「引导输入」）。
+"""users.txt：PBKDF2-SHA256 用户存储（已降级为「引导输入」）。
 
 格式（沿用 codebuddy2api 规范）：
     用户名:pbkdf2_sha256$<iterations>$<salt_b64>$<digest_b64>
 
-B5 之前 users.txt 是唯一用户源；现在启动时一次性导入 SQLite（`DbUserStore`），
+users.txt 曾是唯一用户源；现在启动时一次性导入 SQLite（`DbUserStore`），
 之后 DB 是唯一权威源，本文件与 `UsersFileStore` 保留作引导与灾难恢复路径
 （文件缺失且库为空时，仍可用它把服务拉起来）。
 """
@@ -120,7 +120,7 @@ class UsersFileStore:
         return tuple(self._cache)
 
     def import_into(self, repo) -> int:
-        """把文件里的用户一次性导入仓储（B5 引导）。
+        """把文件里的用户一次性导入仓储（引导）。
 
         一律以 `viewer` 身份导入、不猜角色——角色由 bootstrap 依据
         `ADMIN_USERNAMES` 单独赋权。返回真正新增的行数；已存在的用户
@@ -136,7 +136,7 @@ class UsersFileStore:
 
 
 class DbUserStore:
-    """SQLite 用户存储（B5）：DB 是唯一权威源。
+    """SQLite 用户存储：DB 是唯一权威源。
 
     对外只暴露「够用且不泄密」的读接口；`password_hash` 等敏感列留在仓储层，
     不在本类上透出。所有方法每次现读 DB（无缓存）——用户量是个人/小团队级，

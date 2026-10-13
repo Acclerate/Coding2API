@@ -1,6 +1,6 @@
 """凭证列加解密：Fernet（AES-128-CBC + HMAC），密钥从 APP_SECRET 派生。
 
-APP_SECRET 丢失 = 已存凭证全部不可解，只能重录（PROPOSAL §8 已明示，不做密钥轮换）。
+APP_SECRET 丢失 = 已存凭证全部不可解，只能重录（PROPOSAL §6 已明示，不做密钥轮换）。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ def derive_key(app_secret: str) -> bytes:
     """把任意长度的 APP_SECRET 归一化为 Fernet 需要的 32 字节 base64 key。
 
     刻意保持「无盐单次 SHA-256」：换 HKDF/PBKDF2 + 随机盐会让**已入库的
-    全部凭证不可解**（等价于密钥轮换，PROPOSAL §8 明确不做），属于需要
+    全部凭证不可解**（等价于密钥轮换，PROPOSAL §6 明确不做），属于需要
     运维先解密再重加密的数据迁移，不随本批安全加固一起改。作为补偿，
     下面按熵拒掉弱密钥（`WeakSecretError`）。
     """

@@ -213,11 +213,12 @@ describe("StatsPage", () => {
     renderPage(<StatsPage />, READER);
     await settle();
 
-    expect(screen.getByTestId("range-tabs-7d")).toHaveAttribute("aria-selected", "true");
-    await userEvent.click(screen.getByTestId("range-tabs-24h"));
+    // 默认最近 24 小时
+    expect(screen.getByTestId("range-tabs-24h")).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(screen.getByTestId("range-tabs-7d"));
     // React 会重建 tablist 节点，断言必须每次现查，不能缓存元素引用
     await waitFor(() =>
-      expect(screen.getByTestId("range-tabs-24h")).toHaveAttribute("aria-selected", "true"),
+      expect(screen.getByTestId("range-tabs-7d")).toHaveAttribute("aria-selected", "true"),
     );
     await waitFor(() =>
       expect(fetchSpy.mock.calls.some(([url]) => String(url).includes("since="))).toBe(true),

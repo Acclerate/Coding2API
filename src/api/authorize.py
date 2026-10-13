@@ -28,7 +28,7 @@ def create_router(services: Services) -> APIRouter:
         """TRAE 浏览器 302 落点。
 
         回调不需要 API Key（浏览器不会带），因此这里不做鉴权，但：
-        - 只接受**发起人本人**的回调（M7）
+        - 只接受**发起人本人**的回调
         - 待完成登录有 TTL，过期即作废并清槽
         - 只接受带 refreshToken 的链接，其他一律拒绝
         - 换到的凭证直接落库，响应里绝不回传 token
@@ -39,7 +39,7 @@ def create_router(services: Services) -> APIRouter:
 
         因此不能用 state 匹配回调。改为按**发起人**绑定：回调是顶层浏览器
         导航，SameSite=Lax 会带上管理台的会话 Cookie，据会话用户名找到其待完成
-        登录（M7）。这样：
+        登录。这样：
         - 两个管理员并发发起登录不会互相覆盖（各按用户名分键）；
         - 同网段的其他人无法用自己的 refreshToken 顶掉别人进行中的登录；
         - 凭证记在发起人名下，不会被记错。

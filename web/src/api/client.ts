@@ -47,7 +47,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: {
-      // CSRF 纵深（服务端要求写请求带自定义头，PROPOSAL §8）：
+      // CSRF 纵深（服务端要求写请求带自定义头，PROPOSAL §6）：
       // 浏览器跨站表单/简单请求无法携带自定义头
       "X-Requested-With": "XMLHttpRequest",
       ...(init.body ? { "Content-Type": "application/json" } : {}),
@@ -191,7 +191,7 @@ export const api = {
     request<SettingsResponse>("/api/settings", { method: "PUT", ...json({ values }) }),
   /** 后台任务运行态（进程内）：与 /api/settings 同页展示。 */
   tasks: () => request<TasksResponse>("/api/tasks"),
-  /** 运维告警记录（P1-7）：后台评估命中后落库，倒序回看。 */
+  /** 运维告警记录：后台评估命中后落库，倒序回看。 */
   alerts: (sort?: string, order?: string) =>
     request<AlertsResponse>(`/api/alerts${query({ sort, order })}`),
   /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示。 */

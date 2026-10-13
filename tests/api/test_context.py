@@ -1,8 +1,8 @@
-"""P0-2：上下文压缩（`src/engine/compress.py` + `src/api/context.py`）。
+"""上下文压缩（`src/engine/compress.py` + `src/api/context.py`）。
 
 纯函数直测为主：估算口径、按上限裁剪、system 保留、tool_calls 成组、
 单条超限截断。末尾两节覆盖「按渠道查窗口 + 压缩闭包」与 executor 选号后
-接线（Q60 修订：窗口按实际服务渠道取值，不再跨渠道取 min）。
+接线（窗口按实际服务渠道取值，不再跨渠道取 min）。
 """
 
 from __future__ import annotations

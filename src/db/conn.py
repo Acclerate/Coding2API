@@ -1,4 +1,4 @@
-"""SQLite 连接管理（T-Q2：标准库 sqlite3 + WAL，同步调用）。
+"""SQLite 连接管理（标准库 sqlite3 + WAL，同步调用）。
 
 本地 SQLite 读写为微秒级，asyncio 封装开销大于收益，因此走同步调用 + 线程本地连接。
 """
@@ -73,7 +73,7 @@ class Database:
         否则中途抛错会留下半完成状态；单语句写入也可用，
         让「connect → execute → commit」的样板只出现一次。
 
-        显式 `BEGIN IMMEDIATE`（M11）：sqlite3 默认的 deferred 事务要到**第一条
+        显式 `BEGIN IMMEDIATE`：sqlite3 默认的 deferred 事务要到**第一条
         写语句**才取写锁，于是 `with transaction(): SELECT ...; UPDATE ...` 里的
         SELECT 在锁外读到旧快照，两个写者都基于同一旧值更新 → 丢更新
         （`save_quota` 的 before/after、pin 切换都依赖读改写的一致性）。

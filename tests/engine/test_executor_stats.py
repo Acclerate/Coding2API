@@ -177,6 +177,54 @@ async def test_stream_records_failure_when_credentials_exhausted(repo):
     assert event["ok"] is False and event["error_type"] == "no_healthy_credential"
     assert event["username"] == "bob"
 
+def _model_cool_one(credentials, model):
+    """给唯一凭证写一条未过期的模型级冷却（耗尽轮换的前置条件）。"""
+    from src.engine.scheduler import ErrorOutcome, ModelCooldown
+
+    credential_id = credentials.candidates()[0].credential_id
+    credentials.save_error(credential_id, ErrorOutcome(model_cooldowns={
+        model: ModelCooldown(cooling_until=int(time.time()) + 600,
+                             hits=1, reason="model")}))
+
+async def test_stream_all_model_cooled_records_model_unavailable(repo):
+    """候选全部只因该模型的模型级冷却不可用 → 统计记 model_unavailable。
+
+    与「无可用凭证」区分：账号本身是好的、换个模型立即可用（2026-10-13
+    `ling-3.1-flash`：kilo 唯一凭证被上游 429 写模型级冷却，明细此前一律
+    标「无可用凭证」，读起来像整池凭证挂了）。
+    """
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    _model_cool_one(credentials, "glm-5.2")
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="bob"):
+        pass
+    event = collector.events[-1]
+    assert event["ok"] is False and event["error_type"] == "model_unavailable"
+    # 对外错误码不变：兼容层（Anthropic/Responses）按 no_healthy_credential 映射
+    # （本用例不直接断言错误码，见 test_coverage_edge_executor 的终帧断言）
+
+async def test_complete_all_model_cooled_records_model_unavailable(repo):
+    """非流式路径同口径：模型级冷却耗尽记 model_unavailable。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    _model_cool_one(credentials, "glm-5.2")
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
+
+    from src.compat.openai.request import parse_chat_request
+
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}))
+    assert collector.events[-1]["error_type"] == "model_unavailable"
+
 async def test_complete_records_success_and_failure(repo):
     credentials, _db = repo
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})

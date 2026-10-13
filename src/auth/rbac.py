@@ -1,4 +1,4 @@
-"""角色判定（B5）：三角色由 DB 的 users.role 决定，env 只在引导期参与。
+"""角色判定：三角色由 DB 的 users.role 决定，env 只在引导期参与。
 
 角色从 DB **每请求现读**，不进签名 Cookie——改角色/禁用必须立刻生效，
 否则降级一个 admin 后其旧 Cookie 在过期前仍是 admin（权限撤销漏洞）。
@@ -23,7 +23,7 @@ ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 class Principal:
     username: str
     is_admin: bool = False
-    # 三角色（B5）。默认空串 = 老构造（`Principal("u", True)`）不传角色；
+    # 三角色。默认空串 = 老构造（`Principal("u", True)`）不传角色；
     # 此时 is_admin 仍由显式字段决定，保证既有测试与调用点语义不变。
     role: str = ""
 
@@ -62,7 +62,7 @@ class SelfTargetError(Exception):
 
 
 class PasswordChangeRequiredError(Exception):
-    """首登未改密：除放行清单外的端点一律拒绝（B5）。
+    """首登未改密：除放行清单外的端点一律拒绝。
 
     定义在 rbac 而不是 api.deps：webapp.handlers 需要捕获它，而 deps 依赖
     handlers 的上层链路，放 rbac 可避免循环导入。

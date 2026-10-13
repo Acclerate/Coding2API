@@ -300,7 +300,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     configure_logging(config.log_level)
     db = Database(config.db_path)
     apply_schema(db.connect())
-    # 运行时配置覆盖层（B3.2）：热更键读 DB 覆盖值，其余透明委托给 env 快照。
+    # 运行时配置覆盖层：热更键读 DB 覆盖值，其余透明委托给 env 快照。
     # 必须在 apply_schema 之后构造——新库的 runtime_settings 表由上面建好。
     runtime = load_runtime_settings(config, RuntimeSettingsRepository(db))
     cipher = CredentialCipher(config.app_secret)
@@ -346,7 +346,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                            allow_concurrent=True,
                            max_concurrency=lambda: runtime.codearts_max_concurrency,
                            window_seconds=lambda: runtime.codearts_request_window_seconds)
-    # 按渠道出站代理（P1-6）：启动期解析一次，装配时注入到各 provider 的
+    # 按渠道出站代理：启动期解析一次，装配时注入到各 provider 的
     # httpx client；运行中改值需重启（连接池已建立，见 provider/proxy.py）。
     proxies = parse_provider_proxies(config.provider_proxies, KNOWN_PROVIDERS)
     registry = providers if providers is not None else {
@@ -442,9 +442,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      # 同一份 dict 的引用：模型目录恢复 / 拉取后
                                      # executor 立即可见（倍率查询走它）
                                      model_list_cache=model_cache,
-                                     # 上下文压缩（P0-2 修订）：选号后按实际服务
+                                     # 上下文压缩（修订）：选号后按实际服务
                                      # 渠道的窗口裁剪；settings 传运行态覆盖层，
-                                     # 开关与四个参数每请求现读（B3.2 热更）
+                                     # 开关与四个参数每请求现读（热更）
                                      context_compress=build_context_compressor(
                                          model_cache, model_aliases, runtime)))
 
@@ -588,7 +588,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 仓储/引擎依赖），刷新时就地换值，路由层每请求现读。
     app.state.model_benchmarks = model_benchmarks
     # 待完成的 TRAE 回调登录：{用户名: (started_at_monotonic, state)}。
-    # 按发起人分键（M7）：单槽全局态会被两个管理员的并发登录互相覆盖，
+    # 按发起人分键：单槽全局态会被两个管理员的并发登录互相覆盖，
     # 把 A 的凭证记到 B 名下。回调不带 state，故用会话 Cookie 认发起人。
     app.state.pending_callbacks = {}
     app.state.login_throttle = LoginThrottle()
@@ -643,7 +643,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     )
     app.state.services = services
 
-    # --------------------------------------------- 安全中间件（PROPOSAL §8）
+    # --------------------------------------------- 安全中间件（PROPOSAL §6）
     # Host 白名单（防 DNS rebinding）+ 安全响应头；请求体上限由 ASGI 中间件处理
     # （纯读 content-length 会被 chunked 请求绕过）。
     app.middleware("http")(security_middleware)
@@ -724,7 +724,7 @@ def _upstream_auth(registry: dict, settings: Settings) -> dict:
 
 
 def _load_users(*, settings: Settings, user_repo):
-    """构造 DB 用户存储并完成引导（B5）。
+    """构造 DB 用户存储并完成引导。
 
     引导把 users.txt + ADMIN_USERNAMES 的职责交接给 SQLite（见
     auth/bootstrap.py）；文件缺失不再是致命错误——只要库里已有用户就能启动，

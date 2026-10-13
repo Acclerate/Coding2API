@@ -10,7 +10,7 @@
       "url": "git@github.com:RobbsLuo/Coding2API.git",
       "provider": "github",
       "link_mode": "local-only",
-      "revision": "1b3c5db689695c5a2a9c843919ec537562110857"
+      "revision": "64ba0a4a883486ce5c1c658750e2012eb8d8783a"
     }
   },
   "participants": [
@@ -28,7 +28,7 @@
       "sources": [
         {
           "path": "src/api/chat.py",
-          "line": 45,
+          "line": 44,
           "label": "chat_completions"
         },
         {
@@ -46,12 +46,12 @@
       "sources": [
         {
           "path": "src/api/deps.py",
-          "line": 157,
+          "line": 187,
           "label": "api_key_user"
         },
         {
           "path": "src/auth/api_key.py",
-          "line": 16,
+          "line": 17,
           "label": "digest_api_key"
         }
       ]
@@ -64,12 +64,12 @@
       "sources": [
         {
           "path": "src/engine/executor.py",
-          "line": 224,
+          "line": 362,
           "label": "stream"
         },
         {
           "path": "src/engine/executor.py",
-          "line": 607,
+          "line": 899,
           "label": "_select"
         }
       ]
@@ -82,12 +82,12 @@
       "sources": [
         {
           "path": "src/engine/scheduler.py",
-          "line": 207,
+          "line": 212,
           "label": "select"
         },
         {
           "path": "src/engine/scheduler.py",
-          "line": 245,
+          "line": 266,
           "label": "note_error"
         }
       ]
@@ -96,21 +96,21 @@
       "id": "store",
       "type": "database",
       "label": "SQLite",
-      "sublabel": "WAL · 10 张表",
+      "sublabel": "WAL · 11 张表",
       "sources": [
         {
           "path": "src/db/repo.py",
-          "line": 322,
+          "line": 433,
           "label": "candidates"
         },
         {
           "path": "src/db/repo.py",
-          "line": 186,
+          "line": 297,
           "label": "save_success"
         },
         {
           "path": "src/stats/collector.py",
-          "line": 67,
+          "line": 107,
           "label": "record"
         }
       ]
@@ -123,12 +123,12 @@
       "sources": [
         {
           "path": "src/provider/base.py",
-          "line": 297,
+          "line": 388,
           "label": "Provider"
         },
         {
           "path": "src/provider/codebuddy/client.py",
-          "line": 601,
+          "line": 668,
           "label": "stream_chat"
         }
       ]
@@ -137,7 +137,7 @@
       "id": "upstream",
       "type": "external",
       "label": "上游",
-      "sublabel": "六家渠道 · SSE"
+      "sublabel": "七家渠道 · SSE"
     }
   ],
   "segments": [

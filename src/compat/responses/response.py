@@ -1,4 +1,4 @@
-"""Responses 出站：中立 Event → Responses SSE 帧 / 非流式对象（B2.1）。
+"""Responses 出站：中立 Event → Responses SSE 帧 / 非流式对象。
 
 字段形状全部取自官方 openai-python 3.x 的类型定义（由 OpenAI OpenAPI
 生成，见 `openai/types/responses/*.py`），不凭记忆写。本模块只发 Codex

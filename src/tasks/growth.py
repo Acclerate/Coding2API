@@ -27,7 +27,7 @@ class GrowthTask:
         self._credentials = credentials
         self._providers = providers
         self._events = events
-        # 不可逆动作开关可热更（B3.2）：每轮读当前值，改配置当轮生效
+        # 不可逆动作开关可热更：每轮读当前值，改配置当轮生效
         self._allow_source = live(allow_irreversible)
         self._pacer = pacer
 

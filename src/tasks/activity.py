@@ -1,4 +1,4 @@
-"""活跃上报后台任务（B1.7，可选，默认关闭）。
+"""活跃上报后台任务（可选，默认关闭）。
 
 用途：给 CodeBuddy 账号补发一条对话事件，续上成长中心的连登天数 / 活跃地图。
 与积分、调度无关；上游改版即失效，**不作为可靠性功能**。
@@ -38,7 +38,7 @@ class ActivityTask:
         self._credentials = credentials
         self._providers = providers
         self._events = events
-        # 上报时点可热更（B3.2）：存取值器，due() 每次读当前值
+        # 上报时点可热更：存取值器，due() 每次读当前值
         self._hour_source = live(hour)
         self._now = now
         self._done_scopes: set[str] = set()

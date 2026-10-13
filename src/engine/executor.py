@@ -1,4 +1,4 @@
-"""执行引擎：选号 → 上游流 → 轮换重试 → 统计（Q12=B 轮换 ≤3 次）。"""
+"""执行引擎：选号 → 上游流 → 轮换重试 → 统计（轮换 ≤3 次）。"""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ class _ModelExhausted(Exception):
 
 
 class _AggregateOverflow(Exception):
-    """非流式聚合事件数超上限（M10）：上游持续吐 chunk 而不结束。
+    """非流式聚合事件数超上限：上游持续吐 chunk 而不结束。
 
     内部信号，按瞬态错误处理（换号重试），不对外暴露。
     """
@@ -102,21 +102,21 @@ class ExecutorDeps:
     # 会话粘性（ConversationAffinity）；None 表示关闭。对话进行中固定用原
     # 凭证，出错才轮换，成功后重新粘定实际服务的凭证
     affinity: Any | None = None
-    # 截断续写上限（B1.4）：上游 finish_reason=length 时同凭证续写，最多该次数；
+    # 截断续写上限：上游 finish_reason=length 时同凭证续写，最多该次数；
     # 0 关闭。续写在事件流包装器内完成，不参与凭证轮换
     max_auto_continues: int = 0
     # 非流式聚合整体超时（秒）：流式路径有心跳与 read=None 兜底，非流式
     # 聚合没有——上游连接半开停滞会让请求无限悬挂并占住凭证。超时按瞬态
     # 错误（SOFT：短冷却不累计）换号重试；≤0 关闭
     complete_timeout_seconds: float = 600
-    # 非流式聚合的事件条数上限（M10）：上游若持续吐 chunk（超长回答 / 死循环
+    # 非流式聚合的事件条数上限：上游若持续吐 chunk（超长回答 / 死循环
     # 输出）而不结束，`events` 会无界增长直到 OOM——超时只兜住「慢」，兜不住
     # 「快而无穷」。超过即按瞬态错误换号重试；≤0 关闭
     complete_max_events: int = 200_000
-    # 跨渠道 fallback 兼容组（P1-5）：配置文本 → 组的解析值（dict）；None 表示
+    # 跨渠道 fallback 兼容组：配置文本 → 组的解析值（dict）；None 表示
     # 关闭。零参 callable 时每次请求现读（热更）。空 dict 与 None 等价（无组）。
     fallback_groups: Any | None = None
-    # 上下文压缩（P0-2 修订）：选号后按**实际服务渠道**的输入窗口压缩请求体。
+    # 上下文压缩（修订）：选号后按**实际服务渠道**的输入窗口压缩请求体。
     # (provider_id, 归一名, payload) → payload；None 表示不压缩。契约：实现
     # 必须返回新对象或原样返回，不得原地改入参——同一请求可能在轮换/回退里
     # 对不同渠道各压一次，且 affinity 指纹读的是未压缩原文
@@ -165,6 +165,20 @@ class Executor:
             return _model_cooled_message(target.model, last_error,
                                          self._suggestions(target.model))
         return _unavailable_message(last_error)
+
+    def _exhaust_error_type(self, target: ModelTarget) -> str:
+        """轮换耗尽时落统计的受控 error_type（与 503 文案分流同源）。
+
+        所有候选都只因**该模型的模型级冷却**被排除时（`_all_model_cooled`，
+        与 `_unavailable_text` 同一判据）记 `model_unavailable`，否则记
+        `no_healthy_credential`——统计页此前一律显示「无可用凭证」，把
+        「换个模型就好」的上游限流误读成整池凭证挂了（实测 2026-10-13
+        `ling-3.1-flash`：kilo 唯一凭证被 Novita 429 写模型级冷却后，
+        明细每条都标「无可用凭证」）。对外错误码不变（仍
+        `no_healthy_credential`，兼容层映射依赖它）。
+        """
+        return ("model_unavailable" if self._all_model_cooled(target)
+                else "no_healthy_credential")
 
     def _model_cooled_only(self, providers: Iterable[str],
                            target: ModelTarget, now: int) -> bool:
@@ -218,7 +232,7 @@ class Executor:
         return self._apply_binding(target, provider_binding)
 
     def _fallback_chain(self, target: ModelTarget) -> tuple[ModelTarget, ...]:
-        """请求模型的回退链（P1-5）；未配置或未命中任何组时只有它自己。
+        """请求模型的回退链；未配置或未命中任何组时只有它自己。
 
         兼容组 `fast=glm-4.6,glm-5`：组名只是入口别名（不进链），成员
         `glm-4.6`/`glm-5` 才是候选模型。`@渠道` 强制指定与 API Key 渠道绑定
@@ -290,7 +304,7 @@ class Executor:
 
     def _apply_binding(self, target: ModelTarget,
                        binding: str | None) -> ModelTarget:
-        """按 API Key 的渠道绑定收窄候选上游（B3.5）。
+        """按 API Key 的渠道绑定收窄候选上游。
 
         绑定是 Key 的策略，不是请求参数：它把候选固定到该渠道，并把
         `forced` 置真（跳过模型目录收窄，因为归属已在此校验判断过）。
@@ -326,7 +340,7 @@ class Executor:
         StreamingResponse 之前抛给异常处理器，才能得到正确的 400。
 
         回退链启用时按整条链判断：链首无注册上游但有回退项可用时放行，交给
-        `stream` 逐链项尝试（P1-5）。
+        `stream` 逐链项尝试。
         """
         target = self.resolve_target(request, provider_binding)
         for attempt in self._fallback_chain(target):
@@ -364,7 +378,7 @@ class Executor:
                      provider_binding: str | None = None) -> AsyncIterator[bytes]:
         """流式执行；上游错误按分类冷却并换号，最多 3 次。
 
-        启用兼容组回退链（P1-5）时，**只有在当前链项还没产出任何响应帧之前**
+        启用兼容组回退链时，**只有在当前链项还没产出任何响应帧之前**
         才允许切到下一链项——已出帧后换模型会让客户端看到两个模型的混合输出。
         每链项内部仍是完整的选号 / 冷却 / 轮换 / 粘性 / 统计路径；整条链都用尽
         时用最后一个链项的 translator 产出终帧。
@@ -458,7 +472,7 @@ class Executor:
                 self._deps.record(
                     username=state.username, provider=state.provider,
                     credential_id=state.credential_id, model=target.model, ok=False,
-                    error_type="no_healthy_credential",
+                    error_type=self._exhaust_error_type(target),
                     latency_ms=_elapsed_ms(state.started))
                 raise _ModelExhausted(
                     self._unavailable_text(target, last_error),
@@ -575,7 +589,7 @@ class Executor:
 
     def _stream_source(self, provider_id: str, credential_data: dict[str, Any],
                        payload: dict[str, Any], model: str) -> AsyncIterator[Event]:
-        """上游事件流入口；开启截断续写时包一层（B1.4）。
+        """上游事件流入口；开启截断续写时包一层。
 
         续写在包装器内固定用同一凭证续发请求，因此凭证轮换/记账/统计
         逻辑完全不需要感知它——executor 只会看到一条更长的流。
@@ -583,7 +597,7 @@ class Executor:
         upstream_model = self._upstream_model(provider_id, model)
         stream = self._deps.providers[provider_id].stream_chat(
             credential_data, payload, upstream_model)
-        # 续写上限可热更（B3.2）：0 表示关闭，每次请求读当前值
+        # 续写上限可热更：0 表示关闭，每次请求读当前值
         max_continues = int(live(self._deps.max_auto_continues)())
         if max_continues <= 0:
             return stream
@@ -623,7 +637,7 @@ class Executor:
         """非流式：按兼容组回退链依次尝试，逐链项走完整的换号重试。
 
         回退只在**整条链**都用尽时以最后一个链项的 503/400 收尾；单链项内部
-        的选号 / 冷却 / 轮换 / 会话粘性 / 统计全部沿用既有路径（P1-5）。
+        的选号 / 冷却 / 轮换 / 会话粘性 / 统计全部沿用既有路径。
         """
         target = self.resolve_target(request, provider_binding)
         chain = self._fallback_chain(target)
@@ -665,7 +679,8 @@ class Executor:
                         target.model, last_error, self._suggestions(target.model)))
                 self._deps.record(
                     username=username, provider=last_provider, credential_id=last_credential,
-                    model=target.model, ok=False, error_type="no_healthy_credential",
+                    model=target.model, ok=False,
+                    error_type=self._exhaust_error_type(target),
                     latency_ms=int((time.monotonic() - started) * 1000))
                 raise NoHealthyCredential(
                     self._unavailable_text(target, last_error))
@@ -691,7 +706,7 @@ class Executor:
                         if first_event_at is None:
                             first_event_at = time.monotonic()
                         events.append(event)
-                        # 事件条数上限（M10）：超长/死循环输出下 events 会无界
+                        # 事件条数上限：超长/死循环输出下 events 会无界
                         # 增长直到 OOM，超时兜不住「快而无穷」。按瞬态错误换号。
                         if (self._deps.complete_max_events > 0
                                 and len(events) > self._deps.complete_max_events):
@@ -830,7 +845,7 @@ class Executor:
         （凭证被删、冷却中、用户强制了别的上游）回退常规调度，成功后
         重新粘定，对话不会因此永久失粘。
 
-        手动 pin 优先于粘性（PROPOSAL §4.3「手动 pin 优先 → 过滤 healthy →
+        手动 pin 优先于粘性（PROPOSAL §3.3「手动 pin 优先 → 过滤 healthy →
         到期积分」）：管理员显式指定了凭证时，粘性不得把它顶掉，否则"指定"
         在对话中途失效且无处可见。
 
@@ -1013,7 +1028,7 @@ def _classify(error: Exception) -> ErrKind | None:
 
 
 def _error_summary(error: Exception | None) -> str:
-    """对外错误文案里的错误标识：**只给受控分类，不回显上游正文**（M2）。
+    """对外错误文案里的错误标识：**只给受控分类，不回显上游正文**。
 
     上游错误体可能包含上游内部 schema、请求回显，甚至（若上游回显请求头）
     credential/token 片段；透传给任意 API 消费者等于信息泄露。完整正文只进
@@ -1032,7 +1047,7 @@ def _error_summary(error: Exception | None) -> str:
 
 
 def _unavailable_message(last_error: Exception | None) -> str:
-    """503 文案：带上最后一次错误的**受控标识**便于排查（M2：不回显上游正文）。"""
+    """503 文案：带上最后一次错误的**受控标识**便于排查（不回显上游正文）。"""
     message = "all credentials unavailable"
     summary = _error_summary(last_error)
     if summary:
@@ -1072,7 +1087,7 @@ def _usage_field(usage: object, name: str) -> object:
 
 def _reject_message(model: str, last_error: Exception | None,
                     suggestions: list[str] | None = None) -> str:
-    """所有上游都拒绝该模型时的 400 文案（M2：只带受控标识，不回显上游正文）。"""
+    """所有上游都拒绝该模型时的 400 文案（只带受控标识，不回显上游正文）。"""
     summary = _error_summary(last_error)
     detail = f": {summary}" if summary else ""
     message = f"model {model!r} not available on any configured upstream{detail}"

@@ -1,4 +1,4 @@
-"""OpenAI Responses 请求 → 内部 ChatRequest 的入站映射（B2.1，Codex CLI 出口）。
+"""OpenAI Responses 请求 → 内部 ChatRequest 的入站映射（Codex CLI 出口）。
 
 字段形状全部取自官方 openai-python 3.x 的类型定义（OpenAPI 生成，见
 `openai/types/responses/*.py`），不凭记忆写；本模块只覆盖 Codex CLI 实际
@@ -337,7 +337,7 @@ def parse_responses_request(body: Any) -> ChatRequest:
         upstream["reasoning_effort"] = reasoning["effort"]
     cache_key = body.get("prompt_cache_key")
     if isinstance(cache_key, str) and cache_key:
-        # 与 chat 出站同理：显式会话标识能固定凭证（B1.5），上游也认该字段
+        # 与 chat 出站同理：显式会话标识能固定凭证，上游也认该字段
         upstream["prompt_cache_key"] = cache_key
     text_config = body.get("text")
     if isinstance(text_config, dict):

@@ -1,4 +1,4 @@
-"""TRAE 登录闭环：登录 URL 构造 + 回调链接解析（Q17=C callback 轨道）。
+"""TRAE 登录闭环：登录 URL 构造 + 回调链接解析（callback 轨道）。
 
 回调地址来自 PUBLIC_BASE_URL，废弃原实现的 127.0.0.1:18080 硬编码。
 """

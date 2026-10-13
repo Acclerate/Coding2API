@@ -1,4 +1,4 @@
-"""Provider 协议与中立类型（Q16=A 细接口，Q13=B 中立事件层预留）。
+"""Provider 协议与中立类型（细接口，中立事件层预留）。
 
 Provider 承担上游协议私有部分：发请求、解析事件、分类错误、凭证生命周期与额度探测。
 调度、冷却、重试、统计在共享引擎（engine/）。
@@ -23,7 +23,7 @@ class EventKind(StrEnum):
 
 
 class ErrKind(StrEnum):
-    """错误分类 → 冷却时长（Q12=B）。
+    """错误分类 → 冷却时长。
 
     分类的粒度决定冷却的作用域：账号级（PLAN/SOFT/DEAD/OTHER）与
     模型级（MODEL/BLOCKED）必须分开，否则单个模型打满会连累同账号的
@@ -138,7 +138,7 @@ class UpstreamHTTPError(Exception):
         self.status = status
         self.body = body
         # 异常文本里的 body 摘要只进服务端日志（executor 对这些异常打 warning）；
-        # 对外响应经 `_error_summary` 只取 status/受控标识，绝不回显上游正文（M2）。
+        # 对外响应经 `_error_summary` 只取 status/受控标识，绝不回显上游正文。
         super().__init__(f"upstream http {status}: {body_hint(body)}")
 
     def kind(self) -> ErrKind:
@@ -166,7 +166,7 @@ class UpstreamProtocolViolation(ValueError):
     provider.base import UpstreamProtocolViolation` 复用本类——此前每家有
     一份同名类，导致「按类型翻译探测失败原因」只能逐个渠道硬编码。
 
-    `public` 是**可安全回显给客户端**的文案（M2/M6）：异常文本会带上游原文或
+    `public` 是**可安全回显给客户端**的文案：异常文本会带上游原文或
     内部端点 URL，只能进日志；HTTP 处理器改用 `public_message`，缺省等于
     `str(self)`（多数文案本就不含上游数据），仅少数内嵌 URL/body 的调用点
     显式传 `public=` 收紧。
@@ -214,7 +214,7 @@ class Event:
 
 @dataclass(slots=True)
 class Quota:
-    """额度探测结果。probe_failed 与「探测到 0」必须区分（Q26 三态）。"""
+    """额度探测结果。probe_failed 与「探测到 0」必须区分（三态）。"""
 
     remaining: float | None = None
     total: float | None = None
@@ -344,7 +344,7 @@ class Model:
     max_output_tokens: int | None = None
     supports_images: bool | None = None
     supports_tool_call: bool | None = None
-    # 推理元数据（B1.6）：两边上游的模型配置接口都直接给出，有则透传
+    # 推理元数据：两边上游的模型配置接口都直接给出，有则透传
     supports_reasoning: bool | None = None
     # 上游为该模型配置的默认档位（CB: reasoning.effort ∈ {high, medium}；
     # TRAE 的 reasoning_effort_config 只有 support_thinking 布尔，无档位，为 None）
@@ -352,7 +352,7 @@ class Model:
 
 
 class AuthFlow(StrEnum):
-    """登录轨道类型（Q17=C）。
+    """登录轨道类型。
 
     - `poll`：前端轮询 `poll_auth`，服务端监听本机回环端口
     - `callback`：浏览器 302 回本服务 `/authorize`（TRAE）
@@ -368,7 +368,7 @@ class AuthFlow(StrEnum):
 
 @dataclass(slots=True)
 class AuthSession:
-    """登录轨道（Q17=C）：poll 出 auth_url/interval；callback 出 callback_url；
+    """登录轨道：poll 出 auth_url/interval；callback 出 callback_url；
     paste 出 auth_url 但需用户把回调链接粘回（服务端无法监听本机回环端口）。"""
 
     flow: AuthFlow

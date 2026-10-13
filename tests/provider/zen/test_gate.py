@@ -21,6 +21,30 @@ def test_new_session_id_matches_gate_regex():
     assert SESSION_RE.match(session), session
     assert new_session_id() != session
 
+def test_new_session_id_prefix_encodes_recent_time():
+    """前 12 位 hex 必须是近期时间戳的官方编码（随机 hex 会被上游 403）。
+
+    官方 `Identifier.create`：`~((now_ms << 12) + 1)` 的低 48 位。左移会溢出
+    48 位故按模比较（与上游一致）；两值之差换算回毫秒须精确等于注入的时间。
+    """
+    from src.provider.zen.client import _SESSION_TIME_MASK, _SESSION_TIME_SHIFT
+
+    now_ms = 1_700_000_000_123
+    session = new_session_id(now_ms=now_ms)
+    actual = (~int(session[4:16], 16)) & _SESSION_TIME_MASK
+    expected = (now_ms * _SESSION_TIME_SHIFT + 1) & _SESSION_TIME_MASK
+    assert actual == expected
+    # 后 14 位仍是随机 base62：两次调用前缀相同、整体不同
+    again = new_session_id(now_ms=now_ms)
+    assert again[4:16] == session[4:16]
+    assert again != session
+
+def test_new_session_id_prefix_advances_with_clock():
+    """不同时刻生成的会话前缀不同：确保前缀确实取自时钟而非常量。"""
+    early = new_session_id(now_ms=1_700_000_000_000)[4:16]
+    later = new_session_id(now_ms=1_700_000_001_000)[4:16]
+    assert early != later
+
 def test_gate_headers_include_version_and_session():
     headers = gate_headers(version="2.3.4")
     assert headers["User-Agent"] == "opencode/2.3.4"

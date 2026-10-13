@@ -1,4 +1,4 @@
-"""CodeBuddy 每日签到（M1.5）。
+"""CodeBuddy 每日签到。
 
 AGENTS.md 约束：
 - 只有上游响应 code=0 且 data.credit 是非布尔有限数值才算成功

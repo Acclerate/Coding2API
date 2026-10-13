@@ -1,4 +1,4 @@
-"""截断续写（B1.4，按实测收窄）。
+"""截断续写（按实测收窄）。
 
 触发条件只有一个：上游以 `finish_reason == "length"` 结束本轮流。此时
 上游是被输出长度上限截断的，末尾内容不完整，续写能显著改善体验；且该
@@ -127,7 +127,7 @@ class ContinuationStream:
                 self.continues_done += 1
                 # 每轮结束先把**已完成轮次**的累计用量汇报一次（USAGE 事件不单独
                 # 成帧，只落进 translator.usage）：下一轮若客户端中途断开，记账
-                # 仍能拿到已跑完的用量，而不是退化成 0（M3）。
+                # 仍能拿到已跑完的用量，而不是退化成 0。
                 if not _usage_is_empty(usage):
                     yield Event(kind=EventKind.USAGE, usage=usage)
                 self._payload = extend_payload(

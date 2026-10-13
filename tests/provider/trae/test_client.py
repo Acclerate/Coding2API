@@ -324,7 +324,7 @@ async def test_provider_import_classify_and_models():
         provider.import_credential({"accessToken": "a"})
 
 def test_provider_import_rejects_foreign_api_host():
-    """apiHost 是用户可控输入：非白名单立即拒绝导入，不落库（PROPOSAL §8）。"""
+    """apiHost 是用户可控输入：非白名单立即拒绝导入，不落库（PROPOSAL §6）。"""
     provider = TraeProvider()
     with pytest.raises(trae_events.UpstreamProtocolViolation) as error:
         provider.import_credential(

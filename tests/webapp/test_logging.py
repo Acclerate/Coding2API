@@ -2,7 +2,7 @@
 
 来源：实测发现应用 logger 的 INFO 被静默丢弃——uvicorn 默认 LOGGING_CONFIG
 只配置 `uvicorn` / `uvicorn.access`（propagate=false），**从不配置 root**，
-而 root 默认 level=WARNING 且无 handler。后果是 PROPOSAL §8 要求的凭证审计
+而 root 默认 level=WARNING 且无 handler。后果是 PROPOSAL §6 要求的凭证审计
 日志（增删改/pin/账号切换，共 7 处 logger.info）一条都没落盘。
 """
 
@@ -121,7 +121,7 @@ def test_noisy_libraries_are_downgraded():
     """httpx/httpcore 的 INFO 会给每个上游请求打一条含完整 URL 的日志。
 
     既是噪音（量随请求数线性增长、把审计日志淡出视野），也与
-    PROPOSAL §8「日志脱敏」冲突（URL 可能带 query 参数）。
+    PROPOSAL §6「日志脱敏」冲突（URL 可能带 query 参数）。
     """
     logging.getLogger().handlers = []
     configure_logging("INFO")

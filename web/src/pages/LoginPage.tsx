@@ -8,7 +8,7 @@ import { Button, Input, Notice } from "../ui";
 const HIGHLIGHTS = [
   {
     icon: Boxes,
-    title: "六渠道统一调度",
+    title: "七渠道统一调度",
     text: "CodeBuddy / TRAE / Qoder / CodeArts 与免费层汇入单一 OpenAI 兼容出口。",
   },
   {

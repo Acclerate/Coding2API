@@ -1,4 +1,4 @@
-"""模型名解析（Q21=C 扁平 + Q27=A @provider 后缀）。"""
+"""模型名解析（扁平 + @provider 后缀）。"""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 """会话 Cookie：HMAC 签名，不落库（重启失效可接受）。
 
-payload 里的 `ep` 是 users.session_epoch 的快照（B5）：Cookie 无状态，
+payload 里的 `ep` 是 users.session_epoch 的快照：Cookie 无状态，
 无法逐条作废，于是改密/禁用/改角色时把 DB 里的 epoch +1，这里每请求比对，
 不等即失效（见 deps.principal_from_request）。
 

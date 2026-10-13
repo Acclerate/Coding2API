@@ -19,7 +19,7 @@ system prompt，否则整单 400 / 11128 `first message is not system prompt`
 其余能力差异（只保留**已验证存在**的路径）：
 
 - 聊天 / 模型列表 / 额度探测 / 设备码登录 / token 刷新 —— 全部启用。
-  判据见 TECHNICAL §3.17b：匿名请求命中这些路径返回网关 401（路由已注册），
+  判据见 TECHNICAL §5.5：匿名请求命中这些路径返回网关 401（路由已注册），
   而未注册路径返回应用层 JSON 404（`/billing/meter/daily-checkin` 实测 401，
   `/billing/nope` 实测 404，两者可区分）。
 - 签到 / 成长中心 / 活跃上报 —— **全部关闭**。

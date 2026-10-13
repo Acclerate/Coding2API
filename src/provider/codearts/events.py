@@ -64,13 +64,13 @@ EP_CALLER_IDENTITY = "/v5/caller-identity"
 # 运营活动（每日签到领积分）端点。**前缀与上面这批不一样：`/v1/ops/*` 挂在
 # snap 引擎根上、不带 `snap-manager`**——带上会回 APIG.0101「API does not exist」
 # （而 `/v1/statistics/plugin`、`/v1/current/user` 必须带）。两套前缀混用是
-# 之前扫不到这些接口的根因，Q72 实测记录。
+# 之前扫不到这些接口的根因，实测记录。
 EP_OPS_DELIVERY = "/v1/ops/delivery"
 EP_OPS_CLAIM = "/v1/ops/claim"
 EP_OPS_CONFIRM = "/v1/ops/confirm"
 # delivery 查询的渠道参数（上游按渠道返回可领活动，实测固定 `IDE`）。
 OPS_CHANNEL = "IDE"
-# 「每日签到领1000 积分」的活动 ID（Q72 实测：delivery 同时返回推荐码 3 /
+# 「每日签到领1000 积分」的活动 ID（实测：delivery 同时返回推荐码 3 /
 # 新用户 4 / 学生认证 2 / 每日签到 1，只有这个每天可领）。
 CAMPAIGN_DAILY_CREDIT = 1
 
@@ -324,7 +324,7 @@ def classify_error_code(code: str | None) -> ErrKind:
 def relogin_required(body: bytes) -> str:
     """令牌端点的非 2xx 响应体 → 该凭证是否已**不可自愈**，需要重新登录。
 
-    返回可直接展示的原因（不含上游正文，符合 M2 不回显上游响应的约束）；
+    返回可直接展示的原因（不含上游正文，符合 不回显上游响应的约束）；
     可重试的失败（网络、5xx、限流、绑定项齐全的普通 4xx）返回空串。
 
     为什么必须在这里判终态而不是让 RefreshTask 重试：refresh_token 一次性，
@@ -383,7 +383,7 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
 
 
 # ------------------------------------------------------------------ 每日签到
-# 上游 status 语义（Q72 实测三账号同时覆盖到三档，务必区分）：
+# 上游 status 语义（实测三账号同时覆盖到三档，务必区分）：
 #   ELIGIBLE  → 可领，`claimable=true`、`pendingTotalAmount` 是待领积分数
 #   CLAIMED   → **已领但未确认**（实测 hid_z- 就是这一档）。这不是终态：漏掉
 #               `/v1/ops/confirm` 积分可能不到账，故必须补一次确认而不是当已签。

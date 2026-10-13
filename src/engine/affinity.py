@@ -1,7 +1,7 @@
 """会话粘性：同一对话的多轮请求固定使用同一凭证。
 
 OpenAI Chat Completions 本身无会话概念，客户端（agent/CLI）的「对话」有
-两种可识别形态，按可靠性依次取用（B1.5）：
+两种可识别形态，按可靠性依次取用：
 
 1. **请求体显式会话标识**：`conversation_id` / `conversationId` /
    `prompt_cache_key`（`metadata` 对象内或请求体顶层）。客户端直接给出
@@ -90,7 +90,7 @@ class ConversationAffinity:
     """会话键 → 凭证的粘性表（单事件循环内使用，无需加锁）。"""
 
     def __init__(self, *, ttl_seconds: int, max_entries: int = 512) -> None:
-        # TTL 可热更（B3.2）：存取值器，每次读写读当前值。存量条目记录的
+        # TTL 可热更：存取值器，每次读写读当前值。存量条目记录的
         # 是「写入时的到期时刻」，调小 TTL 后旧条目按原到期时刻失效，
         # 不会因热更而突然全部作废（更不违背用户预期）。
         self._ttl_seconds = live(ttl_seconds)

@@ -240,7 +240,7 @@ async def test_executor_stream_auto_continue_emits_single_finish(dual_repo):
     db.close()
 
 async def test_dual_provider_same_model_routes_and_fails_over(dual_repo):
-    """同一扁平模型名下，一个上游失败 → 自动落到另一个（Q21=C 的核心价值）。
+    """同一扁平模型名下，一个上游失败 → 自动落到另一个（的核心价值）。
 
     用 pin 固定首个上游，避免依赖同分时的字母序挑选。
     """
@@ -268,7 +268,7 @@ async def test_dual_provider_forced_suffix_targets_single_upstream(dual_repo):
     db.close()
 
 async def test_dual_provider_error_classification_is_consistent(dual_repo):
-    """两个 provider 的错误分类都落到同一冷却语义（Q25=A 验证点）。"""
+    """两个 provider 的错误分类都落到同一冷却语义（验证点）。"""
     credentials, db = dual_repo
     credentials.add(provider="trae", credential_data={"accessToken": "a"})
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "b"})

@@ -172,7 +172,7 @@ def test_alert_settings_hot_update(tmp_path):
     db.close()
 
 def test_alert_webhook_rejects_non_http_scheme_and_too_many(tmp_path):
-    """M6：webhook 只接受 http/https，且条目数有上限。"""
+    """webhook 只接受 http/https，且条目数有上限。"""
 
     from src.db.repo import RuntimeSettingsRepository
     from src.runtime_settings import InvalidSetting, load_runtime_settings

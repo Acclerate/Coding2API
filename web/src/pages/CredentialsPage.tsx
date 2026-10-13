@@ -1,20 +1,44 @@
-import { Fragment, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
+  Activity,
   ArrowDownIcon,
+  Ban,
   CalendarCheck,
+  CalendarClock,
+  ChevronRight,
+  CircleCheck,
+  Coins,
   Database,
+  Flame,
   HeartPulse,
+  Hourglass,
   MoreHorizontal,
   Pin,
   Plus,
   Power,
   Radio,
   RefreshCw,
+  Search,
   Sparkles,
+  Timer,
+  ToggleLeft,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import {
+  ANY,
+  DEFAULT_FILTERS,
+  DEFAULT_GROUP_SORT,
+  groupByProvider,
+  matchesFilters,
+  providerOptions,
+  sortGroups,
+  STATE_ORDER,
+  stateOptions,
+} from "../lib/credentialList";
+import type { GroupSort } from "../lib/credentialList";
 import { api } from "../api/client";
 import { useSessionContext } from "../Layout";
 import { useCredentials, useQueryClient } from "../api/hooks";
@@ -54,17 +78,19 @@ import {
   STATE_TONE,
   tokenExpiryView,
 } from "../api/display";
+import type { CredentialState, TokenExpiryView } from "../api/display";
 import type { Credential, CreditEvent, GrowthRunResult } from "../api/types";
-import { PROVIDER_LABEL } from "../api/providers";
-import type { TokenExpiryView } from "../api/display";
+import { providerLabel } from "../api/providers";
 import {
   Badge,
   Button,
   Card,
   Empty,
   EmptyState,
+  Input,
   Notice,
   Panel,
+  Select,
   Table,
   TableBody,
   TableCell,
@@ -76,7 +102,7 @@ import {
 /**
  * 渠道是否支持每日签到。
  *
- * CodeArts 自 Q72 起接入 `/v1/ops/delivery`（此前「上游没有签到接口」的结论
+ * CodeArts 已接入 `/v1/ops/delivery`（此前「上游没有签到接口」的结论
  * 已推翻）。CodeBuddy 国际站（`codebuddy_intl`）**不支持**：上游
  * `/billing/meter/checkin-activity-status` 回 `active: false` 且活动字段全空
  * （渠道侧无此活动，非账号级未开启），后端相应把该渠道的 `checkin*` 置 None，
@@ -99,6 +125,17 @@ function supportsActivity(provider: Credential["provider"]): boolean {
   return provider === "codebuddy" || provider === "codebuddy_intl";
 }
 
+/**
+ * 渠道是否有「成长中心」这一列。
+ *
+ * 后端按能力探测（`getattr(provider, "growth", None)`），目前只有 CodeBuddy 有
+ * （国际站 `intl.py` 显式 `growth = None`）。与行内菜单项的判定同源，避免
+ * 「菜单里没有成长中心、列却常驻一列 —」的错配。
+ */
+function supportsGrowth(provider: string): boolean {
+  return provider === "codebuddy";
+}
+
 /** 套餐到期日：只要日期，时分秒对"哪个包先过期"没用。 */
 function packageExpiry(epoch: number | null): string {
   return epoch === null ? "—" : new Date(epoch * 1000).toLocaleDateString("zh-CN");
@@ -117,6 +154,27 @@ const GROWTH_STEP_TONE: Record<GrowthRunResult["steps"][number]["status"], strin
   idle: "text-muted-foreground",
   skipped: "text-muted-foreground",
   failed: "text-danger",
+};
+
+/**
+ * 组头状态分布的图标：与行内状态徽章的语义色同源，图形本身也表意
+ * （色 + 图形 + 文字三重冗余，不单靠颜色）。
+ */
+const STATE_ICON: Record<CredentialState, typeof CircleCheck> = {
+  ready: CircleCheck,
+  cooling: Timer,
+  disabled: Ban,
+  off: ToggleLeft,
+  exhausted: Flame,
+};
+
+/** 组头状态分布的文字色：`-ink` 变体保证在浅底 / 深底上都够对比。 */
+const STATE_TEXT: Record<CredentialState, string> = {
+  ready: "text-ok",
+  cooling: "text-warn-ink",
+  disabled: "text-danger-ink",
+  off: "text-muted-foreground",
+  exhausted: "text-danger-ink",
 };
 
 /** 一句话汇报：登录失效要单独提示「重新登录」，不能与普通失败混同。 */
@@ -176,6 +234,17 @@ export function CredentialsPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // 添加凭证对话框（登录渠道 / JSON 导入 / 免费层补回都收在里面）
   const [addOpen, setAddOpen] = useState(false);
+  // 列表筛选：池子一大就没有「找到某个号」的路径，这里收搜索 + 渠道 + 状态三件套。
+  // 筛选是纯展示层收敛，不改后端排序（后端仍按 sort/order 给全量）。
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  // 组排序：默认全站渠道顺序（固定，不随轮询跳动）；可切到「额度从高到低」，
+  // 先看还能打最多的渠道。仅重排组，组内行序仍由后端 sort/order 决定。
+  const [groupSort, setGroupSort] = useState<GroupSort>(DEFAULT_GROUP_SORT);
+  // 展开的渠道分组（值为渠道 id）。默认全折叠：组头已经给出「几个号、状态分布、
+  // 多少额度、多少即将过期」，先看渠道级结构，需要看具体账号时再展开——池子一大，
+  // 首屏铺开全部行反而看不出结构。筛选生效时自动展开命中的渠道（见 applyFilters），
+  // 否则「搜完却看不到结果」。
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // 操作结果统一走顶部居中浮层（toast），不再以插入式横幅撑开页面：
   // error 与 notice 各占一个槽位，同类提示只保留最新一条。
   const { toasts, push, dismiss } = useToasts();
@@ -203,6 +272,53 @@ export function CredentialsPage() {
   // 写门槛是 admin 或 operator（与后端 require_operator 同口径）；viewer 只读。
   const canWrite = data?.is_operator ?? false;
   const now = Date.now() / 1000;
+
+  // 先筛后分组：分组只是把筛选结果按渠道归类，不改变「哪些该出现」。
+  const filtered = useMemo(
+    () => credentials.filter((credential) => matchesFilters(credential, filters, now)),
+    // now 每 30s 轮询才变，纳入依赖是为了让「冷却中」筛选在到点后自动收放
+    [credentials, filters, now],
+  );
+  const groups = useMemo(
+    () => sortGroups(groupByProvider(filtered, now), groupSort),
+    [filtered, now, groupSort],
+  );
+  const providerCounts = useMemo(() => providerOptions(credentials), [credentials]);
+  const stateCounts = useMemo(
+    () => stateOptions(credentials, now, filters.state),
+    [credentials, now, filters.state],
+  );
+  // 是否有任何筛选生效：决定「N / 总数」计数与「清空」入口是否出现
+  const filtering =
+    filters.query.trim() !== "" || filters.provider !== ANY || filters.state !== ANY;
+
+  /**
+   * 更新筛选并同步展开态。
+   *
+   * 两个方向都要照顾：
+   * - 筛选**生效**时展开命中的渠道——否则「搜到了但看不到行」；
+   * - 筛选**清空**时收回全折叠——回到默认的渠道级总览。
+   * 组头始终可见，所以「先折叠、要看时点开」在无筛选时仍然成立。
+   */
+  const applyFilters = (next: typeof filters) => {
+    setFilters(next);
+    if (next.query.trim() !== "" || next.provider !== ANY || next.state !== ANY) {
+      setExpanded(new Set(groupByProvider(
+        credentials.filter((item) => matchesFilters(item, next, now)), now,
+      ).map((group) => group.provider)));
+    } else {
+      setExpanded(new Set());
+    }
+  };
+
+  const toggleGroup = (provider: string) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(provider)) next.delete(provider);
+      else next.add(provider);
+      return next;
+    });
+  };
 
   const refresh = () => client.invalidateQueries({ queryKey: ["admin"] });
 
@@ -416,64 +532,336 @@ export function CredentialsPage() {
             data-testid="no-credentials"
           />
         ) : (
-          <Table data-testid="credentials-table">
-            <TableHeader>
-              <TableRow>
-                <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
-                              direction={order} onToggle={toggle} testId="sort-nickname"
-                              hint={<ColumnHint text="昵称 + 所属渠道；「已指定」表示调度器优先使用该凭证（全局唯一）。" />} />
-                <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
-                              direction={order} onToggle={toggle} testId="sort-health"
-                              hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽；已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期自动恢复。健康度：剩余积分占比四态（已知百分比/未探测/无探测/已耗尽）。未探测＝探测失败或渠道未给额度信息（点「探测」可重试），≠已耗尽；无探测＝免费层上游根本没有额度接口。调度器优先选百分比高者，打平时再用账户剩余积分多者。" />} />
-                <SortableHead label="额度" columnKey="quota_remaining"
-                              active={sort === "quota_remaining"} direction={order}
-                              onToggle={toggle} testId="sort-quota_remaining"
-                              hint={<ColumnHint text="CodeBuddy 本周期剩余按日期重置；TRAE 账户剩余单调递减。到期额度行＝调度窗口内即将过期、会被优先消耗的额度；主窗口（36h）打平时才比较次窗口（7 天）。CodeArts 的额度是 token（每日 1000 万池、0 点清零），其余渠道是积分。数字后的下箭头展开该凭证的积分记录（两次额度探测之间的净变化）。" />} />
-                <SortableHead label="token 剩余" columnKey="token_expires_at"
-                              active={sort === "token_expires_at"} direction={order}
-                              onToggle={toggle} testId="sort-token_expires_at"
-                              hint={<ColumnHint text="access token 距离到期还有多久，取自凭证本身（为 0 表示渠道未给到期信息，显示 —）。预刷新任务每小时检查一次，进入 24 小时窗口即自动续期；「已过期」意味着上游会拒绝该凭证，需重新登录。" />} />
-                <SortableHead label="成长中心" columnKey="growth_last_run_at"
-                              active={sort === "growth_last_run_at"} direction={order}
-                              onToggle={toggle} testId="sort-growth_last_run_at"
-                              hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时单行截断，悬浮看全文。" />} />
-                {canWrite && <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻按钮。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录入口在额度列数字后的下箭头。" /></span></TableHead>}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {credentials.map((credential) => (
-                <Fragment key={credential.id}>
-                  <Row
-                    credential={credential}
-                    now={now}
-                    expiryWindow={expiryWindow}
-                    expirySecondaryWindow={expirySecondaryWindow}
-                    tokenWarning={tokenWarning}
-                    canWrite={canWrite}
-                    busy={busy}
-                    confirming={confirmDelete === credential.id}
-                    creditsOpen={creditEvents?.credentialId === credential.id}
-                    onConfirmDelete={setConfirmDelete}
-                    actions={actions}
-                  />
-                  {creditEvents?.credentialId === credential.id && (
-                    <TableRow data-testid={`credit-row-${credential.id}`}>
-                      <TableCell colSpan={canWrite ? 6 : 5} className="p-0">
-                        <CreditDrawer
-                          credentialId={credential.id}
-                          events={creditEvents.events}
-                          sort={creditEvents.sort}
-                          order={creditEvents.order}
-                          onSort={sortCredits}
-                          onClose={() => actions.credits(credential)}
-                        />
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </Fragment>
-              ))}
-            </TableBody>
-          </Table>
+          <>
+            {/* 筛选工具条：池子一大，「找到某个号」就没有路径了。搜索 + 渠道 +
+                状态三件套都是纯展示层收敛，不改后端排序（后端仍按 sort/order
+                给全量）。「筛选后 N / 总数」只在真的筛了才出现，不筛时不制造噪声。 */}
+            <div className="flex flex-wrap items-center gap-2 pb-3" data-testid="credentials-toolbar">
+              <div className="relative">
+                <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={filters.query}
+                  data-testid="credential-search"
+                  aria-label="搜索凭证"
+                  placeholder="搜索昵称 / 渠道 / id"
+                  className="h-8 w-full pl-7 text-xs sm:w-52"
+                  onChange={(event) => applyFilters({ ...filters, query: event.target.value })}
+                />
+              </div>
+              <Select
+                value={filters.provider}
+                data-testid="credential-provider-filter"
+                aria-label="按渠道筛选"
+                className="h-8 w-40 text-xs"
+                onChange={(event) => applyFilters({ ...filters, provider: event.target.value })}
+              >
+                <option value={ANY}>全部渠道（{credentials.length}）</option>
+                {providerCounts.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}（{option.count}）
+                  </option>
+                ))}
+              </Select>
+              <Select
+                value={filters.state}
+                data-testid="credential-state-filter"
+                aria-label="按状态筛选"
+                className="h-8 w-36 text-xs"
+                onChange={(event) => applyFilters({ ...filters, state: event.target.value })}
+              >
+                <option value={ANY}>全部状态（{credentials.length}）</option>
+                {stateCounts.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}（{option.count}）
+                  </option>
+                ))}
+              </Select>
+              {/* 组排序：只重排「渠道组」，不动组内行序（行序仍由列头 / 后端 sort 决定）。
+                  默认「额度从高到低」——先看还能打最多的渠道；额度排序时无额度接口的
+                  免费层垫底（它们没有「剩余额度」可比）。 */}
+              <Select
+                value={groupSort}
+                data-testid="credential-group-sort"
+                aria-label="渠道分组排序"
+                className="h-8 w-40 text-xs"
+                onChange={(event) => setGroupSort(event.target.value as GroupSort)}
+              >
+                <option value="quota">额度从高到低</option>
+                <option value="provider">渠道顺序</option>
+              </Select>
+              {filtering && (
+                <>
+                  <span
+                    className="text-xs text-muted-foreground"
+                    data-testid="credential-filter-count"
+                  >
+                    筛选后 <strong className="tabular-nums text-foreground">{filtered.length}</strong>
+                    {" / "}
+                    {credentials.length}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    data-testid="credential-clear-filters"
+                    onClick={() => applyFilters(DEFAULT_FILTERS)}
+                  >
+                    清空
+                  </Button>
+                </>
+              )}
+            </div>
+
+            {filtered.length === 0 ? (
+              <EmptyState
+                icon={<Search className="size-5" />}
+                title="没有匹配的凭证"
+                description="换个关键词，或清空渠道 / 状态筛选查看全部。"
+                data-testid="no-credential-match"
+              />
+            ) : (
+              // 长列表限高 + 吸顶列头：列头随每个展开的渠道组渲染（见 ColumnHeaderRow），
+              // 滚到第 20 行时列名与操作按钮还在，不必回顶确认「这一列到底是什么」。
+              <Table
+                data-testid="credentials-table"
+                containerClassName="max-h-[70vh] overflow-auto"
+              >
+                <TableBody>
+                  {groups.map((group) => {
+                    const isCollapsed = !expanded.has(group.provider);
+                    // 到期积分：以「窗口 + 数字」两个图块呈现，比一行长句更像仪表盘。
+                    // 主/次窗口措辞区分开（主窗口 36h 是次窗口 7 天的子集）。
+                    const primaryWindowLabel = `${formatDuration(expiryWindow)}内过期`;
+                    const secondaryWindowLabel = `${formatDuration(expirySecondaryWindow)}内过期`;
+                    const hasExpiring = (group.expiring ?? 0) > 0;
+                    // 次窗口只在**比主窗口多出东西**时才展示：次窗口是主窗口的超集，
+                    // 相等就意味着「没有超出 1.5 天窗口的部分」。CodeArts 的每日池
+                    // 当天清零，两个窗口恒等，同时列两块只是把同一个数字说两遍。
+                    const hasExpiringSecondary =
+                      (group.expiringSecondary ?? 0) > (group.expiring ?? 0);
+                    // 成长中心列只在支持的渠道出现（见 supportsGrowth）；**但表格列数
+                    // 保持恒定**：不支持的渠道由操作列 colSpan 吃掉那一格。表格是 auto
+                    // 布局，列数一变就重算列宽，展开的下一组会整列错位。
+                    const showGrowth = supportsGrowth(group.provider);
+                    const columnCount = canWrite ? 6 : 5;
+                    // 额度合计的进度条：剩余 / 总量（免费层两者皆 null，不出条）
+                    const quotaPct =
+                      group.remaining !== null && group.total !== null && group.total > 0
+                        ? Math.min(100, Math.max(0, (group.remaining / group.total) * 100))
+                        : null;
+                    return (
+                      <Fragment key={group.provider}>
+                        {/* 组头：折叠时的「渠道仪表盘」——身份 + 状态分布 + 额度合计 +
+                            1.5 天 / 7 天内将过期的积分。每个指标一个带图标的图块，
+                            比一行纯文字更好扫读；点击展开该渠道（默认全折叠）。 */}
+                        <TableRow data-testid={`group-${group.provider}`}>
+                          <TableCell
+                            colSpan={columnCount}
+                            className="bg-muted/40 p-0"
+                          >
+                            <button
+                              type="button"
+                              data-testid={`group-toggle-${group.provider}`}
+                              aria-expanded={!isCollapsed}
+                              onClick={() => toggleGroup(group.provider)}
+                              className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                            >
+                              {/* 身份：折叠箭头 + 品牌图标 + 渠道名 + 账号数 */}
+                              <span className="flex w-48 shrink-0 items-center gap-2">
+                                <ChevronRight
+                                  className={cn(
+                                    "size-4 shrink-0 text-muted-foreground transition-transform",
+                                    !isCollapsed && "rotate-90",
+                                  )}
+                                  aria-hidden
+                                />
+                                <span className="grid size-7 shrink-0 place-items-center rounded-md bg-background ring-1 ring-border/70">
+                                  <ProviderIcon provider={group.provider} size={16} />
+                                </span>
+                                <span className="min-w-0">
+                                  <span className="block truncate text-[13px] leading-tight font-semibold text-foreground">
+                                    {providerLabel(group.provider)}
+                                  </span>
+                                  <span className="block text-xs leading-tight text-muted-foreground tabular-nums">
+                                    {group.items.length} 个账号
+                                  </span>
+                                </span>
+                              </span>
+
+                              {/* 指标区：状态 / 额度 / 到期，每个都是「图标 + 标签 + 数值」。
+                                  每块**固定宽度**（`w-* shrink-0`），否则内容宽度随渠道变化，
+                                  各组的「状态 / 额度 / 到期」起点会各错各的、读起来不成列。
+                                  窄屏放不下时按整块换行，块内仍保持同一套对齐。 */}
+                              <span className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                                {/* 状态分布：只列出现过的态，图标语义与行内状态徽章同源 */}
+                                <span className="flex w-40 shrink-0 items-center gap-2">
+                                  <span className="grid size-7 shrink-0 place-items-center rounded-md bg-background text-muted-foreground ring-1 ring-border/70">
+                                    <Activity className="size-3.5" aria-hidden />
+                                  </span>
+                                  <span className="min-w-0">
+                                    <span className="block text-[11px] leading-tight text-muted-foreground">状态</span>
+                                    <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                      {STATE_ORDER.filter(
+                                        (state) => (group.states[state] ?? 0) > 0,
+                                      ).map((state) => {
+                                        const StateIcon = STATE_ICON[state];
+                                        return (
+                                          <span
+                                            key={state}
+                                            className="inline-flex items-center gap-1 text-xs leading-tight"
+                                            data-testid={`group-${group.provider}-state-${state}`}
+                                          >
+                                            <StateIcon
+                                              className={cn("size-3.5", STATE_TEXT[state])}
+                                              aria-hidden
+                                            />
+                                            <span className={STATE_TEXT[state]}>
+                                              {STATE_LABEL[state]}
+                                            </span>
+                                            <span className="tabular-nums text-muted-foreground">
+                                              {" "}
+                                              {group.states[state]}
+                                            </span>
+                                          </span>
+                                        );
+                                      })}
+                                    </span>
+                                  </span>
+                                </span>
+
+                                {/* 额度合计：占比环 + 剩余 / 总量（标签行带精确百分比）。
+                                    免费层（zen / kilo）无额度接口，null 显示 — 且不出环，
+                                    退回一个中性图标位保持各块对齐。 */}
+                                <span className="flex w-48 shrink-0 items-center gap-2">
+                                  {quotaPct !== null ? (
+                                    <span data-testid={`group-${group.provider}-quota-pct`}>
+                                      <QuotaRing pct={quotaPct} />
+                                    </span>
+                                  ) : (
+                                    <span className="grid size-7 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground ring-1 ring-border/70">
+                                      <Coins className="size-3.5" aria-hidden />
+                                    </span>
+                                  )}
+                                  <span
+                                    className="min-w-0"
+                                    title="组内各号额度合计（只统计有额度接口的号；免费层无此接口，显示 —）"
+                                  >
+                                    <span className="block text-[11px] leading-tight text-muted-foreground">
+                                      额度合计
+                                      {quotaPct !== null && (
+                                        <span className="ml-1 tabular-nums text-ok-ink">
+                                          {Math.round(quotaPct)}%
+                                        </span>
+                                      )}
+                                    </span>
+                                    <span className="block truncate text-xs leading-tight font-medium tabular-nums text-foreground">
+                                      {group.remaining === null
+                                        ? "—"
+                                        : formatNumber(group.remaining)}
+                                      {group.total !== null && (
+                                        <span className="font-normal text-muted-foreground">
+                                          {" / "}
+                                          {formatNumber(group.total)}
+                                        </span>
+                                      )}
+                                    </span>
+                                  </span>
+                                </span>
+
+                                {/* 到期积分：主窗口（1.5 天）与次窗口（7 天）各一块。
+                                    缺席的窗口不渲染（轨道留空），前几块的对齐不受影响。 */}
+                                {hasExpiring && (
+                                  <span
+                                    className="flex w-36 shrink-0 items-center gap-2"
+                                    data-testid={`group-${group.provider}-expiring`}
+                                    title={`组内各号主窗口（${formatDuration(expiryWindow)}）内将过期的积分合计`}
+                                  >
+                                    <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
+                                      <Hourglass className="size-3.5" aria-hidden />
+                                    </span>
+                                    <span className="min-w-0">
+                                      <span className="block text-[11px] leading-tight text-warn-ink">
+                                        {primaryWindowLabel}
+                                      </span>
+                                      <span className="block text-xs leading-tight font-medium tabular-nums text-warn-ink">
+                                        {formatNumber(group.expiring ?? 0)} {QUOTA_UNIT}
+                                      </span>
+                                    </span>
+                                  </span>
+                                )}
+                                {hasExpiringSecondary && (
+                                  <span
+                                    className="flex w-36 shrink-0 items-center gap-2"
+                                    data-testid={`group-${group.provider}-expiring-secondary`}
+                                    title={`组内各号次窗口（${formatDuration(expirySecondaryWindow)}）内将过期的积分合计，含主窗口的部分`}
+                                  >
+                                    <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
+                                      <CalendarClock className="size-3.5" aria-hidden />
+                                    </span>
+                                    <span className="min-w-0">
+                                      <span className="block text-[11px] leading-tight text-warn-ink">
+                                        {secondaryWindowLabel}
+                                      </span>
+                                      <span className="block text-xs leading-tight font-medium tabular-nums text-warn-ink">
+                                        {formatNumber(group.expiringSecondary ?? 0)} {QUOTA_UNIT}
+                                      </span>
+                                    </span>
+                                  </span>
+                                )}
+                              </span>
+                            </button>
+                          </TableCell>
+                        </TableRow>
+                        {!isCollapsed && (
+                          <>
+                            <ColumnHeaderRow
+                              provider={group.provider}
+                              canWrite={canWrite}
+                              showGrowth={showGrowth}
+                              sort={sort}
+                              order={order}
+                              toggle={toggle}
+                            />
+                            {group.items.map((credential) => (
+                              <Fragment key={credential.id}>
+                                <Row
+                                  credential={credential}
+                                  now={now}
+                                  expiryWindow={expiryWindow}
+                                  expirySecondaryWindow={expirySecondaryWindow}
+                                  tokenWarning={tokenWarning}
+                                  canWrite={canWrite}
+                                  showGrowth={showGrowth}
+                                  busy={busy}
+                                  confirming={confirmDelete === credential.id}
+                                  creditsOpen={creditEvents?.credentialId === credential.id}
+                                  onConfirmDelete={setConfirmDelete}
+                                  actions={actions}
+                                />
+                                {creditEvents?.credentialId === credential.id && (
+                                  <TableRow data-testid={`credit-row-${credential.id}`}>
+                                    <TableCell colSpan={columnCount} className="p-0">
+                                      <CreditDrawer
+                                        credentialId={credential.id}
+                                        events={creditEvents.events}
+                                        sort={creditEvents.sort}
+                                        order={creditEvents.order}
+                                        onSort={sortCredits}
+                                        onClose={() => actions.credits(credential)}
+                                      />
+                                    </TableCell>
+                                  </TableRow>
+                                )}
+                              </Fragment>
+                            ))}
+                          </>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            )}
+          </>
         )}
       </Panel>
 
@@ -581,7 +969,7 @@ function ModelCooldownList({ credential, now }: { credential: Credential; now: n
 }
 
 /**
- * access token 到期展示（B3.3）。
+ * access token 到期展示。
  *
  * 只说一件事：还剩多久。进度条与「最后续期」都不给：
  * - 进度条的量纲是 token 自己的寿命（`exp - iat`），两个渠道分别是 55 天和
@@ -612,6 +1000,127 @@ function TokenExpiry({
   );
 }
 
+/**
+ * 额度占比环：SVG 圆环画「剩余 / 总量」，纯图形仪表（不塞圆心文字）。
+ *
+ * 用环不用条：组头已经是一个多图块的「仪表盘」，横条要占一整行宽度、还只能在
+ * 数字右侧挤着；环是定宽正方，跟 28px 的图标块同高，能直接顶掉原来那个图标位。
+ *
+ * 圆心不放文字：28px 的环内径不到 18px，`100%` 这种四字符放进去必然截断。
+ * 精确百分比交给旁边的「额度合计」标签行（11px，可读），环只负责一眼看比例。
+ *
+ * 用 `stroke-dasharray` 画进度而不是两段 `path`：算出弧长即可，颜色走
+ * `currentColor`（父级 `text-ok`），明暗两态自动跟随 token。
+ */
+function QuotaRing({ pct }: { pct: number }) {
+  // 半径 9、描边 3.5：外径 21.5，在 28px 的方块里留出呼吸，环身也够粗
+  const radius = 9;
+  const circumference = 2 * Math.PI * radius;
+  const remaining = Math.min(circumference, Math.max(0, (pct / 100) * circumference));
+  return (
+    <span className="grid size-7 shrink-0 place-items-center text-ok">
+      <svg viewBox="0 0 24 24" className="size-7 -rotate-90" aria-hidden>
+        {/* 空余轨道：整圈淡色，剩余弧叠在上面 */}
+        <circle
+          cx="12"
+          cy="12"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeOpacity={0.16}
+          strokeWidth={3.5}
+        />
+        {/* 100% 时 dasharray 的零长段配 round 端帽会多出一个圆点，直接画整圈；
+            0% 时同理会留下一个点，干脆不画进度弧。 */}
+        {remaining >= circumference ? (
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={3.5}
+          />
+        ) : remaining > 0 ? (
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={3.5}
+            strokeLinecap="round"
+            strokeDasharray={`${remaining} ${circumference - remaining}`}
+          />
+        ) : null}
+      </svg>
+    </span>
+  );
+}
+
+/**
+ * 列头行：**迁移到每个展开的渠道组内部**，不再是全局表头。
+ *
+ * 折叠态下组头本身就是一张渠道仪表盘，列名没有对应内容；只有展开某组时才需要
+ * 「这一列是什么」的锚点。所以列头跟着展开区走，并在滚动容器里吸顶（`[&>th]:sticky`）。
+ *
+ * `[&>th]:bg-muted` 必须不透明：基类给 tr 设的是 `bg-muted/40`，滚动时行内容
+ * 会从半透明的表头底色里透出来。`testId` 带渠道前缀——多个组同时展开时，
+ * 同一列会渲染多份，不带前缀会撞 id。
+ */
+function ColumnHeaderRow({
+  provider,
+  canWrite,
+  showGrowth,
+  sort,
+  order,
+  toggle,
+}: {
+  provider: string;
+  canWrite: boolean;
+  showGrowth: boolean;
+  sort: string;
+  order: "asc" | "desc";
+  toggle: (columnKey: string) => void;
+}) {
+  return (
+    <TableRow
+      data-testid={`column-header-${provider}`}
+      className="hover:bg-transparent [&>th]:sticky [&>th]:top-0 [&>th]:z-10 [&>th]:h-9 [&>th]:bg-muted"
+    >
+      <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
+                    direction={order} onToggle={toggle} testId={`sort-${provider}-nickname`}
+                    hint={<ColumnHint text="昵称；「已指定」表示调度器优先使用该凭证（全局唯一）。渠道名与数量在分组标题行，行内不再重复。" />} />
+      <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
+                    direction={order} onToggle={toggle} testId={`sort-${provider}-health`}
+                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽；已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期自动恢复。健康度：剩余积分占比四态（已知百分比/未探测/无探测/已耗尽）。未探测＝探测失败或渠道未给额度信息（点「探测」可重试），≠已耗尽；无探测＝免费层上游根本没有额度接口。调度器优先选百分比高者，打平时再用账户剩余积分多者。" />} />
+      <SortableHead label="额度" columnKey="quota_remaining"
+                    active={sort === "quota_remaining"} direction={order}
+                    onToggle={toggle} testId={`sort-${provider}-quota_remaining`}
+                    hint={<ColumnHint text="剩余 / 总量。周期语义按渠道不同（CodeBuddy 本周期剩余、TRAE 账户剩余单调递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口），悬浮额度数字查看本行的口径。到期额度行＝调度窗口内即将过期、会被优先消耗的额度；主窗口（36h）打平时才比较次窗口（7 天）。数字后的下箭头展开该凭证的积分记录（两次额度探测之间的净变化）。" />} />
+      <SortableHead label="token 剩余" columnKey="token_expires_at"
+                    active={sort === "token_expires_at"} direction={order}
+                    onToggle={toggle} testId={`sort-${provider}-token_expires_at`}
+                    hint={<ColumnHint text="access token 距离到期还有多久，取自凭证本身（为 0 表示渠道未给到期信息，显示 —）。预刷新任务每小时检查一次，进入 24 小时窗口即自动续期；「已过期」意味着上游会拒绝该凭证，需重新登录。" />} />
+      {/* 成长中心列只在支持的渠道出现：其余渠道后端没有 growth 能力，常驻一列只会整列「—」。
+          **但列数必须恒定**：表格是 auto 布局，少一格会重算整张表的列宽，下面展开的组
+          就会整列错位（操作列从 1207 跳到 926）。故不支持的渠道用一个空占位格顶住，
+          而不是让操作列 colSpan 吃掉——占位格不参与内容定宽，列宽口径才不变。 */}
+      {showGrowth ? (
+        <SortableHead label="成长中心" columnKey="growth_last_run_at"
+                      active={sort === "growth_last_run_at"} direction={order}
+                      onToggle={toggle} testId={`sort-${provider}-growth_last_run_at`}
+                      hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时单行截断，悬浮看全文。" />} />
+      ) : (
+        <TableHead aria-hidden />
+      )}
+      {canWrite && (
+        <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻按钮。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录入口在额度列数字后的下箭头。" /></span></TableHead>
+      )}
+    </TableRow>
+  );
+}
+
 function Row({
   credential,
   now,
@@ -619,6 +1128,7 @@ function Row({
   expirySecondaryWindow,
   tokenWarning,
   canWrite,
+  showGrowth,
   busy,
   confirming,
   creditsOpen,
@@ -631,6 +1141,7 @@ function Row({
   expirySecondaryWindow: number;
   tokenWarning: number;
   canWrite: boolean;
+  showGrowth: boolean;
   busy: boolean;
   confirming: boolean;
   creditsOpen: boolean;
@@ -639,9 +1150,10 @@ function Row({
 }) {
   const expiring = expiringQuotaLabel(
     credential.quota_expiring_credits, expiryWindow, "primary", QUOTA_UNIT);
-  // 次窗口只在主窗口没有可展示内容时才渲染：7 天窗口是 36h 的超集，
-  // 主窗口已有数字时再列一行只会重复。它的作用是解释「36h 内没有
-  // 到期积分、但一周内会过期」的账号为何仍被优先选中。
+  // 次窗口只在**比主窗口多**时才渲染：7 天窗口是 36h 的超集，两块数字相同
+  // 说明没有「超出主窗口的部分」（CodeArts 每日池当天清零，两窗口恒等），
+  // 再列一行只是把同一个数字说两遍。它的作用是解释「36h 内没有到期积分、
+  // 但一周内会过期」的账号为何仍被优先选中。
   const expiringSecondary = expiring
     ? null
     : expiringQuotaLabel(
@@ -661,23 +1173,16 @@ function Row({
   return (
     <TableRow data-testid={`row-${credential.id}`}>
       <TableCell>
-        {/* 昵称 + 渠道合并成一列：渠道名做小字副行，省一列横向空间 */}
-        <div className="flex items-center gap-2">
-          <ProviderIcon provider={credential.provider} size={14} />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span
-                className="truncate font-medium"
-                title={credential.nickname || credential.id.slice(0, 12)}
-              >
-                {credential.nickname || credential.id.slice(0, 12)}
-              </span>
-              {credential.pinned === 1 && <Badge tone="accent">已指定</Badge>}
-            </div>
-            <div className="text-xs text-muted-foreground">
-              {PROVIDER_LABEL[credential.provider]}
-            </div>
-          </div>
+        {/* 渠道名不在这里重复：它已在组头（按渠道分组后，同一组内所有行的渠道名
+            完全相同）。昵称单独占一行，「已指定」紧贴昵称。 */}
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className="truncate font-medium"
+            title={credential.nickname || credential.id.slice(0, 12)}
+          >
+            {credential.nickname || credential.id.slice(0, 12)}
+          </span>
+          {credential.pinned === 1 && <Badge tone="accent">已指定</Badge>}
         </div>
       </TableCell>
       <TableCell>
@@ -702,7 +1207,13 @@ function Row({
           {/* 数字与积分记录入口同处一个 inline-flex：按钮跟数字做行内居中对齐，
               而不是与整行 baseline 对齐（图标按钮没有文字基线，会明显偏低）。 */}
           <span className="inline-flex items-center gap-1">
-            <span>
+            <span
+              // 周期语义（本周期剩余 / 账户剩余 / 每日池 / 重置日期）从独立的
+              // 第三行收进数字的悬浮说明：同一渠道所有行的这句话几乎完全一样，
+              // 逐行复读只是把行高撑高一倍。虚线下划线提示这里可悬浮。
+              className="cursor-help underline decoration-dotted underline-offset-2"
+              title={quotaSemantics(credential)}
+            >
               {formatNumber(credential.quota_remaining)} / {formatNumber(credential.quota_total)}
             </span>
             {/* 积分记录入口紧贴它要解释的数字：曾经在「更多操作」菜单里，
@@ -746,26 +1257,30 @@ function Row({
             {expiringSecondary}
           </div>
         )}
-        <div className="text-muted-foreground">{quotaSemantics(credential)}</div>
       </TableCell>
       <TableCell className="text-xs">
         <TokenExpiry credential={credential} view={tokenExpiry} />
       </TableCell>
-      <TableCell className="text-xs text-muted-foreground">
-        {credential.growth_last_result ? (
-          // 汇报可能很长（多步领取串成一行）：限宽单行截断，hover 看全文
-          <LongTextTip content={credential.growth_last_result}>
-            <div data-testid={`growth-${credential.id}`} className="max-w-[22rem]">
-              <div className="truncate">{credential.growth_last_result}</div>
-              <div className="text-muted-foreground">
-                {formatTime(credential.growth_last_run_at)}
+      {showGrowth && (
+        <TableCell className="text-xs text-muted-foreground">
+          {credential.growth_last_result ? (
+            // 汇报可能很长（多步领取串成一行）：限宽单行截断，hover 看全文
+            <LongTextTip content={credential.growth_last_result}>
+              <div data-testid={`growth-${credential.id}`} className="max-w-[22rem]">
+                <div className="truncate">{credential.growth_last_result}</div>
+                <div className="text-muted-foreground">
+                  {formatTime(credential.growth_last_run_at)}
+                </div>
               </div>
-            </div>
-          </LongTextTip>
-        ) : (
-          <span>—</span>
-        )}
-      </TableCell>
+            </LongTextTip>
+          ) : (
+            <span>—</span>
+          )}
+        </TableCell>
+      )}
+      {/* 同 ColumnHeaderRow：不支持的渠道用一个空占位格顶住成长中心那一列，
+          列数恒定，操作列才落在同一列上（表格是 auto 布局）。 */}
+      {!showGrowth && <TableCell aria-hidden />}
       {canWrite && (
         <TableCell>
           <div className="flex items-center justify-end gap-1">
@@ -788,7 +1303,7 @@ function Row({
                 {/* 探测 / 签到是高频日常动作，从「更多」菜单提出来常驻，
                     少一次点击；其余低频动作仍收在菜单里。
                     zen / kilo 免费层探测无意义（上游无额度接口，探测恒失败）；
-                    签到现全渠道支持（CodeArts 自 Q72 起接入）。 */}
+                    签到现全渠道支持（CodeArts 已接入）。 */}
                 {hasQuotaProbe(credential.provider) && (
                   <>
                     <Button
@@ -826,7 +1341,7 @@ function Row({
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-44">
-                    {credential.provider === "codebuddy" && (
+                    {supportsGrowth(credential.provider) && (
                       <DropdownMenuItem
                         onSelect={() => actions.growth(credential)}
                         title="手动跑一轮成长中心领取（与定时任务同一条路径）"
@@ -872,7 +1387,7 @@ function Row({
 }
 
 /**
- * 积分记录抽屉（B3.4）：同一行内展开，不弹层。
+ * 积分记录抽屉：同一行内展开，不弹层。
  *
  * 语义纪律：这里展示的是**两次额度探测之间的净变化**，不是动作归因。上游
  * 签到/成长接口不打日志，diff 看不到分数是谁加的，所以文案一律说「净变化」，

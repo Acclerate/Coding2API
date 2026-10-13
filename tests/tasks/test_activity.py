@@ -172,7 +172,7 @@ def test_activity_task_day_key_is_cn_local():
     assert task._day_key() == "2026-09-21"
 
 def test_build_runner_activity_toggle(tmp_path):
-    """活跃上报恒建对象，开关只决定跑不跑（B3.2 起可热更）。
+    """活跃上报恒建对象，开关只决定跑不跑（开关可热更）。
 
     以前是「关闭就不装配」，那样管理台把开关打开后必须重启才生效；现在
     对象总在，`_sync_activity` 每轮现读开关。

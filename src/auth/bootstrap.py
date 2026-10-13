@@ -1,4 +1,4 @@
-"""启动引导（B5）：把身份从 users.txt + env 交接给 SQLite。
+"""启动引导：把身份从 users.txt + env 交接给 SQLite。
 
 四步，顺序有依赖：
 

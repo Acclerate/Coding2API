@@ -1,4 +1,4 @@
-"""运行时配置热更（B3.2）：覆盖层语义、仓储、管理台端点。
+"""运行时配置热更：覆盖层语义、仓储、管理台端点。
 
 这一组测试守着三条容易退化的语义：
 1. 生效值 = DB 覆盖 > env 默认；「恢复默认」必须真的把行删掉而不是写空串。
@@ -153,7 +153,7 @@ def test_parse_value_rejects_overlong_string_setting():
 
 
 def test_error_summary_controlled_identifiers():
-    """M2：对外错误标识取自受控字段（status / error_code / 类名），不含正文。"""
+    """对外错误标识取自受控字段（status / error_code / 类名），不含正文。"""
     from src.engine.executor import _error_summary
 
     class WithStatus(Exception):

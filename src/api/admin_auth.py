@@ -157,7 +157,7 @@ def create_router(services: Services) -> APIRouter:
             if not callable(builder):
                 raise InvalidRequest(f"provider {provider_id!r} does not support login")
             session = builder(resolve_public_callback_url(services.settings))
-            # 按发起人分键登记待完成回调（M7）：单槽全局态会让两个管理员的
+            # 按发起人分键登记待完成回调：单槽全局态会让两个管理员的
             # 并发登录互相覆盖，把 A 的凭证记到 B 名下；按用户名分键后，
             # 同网段的人也无法用自己的 refreshToken 顶掉别人进行中的登录。
             pending = request.app.state.pending_callbacks

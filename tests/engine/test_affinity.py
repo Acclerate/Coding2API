@@ -97,7 +97,7 @@ def test_eviction_drops_expired_first_then_oldest():
     assert len(affinity) == 2
 
 
-# ------------------------------------------------- 显式会话标识（B1.5）
+# ------------------------------------------------- 显式会话标识
 
 @pytest.mark.parametrize("container,key", [
     ("metadata", "conversation_id"),
@@ -328,7 +328,7 @@ async def test_stream_ignores_sticky_when_not_in_candidates():
 
 @pytest.mark.asyncio
 async def test_stream_sticky_yields_to_manual_pin():
-    """手动 pin 优先于粘性（PROPOSAL §4.3）：管理员显式指定的凭证不被粘性顶掉。"""
+    """手动 pin 优先于粘性（PROPOSAL §3.3）：管理员显式指定的凭证不被粘性顶掉。"""
     provider = FakeProvider()
     affinity = FakeAffinity(pinned="c_z")
     executor = Executor(ExecutorDeps(
@@ -399,7 +399,7 @@ async def test_complete_sticks_across_turns():
 
 @pytest.mark.asyncio
 async def test_executor_passes_whole_raw_to_affinity():
-    """B1.5：executor 把整个 request.raw 交给 affinity（而非仅 messages）。"""
+    """executor 把整个 request.raw 交给 affinity（而非仅 messages）。"""
     provider = FakeProvider()
     affinity = FakeAffinity(pinned=None)
     executor = Executor(ExecutorDeps(

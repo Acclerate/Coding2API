@@ -1,6 +1,6 @@
-"""Qoder 设备码 PKCE 登录（poll 轨道，Q17=C）。
+"""Qoder 设备码 PKCE 登录（poll 轨道）。
 
-流程（PROPOSAL §3.3 / 逆向记录）：
+流程（PROPOSAL §2.3 / 逆向记录）：
 
 1. 本地生成 PKCE `verifier/challenge(S256)` 与 `nonce`，拼出授权 URL
    `{website}/device/selectAccounts?...`，用户浏览器授权；
@@ -264,7 +264,7 @@ class QoderOAuth:
         if response.status_code in PENDING_STATUS:
             return None
         if response.status_code != 200:
-            # 内部文案带上游正文片段仅供日志；对外只给受控 status（M2/M6）。
+            # 内部文案带上游正文片段仅供日志；对外只给受控 status。
             logger.info("Qoder device poll HTTP %s: %r", response.status_code,
                         response.content[:160])
             raise UpstreamProtocolViolation(

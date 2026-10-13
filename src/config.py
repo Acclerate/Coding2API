@@ -1,4 +1,4 @@
-"""启动配置：pydantic-settings 绑定 env（T-Q3）。
+"""启动配置：pydantic-settings 绑定 env。
 
 立项定义的配置项在此定型，缺必填项在进程启动阶段失败。
 """
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     allowed_hosts: str = ""
     # 额外放行 FastAPI TestClient 的默认 Host `testserver`。**仅测试用**，默认
     # 关闭：单标签主机名可能被本地 DNS 搜索域解析到本服务，等于给 DNS rebinding
-    # 留了一个免校验入口（M14）。测试由 conftest 的 autouse 夹具置 true。
+    # 留了一个免校验入口。测试由 conftest 的 autouse 夹具置 true。
     allow_test_host: bool = False
     # 是否暴露 /docs 与 /openapi.json：默认关闭（匿名可拉全量 API 结构）。
     # 本地调试需要 Swagger 时置 true
@@ -83,7 +83,7 @@ class Settings(BaseSettings):
         "https://opengw.developer.huaweicloud.com,"
         "https://codearts.huaweicloud.com"
     )
-    # 按渠道出站代理（P1-6，启动期项，见 provider/proxy.py）：格式
+    # 按渠道出站代理（启动期项，见 provider/proxy.py）：格式
     # `渠道=代理URL;渠道2=代理URL2`，协议 http/https/socks5/socks5h；留空 = 直连。
     # 代理作用于连接池，运行中改值需重启，故不做热更。
     provider_proxies: str = ""
@@ -131,12 +131,12 @@ class Settings(BaseSettings):
     # 需要保守部署时可关闭：关闭后仍会领取旅行礼物与任务奖励。
     growth_interval_minutes: int = 60
     growth_irreversible_actions: bool = True
-    # 活跃上报（B1.7，CodeBuddy 与 CodeBuddy 国际版）：默认关闭。给账号补发一条
+    # 活跃上报（CodeBuddy 与 CodeBuddy 国际版）：默认关闭。给账号补发一条
     # 对话事件，续上成长中心连登天数/活跃地图，与积分、调度无关。官方条款禁止脚本
     # 篡改活动数据（处罚为取消资格并追回礼品），开启前请评估账号风险；上游改版即失效。
     activity_report_enabled: bool = False
     activity_report_hour: int = 10          # 本地（北京）时间整点窗口内执行一次
-    # 运维告警（P1-7）：周期评估四类风险，命中即落 alert_events 并可选推送
+    # 运维告警：周期评估四类风险，命中即落 alert_events 并可选推送
     # webhook。webhook 留空 = 只留站内记录、不外推。
     alert_enabled: bool = True
     alert_webhook_url: str = ""
@@ -203,12 +203,12 @@ class Settings(BaseSettings):
     # 原代号的归一键、展示名、展示名的归一键四种写法任一命中即滤——用户照列表
     # 里看到的 `kimi-k3` / `Kimi K3` 写就能生效，老规则按原代号写也仍生效。
     # 覆盖此值时为完全替换（含默认噪音规则），增删请重写全量。
-    # B1.6 实测（2026-09-21，两边上游真实清单）补入的内部/不可用模型：
+    # 实测（2026-09-21，两边上游真实清单）补入的内部/不可用模型：
     #   custom_model_* / *sub*agent* / summary / browser_use_* / file_search_agent
     #   为上游内部或代理模型（chat 报 3003 / 非用户模型）
     #   default 实测 HTTP 200 但零内容（不可用于 chat）
     #   hunyuan-image-* 实测 HTTP 400 11103「backend is not supported」
-    # 2026-10-10 复测六渠道全量清单后补入三条「上游已下架」：
+    # 2026-10-10 复测七渠道全量清单后补入三条「上游已下架」：
     #   hy4-preview-x（CB 400 11102 service info not found；同名的 hy4-preview
     #     仍可用，故写全名不用 glob）
     #   qwen3.8-flash（Qoder qfmodel 400「Execution failed: null」；CB/TRAE 的
@@ -223,14 +223,14 @@ class Settings(BaseSettings):
     )
     # 诊断：把 /v1 入口的原始请求体落到 data/dumps/（排查客户端差异用）
     dump_request_bodies: bool = False
-    # 截断续写（B1.4）：上游以 finish_reason=length 截断时，同凭证自动续写，
+    # 截断续写：上游以 finish_reason=length 截断时，同凭证自动续写，
     # 最多该次数后收尾；0 关闭。仅 length 触发（其余"空正文/代码块未闭合"
     # 判据经实测无支撑，未实现，见 TECHNICAL.md §3.4）
     auto_continue_max: int = 10
     # 非流式聚合整体超时（秒）：上游只支持流式，非流式由引擎聚合；上游连接
     # 半开停滞会让请求无限悬挂并占住凭证。超时按瞬态错误换号重试；≤0 关闭
     upstream_complete_timeout_seconds: int = 600
-    # 上下文压缩（P0-2）：按模型目录里的输入上限裁剪过长对话，避免撞上游硬
+    # 上下文压缩：按模型目录里的输入上限裁剪过长对话，避免撞上游硬
     # 限制（CodeBuddy 11115 prompt is too long）。enabled=false 完全关闭；
     # 目录里查不到上限的模型不受影响（宁可不裁剪也不猜一个数字去砍上下文）。
     # reserve=为模型回复预留的输出 token；safety_ratio=按上限的百分比留估算
@@ -239,7 +239,7 @@ class Settings(BaseSettings):
     context_compress_reserve_tokens: int = 4096
     context_compress_min_keep_messages: int = 4
     context_compress_safety_ratio: float = 0.95
-    # 跨渠道 fallback 链（P1-5）：请求模型在主渠道全部不可用时，按「兼容组」
+    # 跨渠道 fallback 链：请求模型在主渠道全部不可用时，按「兼容组」
     # 依次回退到组内其他模型（组内成员自行带上 @渠道 或依赖目录收窄）。
     # 格式 `组名=成员1,成员2;组名2=成员3`；留空 = 不启用（保持原行为）。
     model_fallback_groups: str = ""
@@ -300,7 +300,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
 
 
 def validate_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
-    """上游地址必须落在白名单内，否则拒绝发出真实 Token（PROPOSAL §8）。"""
+    """上游地址必须落在白名单内，否则拒绝发出真实 Token（PROPOSAL §6）。"""
     return endpoint.strip() in settings.allowed_endpoints
 
 
@@ -330,7 +330,7 @@ def validate_codearts_endpoint_allowed(endpoint: str, settings: Settings) -> boo
 
 
 def live(value: Any) -> Callable[[], Any]:
-    """把「标量或零参 callable」统一成取当前值的零参 callable（B3.2）。
+    """把「标量或零参 callable」统一成取当前值的零参 callable。
 
     热更消费方（调度器 / 节流器 / 后台任务 / 执行器）持有的都是这个封装：
     生产装配传零参 lambda 实时读运行时覆盖层，测试仍可传标量。两条路径

@@ -37,7 +37,7 @@ class RetentionTask:
         self._growth_events = growth_events
 
     def run_once(self) -> dict[str, int]:
-        """同步执行一轮（CPU/IO 密集，调用方负责放到线程池，见 M8）。"""
+        """同步执行一轮（CPU/IO 密集，调用方负责放到线程池，见）。"""
         rolled = self._collector.rollup_hourly()
         purged = self._collector.purge_expired(self.retention_days)
         expired_coolings = (

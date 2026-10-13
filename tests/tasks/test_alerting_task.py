@@ -124,7 +124,7 @@ async def test_alert_task_two_webhooks_both_fail_keeps_first_error(tmp_path):
     db.close()
 
 async def test_alert_task_redacts_webhook_secret_from_log_and_db(tmp_path, caplog):
-    """M5：webhook URL 的 path/query 常即密钥，日志与落库都不得带上整条 URL。"""
+    """webhook URL 的 path/query 常即密钥，日志与落库都不得带上整条 URL。"""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 

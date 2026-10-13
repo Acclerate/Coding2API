@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """直接对 SQLite 建/删管理台用户（无 Web 场景与恢复路径）。
 
-B5 起用户数据的唯一事实来源是 SQLite 的 `users` 表（`secrets/users.txt`
+用户数据的唯一事实来源是 SQLite 的 `users` 表（`secrets/users.txt`
 只在启动时做一次引导导入）。管理台已覆盖日常增删改，本脚本的存在是为了：
 
 1. **首个 admin**：新库没有任何账号，能进管理台之前得先有一个人。

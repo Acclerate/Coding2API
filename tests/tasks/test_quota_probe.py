@@ -16,7 +16,7 @@ async def test_quota_probe_updates_health(repo):
     assert credentials.candidates()[0].health == 80
 
 async def test_quota_probe_failure_marks_unknown_not_zero(repo):
-    """探测失败 → health=NULL（unknown），绝不当作 0 分（Q26 三态）。"""
+    """探测失败 → health=NULL（unknown），绝不当作 0 分（三态）。"""
     credentials, _db = repo
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     task = QuotaProbeTask(credentials, {"codebuddy": ProbeProvider(error=RuntimeError("boom"))})

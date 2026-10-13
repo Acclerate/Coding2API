@@ -1,7 +1,9 @@
 import { screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CredentialsPage } from "../CredentialsPage";
-import { jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent } from "@/test-utils";
+import {
+  expandCredentialGroups, jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent,
+} from "@/test-utils";
 
 const ADMIN = { username: "root", is_admin: true } as const;
 
@@ -45,6 +47,7 @@ describe("CredentialsPage 成长中心", () => {
     mockFetch({ "/api/credentials": listBody([makeCredential({ provider: "trae" })]) });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     // 探测 / 签到是常驻按钮，不随渠道变化
     expect(screen.getByTestId("probe-cred_1")).toBeInTheDocument();
     expect(screen.getByTestId("checkin-cred_1")).toBeInTheDocument();
@@ -63,6 +66,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("actions-cred_1"));
     await userEvent.click(screen.getByRole("menuitem", { name: "活跃上报" }));
     expect(await screen.findByTestId("credentials-notice")).toHaveTextContent(
@@ -77,6 +81,7 @@ describe("CredentialsPage 成长中心", () => {
     ));
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     // 成长中心列显示上一轮结果
     expect(screen.getByTestId("growth-cred_1")).toHaveTextContent("上一轮：无可领取项");
@@ -98,6 +103,7 @@ describe("CredentialsPage 成长中心", () => {
     mockFetch({ "/api/credentials": listBody([makeCredential({ provider: "codebuddy" })]) });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     expect(screen.queryByTestId("growth-cred_1")).not.toBeInTheDocument();
     // 成长中心是第 5 列（0-based 4）；token 剩余列同为「—」，不能按文本全局查
     const row = screen.getByTestId("row-cred_1");
@@ -116,6 +122,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     const cell = screen.getByTestId("growth-cred_1");
     // 单元格内是截断的单行样式（truncate），不是把整段挤成多行撑高表格
@@ -142,6 +149,7 @@ describe("CredentialsPage 成长中心", () => {
     ));
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("actions-cred_1"));
     await userEvent.click(screen.getByRole("menuitem", { name: "成长中心" }));
 
@@ -157,6 +165,7 @@ describe("CredentialsPage 成长中心", () => {
     ));
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("actions-cred_1"));
     await userEvent.click(screen.getByRole("menuitem", { name: "成长中心" }));
 
@@ -164,7 +173,7 @@ describe("CredentialsPage 成长中心", () => {
     expect(screen.queryByTestId("growth-result")).not.toBeInTheDocument();
   });
 
-  // --------------------------------------------------------- B3.3 token 到期
+  // --------------------------------------------------------- token 到期
   it("token 接近到期：独立一列只显示剩余时间，标红预警", async () => {
     const now = Math.floor(Date.now() / 1000);
     mockFetch({
@@ -175,6 +184,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     const cell = screen.getByTestId("token-expiry-soon");
     expect(cell).toHaveTextContent("10 分钟");
@@ -193,6 +203,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.queryByTestId("token-expiry-bar-soon")).not.toBeInTheDocument();
     const row = screen.getByTestId("row-soon");
@@ -207,6 +218,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     const row = screen.getByTestId("row-unknown");
     expect(within(row).queryByTestId("token-expiry-unknown")).not.toBeInTheDocument();
@@ -226,6 +238,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.getByTestId("token-expiry-dead")).toHaveTextContent("已过期");
   });
@@ -240,13 +253,14 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     const cell = screen.getByTestId("token-expiry-fresh");
     expect(cell).toHaveTextContent("30.0 天");
     expect(cell).not.toHaveTextContent("即将到期");
   });
 
-  // --------------------------------------------------------- B3.4 积分记录
+  // --------------------------------------------------------- 积分记录
   it("积分记录抽屉：展示净变化与区间起点，并说明不是动作归因", async () => {
     const now = Math.floor(Date.now() / 1000);
     mockFetch({
@@ -269,6 +283,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     await userEvent.click(screen.getByTestId("credits-cred_1"));
 
@@ -300,7 +315,8 @@ describe("CredentialsPage 成长中心", () => {
     expect(drawerRow.tagName).toBe("TR");
     expect(drawerRow).not.toBe(screen.getByTestId("row-cred_1"));
     expect(within(drawerRow).getByTestId("credit-drawer-cred_1")).toBeInTheDocument();
-    // :scope > td：抽屉内部还有一张表格，直接按 role 查会匹配到里面那些单元格
+    // :scope > td：抽屉内部还有一张表格，直接按 role 查会匹配到里面那些单元格。
+    // 抽屉的 colSpan 与组头一致，是「表格总列数」而非本组的单元格个数
     expect(drawerRow.querySelector(":scope > td")).toHaveAttribute("colspan", "6");
     expect(within(drawer).getByTestId("credit-event-cre_2")).toHaveTextContent(
       "+15（100 → 115）",
@@ -322,6 +338,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("credits-cred_1"));
 
     const cell = await screen.findByTestId("credit-event-cre_x");
@@ -338,6 +355,7 @@ describe("CredentialsPage 成长中心", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     await userEvent.click(screen.getByTestId("credits-cred_1"));
     const drawer = await screen.findByTestId("credit-drawer-cred_1");

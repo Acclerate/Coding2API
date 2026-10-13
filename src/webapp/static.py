@@ -89,7 +89,7 @@ def register_spa_routes(app: FastAPI) -> None:
         if path and candidate.is_file() and dist.resolve() in candidate.parents:
             # 只有 `assets/` 下是 Vite 内容 hash 化的产物，可 immutable；入口
             # 文档（index.html）与 `web/public/` 原样拷贝的文件（theme-init.js
-            # / favicon.svg）文件名不带 hash，必须每次回源校验（M13）。
+            # / favicon.svg）文件名不带 hash，必须每次回源校验。
             relative = candidate.relative_to(dist.resolve())
             headers = (_ASSET_CACHE_HEADERS if relative.parts[:1] == ("assets",)
                        else _INDEX_CACHE_HEADERS)

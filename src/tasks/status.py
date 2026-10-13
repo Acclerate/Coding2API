@@ -81,7 +81,7 @@ class TaskStatusStore:
         self._now = now
         self._runs: dict[str, TaskRun] = {}
         self._counts: dict[str, int] = {}
-        # 连续失败计数（P1-7）：成功清零、失败 +1。只记真实执行——no-op 轮次
+        # 连续失败计数：成功清零、失败 +1。只记真实执行——no-op 轮次
         # 不调 record，不会误清也不会误增。
         self._failure_streaks: dict[str, int] = {}
 
@@ -99,7 +99,7 @@ class TaskStatusStore:
         return self._counts.get(key, 0)
 
     def consecutive_failures(self, key: str) -> int:
-        """连续失败次数（P1-7 告警）：成功一轮即清零；从未失败返回 0。"""
+        """连续失败次数（告警）：成功一轮即清零；从未失败返回 0。"""
         return self._failure_streaks.get(key, 0)
 
     def failing(self, threshold: int) -> list[tuple[str, int]]:

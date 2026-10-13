@@ -1,7 +1,9 @@
 import { screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { CredentialsPage } from "../CredentialsPage";
-import { jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent } from "@/test-utils";
+import {
+  expandCredentialGroups, jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent,
+} from "@/test-utils";
 
 const ADMIN = { username: "root", is_admin: true } as const;
 const READER = { username: "guest", is_admin: false } as const;
@@ -25,6 +27,7 @@ describe("渠道登录入口", () => {
     mockFetch({ "/api/credentials": listBody([]) });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
 
     expect(screen.getByTestId("start-login-codebuddy")).toHaveTextContent("登录 CodeBuddy");
@@ -33,12 +36,13 @@ describe("渠道登录入口", () => {
     expect(screen.getByTestId("start-login-codearts")).toHaveTextContent("登录 CodeArts");
   });
 
-  it("CodeArts 有签到接口：探测与签到都显示（Q72）", async () => {
+  it("CodeArts 有签到接口：探测与签到都显示", async () => {
     mockFetch({
       "/api/credentials": listBody([makeCredential({ id: "ca", provider: "codearts" })]),
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.getByTestId("probe-ca")).toBeInTheDocument();
     expect(screen.getByTestId("checkin-ca")).toBeInTheDocument();
@@ -52,6 +56,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.getByTestId("probe-qd")).toBeInTheDocument();
     expect(screen.getByTestId("checkin-qd")).toBeInTheDocument();
@@ -66,6 +71,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.getByTestId("probe-ci")).toBeInTheDocument();
     expect(screen.queryByTestId("checkin-ci")).not.toBeInTheDocument();
@@ -80,6 +86,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("actions-ci"));
 
     expect(screen.getByRole("menuitem", { name: "活跃上报" })).toBeInTheDocument();
@@ -92,6 +99,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
     expect(screen.getByTestId("checkin-cb")).toBeInTheDocument();
   });
@@ -130,6 +138,7 @@ describe("渠道登录入口", () => {
 
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-codebuddy"));
 
@@ -167,6 +176,7 @@ describe("渠道登录入口", () => {
 
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-trae"));
     expect(await screen.findByTestId("cancel-login-trae")).toBeInTheDocument();
@@ -212,6 +222,7 @@ describe("渠道登录入口", () => {
 
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-codearts"));
 
@@ -244,6 +255,7 @@ describe("渠道登录入口", () => {
 
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-codebuddy"));
     await screen.findByTestId("cancel-login-codebuddy");
@@ -279,6 +291,7 @@ describe("渠道登录入口", () => {
 
     const page = renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-codebuddy"));
     await screen.findByTestId("cancel-login-codebuddy");
@@ -297,6 +310,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
 
     const button = screen.getByTestId("add-zen");
@@ -322,6 +336,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
 
     const button = screen.getByTestId("add-zen");
@@ -339,6 +354,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
 
     const button = screen.getByTestId("add-kilo");
@@ -364,6 +380,7 @@ describe("渠道登录入口", () => {
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
     await openAddDialog();
 
     const button = screen.getByTestId("add-kilo");
@@ -378,6 +395,7 @@ describe("渠道登录入口", () => {
     mockFetch({ "/api/credentials": listBody([], false) });
     renderPage(<CredentialsPage />, READER);
     await settle();
+    await expandCredentialGroups();
     expect(screen.queryByTestId("start-login-codebuddy")).not.toBeInTheDocument();
     expect(screen.queryByTestId("start-login-trae")).not.toBeInTheDocument();
     expect(screen.queryByTestId("add-zen")).not.toBeInTheDocument();

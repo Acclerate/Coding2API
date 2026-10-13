@@ -225,7 +225,7 @@ class StatsQuery:
 
         `include_credential_name`：随行下发凭证昵称与渠道，前端据此在凭证名前
         画渠道 icon 并与请求明细显示同一个名字。昵称取自**全局共享池**（常含
-        邮箱/手机），只对 admin/operator 返回（与 `events()` 的 M7 约束一致）。
+        邮箱/手机），只对 admin/operator 返回（与 `events()` 的 约束一致）。
         """
         assert key in _GROUP_KEYS, f"非法分组键: {key!r}"
         where, params = self._where(username=username, since=since, since_col="ts",
@@ -350,7 +350,7 @@ class StatsQuery:
 
         `include_credential_name`：凭证昵称取自**全局共享池**（常含邮箱/手机），
         只对 admin/operator 返回；viewer 即便只看自己的记录也不该看到池里他人
-        凭证的昵称（M7）。
+        凭证的昵称。
         """
         key, desc = parse_sort_order(sort, order, EVENT_SORT_COLUMNS,
                                      default_key="time", default_desc=True)

@@ -150,7 +150,7 @@ def test_ci_compose_job_builds_fresh_image_with_admin_user():
     两个坑都曾静默通过：
     * compose 同时写了 `build:` 与 `image:`，`up` 不带 `--build` 时会去
       registry 拉 `image:` 指向的已发布镜像 —— 测的不是本次代码；
-    * B5 引导要求至少一个活跃 admin，而 compose 的 ADMIN_USERNAMES 默认
+    * 引导要求至少一个活跃 admin，而 compose 的 ADMIN_USERNAMES 默认
       `admin`，users.txt 建 `ci` 会直接启动失败。
     """
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

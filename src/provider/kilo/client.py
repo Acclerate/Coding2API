@@ -195,7 +195,7 @@ def _model_from_item(item: dict[str, Any], model_id: str) -> Model:
 
 @dataclass(slots=True)
 class KiloProvider:
-    """Provider 协议实现（细接口，Q16=A）。
+    """Provider 协议实现（细接口）。
 
     与 Zen 同为无凭证渠道：只实现对话与模型列表三条能力，其余任务靠
     「方法缺失」自然跳过（CheckinTask / GrowthTask / RefreshTask 都用

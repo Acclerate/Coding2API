@@ -60,7 +60,7 @@ def test_playground_malformed_json_body_is_400(client):
     assert response.status_code == 400
 
 def test_nan_json_body_is_400_not_passed_upstream(client):
-    """M4：JSON 里的 NaN/Infinity（Python 默认接受）必须 400，不能透传给上游。"""
+    """JSON 里的 NaN/Infinity（Python 默认接受）必须 400，不能透传给上游。"""
     key = client.post("/api/api-keys", json={"name": "t"}).json()["api_key"]
     for literal in (b'{"messages":[1],"temperature":NaN}',
                     b'{"messages":[1],"temperature":Infinity}'):
@@ -310,7 +310,7 @@ async def test_body_limit_middleware_sends_only_one_413():
     assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
 
 def test_openai_chat_rejects_bad_numeric_fields():
-    """M4：OpenAI chat 出口与 Anthropic / Responses 用同一套数值边界，
+    """OpenAI chat 出口与 Anthropic / Responses 用同一套数值边界，
     合法 JSON 里的 `-1`/`true`/超上限不能透传给上游。"""
     from src.compat.openai.request import InvalidRequest, parse_chat_request
 
@@ -330,7 +330,7 @@ def test_openai_chat_rejects_bad_numeric_fields():
     assert parse_chat_request({**base, "max_tokens": None}).raw["max_tokens"] is None
 
 def test_openai_chat_rejects_penalty_seed_n_and_logit_bias():
-    """M1：`1e999` 等溢出成 inf 的采样参数、越界 penalty、畸形 seed/n/logit_bias
+    """`1e999` 等溢出成 inf 的采样参数、越界 penalty、畸形 seed/n/logit_bias
     都必须 400，而不是重新序列化成非法 JSON `Infinity` 透传给上游。"""
     from src.compat.openai.request import InvalidRequest, parse_chat_request
 

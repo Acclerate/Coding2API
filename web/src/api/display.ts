@@ -62,7 +62,7 @@ export function quotaSemantics(credential: Credential): string {
   // CodeArts 是每日 token 池折算成的额度（上游 1000 万 token 折 1000 积分，
   // 1 积分 = 10000 token），当日 0 点清零——上游不给重置时间戳，固定按时段
   // 描述，不能退化成「本周期剩余」。这里的「积分」是合成折算值，与上游真积分
-  // （内置模型计费单位，Q72）同名不同物，故文案用「额度池」而非「积分」。
+  // （内置模型计费单位）同名不同物，故文案用「额度池」而非「积分」。
   if (credential.provider === "codearts") {
     return "每日额度池（token 折算，当日 0 点清零）";
   }
@@ -331,7 +331,7 @@ export function formatMoney(
   return estimated ? `≈${text}` : text;
 }
 
-/** 积分变动流水的说明列（B3.4）：只表达归因已知度，不谎称来源。 */
+/** 积分变动流水的说明列：只表达归因已知度，不谎称来源。 */
 export const CREDIT_SOURCE_LABEL: Record<string, string> = {
   observed: "两次探测间净变化",
   sync: "首次建立基线",
@@ -420,23 +420,25 @@ export type UsageErrorType =
   | "client_disconnect"
   | "credential_unavailable"
   | "invalid_request"
+  | "model_unavailable"
   | "no_healthy_credential"
   | "rate_limit"
   | "upstream_error"
   | "upstream_protocol";
 
-/** 明细失败类型的中文说明（TECHNICAL §6.5：界面只展示稳定枚举的翻译）。 */
+/** 明细失败类型的中文说明（TECHNICAL §11.2：界面只展示稳定枚举的翻译）。 */
 export const USAGE_ERROR_LABEL: Record<UsageErrorType, string> = {
   client_disconnect: "客户端中断",
   credential_unavailable: "凭证失效",
   invalid_request: "请求无效",
+  model_unavailable: "该模型暂时不可用",
   no_healthy_credential: "无可用凭证",
   rate_limit: "额度耗尽",
   upstream_error: "渠道错误",
   upstream_protocol: "渠道响应异常",
 };
 
-/** 未知取值不得原样透传（TECHNICAL §6.5），兜底为「失败」。 */
+/** 未知取值不得原样透传（TECHNICAL §11.2），兜底为「失败」。 */
 export function usageErrorLabel(errorType: string | null | undefined): string {
   if (!errorType) return "失败";
   return USAGE_ERROR_LABEL[errorType as UsageErrorType] ?? `失败（${errorType}）`;

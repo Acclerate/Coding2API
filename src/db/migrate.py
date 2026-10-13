@@ -16,22 +16,21 @@ from importlib import resources
 SCHEMA_NAME = "schema.sql"
 
 # 当前 schema 版本。新增列/表、删表时 +1，并在下方对应元组里补增量。
-# 10：新增 runtime_settings 表（B3.2 运行时配置热更新）。新增表只需进
+# 10：新增 runtime_settings 表（运行时配置热更新）。新增表只需进
 # schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作。
-# 11：credentials 新增 token_expires_at / token_issued_at（B3.3
-# token 到期展示与预警）。
-# 12：新增 credit_events 表（B3.4 积分变动流水）。新增表只需进
+# 11：credentials 新增 token_expires_at / token_issued_at（token 到期展示与预警）。
+# 12：新增 credit_events 表（积分变动流水）。新增表只需进
 # schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作。
-# 13：api_keys 新增 provider_binding / allowed_ips（B3.5 多 Key 出口：
-# 渠道绑定与来源 IP 白名单）；两者默认 ''，老库补列后行为不变。
-# 14：新增 users / audit_events 表（B5 账号管理体系）。新增表只需进
+# 13：api_keys 新增 provider_binding / allowed_ips（多 Key 出口：渠道绑定与
+# 来源 IP 白名单）；两者默认 ''，老库补列后行为不变。
+# 14：新增 users / audit_events 表（账号管理体系）。新增表只需进
 # schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作。
 # 15：usage_events 新增 credit_estimated（credit 是否本服务推算）；usage_hourly
 # 新增 credit_estimated_known（其中推算值条数），老库补 0=全部非推算。
-# 16：api_keys 新增 allowed_models / expires_at（P0-3 Key 细粒度策略：模型
-# 白名单与到期时间）；默认 '' / NULL，老库补列后行为不变（不限制、不过期）。
-# 17：新增 alert_events 表（P1-7 运维告警：四类规则命中即落一行，供管理台
-# 「站内告警记录」回看）。新增表只需进 schema.sql（CREATE TABLE IF NOT EXISTS
+# 16：api_keys 新增 allowed_models / expires_at（Key 细粒度策略：模型白名单与
+# 到期时间）；默认 '' / NULL，老库补列后行为不变（不限制、不过期）。
+# 17：新增 alert_events 表（运维告警：四类规则命中即落一行，供管理台「站内告警
+# 记录」回看）。新增表只需进 schema.sql（CREATE TABLE IF NOT EXISTS
 # 对老库同样生效），无需迁移动作。
 # 18：usage_events 新增 cost_usd / cost_cny，usage_hourly 新增 cost_usd_sum /
 # cost_cny_sum / cost_known（成本估算：OpenRouter 刊例价 × 当时汇率，写入时定值）。
@@ -57,17 +56,17 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 额度包明细（展示用，含包名）：与选号指标 quota_expiry_ladder 分开，
     # 避免为管理台展示改动调度排序行为
     ("credentials", "quota_packages TEXT"),
-    # access token 签发/到期时间（B3.3）：上游显式 expires_at 缺失时回落
+    # access token 签发/到期时间：上游显式 expires_at 缺失时回落
     # JWT 的 iat/exp；NULL=老库未回填（列表读到按需派生），0=确实未知
     ("credentials", "token_expires_at INTEGER"),
     ("credentials", "token_issued_at INTEGER"),
-    # 多 Key 出口（B3.5）：空串 = 不限制，老库补列后与补列前行为一致
+    # 多 Key 出口：空串 = 不限制，老库补列后与补列前行为一致
     ("api_keys", "provider_binding TEXT NOT NULL DEFAULT ''"),
     ("api_keys", "allowed_ips TEXT NOT NULL DEFAULT ''"),
     # 积分推算（TRAE 上游不给单请求积分）：老库补 0=历史行全按非推算处理
     ("usage_events", "credit_estimated INTEGER NOT NULL DEFAULT 0"),
     ("usage_hourly", "credit_estimated_known INTEGER NOT NULL DEFAULT 0"),
-    # Key 细粒度策略（P0-3）：模型白名单（''=不限制）/ 到期时间（NULL=不过期），
+    # Key 细粒度策略：模型白名单（''=不限制）/ 到期时间（NULL=不过期），
     # 老库补列后与补列前行为一致
     ("api_keys", "allowed_models TEXT NOT NULL DEFAULT ''"),
     ("api_keys", "expires_at INTEGER"),

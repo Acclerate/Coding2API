@@ -1,6 +1,6 @@
-"""脱敏统计采集与查询（Q24=A）。
+"""脱敏统计采集与查询。
 
-纪律（PROPOSAL §8）：不存提示词、回答、请求头、Token、工具参数、原始错误体、会话 ID。
+纪律（PROPOSAL §6）：不存提示词、回答、请求头、Token、工具参数、原始错误体、会话 ID。
 credit 为上游可选字段，两边都经常为 None。
 成本（cost_usd / cost_cny）是**估算**：OpenRouter 刊例价 × 写入时的汇率，不是上游
 真实扣费；两列同生同灭，匹配不到定价时为 None（界面显示 —）。
@@ -26,11 +26,13 @@ CONTROLLED_ERROR_TYPES = frozenset({
     #   credential_unavailable — session 失效（_error_type_for(DEAD)）
     #   invalid_request    — 请求无效（_record_invalid）
     #   no_healthy_credential — 无可用凭证（executor 耗尽轮换）
+    #   model_unavailable     — 耗尽轮换但候选全部只因**该模型**的模型级
+    #                            冷却不可用（_exhaust_error_type；换个模型即可用）
     #   rate_limit         — 权益耗尽（_error_type_for(PLAN)）
     #   upstream_error / upstream_protocol — 其它上游失败
     "client_disconnect", "credential_unavailable",
-    "invalid_request", "no_healthy_credential", "rate_limit", "upstream_error",
-    "upstream_protocol",
+    "invalid_request", "no_healthy_credential", "model_unavailable",
+    "rate_limit", "upstream_error", "upstream_protocol",
 })
 MAX_MODEL_LENGTH = 64
 
@@ -215,7 +217,7 @@ class StatsCollector:
         )
 
     def window_error_rate(self, *, since: int) -> tuple[int, int]:
-        """近窗口内的 (请求数, 失败数)，供 P1-7 上游错误率告警。
+        """近窗口内的 (请求数, 失败数)，供上游错误率告警。
 
         读明细表 `usage_events` 而不是小时汇总：告警窗是分钟级（默认 15 分钟），
         小时粒度要么整点才更新、要么跨小时口径错乱。明细只保留 90 天，而告警
@@ -228,7 +230,7 @@ class StatsCollector:
         return int(row["requests"] or 0), int(row["failed"] or 0)
 
     def purge_expired(self, retention_days: int = 90, now: int | None = None) -> int:
-        """明细保留 90 天；小时汇总永久（PROPOSAL §8）。
+        """明细保留 90 天；小时汇总永久（PROPOSAL §6）。
 
         切点向上对齐到小时边界：只删**整个小时都已过期**的明细。
         这不是保守取值而是正确性要求——`rollup_hourly` 对整行用 REPLACE

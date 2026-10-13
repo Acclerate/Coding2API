@@ -1,4 +1,4 @@
-"""M0 补充测试：把 session/users/config/db 拉到 100%。"""
+""" 补充测试：把 session/users/config/db 拉到 100%。"""
 
 from __future__ import annotations
 

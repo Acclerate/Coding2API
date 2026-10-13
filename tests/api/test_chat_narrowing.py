@@ -199,7 +199,7 @@ async def test_model_cooling_exhaustion_does_not_fan_out(dual_repo):
 
     实测故障（2026-10-08 15:53）：`qwen3.8-flash` 只有 Qoder 登记（内部原代号
     `qfmodel`），Qoder 节点故障（`[FAIL]node:oa_qwen-plus-main Execution failed`，
-    按 Q50 归 MODEL）让两条 Qoder 凭证进 600s 模型级冷却；此后每次请求收窄到
+    按上游分类归 MODEL）让两条 Qoder 凭证进 600s 模型级冷却；此后每次请求收窄到
     `{qoder}` → 空 → 触发 broader 回退，把请求甩给不持有该模型的渠道——它们的
     别名表没有这个键、拿到的仍是原始名 `qwen3.8-flash`，必然被拒（CB 11102 /
     TRAE 4001 / zen·kilo 401），实测 6 次轮换全废、还给 CB 写下 6 小时起步的

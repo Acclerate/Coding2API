@@ -89,7 +89,7 @@ export interface ApiKey {
   preview: string;
   created_at: number;
   last_used_at: number | null;
-  /** 绑定的渠道（见 KNOWN_PROVIDERS 六渠道）；空串 = 自动 */
+  /** 绑定的渠道（见 KNOWN_PROVIDERS 七渠道）；空串 = 自动 */
   provider_binding: string;
   /** 来源 IP 白名单（规范化后的 IP/CIDR 逗号分隔）；空串 = 不限制 */
   allowed_ips: string;
@@ -226,7 +226,7 @@ export interface StatsEventsResponse {
   total: number | null;
 }
 
-/** 三角色（B5）：与后端 src/auth/rbac.py 的 ROLE_* 字面量一致。 */
+/** 三角色：与后端 src/auth/rbac.py 的 ROLE_* 字面量一致。 */
 export type Role = "admin" | "operator" | "viewer";
 
 export const ROLE_LABELS: Record<Role, string> = {
@@ -374,7 +374,7 @@ export interface GrowthRunResult {
   steps: GrowthStepResult[];
 }
 
-/** 活跃上报（B1.7）单次结果 */
+/** 活跃上报单次结果 */
 export interface ActivityReportResult {
   ok: boolean;
   message: string;
@@ -395,7 +395,7 @@ export interface GrowthEvent {
   trigger: string;
 }
 
-/** 积分变动流水（B3.4）：两次额度探测之间的**净变化**，不是动作归因。 */
+/** 积分变动流水：两次额度探测之间的**净变化**，不是动作归因。 */
 export interface CreditEvent {
   id: string;
   credential_id: string;
@@ -512,6 +512,12 @@ export interface ModelCatalogEntry {
    * 后端按同一套匹配口径补分，匹配不到时字段缺失（页面显示 —）。
    */
   benchmarks?: ModelBenchmarks;
+  /**
+   * 该模型是否**当前渠道真能提供**（与 `/v1/models` 同口径：只算有可用凭证、
+   * 且过当前黑名单的渠道）。OpenRouter 收录数百条，多数本服务没接；页面据此
+   * 提供「只看当前渠道获取到的模型」过滤。无可用渠道时全为 false。
+   */
+  available: boolean;
 }
 
 /**

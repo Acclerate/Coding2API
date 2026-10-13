@@ -1,4 +1,4 @@
-"""Host 白名单与安全响应头（PROPOSAL §8）。
+"""Host 白名单与安全响应头（PROPOSAL §6）。
 
 拆出来是为了让 build_app 只负责装配；这两个策略本身与业务无关，
 改动理由也不同（安全策略调整 vs 服务组装）。
@@ -33,7 +33,7 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
     ALLOWED_HOSTS 配置优先（逗号分隔）；未配置时放行本地回环与 PUBLIC_BASE_URL
     的主机。`testserver`（FastAPI TestClient 默认 Host）只在显式开启
     `ALLOW_TEST_HOST` 时放行——单标签主机名可能被本地 DNS 搜索域解析到本服务，
-    生产默认放行等于给 DNS rebinding 留免校验入口（M14）。
+    生产默认放行等于给 DNS rebinding 留免校验入口。
     只比较主机名，忽略端口。
     """
     hostname = _hostname(host_header)

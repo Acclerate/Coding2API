@@ -3,7 +3,7 @@
 纯函数优先（`qoder_encode` / `signature` / `derive_*`）便于固定向量单测；
 `CosySession` 只做「把常量与凭证拼成一次请求的头」这一件事。
 
-三个与常规协议不同的点（PROPOSAL §3.3 / TECHNICAL §3.16）：
+三个与常规协议不同的点（PROPOSAL §2.3 / TECHNICAL §5.3）：
 
 1. **请求体不是 JSON**，而是自定义 Base64 变体：标准 base64 → 尾/中/首
    三段轮转 → 自定义字母表映射 → `=` 换成 `$`。服务端按同一变换还原。

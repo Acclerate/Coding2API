@@ -1,4 +1,4 @@
-"""M1a 覆盖率补齐：repo / executor / trae client / sse / response 的边界分支。"""
+""" 覆盖率补齐：repo / executor / trae client / sse / response 的边界分支。"""
 
 from __future__ import annotations
 
@@ -422,7 +422,7 @@ def test_parse_frames_sync_handles_crlf():
 
 
 def test_body_hint_truncates_with_marker():
-    """M1/M2：错误体摘要超限时明确标注截断，且单行化。"""
+    """ /错误体摘要超限时明确标注截断，且单行化。"""
     from src.provider.base import body_hint
 
     assert body_hint(b"") == ""
@@ -433,7 +433,7 @@ def test_body_hint_truncates_with_marker():
 
 
 async def test_read_body_bounded_stops_at_limit():
-    """M1：非 2xx 的错误体有界读取，避免超大 body 撑爆内存。"""
+    """非 2xx 的错误体有界读取，避免超大 body 撑爆内存。"""
     from src.provider.base import read_body_bounded
 
     class FakeResponse:
@@ -453,7 +453,7 @@ async def test_read_body_bounded_stops_at_limit():
 
 
 async def test_iter_frames_rejects_oversized_line(monkeypatch):
-    """M1：上游持续发不含换行的大块 → 单行缓冲设上限，达到即中止该流。"""
+    """上游持续发不含换行的大块 → 单行缓冲设上限，达到即中止该流。"""
     from src.engine import sse
 
     monkeypatch.setattr(sse, "MAX_SSE_LINE_BYTES", 16)
@@ -466,7 +466,7 @@ async def test_iter_frames_rejects_oversized_line(monkeypatch):
 
 
 async def test_iter_frames_rejects_oversized_frame(monkeypatch):
-    """M1：endless `data:` 行且不给空行 → 单帧累积设上限。"""
+    """endless `data:` 行且不给空行 → 单帧累积设上限。"""
     from src.engine import sse
 
     monkeypatch.setattr(sse, "MAX_SSE_FRAME_CHARS", 16)
@@ -514,7 +514,7 @@ def test_callback_accepts_upper_case_keys():
 # ------------------------------------------------------------- main app
 
 def test_models_endpoint_lists_connected_providers(tmp_path):
-    """模型列表按渠道凭证加载：有凭证的渠道才合并进列表（Q41）。"""
+    """模型列表按渠道凭证加载：有凭证的渠道才合并进列表。"""
     from src.config import Settings
     from src.provider.base import Model
 

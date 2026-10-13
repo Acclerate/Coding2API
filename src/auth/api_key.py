@@ -25,7 +25,7 @@ def preview_api_key(api_key: str) -> str:
 
 
 def key_expired(expires_at: int | None, *, now: int | None = None) -> bool:
-    """Key 是否已过期（P0-3）。`None`/`0` = 永不过期。
+    """Key 是否已过期。`None`/`0` = 永不过期。
 
     `now` 可注入便于测试；到期时刻本身算「已过期」（`>=`），与「有效期至
     某时刻」的直觉一致。

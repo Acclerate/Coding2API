@@ -1,4 +1,4 @@
-"""按渠道出站代理（P1-6）测试。
+"""按渠道出站代理测试。
 
 覆盖三块：纯解析函数 `parse_provider_proxies`、`build_client` 工厂、
 各 provider 客户端 / OAuth 流把代理透传到 httpx，以及 main 装配接线。

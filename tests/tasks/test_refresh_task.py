@@ -114,7 +114,7 @@ async def test_refresh_task_isolates_failures(repo):
     assert report.failed == 1
 
 async def test_refresh_task_skips_credential_deleted_before_lock(repo):
-    """等编辑锁期间凭证被删 → 持锁后重读为 None，记 skipped 而不是崩溃（M12）。"""
+    """等编辑锁期间凭证被删 → 持锁后重读为 None，记 skipped 而不是崩溃。"""
     credentials, _db = repo
     credential_id = credentials.add(provider="codebuddy", credential_data={
         "bearer_token": "t", "refresh_token": "RT", "auth_source": "oauth",
@@ -157,7 +157,7 @@ async def test_refresh_task_skips_disabled(repo):
 def test_refresh_task_refreshes_codebuddy_without_explicit_expiry(tmp_path):
     """回归：CB 凭证只有 JWT exp 时也要被预刷新（修复前 needs_refresh 恒 False）。
 
-    这是 B3.3 顺带修掉的真实故障：token 到期后上游 401 → DEAD 硬禁用，
+    这是顺带修掉的真实故障：token 到期后上游 401 → DEAD 硬禁用，
     而 revive 不会补刷新，凭证无法自愈。
     """
     import asyncio

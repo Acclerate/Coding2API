@@ -86,7 +86,7 @@ describe("AddCredentialDialog", () => {
     vi.useRealTimers();
   });
 
-  it("拒绝非 http(s) 授权地址，不对弹窗赋值（M5）", async () => {
+  it("拒绝非 http(s) 授权地址，不对弹窗赋值", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/upstream/start")) {

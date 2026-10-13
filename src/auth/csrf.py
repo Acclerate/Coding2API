@@ -1,4 +1,4 @@
-"""CSRF 纵深防护（PROPOSAL §8）：写操作必须带自定义头或同源 Origin/Referer。
+"""CSRF 纵深防护（PROPOSAL §6）：写操作必须带自定义头或同源 Origin/Referer。
 
 分层说明：
 - SameSite=Lax 已挡掉跨站请求自动携带的会话 cookie（第一道防线）。

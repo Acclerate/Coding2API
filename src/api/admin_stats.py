@@ -11,7 +11,7 @@ from .deps import Services, principal_from_request
 def _scope(principal: Principal, username: str | None) -> str | None:
     """admin/operator 传 username 可查全局/指定人；viewer 永远只能看自己。
 
-    operator 是「凭证运维」角色，按 PROPOSAL §4.7 与 README 的角色表应能看
+    operator 是「凭证运维」角色，按 PROPOSAL §3.7 与 README 的角色表应能看
     全量统计（否则看不到自己维护的渠道整体健康）；viewer 才是严格自负。
     """
     return username if principal.is_operator else principal.username
@@ -65,7 +65,7 @@ def create_router(services: Services) -> APIRouter:
     async def stats_by_credential(principal=Depends(principal_from_request),
                                   username: str | None = None, since: int | None = None,
                                   sort: str | None = None, order: str | None = None):
-        # 凭证昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见（M7），
+        # 凭证昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见，
         # 与明细端点同口径；provider 无隐私顾虑，无条件下发（前端画渠道 icon）
         return {"credentials": stats_query.by_credential(
             username=_scope(principal, username), since=since, sort=sort, order=order,
@@ -78,7 +78,7 @@ def create_router(services: Services) -> APIRouter:
                            offset: int = 0, sort: str | None = None,
                            order: str | None = None):
         # 明细保留 90 天；单页上限 200，防止一次拉爆
-        # 凭证昵称来自共享池：仅 admin/operator 可见（M7），viewer 只看自己的记录
+        # 凭证昵称来自共享池：仅 admin/operator 可见，viewer 只看自己的记录
         return stats_query.events(username=_scope(principal, username), since=since,
                                   before=before, limit=max(1, min(limit, 200)),
                                   offset=max(0, offset), sort=sort, order=order,

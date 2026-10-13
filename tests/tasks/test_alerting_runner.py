@@ -174,7 +174,7 @@ def test_retention_without_alerts_reports_zero(repo):
     assert report["purged_alerts"] == 0
 
 def test_retention_prunes_growth_events(repo):
-    """成长中心运行记录按同一保留期清理（M9）：不回收会无界增长。"""
+    """成长中心运行记录按同一保留期清理：不回收会无界增长。"""
     from src.db.repo import GrowthRepository
     from src.provider.base import GrowthResult
 

@@ -1,6 +1,6 @@
 """后台任务调度：把额度探测、签到、token 预刷新、明细清理接进应用生命周期。
 
-设计要点（PROPOSAL §8 / TECHNICAL §6）：
+设计要点（PROPOSAL §6 / TECHNICAL §6）：
 - 两类任务共用一个全局随机间隔节流器（跨所有用户）
 - 后台任务失败只记日志，绝不影响聊天请求
 - 启动时先做一轮额度探测（不节流），避免调度器拿到全 unknown 的池
@@ -49,7 +49,7 @@ class TaskRunner:
     # 「跑一轮」的协程（真正的活是 benchmarks.fetch_openrouter_models + 落盘 +
     # 换入），tasks 层不依赖 benchmarks/httpx。None 表示不装配。
     openrouter_catalog: Callable[[], Awaitable[object]] | None = None,
-    # 运维告警（P1-7）：None 表示不装配该循环（老调用方/测试保持原行为）。
+    # 运维告警：None 表示不装配该循环（老调用方/测试保持原行为）。
     alert: AlertTask | None = None,
     quota_probe_minutes: int | Callable[[], int] = 60,
     growth_interval_minutes: int | Callable[[], int] = 60,
@@ -71,7 +71,7 @@ class TaskRunner:
         self._model_catalog = model_catalog
         self._openrouter_catalog = openrouter_catalog
         self._alert = alert
-        # 周期可热更（B3.2）：存取值器，每轮 sleep 前读当前值（否则改配置
+        # 周期可热更：存取值器，每轮 sleep 前读当前值（否则改配置
         # 要等到下一次重启才生效）。下限与业务语义同前，不变。
         self._quota_probe_minutes = live(quota_probe_minutes)
         self._growth_minutes = live(growth_interval_minutes)
@@ -180,7 +180,7 @@ class TaskRunner:
     async def _sync_activity(self) -> object:
         """活跃上报：仅启用且处于配置小时窗口内才执行，成功凭证当日封账。
 
-        「是否启用」每轮现读（B3.2）：关掉再打开不需要重启，也不必重建循环。
+        「是否启用」每轮现读：关掉再打开不需要重启，也不必重建循环。
         """
         if self._activity is None:
             raise RuntimeError("activity task not configured")
@@ -197,7 +197,7 @@ class TaskRunner:
         return await self._checkin.run_once()
 
     async def _sync_retention(self) -> object:
-        """明细清理：整表 GROUP BY / DELETE 是同步 SQLite，放线程池跑（M8）。
+        """明细清理：整表 GROUP BY / DELETE 是同步 SQLite，放线程池跑。
 
         直接在事件循环里执行会把所有并发请求卡住（热更把
         `context_compress_min_keep_messages` 调大后可达秒级）。
@@ -207,7 +207,7 @@ class TaskRunner:
     async def _sync_alert(self) -> object:
         """运维告警一轮：评估四类规则、静默去重后落库 + 推送。
 
-        是否启用每轮现读（B3.2）：AlertTask.run_once 关着时返回 None，
+        是否启用每轮现读：AlertTask.run_once 关着时返回 None，
         `_guarded` 不记运行态——页面显示「未运行」，而不是「刚跑过」。
         """
         if self._alert is None:
@@ -217,7 +217,7 @@ class TaskRunner:
     async def _loop(self, name: str, runner: Callable[[], Awaitable[object]],
                     interval: float | Callable[[], float],
                     key: str | None = None) -> None:
-        """周期循环：间隔在每次 sleep 前重新求值（B3.2 热更周期）。
+        """周期循环：间隔在每次 sleep 前重新求值（热更周期）。
 
         传标量等价于固定周期（测试与一次性任务仍这么用）。
         """
@@ -375,7 +375,7 @@ def build_runner(credentials, providers: dict, stats_collector, config,
     alerts 同理：None 时不装配运维告警循环、也不清理告警记录（老调用方与测试
     保持原行为；生产路径传入 AlertRepository）。
 
-    B3.2 热更：`config` 既可以是启动期快照 `Settings`，也可以是
+    热更：`config` 既可以是启动期快照 `Settings`，也可以是
     `RuntimeSettings` 覆盖层。装配时所有「可热更项」必须传**零参 lambda**，
     后台循环每轮读当前值——否则改周期/开关都要等重启，热更就名存实亡。
     注意不能写成 `live(config.x)`：那会立刻求值一次再包成常量，

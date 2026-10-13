@@ -1,4 +1,4 @@
-"""scripts/create_user.py 的建/删/列表测试（B5 CLI 恢复路径）。"""
+"""scripts/create_user.py 的建/删/列表测试（CLI 恢复路径）。"""
 
 from __future__ import annotations
 

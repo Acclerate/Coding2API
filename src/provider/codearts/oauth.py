@@ -43,7 +43,7 @@ def _token_error_message(error: Exception) -> str:
     """令牌端点错误 → 用户可读文案（带上游原文，便于定位）。
 
     只在**服务端日志**里用：上游原文可能回显请求参数（含 secret/code），
-    不能进对外响应，故调用点用 `public=` 另给受控文案（M2/M6）。
+    不能进对外响应，故调用点用 `public=` 另给受控文案。
     """
     body = getattr(error, "body", b"") or b""
     text = body.decode("utf-8", errors="replace").strip()

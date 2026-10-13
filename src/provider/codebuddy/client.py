@@ -1,7 +1,7 @@
 """CodeBuddy 上游客户端：聊天流、额度探测、凭证规范化。
 
-M1b 范围（PROPOSAL §9）：bearer-only 手动凭证 + 聊天 + 个人版额度。
-OAuth 轮询、企业额度、多账号切换在 M1.5。
+范围：bearer-only 手动凭证 + 聊天 + 个人版额度；OAuth 轮询、企业额度、
+多账号切换未接入。
 """
 
 from __future__ import annotations
@@ -227,7 +227,7 @@ class CodeBuddyClient:
         # 下面的原地改写（developer→system / 指纹中和 / 脏 tool_call 清理）
         # 会穿透回 request.raw；而会话粘性在改写前后都用请求原文算指纹
         # （pin_for / remember），穿透会让指纹链失配、粘性静默失效
-        # （B1.5 目标场景恰是带 developer 角色的对话）
+        # （目标场景恰是带 developer 角色的对话）
         body["messages"] = copy.deepcopy(body.get("messages"))
         body["model"] = model
         body["stream"] = True
@@ -339,7 +339,7 @@ class CodeBuddyClient:
         #   TotalDosage 在一整个周期内不变，无法反映实时余额（曾出现
         #   remaining == total、健康度恒 100、credit_events 不再记录）。
         #   它与本函数已算出的逐包 remaining 基准不同，会与 expiry_ladder /
-        #   quota_packages / 管理台明细自相矛盾。PROPOSAL §4.3 的口径也是
+        #   quota_packages / 管理台明细自相矛盾。PROPOSAL §3.3 的口径也是
         #   CycleCapacityRemainPrecise。
         return Quota(remaining=remaining, total=total, cycle_end=cycle_end,
                      expiry_ladder=ladder, packages=packages or None,
@@ -635,7 +635,7 @@ class UpstreamHTTPError(base.UpstreamHTTPError):
 
 @dataclass(slots=True)
 class CodeBuddyProvider:
-    """Provider 协议实现（M1b：bearer-only + 聊天 + 个人额度）。
+    """Provider 协议实现（bearer-only + 聊天 + 个人额度）。
 
     pacer：聊天请求节流器（腾讯频率风控对策）；None 表示不限速。
     """
@@ -682,7 +682,7 @@ class CodeBuddyProvider:
     def host(self) -> str:
         return host_of(self.client.endpoint)
 
-    # -------------------------------------------------------------- M1.5
+    # --------------------------------------------------------------
 
     async def aclose(self) -> None:
         """释放内部 HTTP 连接池与 OAuth 客户端。"""
@@ -730,7 +730,7 @@ class CodeBuddyProvider:
         return await runner.run(credential)
 
     async def activity(self, credential_data: dict) -> ActivityResult:
-        """活跃上报一条 chat_request_send（B1.7，可选，默认关闭）。
+        """活跃上报一条 chat_request_send（可选，默认关闭）。
 
         只发一条：与官方「单日一次对话」等价。userId 必填，缺失直接判失败。
         """

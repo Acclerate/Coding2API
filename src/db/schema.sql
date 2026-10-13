@@ -1,4 +1,4 @@
--- coding2api schema（PROPOSAL §5 定稿 + pin 列）
+-- coding2api schema（PROPOSAL §4 定稿 + pin 列）
 --
 -- 变更纪律：只加不改。
 --   新增列 → 这里加定义 + src/db/migrate.py 的 _MIGRATION_COLUMNS 补一条
@@ -10,7 +10,7 @@
 -- 集合实现（上游 status 为准）；模型列表是「进程内 TTL 缓存 + DATA_DIR 落盘
 -- 快照（model_catalog.json）」，不占表（见 src/api/model_catalog.py）。
 
--- 用户建表（B5）：users.txt（PBKDF2）降级为「引导输入」，启动时一次性导入，
+-- 用户建表：users.txt（PBKDF2）降级为「引导输入」，启动时一次性导入，
 -- 之后 DB 是唯一权威源。ADMIN_USERNAMES env 降级为「引导期角色来源 + 防锁死
 -- 兑回」，不再参与每请求鉴权。
 -- api_keys.username 由应用层校验存在性，不加外键。
@@ -23,11 +23,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     preview       TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     last_used_at  INTEGER,
-    -- B3.5 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 六渠道 | ''=自动）与来源 IP
+    -- 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 七渠道 | ''=自动）与来源 IP
     -- 白名单（逗号分隔 IP/CIDR，''=不限制）。空值即老库/未设置时的原行为。
     provider_binding TEXT NOT NULL DEFAULT '',
     allowed_ips   TEXT NOT NULL DEFAULT '',
-    -- P0-3 Key 细粒度策略：模型白名单（fnmatch glob，逗号分隔，''=不限制）
+    -- Key 细粒度策略：模型白名单（fnmatch glob，逗号分隔，''=不限制）
     -- 与到期时间（epoch 秒，NULL=永不过期）。
     allowed_models TEXT NOT NULL DEFAULT '',
     expires_at    INTEGER
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE TABLE IF NOT EXISTS credentials (
     id               TEXT PRIMARY KEY,
-    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（六渠道）
+    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（七渠道）
     nickname         TEXT NOT NULL DEFAULT '',
     data_enc         BLOB NOT NULL,          -- Fernet 加密的凭证 JSON
     enabled          INTEGER NOT NULL DEFAULT 1,   -- 用户软开关
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS growth_events (
 
 CREATE INDEX IF NOT EXISTS idx_growth_cred_ts ON growth_events(credential_id, ts);
 
--- 积分变动流水（B3.4）：额度探测写回时比对余额，只增记一条。
+-- 积分变动流水：额度探测写回时比对余额，只增记一条。
 --
 -- 为什么靠 diff：签到 / 成长中心的上游接口普遍不打日志，拿不到「这次动作
 -- 加了多少分」。所以本表记的是**两次探测之间的净变化**，不是动作归因——
@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS credential_model_cooldowns (
 CREATE INDEX IF NOT EXISTS idx_model_cooling_until
     ON credential_model_cooldowns(cooling_until);
 
--- 运行时配置覆盖（B3.2）：只存「管理台改过」的 key，未出现的 key 回落 env。
+-- 运行时配置覆盖：只存「管理台改过」的 key，未出现的 key 回落 env。
 --
 -- 为什么单独建表而不是加列到别的表：键集合随版本演进（新增可热更项不
 -- 需要迁移），且 key/value 都是文本，值的类型与取值范围由
@@ -184,7 +184,7 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
     updated_at  INTEGER NOT NULL
 );
 
--- 管理台用户账号（B5）。启动时由 users.txt 导入一次，之后本表是唯一权威源。
+-- 管理台用户账号。启动时由 users.txt 导入一次，之后本表是唯一权威源。
 --
 -- 为什么建表：users.txt 只能手工编辑 + 重启才生效，做不到「禁用立即踢会话」
 -- 「改角色即时生效」「登录与操作留痕」。本表把身份变成可运维的数据。
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS users (
     enabled              INTEGER NOT NULL DEFAULT 1,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     session_epoch        INTEGER NOT NULL DEFAULT 0,
-    -- 一次性激活令牌（B5）：只存摘要，明文仅在创建响应里回显一次，与 API Key 同一心智模型。
+    -- 一次性激活令牌：只存摘要，明文仅在创建响应里回显一次，与 API Key 同一心智模型。
     -- 用户带 token 访问 /activate 自设密码；成功即清空。NULL = 无待激活令牌。
     activation_digest    TEXT,
     activation_expires_at INTEGER,
@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_role_enabled ON users(role, enabled);
 CREATE INDEX IF NOT EXISTS idx_users_activation ON users(activation_digest);
 
--- 审计流水（B5）：登录、账号变动、凭证写操作。
+-- 审计流水：登录、账号变动、凭证写操作。
 --
 -- 为什么单独建表而不是只打日志：日志会滚动丢失、无法按 actor 过滤、也不能在
 -- 管理台展示。detail 只放可读短句，绝不写密码 / 令牌 / 凭证明文。
@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor, ts);
 
--- 运维告警事件（P1-7）：后台周期评估四类风险（池耗尽 / 任务连续失败 / token
+-- 运维告警事件：后台周期评估四类风险（池耗尽 / 任务连续失败 / token
 -- 临近到期 / 上游错误率骤升），命中即落一行，供管理台「站内告警记录」回看。
 --
 -- 为什么落库而不是像 TaskStatusStore 只留内存：告警的价值恰在「错过的那段

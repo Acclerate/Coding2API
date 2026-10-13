@@ -11,7 +11,6 @@
 **Source of truth:** `web/src/styles.css`（token） + `web/src/ui/index.tsx`（组件适配层）
 
 > ⚠️ 本文件是**手工核定**的设计系统，不是 `search.py --design-system` 的自动输出。
-> 自动输出的配色（#0F172A / #22C55E / Fira）与本项目不符，已弃用。
 > 改 token 时**先改 `styles.css`**，再回写本表——不要反向操作。
 
 ---

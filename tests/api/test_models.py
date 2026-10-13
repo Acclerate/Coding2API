@@ -38,7 +38,7 @@ def test_default_registry_contains_both_providers(tmp_path):
         "trae": TraeStub(),
         "codebuddy": FailingCB(),
     })
-    # 模型列表按渠道凭证加载：接入凭证后该渠道才参与（Q41）
+    # 模型列表按渠道凭证加载：接入凭证后该渠道才参与
     app.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
     app.state.credentials.add(provider="codebuddy", credential_data={"token": "b"})
     key = app.state.api_keys.create("root")["api_key"]
@@ -50,7 +50,7 @@ def test_default_registry_contains_both_providers(tmp_path):
     assert by_id["glm-5.2"] == ["trae"]
 
 def test_models_endpoint_skips_providers_without_credentials(tmp_path):
-    """Q41：模型列表按渠道凭证加载——没凭证的渠道既不拉取也不展示。
+    """模型列表按渠道凭证加载——没凭证的渠道既不拉取也不展示。
 
     冷启动只有一个渠道接入时，另一个渠道的 list_models 根本不该被调用，
     Playground / `/v1/models` 也不应出现它的模型。
@@ -136,7 +136,7 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
 
     trae = FlakyTrae()
     app = build_app(settings, providers={"trae": trae, "codebuddy": FailingCB()})
-    # CB 有凭证才会被尝试拉取（进而触发失败回退）；TRAE 同理（Q41）
+    # CB 有凭证才会被尝试拉取（进而触发失败回退）；TRAE 同理
     app.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
     app.state.credentials.add(provider="codebuddy", credential_data={"token": "b"})
     key = app.state.api_keys.create("root")["api_key"]

@@ -1,4 +1,4 @@
-"""安全边界测试（PROPOSAL §8）：登录限流 / CSRF / 请求体上限 / 安全头 / Host 白名单。
+"""安全边界测试（PROPOSAL §6）：登录限流 / CSRF / 请求体上限 / 安全头 / Host 白名单。
 
 每个测试独立 build_app（独立 throttle 与数据库），互不污染窗口计数。
 """
@@ -443,7 +443,7 @@ def test_host_whitelist_allows_configured(tmp_path):
 
 
 def test_host_allowed_excludes_testserver_unless_enabled():
-    """M14：testserver 只在显式开启 ALLOW_TEST_HOST 时放行。
+    """testserver 只在显式开启 ALLOW_TEST_HOST 时放行。
 
     单标签主机名可能被本地 DNS 搜索域解析到本服务，生产默认放行等于给
     DNS rebinding 留免校验入口。

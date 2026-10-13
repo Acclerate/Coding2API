@@ -391,6 +391,8 @@ describe("display helpers", () => {
   it("明细失败类型翻成中文，未知值不进主提示但保留原文", () => {
     expect(usageErrorLabel("rate_limit")).toBe("额度耗尽");
     expect(usageErrorLabel("client_disconnect")).toBe("客户端中断");
+    expect(usageErrorLabel("model_unavailable")).toBe("该模型暂时不可用");
+    expect(usageErrorLabel("no_healthy_credential")).toBe("无可用凭证");
     expect(usageErrorLabel(null)).toBe("失败");
     expect(usageErrorLabel(undefined)).toBe("失败");
     // 后端新增枚举时前端不能显示空白：兜底文案带原值便于对照排查

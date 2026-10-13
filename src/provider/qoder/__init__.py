@@ -65,7 +65,7 @@ def status_to_dict(status: CheckinStatus) -> dict[str, Any]:
 
 @dataclass(slots=True)
 class QoderProvider:
-    """Provider 协议实现（细接口，Q16=A）。
+    """Provider 协议实现（细接口）。
 
     `pacer`：聊天请求节流器（Qoder 上游按账号频控）；None 表示不限速。
     """
@@ -82,7 +82,7 @@ class QoderProvider:
         return parse_credential(raw, auth_source="manual").to_dict()
 
     def credential_from(self, credential_data: dict) -> QoderCredential:
-        """供 RefreshTask 判断是否进入刷新窗口（Q12 预刷新）。"""
+        """供 RefreshTask 判断是否进入刷新窗口（预刷新）。"""
         return QoderCredential.from_dict(credential_data)
 
     async def refresh(self, credential_data: dict) -> dict:

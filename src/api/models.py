@@ -18,7 +18,7 @@ publish 别名表——否则启动预热跑完之前别名表是空的，扁平
 重跑一遍拉取（zen 探活最慢可占十几秒），把列表请求打成一串超时。
 
 **缓存存的是未过滤列表，过滤在每个出口现做**：MODEL_BLOCKLIST 是可热更项
-（Q34「改完立即生效」），若把过滤结果存进缓存，改完黑名单要等 TTL（300s）
+（「改完立即生效」），若把过滤结果存进缓存，改完黑名单要等 TTL（300s）
 才反映到 Playground，且被滤掉的模型在 TTL 内会从「兜底缓存」里复活。
 """
 
@@ -244,7 +244,7 @@ def _build_response(services: Services, connected: set[str],
                     benchmarks: BenchmarkTable | None = None) -> dict:
     """按当前缓存合并出响应（不碰上游），并就地 publish 别名表。
 
-    `allowed_models` 非空时按该 Key 的模型白名单过滤展示（P0-3）：白名单是
+    `allowed_models` 非空时按该 Key 的模型白名单过滤展示：白名单是
     Key 级策略，执行时的权威判定在出口（`model_allowed`），这里只是让
     `/v1/models` 与 Key 实际能用的模型一致。
 

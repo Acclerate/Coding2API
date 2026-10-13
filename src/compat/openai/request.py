@@ -18,7 +18,7 @@ MAX_OUTPUT_TOKENS = 4_000_000
 
 
 def require_finite_number(value: Any, name: str) -> float:
-    """数值字段校验：拒绝 bool、非数、NaN/Inf（M4）。"""
+    """数值字段校验：拒绝 bool、非数、NaN/Inf。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidRequest(f"{name} must be a number")
     if not math.isfinite(value):
@@ -27,7 +27,7 @@ def require_finite_number(value: Any, name: str) -> float:
 
 
 def require_positive_int(value: Any, name: str, *, maximum: int) -> int:
-    """正整数校验：拒绝 bool、非整数、≤0、超过上界（M4）。"""
+    """正整数校验：拒绝 bool、非整数、≤0、超过上界。"""
     if isinstance(value, bool) or not isinstance(value, int):
         raise InvalidRequest(f"{name} must be an integer")
     if value <= 0 or value > maximum:
@@ -43,7 +43,7 @@ MAX_CHOICES = 8
 
 
 def validate_numeric_fields(raw: dict[str, Any]) -> None:
-    """校验全部数值型顶层字段，拒绝 NaN/±Inf 与畸形值（M4）。
+    """校验全部数值型顶层字段，拒绝 NaN/±Inf 与畸形值。
 
     只在 `read_json_body` 的 `parse_constant` 之外补齐：`parse_constant` 只拦
     字面量 `NaN`/`Infinity`，拦不住 JSON 溢出成 `inf` 的 `1e999`
@@ -107,7 +107,7 @@ def parse_chat_request(body: Any) -> ChatRequest:
     stream = body.get("stream", False)
     if not isinstance(stream, bool):
         raise InvalidRequest("stream must be a boolean")
-    # 数值字段校验（M4）：NaN/Inf 由 read_json_body 拦在 JSON 层，但 `-1`/`true`
+    # 数值字段校验：NaN/Inf 由 read_json_body 拦在 JSON 层，但 `-1`/`true`
     # 这类合法 JSON 仍会透传到上游、污染凭证健康度与统计；与 Anthropic /
     # Responses 出口保持同一套边界。在 raw 副本上归一，不改动调用方 body。
     raw = dict(body)

@@ -1,6 +1,6 @@
 # coding2api 项目级约束
 
-全局约束见 `~/.pi/agent/AGENTS.md`；本文件是更具体的项目规则，冲突时以本文件为准。
+全局约束见 `~/.claude/CLAUDE.md`（opencode 经 `~/.config/opencode/AGENTS.md` 软链读取）；本文件是更具体的项目规则，冲突时以本文件为准。
 
 ## 质量门槛（提交前必须全部通过）
 
@@ -15,7 +15,7 @@
 - 注意平台差异：本地 macOS 通过不代表 CI（ubuntu-latest）通过；平台相关分支
   （platform.system/machine 等）必须用 monkeypatch 测全所有分支
 - **测试不得依赖本地 `.env`**：本地 `.env` 补上 `APP_SECRET` 等必填项，CI 没有。
-  构造 `Settings` 必须显式传值；验证时临时移走 `.env` 再跑全量（B5 首条 CI 即栽于此）
+  构造 `Settings` 必须显式传值；验证时临时移走 `.env` 再跑全量
 - **改 `src/` 必须重启服务才算验证完成**（只改前端则重新构建即可）。否则出现
   「新前端 + 旧后端」错配：新端点 404，前端弹出与真实原因无关的兜底文案。
   具体重启命令随部署形态而定，见 `docs/local-environment.md` 或 README「部署注意」

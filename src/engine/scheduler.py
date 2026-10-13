@@ -1,7 +1,7 @@
-"""调度器：选号 + 冷却状态机 + pin（Q12=B，Q26 三态健康度）。
+"""调度器：选号 + 冷却状态机 + pin（三态健康度）。
 
 纯逻辑：操作 Candidate 数据类，不碰数据库；持久化由调用方完成。
-这样 100% 覆盖可以用假数据达成（Q14=B）。
+这样 100% 覆盖可以用假数据达成。
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ class Scheduler:
     ) -> None:
         self.max_rotate = max_rotate
         self.err_threshold = err_threshold
-        # 到期窗口可热更（B3.2）：存「取值器」而不是快照，每次选号读当前值。
+        # 到期窗口可热更：存「取值器」而不是快照，每次选号读当前值。
         # expiry_windows 的归一化（主窗口 ≤0 → 次窗口一并归零）必须同步在
         # 读取时做，否则热更把主窗口改成 0、次窗口仍会单独参与排序。
         self._expiry_window = live(expiry_window)

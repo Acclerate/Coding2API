@@ -1,4 +1,4 @@
-"""Anthropic Messages 请求 → 内部 ChatRequest 的入站映射（P0-1）。
+"""Anthropic Messages 请求 → 内部 ChatRequest 的入站映射。
 
 形状取自 Anthropic Messages API（anthropic-python 官方 SDK 类型定义），只覆盖
 Claude Code / Anthropic SDK 会用的子集，其余显式 400（`InvalidRequest`），

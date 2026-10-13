@@ -237,7 +237,7 @@ def test_parse_rejects_bad_max_tokens_and_stop_sequences():
         parse_messages_request(_body(stop_sequences="x"))
 
 def test_parse_rejects_out_of_range_and_non_finite_numbers():
-    """M4：负数/超大 max_tokens、NaN/Inf 采样参数在入站即 400，不透传给上游。"""
+    """负数/超大 max_tokens、NaN/Inf 采样参数在入站即 400，不透传给上游。"""
     with pytest.raises(InvalidRequest, match="between 1 and"):
         parse_messages_request(_body(max_tokens=-1))
     with pytest.raises(InvalidRequest, match="between 1 and"):

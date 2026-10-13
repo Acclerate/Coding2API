@@ -1,6 +1,6 @@
 """Qoder 上游客户端：COSY 签名推理流、模型发现、额度、签到、刷新。
 
-三类端点（PROPOSAL §3.3 / TECHNICAL §3.16）：
+三类端点（PROPOSAL §2.3 / TECHNICAL §5.3）：
 
 * **推理** `POST {gateway}/algo/api/v2/service/pro/sse/agent_chat_generation`
   —— 请求体是自定义 Base64 变体，头是整套 `cosy-*`；响应是**信封式 SSE**

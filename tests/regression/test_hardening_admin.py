@@ -78,7 +78,7 @@ def test_models_endpoint_reuses_cache_within_ttl(settings):
             return raw
 
     app = build_app(settings, providers={"trae": Provider()})
-    # 没凭证的渠道不参与模型列表（Q41），故先接入一条凭证
+    # 没凭证的渠道不参与模型列表，故先接入一条凭证
     app.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
     key = app.state.api_keys.create("root")["api_key"]
     with TestClient(app) as c:
@@ -187,7 +187,7 @@ def test_static_cache_headers_keep_entry_fresh_and_assets_immutable(
     assert asset.status_code == 200
     assert "immutable" in asset.headers["cache-control"]
 
-    # 直接请求 /index.html（不是 catch-all 回落）也必须 no-cache（M13）：
+    # 直接请求 /index.html（不是 catch-all 回落）也必须 no-cache：
     # 它是入口文档而非 hash 化资源，immutable 会让浏览器缓存旧入口。
     direct = client.get("/index.html")
     assert direct.status_code == 200

@@ -109,11 +109,11 @@ def create_router(services: Services) -> APIRouter:
         return {"credentials": credentials.list_all(
                     expiring_window=window, expiring_secondary_window=secondary,
                     sort=sort, order=order,
-                    # 昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见（M7）
+                    # 昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见
                     include_nickname=principal.is_operator),
                 "expiry_window_seconds": window,
                 "expiry_secondary_window_seconds": secondary,
-                # 到期预警阈值（B3.3）：前端进度条与 <1h 红字同源，避免两处各写一个数
+                # 到期预警阈值：前端进度条与 <1h 红字同源，避免两处各写一个数
                 "token_expiry_warning_seconds":
                     services.settings.token_expiry_warning_seconds,
                 "viewer": principal.username,
@@ -208,7 +208,7 @@ def create_router(services: Services) -> APIRouter:
             reason = describe_probe_failure(error)
             logger.info("额度探测失败 %s: %s", credential_id, reason)
             # detail 只在**服务端日志**里带上游原文（可能是 2048 字的响应体摘要）；
-            # 对外只回受控 reason，避免上游回显请求头/正文时泄露凭证片段（M2/M4）。
+            # 对外只回受控 reason，避免上游回显请求头/正文时泄露凭证片段。
             logger.info("额度探测失败详情 %s: %s", credential_id, str(error)[:200])
             return {"probed": False, "reason": reason}
         credentials.save_quota(credential_id, quota)
@@ -297,7 +297,7 @@ def create_router(services: Services) -> APIRouter:
     async def run_activity(credential_id: str,
                            _csrf: None = Depends(csrf_protected),
                            principal=Depends(principal_from_request)):
-        """手动补发一条活跃上报（B1.7）：与定时任务同一条路径。
+        """手动补发一条活跃上报：与定时任务同一条路径。
 
         独立于 activity_report_enabled 开关：定时任务默认关闭不影响管理员在
         管理台手动补报一次（用途就是部署后验证闭环）。结果记一行 growth_events。
@@ -343,7 +343,7 @@ def create_router(services: Services) -> APIRouter:
         provider, _ = provider_for(
             credential_id, "switch_account",
             error="credential does not support account switching")
-        # 编辑锁（M12）：与 RefreshTask 的「读 → await → 整份覆写」互斥，否则
+        # 编辑锁：与 RefreshTask 的「读 → await → 整份覆写」互斥，否则
         # 刷新会把刚切好的账号覆盖回旧值（反之亦然）。
         async with credentials.edit_lock(credential_id):
             data = credentials.credential_data(credential_id)

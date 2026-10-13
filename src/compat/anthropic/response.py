@@ -1,4 +1,4 @@
-"""Anthropic Messages 出站：中立 Event → Anthropic SSE 帧 / 非流式对象（P0-1）。
+"""Anthropic Messages 出站：中立 Event → Anthropic SSE 帧 / 非流式对象。
 
 接口与 `compat.responses.response.ResponsesStreamTranslator` 对齐
 （translate / finish / keepalive / usage / done_sent / error_frame），由

@@ -67,7 +67,7 @@ def test_session_endpoint_requires_login(tmp_path):
         assert client.get("/api/auth/session").status_code == 401
 
 def test_build_app_fails_without_users_file(tmp_path, monkeypatch):
-    """文件缺失**且**库为空才是致命错误（B5：库非空时文件缺失可正常启动）。"""
+    """文件缺失**且**库为空才是致命错误（库非空时文件缺失可正常启动）。"""
     from src.auth.users import UsersFileError
 
     monkeypatch.setenv("USERS_FILE", str(tmp_path / "missing.txt"))

@@ -95,7 +95,9 @@ function statusCell(row: UsageEventRow) {
 
 export function StatsPage() {
   const session = useSessionContext();
-  const [range, setRange] = useState("7d");
+  // 默认最近 24 小时：「这个池子现在怎么样」是打开用量统计的第一问题，
+  // 7 天会把当天的波动摊平（与凭证池页的实时气质一致）。
+  const [range, setRange] = useState("24h");
   const [metric, setMetric] = useState("requests");
   const [groupDimension, setGroupDimension] = useState("provider");
   // 分组统计默认按请求数降序（「用得最多」才是分组表的用途）

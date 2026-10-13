@@ -1,6 +1,6 @@
 """TRAE SOLO 上游客户端：payload 改写、SSE 流、凭证解析、模型/额度查询。
 
-双 httpx 客户端（T-Q4）：流式无总超时防长流截断；短请求 30s 总超时防悬挂。
+双 httpx 客户端：流式无总超时防长流截断；短请求 30s 总超时防悬挂。
 """
 
 from __future__ import annotations
@@ -536,7 +536,7 @@ class TraeClient:
 
 
 def _trae_supports_reasoning(config: dict[str, Any]) -> bool | None:
-    """TRAE 侧推理能力判定（B1.6，实测两处上游字段）。
+    """TRAE 侧推理能力判定（实测两处上游字段）。
 
     优先 `display_config.model_capability == "reasoning_model"`；缺失时回落
     `reasoning_effort_config.support_thinking`。两者都不可信时返回 None。
@@ -584,7 +584,7 @@ class UpstreamHTTPError(base.UpstreamHTTPError):
 
 # 上游 OAuth 地址白名单：凭证 JSON 里的 apiHost 是用户可控输入，
 # 一旦被伪造，ExchangeToken 会把真实 refreshToken 发往任意主机
-# （PROPOSAL §8「真实 Token 绝不转发到未授权站点」）。
+# （PROPOSAL §6「真实 Token 绝不转发到未授权站点」）。
 ALLOWED_OAUTH_HOSTS: frozenset[str] = frozenset(
     {AGENT_HOST, UG_HOST, OAUTH_HOST, "https://api.trae.cn", "https://api.trae.com.cn"}
 )
@@ -609,7 +609,7 @@ def _pacer_key(credential: TraeCredential) -> str:
 
 @dataclass(slots=True)
 class TraeProvider:
-    """Provider 协议实现（细接口，Q16=A）。"""
+    """Provider 协议实现（细接口）。"""
 
     client: TraeClient = field(default_factory=TraeClient)
     pacer: Any | None = None
@@ -618,7 +618,7 @@ class TraeProvider:
 
     # 动态模型拉取失败负缓存：失败后 N 秒内不再打上游（静态表兜底）。
     # 上游 /v1/models 每次都要拉取，故障期会反复失败；
-    # 负缓存把无效请求压到 5 分钟一次（PROPOSAL §4.4 约定）。
+    # 负缓存把无效请求压到 5 分钟一次（PROPOSAL §3.4 约定）。
     _dynamic_models_blocked_until: float | None = field(default=None, init=False)
     # 上次成功动态拉取的元数据（lower 名 → 字段表），静态表兜底时填倍率不丢
     _last_dynamic_meta: dict[str, dict] = field(default_factory=dict, init=False)
@@ -635,7 +635,7 @@ class TraeProvider:
         return credential.to_dict()
 
     def credential_from(self, credential_data: dict) -> TraeCredential:
-        """供 RefreshTask 判断是否进入刷新窗口（Q12 预刷新）。
+        """供 RefreshTask 判断是否进入刷新窗口（预刷新）。
 
         缺少这个方法时 `_needs_refresh` 对 TRAE 恒返回 False，
         凭证只能等 access token 过期后被动失效，永远不预刷新。
@@ -785,7 +785,7 @@ class TraeProvider:
         return last if last is not None else CheckinResult(  # pragma: no cover
             ok=False, message="签到未完成")
 
-    # ------------------------------------------------- callback 轨道（Q17=C）
+    # ------------------------------------------------- callback 轨道
 
     def parse_login_url(self, raw_url: str) -> CallbackInfo:
         """解析 TRAE 登录回调链接。"""

@@ -1,4 +1,4 @@
-"""CodeBuddy OAuth 设备码轮询登录（Q17=C poll 轨道）。
+"""CodeBuddy OAuth 设备码轮询登录（poll 轨道）。
 
 流程（来自 codebuddy2api 的实测实现）：
 1. POST /v2/plugin/auth/state?platform=CLI → {authUrl, state}

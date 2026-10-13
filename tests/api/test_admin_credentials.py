@@ -88,7 +88,7 @@ def test_credential_account_endpoints_unsupported_for_trae(admin_client):
     assert client.get("/api/credentials/ghost/accounts").status_code == 400
 
 def test_select_account_rejects_vanished_credential(admin_client):
-    """provider 支持切换但持锁后凭证已消失 → 400，不拿 None 去打上游（M12）。"""
+    """provider 支持切换但持锁后凭证已消失 → 400，不拿 None 去打上游。"""
     app, client = admin_client
     credential_id = app.state.credentials.add(
         provider="codebuddy", credential_data={"bearer_token": "t"})
@@ -165,7 +165,7 @@ def test_probe_endpoint_marks_failed_on_provider_error(admin_client):
     # 不能把 Python 类名当作 reason 暴露给用户
     assert body["reason"] == "unknown_error"
     assert "RuntimeError" not in body["reason"]
-    # 上游原文/异常文本不再回显给客户端（M2/M4），只回受控 reason
+    # 上游原文/异常文本不再回显给客户端，只回受控 reason
     assert "detail" not in body
     assert app.state.credentials.candidates()[0].health is None
 

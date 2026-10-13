@@ -76,11 +76,11 @@ class Services:
     upstream_auth: dict[str, Any]
     model_aliases: dict[str, dict[str, str]]
     schedule_probe: Callable[[str], None]
-    # 用户仓储（B5）：用户管理端点直接读写行，不经过 DbUserStore（后者只做鉴权读）。
+    # 用户仓储：用户管理端点直接读写行，不经过 DbUserStore（后者只做鉴权读）。
     user_repo: UserRepository
-    # 审计流水（B5）：登录/账号变动/凭证写操作。
+    # 审计流水：登录/账号变动/凭证写操作。
     audit: AuditRepository
-    # 运维告警事件（P1-7）：后台评估命中后落库，/api/alerts 回看。
+    # 运维告警事件：后台评估命中后落库，/api/alerts 回看。
     alerts: AlertRepository
     # 模型列表缓存：provider_id → {小写模型名: Model}（含元数据）。
     # list_models 成功时更新，某上游拉取失败时用缓存兜底（v1/models 稳定返回）。
@@ -155,7 +155,7 @@ def _enforce_password_change(request: Request) -> None:
 
 @dataclass(frozen=True)
 class ApiKeyPrincipal:
-    """外部 /v1 出口的鉴权结果：归属用户 + 该 Key 的访问策略（B3.5 / P0-3）。
+    """外部 /v1 出口的鉴权结果：归属用户 + 该 Key 的访问策略。
 
     返回结构体而不是裸用户名，是因为出口需要 `provider_binding` 去收窄
     候选上游、需要 `allowed_models` 去拒绝未授权模型；IP 白名单与到期时间
@@ -231,7 +231,7 @@ async def read_json_body(request: Request) -> Any:
 
     `parse_constant` 拒绝 `NaN` / `Infinity` / `-Infinity`（JSON 标准不允许，
     但 Python json 默认接受）：这些值会经本服务重新序列化透传给上游，把
-    本应 400 的输入变成上游 4xx，污染凭证健康度与统计（M4）。
+    本应 400 的输入变成上游 4xx，污染凭证健康度与统计。
     """
     def _reject_constant(token: str) -> Any:
         raise InvalidRequest(f"JSON value {token} is not allowed")

@@ -1,4 +1,4 @@
-"""账号身份层（B5）：DbUserStore、bootstrap、三角色 RBAC、会话 epoch、强制改密。
+"""账号身份层：DbUserStore、bootstrap、三角色 RBAC、会话 epoch、强制改密。
 
 这一组守着四条容易退化的语义：
 1. 角色/启用状态从 DB **每请求现读**——改完立即生效，不靠重新登录。

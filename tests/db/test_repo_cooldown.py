@@ -170,7 +170,7 @@ def test_retention_task_prunes_audit_events(repo):
     assert RetentionTask(collector).run_once()["purged_audit"] == 0
 
 def test_credential_edit_lock_is_reused_per_id(repo):
-    """编辑锁按凭证 id 分键复用：同 id 返回同一把锁，不同 id 各自独立（M12）。"""
+    """编辑锁按凭证 id 分键复用：同 id 返回同一把锁，不同 id 各自独立。"""
     credentials, db = repo
     first = credentials.edit_lock("cred_a")
     assert credentials.edit_lock("cred_a") is first

@@ -4,7 +4,9 @@
 
 * `User-Agent` 形如 `opencode/<version>`，且 version ≥ 1.18.0
   （低于阈值 → 426；无版本号 → 403）；
-* `x-opencode-session` 匹配 `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`；
+* `x-opencode-session` 匹配 `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`，**且前 12 位
+  十六进制必须解码回近期时间戳**（官方 `Identifier.create` 的编码，见
+  `new_session_id`；随机 hex 在 2026-10-09 上游收紧后一律 403）；
 * body `stream` 必须为 `true`（本项目只用流式，非流式由引擎聚合）；
 * body `tools` 必须**同时**含 name 为 `bash` 与 `read` 的工具
   （只校验 name，参数留空壳即可）。
@@ -113,11 +115,30 @@ GATE_403_RETRY_DELAY = 1.0
 # session id 的 base62 字母表（12 位 hex + 14 位 base62，共 26 位）
 _SESSION_ALPHABET = string.ascii_letters + string.digits
 
+# 会话 id 前 12 位 hex 的**时间编码**（2026-10-09 上游收紧，实测）：
+# 门禁不只校验形态（`ses_` + 12 hex + 14 base62），还要求该 12 位 hex 能解码回
+# **近期时间**。官方 `Identifier.create` 的做法是把毫秒时间戳左移 12 位（`*0x1000`）
+# 再 `+1`，然后**按位取反**，取低 48 位写成 12 位小写十六进制。随机 hex 一律
+# 403 `FreeTierError`，与形态是否合规无关（详见 TECHNICAL.md §Zen）。
+_SESSION_TIME_SHIFT = 0x1000
+_SESSION_TIME_MASK = (1 << 48) - 1
 
-def new_session_id() -> str:
-    """生成符合门禁正则的会话 ID：`ses_` + 12 位小写 hex + 14 位 base62。"""
+
+def _session_time_prefix(now_ms: int) -> str:
+    """毫秒时间戳 → 会话 id 的 12 位十六进制前缀（官方编码的复刻）。"""
+    value = (~(now_ms * _SESSION_TIME_SHIFT + 1)) & _SESSION_TIME_MASK
+    return format(value, "012x")
+
+
+def new_session_id(*, now_ms: int | None = None) -> str:
+    """生成符合门禁的会话 ID：`ses_` + 12 位时间 hex + 14 位 base62。
+
+    前 12 位是**近期时间戳**的编码（见 `_session_time_prefix`），后 14 位内容
+    自由。`now_ms` 仅供测试注入固定时间；生产走当前时钟，故每次调用都新鲜。
+    """
+    millis = int(time.time() * 1000) if now_ms is None else int(now_ms)
     suffix = "".join(secrets.choice(_SESSION_ALPHABET) for _ in range(14))
-    return f"ses_{secrets.token_hex(6)}{suffix}"
+    return f"ses_{_session_time_prefix(millis)}{suffix}"
 
 
 def gate_headers(*, version: str = MIN_OPENCODE_VERSION,
@@ -472,7 +493,7 @@ class ZenClient:
 
 @dataclass(slots=True)
 class ZenProvider:
-    """Provider 协议实现（细接口，Q16=A）。
+    """Provider 协议实现（细接口）。
 
     Zen 免费层无凭证、无额度、无签到/成长：只实现对话与模型列表三条能力，
     其余任务靠「方法缺失」自然跳过（CheckinTask / GrowthTask / RefreshTask

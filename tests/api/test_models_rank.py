@@ -111,7 +111,7 @@ def test_models_list_orders_dual_provider_by_highest_rank(tmp_path):
         "codebuddy", "trae"]
 
 def test_models_passthrough_reasoning_metadata(tmp_path):
-    """B1.6：supports_reasoning / default_effort 随条目透传，且逐字段补缺。"""
+    """supports_reasoning / default_effort 随条目透传，且逐字段补缺。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
 
     class Stub:

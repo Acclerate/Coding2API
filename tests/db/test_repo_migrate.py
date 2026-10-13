@@ -110,9 +110,9 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     assert "checkins" not in tables and "model_cache" not in tables
     # 新增表（(凭证, 模型) 冷却）也由启动时的 schema.sql 全量补建
     assert "credential_model_cooldowns" in tables
-    # 运行时配置覆盖表（B3.2）同样是「只加表、不加列」，老库升级后必须存在且可写
+    # 运行时配置覆盖表同样是「只加表、不加列」，老库升级后必须存在且可写
     assert "runtime_settings" in tables
-    # 账号体系（B5）：users / audit_events 也是「只加表」，老库升级后必须建好
+    # 账号体系：users / audit_events 也是「只加表」，老库升级后必须建好
     assert "users" in tables and "audit_events" in tables
     # 补列后可写入、可读出
     db.connect().execute(

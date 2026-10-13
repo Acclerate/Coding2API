@@ -1,7 +1,7 @@
 import { fireEvent, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ModelCatalogPage } from "../ModelCatalogPage";
-import { renderPage, settle } from "@/test-utils";
+import { renderPage, settle, userEvent } from "@/test-utils";
 
 function stubFetch(body: unknown, status = 200) {
   const spy = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
@@ -40,6 +40,7 @@ const CATALOG = {
       output: 1.5,
       cache_read: 0.05,
       cache_write: null,
+      available: true,
     },
     {
       id: "glm-5.2",
@@ -61,6 +62,7 @@ const CATALOG = {
       output: 2.0,
       cache_read: 0.1,
       cache_write: 1.25,
+      available: false,
     },
   ],
 };
@@ -242,5 +244,73 @@ describe("ModelCatalogPage（模型列表）", () => {
     renderPage(<ModelCatalogPage />);
     await settle();
     expect(screen.getByTestId("model-catalog-error")).toBeInTheDocument();
+  });
+
+  it("「只看当前渠道」默认关闭，开启后只留 available 的模型", async () => {
+    stubFetch(CATALOG);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    // 默认关闭：两条都展示
+    const toggle = screen.getByTestId("model-available-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
+    expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
+
+    // 开启：只留 available=true 的 a-model，标题计数同步收窄
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
+    expect(screen.queryByTestId("model-row-glm-5.2")).not.toBeInTheDocument();
+    expect(screen.getByText("模型列表（1 / 2）")).toBeInTheDocument();
+
+    // 关闭：恢复两条
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
+  });
+
+  it("开启过滤但无任何 available 模型时显示渠道空态（非搜索空态）", async () => {
+    stubFetch({
+      ...CATALOG,
+      models: CATALOG.models.map((row) => ({ ...row, available: false })),
+    });
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("model-available-toggle"));
+    expect(screen.getByTestId("no-model-match")).toHaveTextContent(
+      "当前渠道没有可用模型");
+  });
+
+  it("吸顶表头不透明：滚动时行内容不从表头底下透出", async () => {
+    stubFetch(CATALOG);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    // 表头 sticky 且 th 带不透明底色（基类 tr 的 bg-muted/40 是半透明的，
+    // 不覆盖会在滚动时透出后面的行）
+    const thead = screen.getByTestId("model-catalog-table").querySelector("thead")!;
+    expect(thead).toHaveClass("sticky");
+    expect(thead).toHaveClass("[&_th]:bg-muted");
+  });
+
+  it("能力分列可排序：点列头下发 sort=intelligence（首点降序）", async () => {
+    const spy = stubFetch(CATALOG);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    const urls = () => spy.mock.calls.map((call) => String(call[0]));
+    // 默认按 id 升序，不带 intelligence
+    expect(urls()[0]).toContain("sort=id");
+
+    await userEvent.click(screen.getByTestId("sort-intelligence"));
+    await settle();
+    expect(urls().at(-1)!).toContain("sort=intelligence");
+    expect(urls().at(-1)!).toContain("order=desc");   // 分数类列首点降序（先看最高）
+
+    // 再点同列：升序
+    await userEvent.click(screen.getByTestId("sort-intelligence"));
+    await settle();
+    expect(urls().at(-1)!).toContain("order=asc");
   });
 });

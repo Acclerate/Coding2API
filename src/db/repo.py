@@ -1,4 +1,4 @@
-"""凭证与 API Key 的持久化访问（手写 SQL，T-Q2）。
+"""凭证与 API Key 的持久化访问（手写 SQL）。
 
 凭证内容以 Fernet 密文入库；解密只发生在引擎侧，provider 不接触数据库。
 """
@@ -173,7 +173,7 @@ class CredentialRepository:
     def __init__(self, db, cipher: CredentialCipher) -> None:
         self._db = db
         self._cipher = cipher
-        # 凭证级编辑锁（M12）：refresh / 账号切换都是「解密取整份 data → await
+        # 凭证级编辑锁：refresh / 账号切换都是「解密取整份 data → await
         # 上游 → 整份覆写 data_enc」，两个写者在 await 点交错时，后写的会用自己
         # 读到的旧快照覆盖先写的新值（典型：刷新把刚切好的账号覆盖回去）。
         # 锁只按凭证 id 分键，不同凭证互不阻塞。
@@ -345,7 +345,7 @@ class CredentialRepository:
                 (self._cipher.encrypt(payload), expires_at, issued_at, credential_id))
 
     def save_quota(self, credential_id: str, quota: Quota) -> None:
-        """写回额度，并顺带记一条积分变动流水（B3.4）。
+        """写回额度，并顺带记一条积分变动流水。
 
         流水必须在同一事务里与前值比较：分两次读改写会与并发探测交错，
         记出「before 是别人写过的值」的错行。因此这里先取旧余额，
@@ -518,15 +518,15 @@ class CredentialRepository:
         放在组装之后，而不是 SQL。
 
         `include_nickname=False`：昵称来自全局共享池（常含邮箱/手机），只对
-        admin/operator 返回（与 `/api/stats/events`、`by-credential` 的 M7
-        约束同一口径）；viewer 只看得到自己的记录，昵称对它没有用途。
+        admin/operator 返回，与 `/api/stats/events`、`by-credential` 口径一致；
+        viewer 只看得到自己的记录，昵称对它没有用途。
 
         附 `quota_expiring_credits`（主窗口内即将到期的积分，与调度排序第一级同源）；
         附 `quota_expiring_credits_secondary`（次窗口，主窗口打平时才参与排序的第二级）；
         附 `quota_expiry_ladder`（套餐到期阶梯，[[epoch, 剩余积分]]，按包独立到期的渠道）；
         渠道无到期信息时三者都为 None，展示层据此隐藏。
         附 `model_cooldowns`（model → 截止 epoch），只在模型级限流/负缓存时非空。
-        附 `token_expires_at` / `token_issued_at`（B3.3 token 到期展示）：只下发
+        附 `token_expires_at` / `token_issued_at`（token 到期展示）：只下发
         绝对 epoch，剩余时间与预警阈值判定交给展示层用同一个时钟现算——否则
         服务端算好的「剩余秒数」不会随页面 tick 更新，两处口径还会漂移。
         到期时间未知时为 0（展示层隐藏，绝不当成已过期）。
@@ -579,7 +579,7 @@ class CredentialRepository:
 
     def expiring_tokens(self, *, within_seconds: int, now: int | None = None,
                         ) -> list[dict[str, Any]]:
-        """列出 access token 将在窗口内到期的凭证（P1-7 告警）。
+        """列出 access token 将在窗口内到期的凭证（告警）。
 
         只收「到期时间已知且落在 (moment, moment+within]」的行：
         - `token_expires_at` 列 NULL（老库未写回）→ 从密文按需派生，与列表页
@@ -769,7 +769,7 @@ class CreditEventRepository:
 
 
 class AlertRepository:
-    """运维告警事件（alert_events，P1-7）：落库 + 去重静默查询。
+    """运维告警事件（alert_events）：落库 + 去重静默查询。
 
     为什么独立仓储：告警是「管理台要回看的历史」，与凭证/统计无关；写入与
     读取都由后台 AlertTask 与 /api/alerts 端点使用。静默去重靠
@@ -860,7 +860,7 @@ class RuntimeSettingsRepository:
 
 
 class UserRepository:
-    """管理台用户账号（users，B5）。
+    """管理台用户账号（users）。
 
     本仓储**返回整行**（含 password_hash / activation_digest），因为
     `DbUserStore` 需要它们做校验。对外 API 必须显式挑选字段——绝不要把这里的
@@ -991,7 +991,7 @@ class UserRepository:
 
 
 class AuditRepository:
-    """审计流水（audit_events，B5）。
+    """审计流水（audit_events）。
 
     写入刻意不在这里做「业务校验」：调用方负责保证 detail 不含密码/令牌。
     `prune` 与 usage_events 同保留策略入口，由 RetentionTask 调用。

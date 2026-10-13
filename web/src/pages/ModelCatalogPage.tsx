@@ -11,11 +11,14 @@ import {
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { SortableHead } from "../components/SortableHead";
+import { ColumnHint } from "../components/Tip";
 import { useSort } from "../hooks/useSort";
 import {
   Button,
+  Checkbox,
   Empty,
   Input,
+  Label,
   Metric,
   Notice,
   Panel,
@@ -116,24 +119,29 @@ export function ModelCatalogPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("id", "asc",
     { context: "desc", max_output: "desc", input: "desc", output: "desc",
-      cache_read: "desc", cache_write: "desc" });
+      cache_read: "desc", cache_write: "desc", intelligence: "desc" });
   const { data, isLoading, isError } = useModelCatalog(session.username, sort, order);
   const [query, setQuery] = useState("");
   const [currency, setCurrency] = useState<Currency>("USD");
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState(50);
+  // 只看「当前渠道获取到的模型」：默认关闭（OpenRouter 收录全量，用户按需收窄）。
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
 
   const rate = data?.usd_cny_rate ?? 1;
   const models = useMemo(() => data?.models ?? [], [data]);
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return models;
-    // provider 不参与匹配：它恒为 id 的厂商前缀（id 的子串），匹配它等于匹配 id
-    return models.filter((row) =>
-      row.id.toLowerCase().includes(needle) ||
-      (row.name ?? "").toLowerCase().includes(needle),
-    );
-  }, [models, query]);
+    return models.filter((row) => {
+      if (onlyAvailable && !row.available) return false;
+      if (!needle) return true;
+      // provider 不参与匹配：它恒为 id 的厂商前缀（id 的子串），匹配它等于匹配 id
+      return (
+        row.id.toLowerCase().includes(needle) ||
+        (row.name ?? "").toLowerCase().includes(needle)
+      );
+    });
+  }, [models, query, onlyAvailable]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(pageIndex, pageCount - 1);
@@ -142,10 +150,10 @@ export function ModelCatalogPage() {
     [filtered, safePage, pageSize],
   );
 
-  // 搜索 / 改每页条数 / 换排序后回到第一页：否则会停在一个已不存在的页码上（空白）
+  // 搜索 / 改每页条数 / 换排序 / 切渠道过滤后回到第一页：否则会停在一个已不存在的页码上（空白）
   useEffect(() => {
     setPageIndex(0);
-  }, [query, pageSize, sort, order]);
+  }, [query, pageSize, sort, order, onlyAvailable]);
 
   if (isLoading) {
     return (
@@ -175,6 +183,14 @@ export function ModelCatalogPage() {
         onChange={(value) => setCurrency(value as Currency)}
         testId="model-currency-tabs"
       />
+      <Label className="w-fit cursor-pointer gap-1.5 text-xs font-normal text-muted-foreground">
+        <Checkbox
+          checked={onlyAvailable}
+          data-testid="model-available-toggle"
+          onCheckedChange={(value) => setOnlyAvailable(value === true)}
+        />
+        只看当前渠道
+      </Label>
     </div>
   );
 
@@ -243,14 +259,20 @@ export function ModelCatalogPage() {
           </div>
 
           {filtered.length === 0 ? (
-            <Empty data-testid="no-model-match">没有匹配「{query}」的模型</Empty>
+            <Empty data-testid="no-model-match">
+              {query.trim()
+                ? `没有匹配「${query}」的模型`
+                : "当前渠道没有可用模型（未接入渠道或全部暂停）"}
+            </Empty>
           ) : (
             <div className="mt-3">
               <Table
                 data-testid="model-catalog-table"
                 containerClassName="max-h-[70vh] overflow-auto"
               >
-                <TableHeader className="sticky top-0 z-10">
+                {/* [&_th]:bg-muted：吸顶表头必须不透明，否则滚动时行内容会从
+                    半透明的表头底色（基类 tr 的 bg-muted/40）里透出来。 */}
+                <TableHeader className="sticky top-0 z-10 [&_th]:bg-muted">
                   <TableRow>
                     <SortableHead label="模型" columnKey="id" active={sort === "id"}
                                   direction={order} onToggle={toggle} testId="sort-id" />
@@ -259,7 +281,10 @@ export function ModelCatalogPage() {
                                   onToggle={toggle} testId="sort-context" />
                     <TableHead>输入 → 输出模态</TableHead>
                     <TableHead>能力</TableHead>
-                    <TableHead>能力分</TableHead>
+                    <SortableHead label="能力分" columnKey="intelligence"
+                                  active={sort === "intelligence"} direction={order}
+                                  onToggle={toggle} testId="sort-intelligence"
+                                  hint={<ColumnHint text="Artificial Analysis 三项指数（智 / 编 / 体），经 OpenRouter 公开接口，非本服务实测。点列头按「智」（综合智能指数）排序；无分数的行排在末尾。" />} />
                     <SortableHead label="知识截止" columnKey="knowledge"
                                   active={sort === "knowledge"} direction={order}
                                   onToggle={toggle} testId="sort-knowledge" />

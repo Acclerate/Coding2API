@@ -1,4 +1,4 @@
-"""B1.4 截断续写：判定、请求体扩展、包装器行为。"""
+""" 截断续写：判定、请求体扩展、包装器行为。"""
 
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ async def test_continues_on_length_and_accumulates_usage():
 
 @pytest.mark.asyncio
 async def test_usage_reported_before_continuation_round():
-    """M3：每轮结束先补发一条累计 usage，客户端在第一轮后续写途中断开也能记账。"""
+    """每轮结束先补发一条累计 usage，客户端在第一轮后续写途中断开也能记账。"""
     provider = _FakeProvider([
         [Event(kind=EventKind.CONTENT, content="part1"),
          Event(kind=EventKind.USAGE, usage=Usage(input_tokens=10, output_tokens=5)),

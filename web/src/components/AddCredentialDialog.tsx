@@ -18,7 +18,7 @@ const LOGIN_PROVIDERS: Provider[] = [
 type TabValue = "login" | "import";
 
 /** 只允许 http(s) 授权地址：上游返回的 auth_url 若为 `javascript:` / `data:`
- * 等被赋给弹窗 location 会在弹窗（继承本页 origin）执行脚本（M5）。
+ * 等被赋给弹窗 location 会在弹窗（继承本页 origin）执行脚本。
  *
  * 不做主机白名单：auth_url 由各渠道上游下发（如 codebuddy 的登录域名随账号
  * 区域变化），写死域名会在渠道侧变更时直接打断登录，而这里的真实威胁是
@@ -114,7 +114,7 @@ export function AddCredentialDialog({
     // 先同步开一个占位窗口：window.open 若在 await 之后才调用，
     // 会脱离用户手势上下文而被浏览器弹窗拦截。
     const popup = window.open("", "_blank");
-    if (popup) popup.opener = null;               // 切断对管理台 window 的引用（M5）
+    if (popup) popup.opener = null;               // 切断对管理台 window 的引用
     try {
       const started = await api.upstreamStart(provider);
       loginStatesRef.current[provider] = started.state;

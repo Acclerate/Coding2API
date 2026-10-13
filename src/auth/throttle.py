@@ -1,4 +1,4 @@
-"""登录限流：全局 / IP / 用户名三级固定窗口 + PBKDF2 并发上限（PROPOSAL §8）。
+"""登录限流：全局 / IP / 用户名三级固定窗口 + PBKDF2 并发上限（PROPOSAL §6）。
 
 威胁模型：登录接口可被脚本爆破；PBKDF2（600k 迭代）是 CPU 密集操作，
 并发请求能打满默认线程池（asyncio.to_thread 默认 min(32, cpu+4) 线程）。

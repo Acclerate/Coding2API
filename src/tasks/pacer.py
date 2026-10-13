@@ -1,4 +1,4 @@
-"""上游请求节流器（PACER_MIN/MAX_SECONDS，PROPOSAL §8）。
+"""上游请求节流器（PACER_MIN/MAX_SECONDS，PROPOSAL §6）。
 
 两种模式，差别只在「同一时刻允不允许并发」：
 
@@ -66,7 +66,7 @@ class Pacer:
                  window_seconds: float | Callable[[], float] = 0,
                  sleep: Callable[[float], Awaitable[None]] | None = None,
                  now: Callable[[], float] | None = None) -> None:
-        # 上下限可热更（B3.2）：存取值器，每次计间隔读当前值。校验必须放在
+        # 上下限可热更：存取值器，每次计间隔读当前值。校验必须放在
         # 读取时（而不是只在构造时）：覆盖层把下限改到上限之上时，构造成员
         # 早已完成，只能在真正用时拒绝，否则会算出负间隔。
         self._min = live(min_seconds)

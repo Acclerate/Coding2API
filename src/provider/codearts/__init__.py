@@ -9,7 +9,7 @@
    `tasks.refresh.RefreshTask`（唯一持有者，**先落库再同步**）承担，额度探测
    等旁路**不得**顺手刷新——否则一个一次性 refresh_token 被两个地方各消费一次，
    后到的必然报 `the refresh token has been used`，DB 里的 token 也被烧掉。
-3. **每日签到领 1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，Q72）。
+3. **每日签到领 1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`）。
    `CheckinTask` 与管理台靠 `getattr` 自动发现，故这里实现 `checkin` /
    `checkin_status` / `checkin_scope`；`claim` 后**必须** `confirm`，否则积分
    可能不到账（上游 `CLAIMED` 是「已领未确认」而非终态）。
@@ -44,7 +44,7 @@ def credential_key(credential: CodeArtsCredential) -> str:
 
 @dataclass(slots=True)
 class CodeArtsProvider:
-    """Provider 协议实现（细接口，Q16=A）。只依赖注入的 client，不 import config。"""
+    """Provider 协议实现（细接口）。只依赖注入的 client，不 import config。"""
 
     client: CodeArtsClient = field(default_factory=CodeArtsClient)
     pacer: Any | None = None
@@ -74,7 +74,7 @@ class CodeArtsProvider:
         return credential.to_dict()
 
     def credential_from(self, credential_data: dict) -> CodeArtsCredential:
-        """供 RefreshTask 判断是否进入刷新窗口（Q12 预刷新）。"""
+        """供 RefreshTask 判断是否进入刷新窗口（预刷新）。"""
         return CodeArtsCredential.from_dict(credential_data)
 
     def classify(self, status: int, body: bytes) -> ErrKind:

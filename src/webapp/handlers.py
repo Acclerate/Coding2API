@@ -1,4 +1,4 @@
-"""异常 → HTTP 响应映射（TECHNICAL §6.5：稳定的机器可读错误码）。
+"""异常 → HTTP 响应映射（TECHNICAL §11.2：稳定的机器可读错误码）。
 
 管理端点返回的失败原因必须是稳定枚举，不能是 Python 异常类名——
 类名是实现细节，用户既判断不出问题也不知道下一步做什么，重构时还会漂移。
@@ -75,7 +75,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ForbiddenError)
     async def _forbidden(_request, error: ForbiddenError):
         # 沿用异常自带文案：除了 rbac 的 "admin only"，/v1 出口还会因 API Key
-        # 的 IP 白名单拒绝请求（B3.5），统一回 "admin only" 会误导调用方。
+        # 的 IP 白名单拒绝请求，统一回 "admin only" 会误导调用方。
         return JSONResponse(status_code=403,
                             content=error_payload(str(error) or "admin only",
                                                   "forbidden", 403))
@@ -94,7 +94,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(PasswordChangeRequiredError)
     async def _password_change_required(_request, _error: PasswordChangeRequiredError):
-        """首登未改密：前端据此弹不可关闭的改密对话框（B5）。"""
+        """首登未改密：前端据此弹不可关闭的改密对话框。"""
         return JSONResponse(status_code=403,
                             content=error_payload("password change required",
                                                   "password_change_required", 403))

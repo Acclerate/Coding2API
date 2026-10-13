@@ -16,7 +16,7 @@ export function makeClient() {
 /**
  * 测试会话：只需给 username（+ 可选的升级字段）。
  *
- * B5 给 SessionInfo 加了 role / must_change_password，历史上几十处调用点
+ * 给 SessionInfo 加了 role / must_change_password，历史上几十处调用点
  * 只传 `{ username, is_admin }`。这里按 is_admin 推导 role 并补默认值，
  * 避免为了两个新字段去改所有测试（也顺带让老测试继续验证向后兼容）。
  */
@@ -121,6 +121,22 @@ export async function settle() {
   await waitFor(() => {
     expect(screen.queryByText("载入中…")).not.toBeInTheDocument();
   });
+}
+
+/**
+ * 展开凭证页所有渠道分组。
+ *
+ * 分组默认折叠（见 CredentialsPage），而绝大多数用例关心的是行内内容。
+ * 先 settle 再调用本函数（此时列表已渲染，分组按钮同步存在）；空池没有分组，
+ * 返回 0 个不报错。
+ */
+export async function expandCredentialGroups() {
+  const toggles = screen.queryAllByTestId(/^group-toggle-/);
+  for (const toggle of toggles) {
+    if (toggle.getAttribute("aria-expanded") === "false") {
+      await userEvent.click(toggle);
+    }
+  }
 }
 
 export { userEvent };

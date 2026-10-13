@@ -1,4 +1,4 @@
-"""CodeBuddy 凭证刷新与多账号切换（M1.5）。
+"""CodeBuddy 凭证刷新与多账号切换。
 
 AGENTS.md 约束：
 - 刷新端点一旦返回轮换后的 refresh token，必须先按凭证代次原子持久化，再同步账号列表

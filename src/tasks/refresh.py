@@ -52,7 +52,7 @@ class RefreshTask:
             # 打上游的写请求，不过节流会绕开全局频率风控对策
             if self._pacer is not None:
                 await self._pacer.wait_turn()
-            # 编辑锁（M12）：读 → await 上游 → 整份覆写必须与账号切换等写者互斥，
+            # 编辑锁：读 → await 上游 → 整份覆写必须与账号切换等写者互斥，
             # 否则两边都用自己读到的旧快照写回，后写者覆盖先写者。
             async with self._credentials.edit_lock(candidate.credential_id):
                 # 持锁后重读：等锁期间可能已被别的写者改过（如刚切了账号），

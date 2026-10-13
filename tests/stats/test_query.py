@@ -95,7 +95,7 @@ def test_stats_by_credential_aggregates(stats):
 def test_stats_by_credential_reports_name_and_provider(repo):
     """凭证分组随行下发渠道（画 icon）与昵称（与明细同口径显示凭证名）。
 
-    昵称取自共享池，只对 operator 返回（M7）；渠道优先取凭证当前所属，
+    昵称取自共享池，只对 operator 返回；渠道优先取凭证当前所属，
     凭证已删除则回退明细里的渠道。
     """
     credentials, db = repo
@@ -125,7 +125,7 @@ def test_stats_by_credential_reports_name_and_provider(repo):
     assert rows[blank_id]["credential_name"] is None        # 空昵称 → 同回退
     assert rows[blank_id]["provider"] == "codearts"
 
-    # M7：默认（viewer 口径）不下发共享池昵称，渠道照常给（前端 icon 依赖）
+    # 默认（viewer 口径）不下发共享池昵称，渠道照常给（前端 icon 依赖）
     default_rows = {row["credential_id"]: row for row in query.by_credential()}
     assert default_rows[keep_id]["credential_name"] is None
     assert default_rows[keep_id]["provider"] == "trae"
@@ -141,7 +141,7 @@ def test_stats_by_credential_endpoint_gates_credential_name(admin_client, tmp_pa
     row = client.get("/api/stats/by-credential").json()["credentials"][0]
     assert row["credential_name"] == "主号" and row["provider"] == "trae"
 
-    # 非 operator 身份：共享池昵称不下发（M7），渠道 icon 依赖的 provider 照常
+    # 非 operator 身份：共享池昵称不下发，渠道 icon 依赖的 provider 照常
     reader_settings = Settings(_env_file=None, APP_SECRET=SECRET,
                                DATA_DIR=str(tmp_path / "reader"))
     reader_app = build_app(reader_settings)
@@ -437,7 +437,7 @@ def test_stats_events_include_credential_name(repo):
     assert rows[None]["credential_name"] is None            # 无凭证
     assert rows[blank_id]["credential_name"] is None        # 空昵称 → 同回退
 
-    # M7：默认（viewer 口径）不暴露共享池昵称
+    # 默认（viewer 口径）不暴露共享池昵称
     default_rows = {e["credential_id"]: e for e in query.events()["events"]}
     assert default_rows[keep_id]["credential_name"] is None
 

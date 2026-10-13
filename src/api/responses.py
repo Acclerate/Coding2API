@@ -1,4 +1,4 @@
-"""OpenAI Responses 兼容出口：POST /v1/responses（B2.1，Codex CLI）。
+"""OpenAI Responses 兼容出口：POST /v1/responses（Codex CLI）。
 
 与 `/v1/chat/completions` 共用同一 `executor`（选号 / 冷却 / 轮换 / 统计 /
 会话粘性全部不动），只换入站映射与出口翻译：

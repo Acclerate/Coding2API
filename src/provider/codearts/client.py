@@ -14,7 +14,7 @@
   不是按月的套餐积分。**当日没用完即作废**，故 `parse_balance` 把当日剩余登记成
   到期点＝次日 0 点的 `expiry_ladder`，让调度器「快过期的先用」把 CodeArts 排在
   其它渠道之前。上游 token 由 `units` 统一折成「积分」（1 积分 = 10000 token，
-  每日池满额 = 1000 积分），与其它渠道同口径，见该模块。**每日签到**（Q72）
+  每日池满额 = 1000 积分），与其它渠道同口径，见该模块。**每日签到**
   走另一套接口（`GET {snap}/v1/ops/delivery` → `claim` → `confirm`，见下），
   与上述 token 池并行的积分账，临时凭证的续期由
   `tasks.refresh.RefreshTask` 独占（先落库再同步）；额度探测只读余额，
@@ -372,7 +372,7 @@ class CodeArtsClient:
             merged.append(model)
         if not merged:
             # 文案含上游错误原文（builtin_error/benefit_error）→ 只进日志，
-            # 对外用受控 `public`（M2：绝不回显上游正文）。
+            # 对外用受控 `public`（绝不回显上游正文）。
             raise UpstreamProtocolViolation(
                 f"models api returned empty list (builtin={builtin_error}, "
                 f"benefit={benefit_error or ''})",
@@ -460,7 +460,7 @@ class CodeArtsClient:
         """领取当日签到积分，返回 `(业务码, 提示文案)`。
 
         **claim 之后必须 confirm**：`CLAIMED`（已领未确认）是上游真实存在的
-        状态（Q72 实测三账号之一正卡在这一档），漏掉 confirm 积分可能不到账。
+        状态（实测三账号之一正卡在这一档），漏掉 confirm 积分可能不到账。
         所以本方法把两步捆在一起，调用方无需知道这个两步协议。
 
         业务码取上游 `code`（`0` 为成功）。非 0 是**业务**失败而非签名失败——
@@ -485,7 +485,7 @@ class CodeArtsClient:
     async def _confirm_daily_credit(self, credential: CodeArtsCredential) -> bool:
         """确认已领积分（claim 的第二步）；返回是否成功。
 
-        积分在 **claim 时就已到账**（Q72 实测：claim 后总额 +1000），confirm 只把
+        积分在 **claim 时就已到账**（实测：claim 后总额 +1000），confirm 只把
         状态从 `CLAIMED` 推到 `CONFIRMED`。所以 confirm 失败不丢积分，但它决定
         本方法返回值——`checkin()` 的 `CLAIMED` 分支要靠它决定是否封账，吞掉失败
         会让 `CheckinTask` 当天封账后再也不补确认。
@@ -507,7 +507,7 @@ class CodeArtsClient:
         `CheckinTask` 只认 `CheckinResult.ok`（成功即当日封账）与
         `already_checked_in`（已签不算错误），故这里把上游四种 status 归一到
         该语义，细节见 `codearts_events` 顶部的 status 说明。三种真实状态
-        （Q72 实测三账号各占一档）都有对应分支：
+        （实测三账号各占一档）都有对应分支：
 
         * `ELIGIBLE` 且 `claimable` → claim + confirm；
         * `CLAIMED`（已领未确认）→ **只补 confirm**，不能当已签跳过；

@@ -49,7 +49,7 @@ async def test_events_iter_data_lines_multibyte_split_across_chunks():
     assert lines == ['{"text": "中文"}']
 
 async def test_events_iter_data_lines_rejects_oversized_line(monkeypatch):
-    """M1：CodeArts 行缓冲同样有上限，上游不吐换行时中止该流。"""
+    """CodeArts 行缓冲同样有上限，上游不吐换行时中止该流。"""
     from src.engine import sse
 
     monkeypatch.setattr(codearts_events, "MAX_DATA_LINE_CHARS", 8)
@@ -141,7 +141,7 @@ def test_events_usage_tolerates_bad_types():
     assert usage.usage.input_tokens == 1 and usage.usage.output_tokens is None
 
 def test_usage_object_reads_details_fields():
-    """上游实测把 cached/reasoning 放在 details 里（TECHNICAL §3.17）。"""
+    """上游实测把 cached/reasoning 放在 details 里（TECHNICAL §5.4）。"""
     usage = _v2_usage({
         "prompt_tokens": 35, "completion_tokens": 45,
         "prompt_tokens_details": {"cached_tokens": 12},

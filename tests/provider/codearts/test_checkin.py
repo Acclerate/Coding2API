@@ -66,7 +66,7 @@ def test_events_campaign_field_accessors_tolerate_missing():
     assert codearts_events.campaign_name(None) == "每日签到领积分"
 
 def test_events_campaign_end_epoch_parses_utc_and_degrades():
-    # 2026-12-30T16:00:00Z == 2026-12-31 00:00 +08（活动截止，Q72 实测原文）
+    # 2026-12-30T16:00:00Z == 2026-12-31 00:00 +08（活动截止，实测原文）
     assert codearts_events.campaign_end_epoch(_campaign()) == 1798646400
     # 无时区后缀按 UTC 处理
     assert codearts_events.campaign_end_epoch(
@@ -81,7 +81,7 @@ def test_events_campaign_end_epoch_parses_utc_and_degrades():
         assert codearts_events.campaign_end_epoch(bad) is None
 
 async def test_client_fetch_checkin_status_uses_ops_path_without_prefix():
-    """`/v1/ops/*` 不带 `snap-manager` 前缀——带上会 APIG.0101（Q72 踩坑根因）。"""
+    """`/v1/ops/*` 不带 `snap-manager` 前缀——带上会 APIG.0101（踩坑根因）。"""
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:

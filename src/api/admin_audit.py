@@ -1,4 +1,4 @@
-"""审计查看端点（B5，admin only）。
+"""审计查看端点（admin only）。
 
 只读：写入散落在各业务端点（登录、账号变动、凭证写操作），不在这里做。
 响应形状与 /api/stats/events 的分页约定一致（limit/offset）。

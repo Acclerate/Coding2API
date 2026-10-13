@@ -180,7 +180,7 @@ def test_stream_midway_rejection_emits_failed_event(tmp_path):
     assert '"invalid_request"' in response.text
 
 def test_endpoint_model_alias_and_session_indicator(tmp_path):
-    """prompt_cache_key 透传到上游，供会话粘性使用（B1.5）。"""
+    """prompt_cache_key 透传到上游，供会话粘性使用。"""
     provider = _Provider()
     app = _app(tmp_path, provider)
     with TestClient(app) as client:

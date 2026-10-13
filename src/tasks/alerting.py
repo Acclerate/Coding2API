@@ -1,4 +1,4 @@
-"""运维告警后台任务（P1-7）：四类规则 + webhook 推送 + 站内记录。
+"""运维告警后台任务：四类规则 + webhook 推送 + 站内记录。
 
 语义（与用户确认的范围一致）：
 
@@ -49,7 +49,7 @@ _WEBHOOK_TIMEOUT = 10.0
 _WEBHOOK_TOTAL_BUDGET = 15.0
 
 # 外发 webhook 的 detail 里需要脱敏的字段：`nickname` 是用户自定义标签，
-# 实践中常填邮箱 / 手机号，站内记录留原文、外发一律打码（M5 同源问题）。
+# 实践中常填邮箱 / 手机号，站内记录留原文、外发一律打码（同源问题）。
 _PII_DETAIL_KEYS = ("nickname",)
 _PII_MASK = "***"
 
@@ -58,7 +58,7 @@ SEVERITY_WARNING = "warning"
 
 
 def _redact_webhook_url(url: str) -> str:
-    """webhook URL → 只留 scheme://host（Slack/飞书的 path 即密钥，M5）。"""
+    """webhook URL → 只留 scheme://host（Slack/飞书的 path 即密钥）。"""
     parts = urlsplit(url)
     if not parts.scheme or not parts.netloc:
         return "<webhook>"
@@ -69,7 +69,7 @@ def _redact_webhook_error(error: Exception) -> str:
     """httpx 异常文本里可能内嵌整条 URL（含密钥 path/query）：只留异常类名。
 
     httpx 的 `RequestError.__str__` 会带上请求 URL，落库后经 `GET /api/alerts`
-    回显给管理台即等于把 webhook 密钥写进审计记录（M5）。
+    回显给管理台即等于把 webhook 密钥写进审计记录。
     """
     return f"{type(error).__name__}: webhook delivery failed"
 
@@ -325,7 +325,7 @@ class AlertTask:
         """投递单个地址；失败只记日志并返回脱敏后的错误串，不抛出。
 
         webhook path/query 常即密钥（Slack/飞书），日志与落库都只留 host，
-        绝不带上整条 URL 或 httpx 异常里内嵌的 URL（M5）。
+        绝不带上整条 URL 或 httpx 异常里内嵌的 URL。
         """
         try:
             await self._post(url, payload)

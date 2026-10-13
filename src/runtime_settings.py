@@ -1,4 +1,4 @@
-"""运行时配置覆盖层（B3.2）。
+"""运行时配置覆盖层。
 
 分层原则（这是本模块存在的理由，不是实现细节）：
 
@@ -182,7 +182,7 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("activity_report_hour", int, "活跃上报时点（0-23）",
                "本地（北京）时间整点窗口；该小时内每 10 分钟检查一次，每号每天"
                "最多补发一条。", minimum=0, maximum=23, task="activity"),
-    # 运维告警（P1-7）：全部归到「运维告警」任务卡片下——改阈值时人就在看
+    # 运维告警：全部归到「运维告警」任务卡片下——改阈值时人就在看
     # 这个任务最近报了什么。webhook 留空 = 只留站内记录、不外推。
     HotSetting("alert_enabled", bool, "运维告警开关",
                "是否启用后台告警评估。关闭后不落站内记录也不推送 webhook。",
@@ -276,7 +276,7 @@ def _coerce(spec: HotSetting, raw: Any) -> Any:
 
 
 # 告警 webhook 只允许 http/https：地址由 admin 配置（受信边界），但仍不能是
-# `file:` / `javascript:` 等 scheme——它会被后台任务直接 httpx POST（M6）。
+# `file:` / `javascript:` 等 scheme——它会被后台任务直接 httpx POST。
 WEBHOOK_SCHEMES = ("http", "https")
 MAX_WEBHOOK_ENTRIES = 16
 

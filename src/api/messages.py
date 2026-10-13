@@ -1,4 +1,4 @@
-"""Anthropic Messages 兼容出口：`POST /v1/messages` + `/v1/messages/count_tokens`（P0-1）。
+"""Anthropic Messages 兼容出口：`POST /v1/messages` + `/v1/messages/count_tokens`。
 
 与 `/v1/chat/completions` / `/v1/responses` 共用同一 `executor`（选号 / 冷却 /
 轮换 / 统计 / 会话粘性全部不动），只换入站映射与出口翻译：

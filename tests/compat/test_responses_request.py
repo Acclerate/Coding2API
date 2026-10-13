@@ -122,7 +122,7 @@ def test_tool_choice_strings_pass_through():
         assert parsed.raw["tool_choice"] == value
 
 def test_rejects_non_finite_sampling_and_bad_max_output_tokens():
-    """M4：NaN/Inf 采样参数与越界 max_output_tokens 在入站即 400。"""
+    """NaN/Inf 采样参数与越界 max_output_tokens 在入站即 400。"""
     with pytest.raises(InvalidRequest, match="must be a finite number"):
         parse_responses_request({"input": "hi", "temperature": float("inf")})
     with pytest.raises(InvalidRequest, match="must be a number"):
