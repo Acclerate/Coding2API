@@ -51,7 +51,9 @@ async def test_refresh_task_marks_relogin_required_on_terminal_failure(repo):
     class DeadProvider(ProbeProvider):
         async def refresh(self, _data):
             self.refresh_calls += 1
-            raise UpstreamReloginRequired("刷新令牌已失效，需重新登录")
+            # 上游原文可能内嵌 token/URL；落库必须换成固定文案（见 RELOGIN_REASON）
+            raise UpstreamReloginRequired(
+                "upstream rejected: refresh_token=SECRET-LEAK-42")
 
     provider = DeadProvider()
     task = RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600,
@@ -60,7 +62,9 @@ async def test_refresh_task_marks_relogin_required_on_terminal_failure(repo):
     assert report.failed == 1 and report.succeeded == 0
     row = credentials.list_all()[0]
     assert row["disabled"] == 1
+    # 固定文案：上游原文（可能含 token）绝不写进 disabled_reason
     assert row["disabled_reason"] == "刷新令牌已失效，需重新登录"
+    assert "SECRET-LEAK-42" not in row["disabled_reason"]
     # 凭证字段未被失败路径改写（旧票仍原样留着，供管理员复核）
     assert credentials.credential_data(credential_id)["bearer_token"] == "old"
     # 第二轮：已硬禁用 → 直接跳过，不再发刷新请求

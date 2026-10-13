@@ -115,7 +115,7 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 `AuthFlow` 三值：`poll`（后端轮询上游：CB / Qoder）、`callback`（浏览器 302 回本服务 `/authorize`：TRAE）、`paste`（用户把回调链接粘回：CodeArts，服务端监听不到本机回环端口）。
 
 - **回调统一走主端口** `/authorize`；远程部署只需暴露一个端口。回调地址要写进登录 URL，故必须可配：`PUBLIC_BASE_URL`。
-- 前端在「凭证管理」页内实现：**poll** 拿到 `authUrl` 开新窗、轮询 `/api/auth/upstream/poll`；**callback** 开授权窗、浏览器 302 回 `/authorize` 直接落库，前端轮询凭证列表出现新条目即视为完成（上游不回传 state）。`/authorize` 无鉴权（浏览器 302 不带 key），故按**发起人**绑定 + 待完成登录有 TTL（10 分钟）。
+- 前端在「凭证管理」页内实现：**poll** 拿到 `authUrl` 开新窗、轮询 `/api/auth/upstream/poll`；**callback** 开授权窗、浏览器 302 回 `/authorize` 直接落库，前端轮询凭证列表出现新条目即视为完成（上游不回传 state）。`/authorize` 无鉴权（浏览器 302 不带 key），故按**发起人会话** + **`loginTraceID`**（TRAE 原样回显登录 URL 里的 `(machine_id + device_id)[-16:]`，攻击者拿不到）双重绑定，且待完成登录有 TTL（10 分钟）。
 
 ### 3.6 中立事件层
 
@@ -171,10 +171,10 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCH
 - **凭证加密**：`data_enc` 走 Fernet，密钥走 `APP_SECRET`（≥16 字符，拒绝低熵值）；**丢失 = 已存凭证全部不可解，只能重录**，不做密钥轮换。解密失败返回可行动错误码，不暴露裸 500。
 - TLS 校验默认开启；Host / Origin 白名单；CSP `frame-ancestors 'none'`、`object-src 'none'`、`base-uri 'self'`、`form-action 'self'`。**请求体上限**：登录 8KB、其余 16MB（ASGI 层按实际字节计数，`chunked` 不能绕过）。登录三级限流（全局 / IP / 用户名）+ PBKDF2 并发上限；失败键有数量上限 + 过期淘汰（防内存 DoS）。
 - **API Key 仅存摘要**，明文只在创建时返回一次；可按 Key 限定渠道绑定、来源 IP 白名单（默认**不信** `X-Forwarded-For`，仅 `TRUST_PROXY=true` 时取 XFF 最后一个条目）、模型白名单（fnmatch，无法判定模型名时 fail closed）与到期时间。
-- **会话**：Cookie `SameSite=Lax` + 写操作 CSRF 校验（含 logout）；**无 Cookie 的写端点（登录 / `/authorize`）也校验 Origin**（防 login CSRF）；会话与 API Key 除签名 / 摘要外校验用户仍存在、启用且 epoch 一致。
+- **会话**：Cookie `SameSite=Lax` + 写操作 CSRF 校验（含 logout）；**无 Cookie 的写端点（登录 / `/authorize`）也做跨站防护**：登录按 Origin/Referer 同源校验（防 login CSRF），`/authorize` 按上游原样回显的 `loginTraceID` 绑定到**发起登录那一次**（TRAE 回调本就跨源，Origin/Referer 既拦不住真攻击也可能误杀真回调）；会话与 API Key 除签名 / 摘要外校验用户仍存在、启用且 epoch 一致。
 - **错误响应不回流上游正文**：`/v1` 与外层的错误文案只带受控标识（HTTP 状态码 / 上游业务码 / 异常类名），上游错误体摘要只进服务端日志；未匹配的 `/api`、`/v1` 路径返回 JSON 404（不落到 SPA 的 200 + HTML）。**日志脱敏**：不打印 Token、完整请求体；审计写 INFO（含操作人），**绝不记密码/令牌明文**。
 - **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。
-- **热更配置写入即校验**：float 拒 NaN/±inf；字符串类有长度上限；告警 webhook 只接受 `http(s)` 并做 **SSRF 校验**（拒内网 / 回环 / 链路本地 / 保留 / 多播 / 未指定地址），外发载荷对 `nickname` 打码，多地址并发投递并加总预算。
+- **热更配置写入即校验**：float 拒 NaN/±inf；字符串类有长度上限；告警 webhook 只接受 `http(s)` 并做 **SSRF 校验**（写入期拒字面量内网 / 回环 / 链路本地 / 保留 / 多播 / 未指定地址，**投递前再按 DNS 解析结果复核一次**、解析失败即阻断），外发载荷对 `nickname` 打码，多地址并发投递并加总预算。告警出站 client `trust_env=False`，不吃宿主代理环境变量。
 - **上游流解析有界**：SSE 单行与单帧缓冲设上限，非 2xx 错误体有界读取；OAuth state store 的 owner/consume 有 TTL 判定。**入站解析把关**：三个出站协议在入口拒绝越界数值字段（`max_tokens` ≤0 或超上限、`temperature`/`top_p` 为 NaN/Inf）与 JSON 里的 `NaN`/`Infinity`。
 - **OAuth 登录弹窗**只允许 `http(s)` scheme，弹窗 `opener` 置空。**库版本守卫**：`user_version` 高于本程序时 `apply_schema` 拒绝执行。`scripts/hash_password` / `create_user` 支持 `--password-stdin`；拒绝含 `:` / 换行的用户名。
 - **不做**：mTLS；面向管理台与端口的 IP 限制（交给反向代理）。不做全量请求审计（统计表已是脱敏的请求级记录）。

@@ -100,7 +100,8 @@ def derive_id(uid: str, salt: str) -> str:
     「可用但会被关联」的降级态，登录流程必须尽力补齐 uid。
     """
     seed = f"{salt}:{uid or 'anonymous'}"
-    return hashlib.md5(seed.encode("utf-8")).hexdigest()[:36]
+    # usedforsecurity=False：复刻上游 COSY 协议的设备指纹，非本服务安全机制。
+    return hashlib.md5(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:36]
 
 
 def derive_machine_type(uid: str) -> str:
@@ -185,7 +186,8 @@ def cosy_signature(*, payload_b64: str, cosy_key: str, date: str, body: str,
                    path: str) -> str:
     """`md5(payload_b64 \\n cosy_key \\n date \\n body \\n path)` 十六进制。"""
     raw = "\n".join([payload_b64, cosy_key, date, body, path])
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    # usedforsecurity=False：这是上游 COSY 协议规定的签名算法，必须逐字节一致。
+    return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def cosy_payload(session: _SessionMaterial, request_id: str) -> str:

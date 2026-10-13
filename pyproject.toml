@@ -1,7 +1,7 @@
 [project]
 name = "coding2api"
 version = "0.4.3"
-description = "把 CodeBuddy 与 TRAE SOLO 上游通道统一封装为 OpenAI 兼容 API"
+description = "把 CodeBuddy（国内站 + 国际版）、TRAE SOLO、OpenCode Zen、Kilo Gateway、Qoder、CodeArts 七个上游渠道统一封装为 OpenAI / Responses / Anthropic 兼容 API"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -56,3 +56,11 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 # FastAPI 的 Depends() 默认参数写法是官方推荐的，B008 为误报
 ignore = ["B008"]
+
+[tool.bandit]
+# B608（SQL 字符串拼接）在本仓全部是**白名单拼接**：分组键过 `_GROUP_KEYS`、
+# 排序走 `sql_order`、backfill 是字面量列名，值一律参数化。逐处 `# nosec`
+# 只会让 15 个真实告警被噪声淹没，故在配置层统一关闭并在此留档；新增拼接点
+# 仍须过白名单（见 tests/stats/test_query.py::test_group_methods_reject_*）。
+skips = ["B608"]
+

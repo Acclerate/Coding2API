@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from src.config import Settings
 from src.main import build_app
+from src.provider.trae.callback import login_trace_id
 from src.provider.trae.client import TraeProvider
 from tests.helpers.constants import SECRET
 
@@ -105,7 +106,8 @@ def test_authorize_completes_trae_login_end_to_end(tmp_path):
         started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
 
         callback = ("/authorize?refreshToken=RT1&userInfo=%7B%22uid%22%3A%22u1%22%7D"
-                    f"&state={started['state']}")
+                    f"&state={started['state']}"
+                    f"&loginTraceID={login_trace_id(*started['state'].split(':'))}")
         response = client.get(callback)
         assert response.status_code == 200 and response.json()["captured"] is True
 
@@ -120,16 +122,44 @@ def test_authorize_completes_trae_login_end_to_end(tmp_path):
         assert replay.get(callback).status_code == 400
 
 def test_authorize_rejects_callback_without_token(tmp_path):
-    """带 state 但没有 refreshToken/userJwt 的回调必须拒绝。"""
+    """带 state 与正确 loginTraceID 但没有 refreshToken/userJwt 的回调必须拒绝。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
     app = build_app(settings)
     with TestClient(app) as client:
         client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
         started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
-        response = client.get(f"/authorize?state={started['state']}")
+        trace = login_trace_id(*started["state"].split(":"))
+        response = client.get(f"/authorize?state={started['state']}&loginTraceID={trace}")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_authorize_rejects_callback_with_wrong_login_trace_id(tmp_path):
+    """绑定校验：缺失 / 不匹配的 loginTraceID 一律拒绝，且不消费 pending。
+
+    这是 `/authorize` 的跨站防护——攻击者能带上受害者会话 Cookie（顶层导航
+    会带 SameSite=Lax），但拿不到发起那次登录的 trace id，因此无法用自己的
+    refreshToken 顶掉别人进行中的登录。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
+
+        # 缺失
+        missing = client.get(f"/authorize?refreshToken=RT&state={started['state']}")
+        assert missing.status_code == 400
+        assert missing.json()["error"]["message"] == "callback does not match the pending login"
+        # 不匹配（攻击者自造的 trace）
+        wrong = client.get(f"/authorize?refreshToken=RT&state={started['state']}"
+                           "&loginTraceID=0000000000000000")
+        assert wrong.status_code == 400
+        assert wrong.json()["error"]["message"] == "callback does not match the pending login"
+        # 被拒的回调不消费 pending：发起人仍能用正确 trace 走完流程
+        assert "root" in app.state.pending_callbacks
 
 def test_upstream_start_uses_poll_track_for_codebuddy(admin_client):
     """provider 在 upstream_auth 里时走 poll 轨道（main 275-276）。"""
@@ -201,7 +231,8 @@ def test_authorize_reports_invalid_credential(tmp_path):
         client.post("/api/auth/upstream/start", json={"provider": "trae"})
         # 有 refreshToken 但状态串损坏 → complete_callback 抛协议违规
         app.state.pending_callbacks["root"] = (time.monotonic(), "broken")
-        response = client.get("/authorize?refreshToken=RT&state=broken")
+        response = client.get("/authorize?refreshToken=RT&state=broken"
+                              "&loginTraceID=broken")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_credential"
 
@@ -234,9 +265,11 @@ def test_authorize_accepts_real_trae_callback_without_state(tmp_path):
         client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
         started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
 
-        # 与真实回调一致：不带 state 参数
+        # 与真实回调一致：不带 state 参数，但带 TRAE 回显的 loginTraceID
+        trace = login_trace_id(*started["state"].split(":"))
         callback = ("/authorize?refreshToken=RT1&userInfo="
-                    "%7B%22uid%22%3A%22uid-9%22%2C%22nickname%22%3A%22%E7%9C%9F%E5%90%8D%22%7D")
+                    "%7B%22uid%22%3A%22uid-9%22%2C%22nickname%22%3A%22%E7%9C%9F%E5%90%8D%22%7D"
+                    f"&loginTraceID={trace}")
         response = client.get(callback)
         assert response.status_code == 200, response.text
 

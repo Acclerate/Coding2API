@@ -203,6 +203,37 @@ def test_alert_webhook_rejects_non_http_scheme_and_too_many(tmp_path):
     db.close()
 
 
+def test_blocked_webhook_host_covers_literal_and_resolved_paths(monkeypatch):
+    """投递前复核（SSRF 兜底）：字面量 IP 直接判，域名看解析结果，失败即阻断。"""
+    from src.runtime_settings import blocked_webhook_host
+
+    # 无主机名 / 字面量黑名单：不查 DNS 直接判
+    assert blocked_webhook_host("http:///nohost") is True
+    assert blocked_webhook_host("http://127.0.0.1/hook") is True
+
+    # 域名解析到公网 → 放行
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo",
+                        lambda host, port: [(2, 1, 6, "", ("93.184.216.34", 0))])
+    assert blocked_webhook_host("https://hook.example/a") is False
+
+    # 域名解析到内网（云元数据 169.254.169.254）→ 阻断
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo",
+                        lambda host, port: [(2, 1, 6, "", ("169.254.169.254", 0))])
+    assert blocked_webhook_host("https://metadata.example/latest") is True
+
+    # IPv6 链路本地带 `%en0` 作用域后缀：剥掉后再判，不得因后缀漏过
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo",
+                        lambda host, port: [(10, 1, 6, "", ("fe80::1%en0", 0, 0, 0))])
+    assert blocked_webhook_host("https://linklocal.example/x") is True
+
+    # 解析失败（NXDOMAIN/网络不通）→ fail closed，宁可漏报一条告警
+    def _boom(host, port):
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo", _boom)
+    assert blocked_webhook_host("https://unresolvable.example/x") is True
+
+
 def test_env_webhook_url_is_validated_at_load(tmp_path):
     """env 提供的 ALERT_WEBHOOK_URL 也要过校验（不能只靠运行时失败兜底）。"""
     from src.db.repo import RuntimeSettingsRepository

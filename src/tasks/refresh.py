@@ -19,6 +19,9 @@ from .pacer import Pacer
 
 logger = logging.getLogger(__name__)
 
+# 落库的「需重新登录」原因：固定文案，绝不写上游原文（见 run_once 注释）。
+RELOGIN_REASON = "刷新令牌已失效，需重新登录"
+
 
 class RefreshTask:
     """token 预刷新：只处理进入 refresh_skew 窗口的凭证。"""
@@ -70,8 +73,11 @@ class RefreshTask:
                     logger.warning(
                         "refresh for %s needs re-login, disabling credential: %s",
                         candidate.credential_id, error)
+                    # 落库文案固定，不写 `str(error)`：该值经 GET /api/credentials
+                    # 回显管理台，固定文案可保证「将来有人往异常里塞上游原文」时
+                    # 也不会把上游响应写进凭证状态。
                     self._credentials.mark_relogin_required(
-                        candidate.credential_id, str(error))
+                        candidate.credential_id, RELOGIN_REASON)
                     report.failed += 1
                     continue
                 except Exception as error:  # noqa: BLE001

@@ -372,7 +372,7 @@ CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端�
 | `ACTIVITY_REPORT_ENABLED` | `false` | 活跃上报（CodeBuddy 与国际版）：每天为账号补发一条对话事件续连登。**默认关闭**——条款禁止篡改活动数据，上游改版即失效 |
 | `ACTIVITY_REPORT_HOUR` | `10` | 活跃上报的本地（北京）时间整点窗口；仅在开关开启时生效 |
 | `ALERT_ENABLED` | `true` | 运维告警开关：后台周期评估四类风险（池耗尽 / 任务连续失败 / token 临近到期 / 上游错误率骤升），命中落 `alert_events` |
-| `ALERT_WEBHOOK_URL` | 空 | 告警 Webhook：命中时 POST JSON，多个用逗号分隔（≤16 个，仅 `http(s)`，拒内网/回环/链路本地/保留地址防 SSRF），并发投递、全部成功才算成功（总预算 15s）；留空 = 只留站内记录 |
+| `ALERT_WEBHOOK_URL` | 空 | 告警 Webhook：命中时 POST JSON，多个用逗号分隔（≤16 个，仅 `http(s)`，拒内网/回环/链路本地/保留地址防 SSRF，投递前再按 DNS 解析复核一次、解析失败即跳过），并发投递、全部成功才算成功（总预算 15s）；留空 = 只留站内记录 |
 | `ALERT_INTERVAL_MINUTES` | `5` | 运维告警评估周期（下限 1 分钟） |
 | `ALERT_SILENCE_MINUTES` | `30` | 同一 `(规则, 对象)` 的静默窗：窗口内只落库 / 推送一次；`0` 关闭静默 |
 | `ALERT_POOL_READY_MIN` | `1` | 池耗尽阈值：可用凭证数少于该值时告警；`0` 关闭该规则 |

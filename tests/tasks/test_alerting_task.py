@@ -151,6 +151,32 @@ def test_redact_webhook_url_falls_back_for_opaque_value():
     assert _redact_webhook_url("not-a-url") == "<webhook>"
     assert _redact_webhook_url("https://hook.example/x") == "https://hook.example"
 
+async def test_alert_task_blocks_webhook_resolving_to_private_host(tmp_path, monkeypatch):
+    """投递前 DNS 复核命中内网 → 跳过投递并记脱敏错误（SSRF 兜底）。"""
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(str(request.url))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    # 覆盖 tests/tasks/conftest.py 的放行桩，走真实复核逻辑
+    monkeypatch.setattr("src.tasks.alerting.blocked_webhook_host", lambda url: True)
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        webhook_url=lambda: "https://hooks.example/super-secret-token",
+        client=client, now=lambda: 5)
+    report = await task.run_once()
+    assert report["delivered"] == 0
+    assert posted == []                      # 根本没发出去
+    row = alerts.recent()[0]
+    assert row["delivered"] == 0
+    assert "BlockedWebhookHost" in row["delivery_error"]
+    assert "super-secret-token" not in row["delivery_error"]
+    await client.aclose()
+    db.close()
+
+
 async def test_alert_task_default_client_path(tmp_path, monkeypatch):
     """未注入 client 时走自建 httpx.AsyncClient（生产路径）。"""
     captured: list[dict] = []

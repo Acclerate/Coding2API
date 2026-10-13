@@ -17,6 +17,17 @@ jobs:
       - name: 测试与覆盖率（门槛 100%）
         run: uv run pytest -q --cov=src --cov-report=term --cov-fail-under=100
 
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+      - run: uv sync --frozen
+      - name: bandit（中危及以上，配置见 pyproject [tool.bandit]）
+        run: uvx bandit -c pyproject.toml -r src scripts -ll
+      - name: pip-audit（已知漏洞，含 dev 依赖）
+        run: uvx pip-audit --skip-editable
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -33,6 +44,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: 依赖漏洞（生产依赖，high 及以上阻断）
+        run: pnpm audit --prod --audit-level=high
       - run: pnpm exec tsc --noEmit
       - run: pnpm exec vitest run
       - run: pnpm build

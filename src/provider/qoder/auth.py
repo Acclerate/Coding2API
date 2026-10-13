@@ -77,7 +77,9 @@ def _fallback_machine_id() -> str:
     if cached:
         return cached
     seed = f"{uuid.getnode()}:{os.getpid()}:qoder-machine"
-    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    # usedforsecurity=False：这里只是复刻官方客户端的设备指纹派生，不是
+    # 本服务的安全机制（该值随进程变化且不含密钥）。
+    digest = hashlib.md5(seed.encode("utf-8"), usedforsecurity=False).hexdigest()
     # 官方客户端的 machine_id 是带横线 UUID 形态（issue #3：无横线 32 位 hex
     # 会被授权页判「参数无效」），回落值也拼成同形态。
     value = "-".join((digest[:8], digest[8:12], digest[12:16],

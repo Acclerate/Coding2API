@@ -36,6 +36,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ..db.repo import AlertRepository, CredentialRepository
+from ..runtime_settings import blocked_webhook_host
 from ..stats.collector import StatsCollector
 from .status import TASK_BY_KEY, TaskStatusStore
 
@@ -327,6 +328,13 @@ class AlertTask:
         webhook path/query 常即密钥（Slack/飞书），日志与落库都只留 host，
         绝不带上整条 URL 或 httpx 异常里内嵌的 URL。
         """
+        if await asyncio.to_thread(blocked_webhook_host, url):
+            # 写入期只能拦字面量 IP（域名当时解析不了），这里在**投递前**按
+            # 实际解析结果复核一次，堵住「域名指向 127.0.0.1 / 169.254.169.254
+            # / 内网 DNS 名」的 SSRF。解析失败按阻断处理（fail closed）。
+            logger.warning("告警 webhook 解析到内网/保留地址，已跳过 %s",
+                           _redact_webhook_url(url))
+            return "BlockedWebhookHost: resolves to a private address"
         try:
             await self._post(url, payload)
         except Exception as exc:  # noqa: BLE001 - 单点失败不影响其余地址
@@ -340,6 +348,9 @@ class AlertTask:
         if self._client is not None:
             response = await self._client.post(url, json=payload)
         else:
-            async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT) as client:
+            # trust_env=False 与 provider/proxy.build_client 同口径：告警 JSON
+            # 带池子健康详情，不能被宿主环境代理静默转手。
+            async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT,
+                                         trust_env=False) as client:
                 response = await client.post(url, json=payload)
         response.raise_for_status()

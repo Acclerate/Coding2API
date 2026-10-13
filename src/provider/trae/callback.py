@@ -33,13 +33,25 @@ def new_machine_identity() -> tuple[str, str]:
     return secrets.token_hex(16), secrets.token_hex(16)
 
 
+def login_trace_id(machine_id: str, device_id: str) -> str:
+    """登录 URL 的 `login_trace_id`（= `(machine_id + device_id)[-16:]`）。
+
+    TRAE 回跳时把它**原样回显**在回调 URL 的 `loginTraceID` 参数上（实测 3/3
+    真实回调均带），因此它同时是 `/authorize` 的回调绑定令牌：值是
+    `secrets.token_hex` 派生的 64 位、只有发起登录的那次响应里出现，攻击者
+    无从猜测，据此可把回调钉死在**那一次** pending 登录上。
+    与 `build_login_url` 共用同一函数，避免生成与校验两处公式漂移。
+    """
+    return (machine_id + device_id)[-16:]
+
+
 def build_login_url(callback_url: str, *, machine_id: str, device_id: str) -> str:
     """构造 TRAE 登录 URL（复刻原实现的参数集，勿增删）。
 
     端点是 ConsoleHost + /authorization；machine/device id 与落盘凭证共用同一对，
     否则登录态与凭证不匹配。
     """
-    trace_id = (machine_id + device_id)[-16:]
+    trace_id = login_trace_id(machine_id, device_id)
     query = (
         f"login_version={LOGIN_VERSION}"
         "&auth_from=solo"

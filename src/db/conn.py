@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 PRAGMAS = (
@@ -35,6 +36,10 @@ class Database:
         parent = Path(self.path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
+            # 库内是凭证密文 + 明文用量/审计/用户名：目录不对同机其他用户开放。
+            # chmod 失败（共享目录、他人属主）不阻断启动。
+            with suppress(OSError):
+                os.chmod(parent, 0o700)
 
     def connect(self) -> sqlite3.Connection:
         """返回当前线程的专属连接（同线程复用）。"""

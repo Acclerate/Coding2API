@@ -7,9 +7,9 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth.csrf import check_origin
 from ..auth.session import SESSION_COOKIE, verify_session_token
 from ..compat.openai.errors import error_payload
+from ..provider.trae.callback import login_trace_id
 from ..provider.trae.events import UpstreamProtocolViolation
 from .deps import Services
 
@@ -37,16 +37,25 @@ def create_router(services: Services) -> APIRouter:
         登录 URL 里的 state**——machine/device id 从待完成登录的 state 里取，
         这正是 start_auth 把它们编码进 state 的原因（保证登录与落盘凭证一致）。
 
-        因此不能用 state 匹配回调。改为按**发起人**绑定：回调是顶层浏览器
-        导航，SameSite=Lax 会带上管理台的会话 Cookie，据会话用户名找到其待完成
-        登录。这样：
+        因此不能用 state 匹配回调。绑定方式两条并用：
+        - **loginTraceID**（主）：TRAE 原样回显 `login_trace_id`，值是
+          `(machine_id + device_id)[-16:]`，只有发起登录那次拿得到；
+        - **发起人会话**（辅）：回调是顶层浏览器导航，SameSite=Lax 会带上
+          管理台的会话 Cookie，据会话用户名找到其待完成登录。
+
+        这样：
         - 两个管理员并发发起登录不会互相覆盖（各按用户名分键）；
-        - 同网段的其他人无法用自己的 refreshToken 顶掉别人进行中的登录；
+        - 同网段的其他人无法用自己的 refreshToken 顶掉别人进行中的登录
+          （缺 loginTraceID 或不符即拒）；
         - 凭证记在发起人名下，不会被记错。
         """
-        # 唯一无鉴权的写端点：先做 Origin/Referer 同源校验，拒绝被诱导的
-        # 跨站顶层导航（同源导航缺头时仍放行，兼容部分浏览器/中间件）。
-        check_origin(request)
+        # 唯一无鉴权的写端点。**不用 Origin/Referer 启发式**：合法回调本就
+        # 由上游门户（www.trae.cn）302 跳来，是跨源的；https 部署下浏览器
+        # 还会因协议降级/Referrer-Policy 丢掉 Referer——按 Referer 判同源
+        # 既拦不住真攻击（攻击者加 no-referrer 即绕过），又可能误杀真回调。
+        # 改用回调自带的 `loginTraceID` 绑定：它是 start_auth 生成的
+        # `(machine_id + device_id)[-16:]`，只出现在发起登录那次的 auth_url 里，
+        # 攻击者拿不到，故能钉死到**那一次** pending 登录。
         raw = str(request.url)
         provider = services.registry.get("trae")
         pending: dict[str, tuple[float, str]] = request.app.state.pending_callbacks
@@ -75,6 +84,13 @@ def create_router(services: Services) -> APIRouter:
             return JSONResponse(status_code=400, content=error_payload(
                 "pending TRAE login expired, start a new one",
                 "invalid_request", 400))
+        # 回调绑定：loginTraceID 必须等于本次 pending 登录的 trace id
+        # （machine/device id 在 state 里）。缺失/不符一律拒绝——这才是
+        # 「只接受发起人本人那次登录的回调」，与 Referer 无关。
+        machine_id, _, device_id = state.partition(":")
+        if request.query_params.get("loginTraceID") != login_trace_id(machine_id, device_id):
+            return JSONResponse(status_code=400, content=error_payload(
+                "callback does not match the pending login", "invalid_request", 400))
         if not request.query_params.get("refreshToken") and not request.query_params.get("userJwt"):
             return JSONResponse(status_code=400, content=error_payload(
                 "callback missing refreshToken", "invalid_request", 400))

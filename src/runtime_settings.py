@@ -25,6 +25,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import math
+import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -310,10 +311,30 @@ def _is_blocked_webhook_host(host: str) -> bool:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False                    # 域名：无法在写入期解析，交给运行时
+        return False                    # 域名：写入期解析不了，交给投递前复核
     return (address.is_private or address.is_loopback
             or address.is_link_local or address.is_reserved
             or address.is_multicast or address.is_unspecified)
+
+
+def blocked_webhook_host(url: str) -> bool:
+    """webhook URL 在**投递前**是否指向内网/保留地址（含 DNS 解析）。
+
+    写入期 `_is_blocked_webhook_host` 只能判字面量 IP（域名当时解析不了）。
+    这里补上解析：`getaddrinfo` 的每个结果都必须过 IP 黑名单，堵住「域名指向
+    127.0.0.1 / 169.254.169.254（云元数据）/ 内网 DNS 名」的 SSRF。解析失败
+    按阻断处理——宁可漏报一条告警，也不把池子健康详情 POST 进内网。
+    """
+    host = (urlparse(url).hostname or "").strip().lower()
+    if not host or _is_blocked_webhook_host(host):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return True
+    # IPv6 链路本地地址会带 `%en0` 作用域后缀，先剥掉再判
+    return any(_is_blocked_webhook_host(info[4][0].split("%", 1)[0])
+               for info in infos)
 
 
 def _parse_bool(text: str) -> bool:

@@ -45,6 +45,20 @@ def test_stats_by_model_empty(stats):
     assert query.by_model() == []
     assert query.by_model(username="nobody") == []
 
+
+def test_group_methods_reject_non_whitelisted_key(stats):
+    """分组键是 SQL 片段拼接位：白名单外必须显式报错，不能静默拼进 SQL。
+
+    公开入口（by_provider/by_model/by_user/by_credential）只传白名单常量，
+    因此这条防御只在私有方法上可触达——但它是 SQL 注入的唯一闸门，必须守住。
+    """
+    import pytest
+
+    _collector, query = stats
+    for method in (query._group_hourly, query._group_events):
+        with pytest.raises(ValueError, match="非法分组键"):
+            method("1=1; DROP TABLE usage_events")
+
 def test_stats_by_user_aggregates(stats):
     collector, query = stats
     collector.record(username="alice", provider="trae", model="glm-5.2", ok=True,
