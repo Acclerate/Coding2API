@@ -21,7 +21,7 @@ import httpx
 
 from ...provider.base import AuthFlow, AuthResult, AuthSession
 from ...provider.proxy import build_client
-from .credential import CodeBuddyCredential
+from .credential import CodeBuddyCredential, validate_domain
 from .events import UpstreamProtocolViolation
 from .headers import EP_AUTH_STATE, EP_AUTH_TOKEN, EP_LOGIN_ACCOUNT, auth_start_headers, host_of
 
@@ -65,18 +65,31 @@ class AuthStateStore:
             upstream_state=upstream_state)
         return reservation
 
-    def upstream_state(self, auth_state: str, username: str) -> str | None:
+    def upstream_state(self, auth_state: str, username: str,
+                       now: int | None = None) -> str | None:
         """轮询上游时必须用上游发的 state，而不是本地的 reservation。"""
-        if not self.owner(auth_state, username):
+        if not self.owner(auth_state, username, now):
             return None
         return self._entries[auth_state].upstream_state
 
-    def owner(self, auth_state: str, username: str) -> bool:
-        entry = self._entries.get(auth_state)
-        return entry is not None and entry.username == username
+    def owner(self, auth_state: str, username: str, now: int | None = None) -> bool:
+        """归属校验，**含 TTL**：过期 reservation 不得再轮询/重放。
 
-    def progress(self, auth_state: str, username: str) -> AuthProgress | None:
-        if not self.owner(auth_state, username):
+        `cleanup()` 只在 `begin()` 时触发；若 owner 不判过期，一个过期的
+        state 在下次 begin 之前会一直可被轮询（每次轮询都打上游）。
+        """
+        entry = self._entries.get(auth_state)
+        if entry is None or entry.username != username:
+            return False
+        current = int(now if now is not None else time.time())
+        if current - entry.created_at >= self._ttl:
+            del self._entries[auth_state]          # 惰性清理，避免字典堆积
+            return False
+        return True
+
+    def progress(self, auth_state: str, username: str,
+                 now: int | None = None) -> AuthProgress | None:
+        if not self.owner(auth_state, username, now):
             return None
         return self._entries[auth_state].progress
 
@@ -84,15 +97,15 @@ class AuthStateStore:
         if auth_state in self._entries:
             self._entries[auth_state].progress = progress
 
-    def consume(self, auth_state: str, username: str) -> bool:
+    def consume(self, auth_state: str, username: str, now: int | None = None) -> bool:
         """消费：成功后该 state 不可再次轮询或重放。"""
-        if not self.owner(auth_state, username):
+        if not self.owner(auth_state, username, now):
             return False
         del self._entries[auth_state]
         return True
 
-    def cancel(self, auth_state: str, username: str) -> bool:
-        return self.consume(auth_state, username)
+    def cancel(self, auth_state: str, username: str, now: int | None = None) -> bool:
+        return self.consume(auth_state, username, now)
 
     def cleanup(self, now: int | None = None) -> None:
         current = int(now if now is not None else time.time())
@@ -208,6 +221,9 @@ def _build_credential(token_data: dict[str, Any],
                       accounts: dict[str, Any]) -> CodeBuddyCredential:
     account = accounts.get("account") if isinstance(accounts.get("account"), dict) else {}
     user_id = token_data.get("user_id") or accounts.get("user_id") or ""
+    # OAuth 路径的 domain 同样进 Host/X-Domain：复用统一的合法性校验，
+    # 不让上游下发的畸形 domain 绕过 parse_credential 的防线。
+    validate_domain(str(token_data.get("domain") or ""))
     return CodeBuddyCredential(
         bearer_token=str(token_data.get("accessToken") or ""),
         user_id=str(user_id),

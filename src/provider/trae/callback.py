@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import secrets
-import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -128,7 +127,7 @@ def credential_from_callback(info: CallbackInfo, access_token: str, *,
     """回调信息 + ExchangeToken 结果 → 可入库凭证。"""
     return TraeCredential(
         uid=info.uid, access_token=access_token, refresh_token=info.refresh_token,
-        expires_at=info.expires_at or int(time.time()) + 3600, domain="trae.cn",
+        expires_at=info.expires_at, domain="trae.cn",
         api_host=api_host, machine_id=machine_id, device_id=device_id,
         enterprise_id=info.enterprise_id, nickname=info.nickname,
     )

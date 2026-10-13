@@ -54,6 +54,16 @@ async def test_oauth_start_rejects_http_error_and_registers_nothing():
     assert oauth.store.owner("anything", "alice") is False
     await oauth.aclose()
 
+
+def test_build_credential_rejects_malformed_domain():
+    """OAuth 路径的 domain 也进 Host/X-Domain 头，必须与导入路径同样校验。"""
+    from src.provider.codebuddy.oauth import _build_credential
+
+    with pytest.raises(UpstreamProtocolViolation, match="domain"):
+        _build_credential({"accessToken": "AT", "domain": "evil.com/x"}, {})
+    ok = _build_credential({"accessToken": "AT", "domain": "copilot.tencent.com"}, {})
+    assert ok.domain == "copilot.tencent.com"
+
 async def test_oauth_poll_pending_then_success():
     """code=11217 → 继续等待；code=0 → 拿 token 与账号 → 消费 state。"""
     calls = {"n": 0}
@@ -197,11 +207,16 @@ def test_auth_state_store_ttl_cleanup_and_cancel():
     store = AuthStateStore(ttl_seconds=10)
     first = store.begin("alice", "s1", now=0)
     second = store.begin("alice", "s2", now=100)          # 触发 cleanup
-    assert store.owner(second, "alice") is True
-    assert store.owner(first, "alice") is False           # 已过期
-    assert store.cancel(second, "alice") is True
-    assert store.cancel(second, "alice") is False
-    assert store.upstream_state("ghost", "alice") is None
+    assert store.owner(second, "alice", now=100) is True
+    assert store.owner(first, "alice", now=100) is False  # 已过期
+    assert store.cancel(second, "alice", now=100) is True
+    assert store.cancel(second, "alice", now=100) is False
+    assert store.upstream_state("ghost", "alice", now=100) is None
+    # owner 惰性判过期：未触发 cleanup 也能挡掉过期 state（并顺手删除）
+    lazy = AuthStateStore(ttl_seconds=10)
+    stale = lazy.begin("bob", "s3", now=0)
+    assert lazy.owner(stale, "bob", now=10) is False
+    assert stale not in lazy._entries
 
 def test_auth_state_store_set_progress_only_for_known_state():
     store = AuthStateStore()

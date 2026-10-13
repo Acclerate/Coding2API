@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .. import base
 from . import dpop
 from .events import (
     CLIENT_ID,
@@ -160,7 +161,8 @@ async def _post_form(client: httpx.AsyncClient, url: str, form: dict[str, str],
     }
     response = await client.post(url, data=form, headers=headers)
     if response.status_code >= 400:
-        raise TokenEndpointError(response.status_code, response.content)
+        raise TokenEndpointError(
+            response.status_code, await base.read_body_bounded(response))
     return _parse_json(response)
 
 
@@ -213,7 +215,8 @@ async def poll_ticket(client: httpx.AsyncClient, config: LoginConfig, *,
         f"{config.snap_manager}{EP_LOGIN_TICKET}",
         params={"ticket_id": ticket_id, "secret": secret}, headers=headers)
     if response.status_code >= 400:
-        raise TokenEndpointError(response.status_code, response.content)
+        raise TokenEndpointError(
+            response.status_code, await base.read_body_bounded(response))
     data = _parse_json(response)
     if not _has_credentials(data):
         return {}

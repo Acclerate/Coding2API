@@ -303,7 +303,8 @@ class QoderClient:
             try:
                 response = await self._short.get(url, headers=headers)
                 if response.status_code >= 400:
-                    raise UpstreamHTTPError(response.status_code, response.content)
+                    raise UpstreamHTTPError(
+                        response.status_code, await base.read_body_bounded(response))
                 payload = response.json()
                 break
             except (httpx.TransportError, ValueError) as error:
@@ -507,7 +508,7 @@ class QoderClient:
         if extra_headers:
             headers.update(extra_headers)
         response = await self._short.get(url, headers=headers)
-        return _parse_json_response(response, url)
+        return await _parse_json_response(response, url)
 
     async def _post_json(self, url: str, payload: dict[str, Any],
                          credential: QoderCredential, *,
@@ -522,12 +523,13 @@ class QoderClient:
             # 刷新端点只认 refresh_token，无需 Authorization。
             headers.pop("Authorization", None)
         response = await self._short.post(url, json=payload, headers=headers)
-        return _parse_json_response(response, url)
+        return await _parse_json_response(response, url)
 
 
-def _parse_json_response(response: httpx.Response, url: str) -> dict[str, Any]:
+async def _parse_json_response(response: httpx.Response, url: str) -> dict[str, Any]:
     if response.status_code >= 400:
-        raise UpstreamHTTPError(response.status_code, response.content)
+        raise UpstreamHTTPError(response.status_code,
+                                await base.read_body_bounded(response))
     try:
         data = response.json()
     except ValueError as error:

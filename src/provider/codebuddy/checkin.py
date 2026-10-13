@@ -124,9 +124,11 @@ def checkin_scope_key(endpoint: str, user_id: str) -> str:
 
 
 class CodeBuddyCheckin:
-    def __init__(self, endpoint: str, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, endpoint: str, *, client: httpx.AsyncClient | None = None,
+                 proxy: str | None = None) -> None:
         self.endpoint = endpoint
         self._client = client
+        self._proxy = proxy          # 兜底自建 client 时也要走渠道代理
 
     async def fetch_status(self, credential: CodeBuddyCredential) -> CheckinStatus:
         """查询签到活动状态：连续天数 / 今日是否已签 / 今日与累计积分。
@@ -151,7 +153,8 @@ class CodeBuddyCheckin:
     @property
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False)
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False,
+                                              proxy=self._proxy)
         return self._client
 
     async def aclose(self) -> None:

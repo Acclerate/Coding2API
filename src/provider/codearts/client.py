@@ -371,9 +371,12 @@ class CodeArtsClient:
             seen.add(key)
             merged.append(model)
         if not merged:
+            # 文案含上游错误原文（builtin_error/benefit_error）→ 只进日志，
+            # 对外用受控 `public`（M2：绝不回显上游正文）。
             raise UpstreamProtocolViolation(
                 f"models api returned empty list (builtin={builtin_error}, "
-                f"benefit={benefit_error or ''})")
+                f"benefit={benefit_error or ''})",
+                public="upstream returned no available models")
         return merged
 
     async def refresh_benefit_catalog(self, credential: CodeArtsCredential) -> None:
@@ -610,7 +613,8 @@ class CodeArtsClient:
         response = await self._short().request(method, url, content=raw if body is not None
                                                else None, headers=signed)
         if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code, response.content)
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
         try:
             data = response.json()
         except ValueError as error:

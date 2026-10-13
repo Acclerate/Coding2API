@@ -50,4 +50,16 @@ def test_credential_from_callback():
     info = parse_callback_url(url)
     credential = credential_from_callback(info, "A", machine_id="m", device_id="d")
     assert credential.access_token == "A" and credential.refresh_token == "R"
-    assert credential.uid == "u" and credential.needs_refresh(0, now=0) is False
+    # 回调不带 expiresAt → 不臆造 TTL（保持 0），needs_refresh 保守判为需刷新
+    assert credential.uid == "u" and credential.expires_at == 0
+    assert credential.needs_refresh(0, now=0) is True
+
+
+def test_credential_from_callback_keeps_explicit_expiry():
+    """回调带 expiresAt 时原样保留。"""
+    url = ("http://x/authorize?refreshToken=R"
+           "&userInfo=%7B%22uid%22%3A%22u%22%2C%22expiresAt%22%3A999%7D")
+    info = parse_callback_url(url)
+    credential = credential_from_callback(info, "A", machine_id="m", device_id="d")
+    assert credential.expires_at == 999
+    assert credential.needs_refresh(0, now=100) is False

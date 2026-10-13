@@ -139,7 +139,8 @@ class KiloClient:
         response = await self._short().get(
             f"{self.host}{EP_MODELS}", headers=request_headers())
         if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code, response.content)
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
         try:
             data = response.json()
         except ValueError as error:

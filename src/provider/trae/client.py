@@ -520,7 +520,8 @@ class TraeClient:
                          headers: dict[str, str]) -> dict[str, Any]:
         response = await self._short().post(url, json=body, headers=headers)
         if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code, response.content)
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
         try:
             data = response.json()
         except ValueError as error:

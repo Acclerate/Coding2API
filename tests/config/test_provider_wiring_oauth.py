@@ -114,9 +114,14 @@ async def test_codearts_oauth_store_and_client_edge_branches():
     session = codearts_auth.new_login_session(config, port=1)
     state = store.begin("alice", session, now=100)
     store.cleanup(now=105)
-    assert store.owner(state, "alice") is True
+    assert store.owner(state, "alice", now=105) is True
     store.cleanup(now=111)
-    assert store.owner(state, "alice") is False
+    assert store.owner(state, "alice", now=111) is False
+    # owner 惰性判过期（未触发 cleanup）
+    lazy = AuthStateStore(ttl_seconds=10)
+    stale = lazy.begin("alice", codearts_auth.new_login_session(config, port=1), now=0)
+    assert lazy.owner(stale, "alice", now=10) is False
+    assert stale not in lazy._entries
     # consume 非归属者 → False
     assert store.consume("ghost", "alice") is False
 

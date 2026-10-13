@@ -375,7 +375,8 @@ class CodeBuddyClient:
         })
         response = await self._short.get(f"{self.endpoint}{EP_CONFIG}", headers=headers)
         if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code, response.content)
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
         try:
             body = response.json()
         except ValueError as error:
@@ -429,7 +430,8 @@ class CodeBuddyClient:
         headers = build_headers(credential, self.endpoint, quota_only=quota_only)
         response = await self._short.post(url, json=payload, headers=headers)
         if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code, response.content)
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
         try:
             data = response.json()
         except ValueError as error:
@@ -570,7 +572,8 @@ def _cached_checkin(client: CodeBuddyClient):
 
     cached = _CHECKIN_CACHE.get(client)
     if cached is None:
-        cached = CodeBuddyCheckin(client.endpoint, client=client._short)
+        cached = CodeBuddyCheckin(client.endpoint, client=client._short,
+                                     proxy=client._proxy)
         _CHECKIN_CACHE[client] = cached
     return cached
 
@@ -580,7 +583,8 @@ def _cached_growth(client: CodeBuddyClient):
 
     cached = _GROWTH_CACHE.get(client)
     if cached is None:
-        cached = CodeBuddyGrowth(client.endpoint, client=client._short)
+        cached = CodeBuddyGrowth(client.endpoint, client=client._short,
+                                     proxy=client._proxy)
         _GROWTH_CACHE[client] = cached
     return cached
 
@@ -590,7 +594,8 @@ def _cached_activity(client: CodeBuddyClient):
 
     cached = _ACTIVITY_CACHE.get(client)
     if cached is None:
-        cached = CodeBuddyActivity(client.endpoint, client=client._short)
+        cached = CodeBuddyActivity(client.endpoint, client=client._short,
+                                     proxy=client._proxy)
         _ACTIVITY_CACHE[client] = cached
     return cached
 
@@ -600,7 +605,8 @@ def _cached_refresh(client: CodeBuddyClient):
 
     cached = _REFRESH_CACHE.get(client)
     if cached is None:
-        cached = CodeBuddyRefresh(client.endpoint, client=client._short)
+        cached = CodeBuddyRefresh(client.endpoint, client=client._short,
+                                     proxy=client._proxy)
         _REFRESH_CACHE[client] = cached
     return cached
 

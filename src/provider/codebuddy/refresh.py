@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from ..base import UpstreamReloginRequired
-from .credential import CodeBuddyCredential
+from .credential import CodeBuddyCredential, validate_domain
 from .events import UpstreamProtocolViolation
 from .headers import EP_ACCOUNTS, EP_SWITCH_ENTERPRISE, EP_TOKEN_REFRESH, host_of
 from .oauth import _expires_at
@@ -40,14 +40,17 @@ class RefreshOutcome:
 
 
 class CodeBuddyRefresh:
-    def __init__(self, endpoint: str, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, endpoint: str, *, client: httpx.AsyncClient | None = None,
+                 proxy: str | None = None) -> None:
         self.endpoint = endpoint
         self._client = client
+        self._proxy = proxy          # 兜底自建 client 时也要走渠道代理
 
     @property
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False)
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False,
+                                              proxy=self._proxy)
         return self._client
 
     async def aclose(self) -> None:
@@ -194,12 +197,14 @@ class CodeBuddyRefresh:
         new_refresh = data.get("refreshToken")
 
         # 切换后重新拉账号列表，确认目标账号仍然启用
+        switched_domain = str(data.get("domain") or credential.domain)
+        validate_domain(switched_domain)
         switched_credential = CodeBuddyCredential(
             bearer_token=new_token if isinstance(new_token, str) and new_token
             else credential.bearer_token,
             user_id=credential.user_id,
             account_uid=target.account_id,
-            domain=str(data.get("domain") or credential.domain),
+            domain=switched_domain,
             enterprise_id="" if is_personal else target.enterprise_id,
             # 切到个人账号时必须清空企业上下文，禁止回退旧 enterprise_id
             department_full_name="" if is_personal else credential.department_full_name,

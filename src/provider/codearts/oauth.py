@@ -115,24 +115,32 @@ class AuthStateStore:
             session=session)
         return reservation
 
-    def owner(self, auth_state: str, username: str) -> bool:
+    def owner(self, auth_state: str, username: str, now: int | None = None) -> bool:
+        """归属校验，**含 TTL**（同 CodeBuddy）：过期 state 不得再轮询/重放。"""
         entry = self._entries.get(auth_state)
-        return entry is not None and entry.username == username
+        if entry is None or entry.username != username:
+            return False
+        current = int(now if now is not None else time.time())
+        if current - entry.created_at >= self._ttl:
+            del self._entries[auth_state]
+            return False
+        return True
 
-    def session_entry(self, auth_state: str, username: str) -> _Reservation | None:
-        if not self.owner(auth_state, username):
+    def session_entry(self, auth_state: str, username: str,
+                      now: int | None = None) -> _Reservation | None:
+        if not self.owner(auth_state, username, now):
             return None
         return self._entries[auth_state]
 
-    def consume(self, auth_state: str, username: str) -> bool:
+    def consume(self, auth_state: str, username: str, now: int | None = None) -> bool:
         """消费：成功后该 state 不可再次轮询或重放。"""
-        if not self.owner(auth_state, username):
+        if not self.owner(auth_state, username, now):
             return False
         del self._entries[auth_state]
         return True
 
-    def cancel(self, auth_state: str, username: str) -> bool:
-        return self.consume(auth_state, username)
+    def cancel(self, auth_state: str, username: str, now: int | None = None) -> bool:
+        return self.consume(auth_state, username, now)
 
     def cleanup(self, now: int | None = None) -> None:
         current = int(now if now is not None else time.time())

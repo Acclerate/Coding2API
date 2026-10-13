@@ -151,14 +151,20 @@ def test_auth_store_ttl_and_cleanup():
     store = AuthStateStore(ttl_seconds=10)
     state = store.begin("root", verifier="v", nonce="n", realm="cn",
                         machine_id="m", now=1000)
-    assert store.owner(state, "root") is True
-    assert store.reservation(state, "root") is not None
-    assert store.reservation(state, "other") is None
+    assert store.owner(state, "root", now=1000) is True
+    assert store.reservation(state, "root", now=1000) is not None
+    assert store.reservation(state, "other", now=1000) is None
     store.cleanup(now=1009)
-    assert store.owner(state, "root") is True
+    assert store.owner(state, "root", now=1009) is True
     store.cleanup(now=1010)
-    assert store.owner(state, "root") is False
-    assert store.consume(state, "root") is False
+    assert store.owner(state, "root", now=1010) is False
+    assert store.consume(state, "root", now=1010) is False
+    # owner 惰性判过期（未触发 cleanup）
+    lazy = AuthStateStore(ttl_seconds=10)
+    stale = lazy.begin("root", verifier="v", nonce="n", realm="cn",
+                       machine_id="m", now=0)
+    assert lazy.owner(stale, "root", now=10) is False
+    assert stale not in lazy._entries
 
 def test_pkce_pair_shape_and_auth_url_realm_difference():
     verifier, challenge = pkce_pair()

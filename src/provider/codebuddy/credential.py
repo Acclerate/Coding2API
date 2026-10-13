@@ -16,6 +16,18 @@ from .events import UpstreamProtocolViolation
 _HOSTNAME_RE = re.compile(r"[A-Za-z0-9.\-]+(?::\d{1,5})?")
 
 
+def validate_domain(domain: str) -> str:
+    """校验上游下发的 `domain`（会直接进 `Host`/`X-Domain` 头）。
+
+    OAuth / refresh 路径从上游响应里取 domain，**绕过了 `parse_credential`
+    的校验**；一旦上游（或中间人）返回畸形 domain，每次请求都会发出被改写
+    的 Host，改变上游路由与租户判定。统一在这里挡掉。
+    """
+    if domain and not _HOSTNAME_RE.fullmatch(domain):
+        raise UpstreamProtocolViolation("credential domain is not a valid hostname")
+    return domain
+
+
 @dataclass(slots=True)
 class CodeBuddyCredential:
     """归一化凭证。bearer-only 手动凭证只有 bearer_token 也是合法的。"""
@@ -114,8 +126,7 @@ def parse_credential(raw: bytes | dict[str, Any], *,
     # `-`、`.`，可带端口），挡掉 CRLF / 空格 / 路径等畸形值——否则凭证一旦
     # 被写入畸形 domain，每次请求都会发出被改写的 Host（httpx 拒 CRLF，
     # 但任意域名仍会改变上游路由与租户判定）。
-    if credential.domain and not _HOSTNAME_RE.fullmatch(credential.domain):
-        raise UpstreamProtocolViolation("credential domain is not a valid hostname")
+    validate_domain(credential.domain)
     # AGENTS.md 约束：来源只能由可信创建入口显式写入。
     # - 字段缺失 → 由入口决定（手动导入 = manual）
     # - 字段存在但非法 → 保持 unknown，绝不能默认成 manual
