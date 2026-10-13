@@ -36,4 +36,4 @@
   - 已有表的新列必须走 `src/db/migrate.py` 的 `_MIGRATION_COLUMNS` 幂等补列
   - 删表必须在 schema.sql 删定义**同时**在 `_MIGRATION_DROPS` 补一条
     （`CREATE TABLE IF NOT EXISTS` 对老库无效，不补删则遗留死表），并 `SCHEMA_VERSION + 1`
-  - 两者都需附老库升级测试（`test_m15_operations.py` 有现成样板）
+  - 两者都需附老库升级测试（`tests/db/test_repo_migrate.py` 有现成样板）

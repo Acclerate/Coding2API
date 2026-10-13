@@ -1,7 +1,8 @@
 """CodeBuddy 国际版渠道（`codebuddy_intl`）接线与能力边界。
 
 国际版与国内站**同协议**（同一 Keycloak realm、同一组 `/v2/*` `/v3/*` `/billing/*`
-路径），所以本文件只测**接线与差异**，不重复测协议解析（那些在 test_m1b_codebuddy.py）：
+路径），所以本文件只测**接线与差异**，不重复测协议解析（那些在本目录其余
+`test_client*.py` / `test_events.py` 里）：
 
 - Settings 新字段与**独立**白名单（混发两站 Token 即泄露，必须测到）
 - 端点解析的白名单拒绝路径

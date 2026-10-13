@@ -5,7 +5,7 @@
 events）、汇率热更。
 
 价表本身与「模型列表」目录的构建 / 落盘 / 抓取在 `src/benchmarks.py`（单一
-OpenRouter 数据源，与能力分同一次抓取），由 `tests/test_benchmarks.py` 覆盖；
+OpenRouter 数据源，与能力分同一次抓取），由 `tests/provider/test_benchmarks.py` 覆盖；
 这里只留纯计算与统计侧。
 """
 

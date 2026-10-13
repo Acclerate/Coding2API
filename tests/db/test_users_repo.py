@@ -1,7 +1,7 @@
 """账号数据层（B5）：users / audit_events 表与两个仓储。
 
 不构造真实 PBKDF2 哈希（单次 600k 迭代约 50ms，仓储层不校验格式），
-直接传占位串——密码学正确性由 tests/test_m0_skeleton.py 的 users 单测守着。
+直接传占位串——密码学正确性由 tests/auth/test_users.py 的 users 单测守着。
 """
 
 from __future__ import annotations

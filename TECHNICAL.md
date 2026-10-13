@@ -167,7 +167,13 @@ coding2api/
 ├── deploy/                      # 各部署形态的模板（systemd / logrotate 等）
 ├── diagrams/                    # 架构图 / 请求时序图 / 调度状态机（HTML 成品 + 源 JSON）
 ├── scripts/                     # hash_password / create_user / cleanup_invalid_stats / 部署与运维脚本
-├── tests/
+├── tests/                       # 测试目录按 src/ 子包镜像
+│   ├── conftest.py              # 全局夹具（repo/db/dual_repo/growth_repo/admin_client/client/reset_model_cache）
+│   ├── helpers/                 # 跨目录共享的纯函数/常量/替身（constants·paths·db·http·auth·events·executor·scheduler·chat·stores·providers）
+│   ├── api/ auth/ compat/ config/ db/ deploy/ engine/ provider/ scripts/ stats/ tasks/ webapp/  # 与 src/ 一一对应
+│   │   └── <pkg>/conftest.py    # 目录级夹具；`_support.py` 等为测试私有替身（非 `test_*`，不被收集）
+│   ├── provider/{codebuddy,trae,qoder,codearts,zen,kilo}/  # 各渠道单独成目录
+│   └── regression/              # 跨模块回归与纯补覆盖（含 conftest）
 ├── Dockerfile / docker-compose.yml  # 仓库根（compose build context 依赖根目录）
 ├── NOTICE / LICENSE / README.md（中文）/ README.en.md
 ```
@@ -574,7 +580,7 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 **单位折算（token → 积分，2026-10-01）**：上游余额是千万量级 token，直接展示既难看、也让「窗口内到期额度多者先用」拿它跟其它渠道的几百积分硬比（CodeArts 恒占优）。故统一口径：**每日池满额 1000 万 token ≡ 1000 积分，1 积分 = 10000 token**，定义只在 `src/provider/codearts/units.py`（`TOKENS_PER_CREDIT` / `tokens_to_credits`）。折算在两处，保证余额、额度、到期阶梯、单请求扣池同单位：`parse_balance` 折 `remaining`/`total`/`expiry_ladder`，`_fill_estimated_credit` 折单请求 `credit`。改动前已落库的历史数据（凭证额度、`usage_events.credit`、`usage_hourly.credit_sum`、`credit_events` 变动）由一次性脚本 `scripts/convert_codearts_credit_unit.py`（默认预览、`--apply` 才写并先备份）折算；除数是常量、除法不可逆，脚本**只能跑一次**。**优先消耗（用完即弃）**：当日没用完的额度 0 点清零、不累计，故该池必须**先用掉**。`parse_balance` 把它登记成与 CodeBuddy/TRAE 同构的 `expiry_ladder`：到期点＝次日本地 0 点（上游不返回重置时间戳，按服务端时区推算，见 `_next_local_midnight`）、金额＝当日剩余。于是调度器「窗口内即将到期额度多者先用」的一级指标恒把 CodeArts（每日池满额 1000 积分）排在其它渠道前——只要它还有额度就先走它，用尽（`remaining=0`，`expiry_ladder` 为空 → 指标归 0，健康度也归 0）则自然回落。金额已折成积分，与其余渠道同单位，展示层不再按渠道换单位。**倍率（`credit_rate`）**：内置模型 `GET {snap}/v1/model/builtin` 的每条目带 `credit[]`，其中 `ratio_display`（如 `"0.7x"`、`"0.32x"`）是官方对外展示的消耗倍率，取首档作为本渠道 `credit_rate`（`_parse_ratio` 容忍 `0.7x`/`0.7`/`0.7` 三种写法）。**福利模型不给倍率**（`credit_rate=None`）：它走每日免费 token 池、上游不返回该字段，标 `0.0` 会被前端渲染成 zen/kilo 式「免费」，而它实际消耗每日额度、用尽即不可用。**单请求扣池（`credit`，2026-10-01）**：福利模型虽不给倍率但**确实消耗每日池**，故单请求用量不能留空。上游 usage 只给 token 数、不带额度字段，而福利模型实测按每日 token 池 **1:1** 扣减（`credit_events` 反解：一条输入 32 + 输出 694 = 726 token 的请求，池余额恰好 −726），故 `_fill_estimated_credit` 在流式事件上把 `credit` 补成「输入 + 输出 token 折成的积分」（1 积分 = 10000 token）并标 `credit_estimated`（统计页加 ≈）。
 **只补福利模型**：内置模型不扣这条每日池（走 `credit[]` 的付费倍率），补了会把 token 数误当池消耗。故同一渠道内 `credit` 字段语义随模型分档——福利＝每日池积分消耗、内置＝上游真值（若返回）。上游将来直接回传 `credit` 时不覆盖。**登录**：OAuth2 PKCE → `POST {snap-manager}/v1/oauth2/tokens`（authorization_code）换 `{access_key_id, secret_access_key, security_token, expiration, refresh_token}`，DPoP 私钥随 credential 一起生成并加密入库。**门户把授权码 302 回 `http://127.0.0.1:{port}/oauth/callback`——用户本机地址，服务端监听不到**；故本渠道不用 poll 轨道，而走「paste 轨道」：前端展示授权页后让用户把浏览器地址栏里那条打不开的回调链接粘回，走 `POST /api/auth/upstream/complete` 由服务端用 code + 登录时登记的 PKCE `code_verifier`/DPoP 私钥换 token。（上游另有 `GET {snap-manager}/v1/login/ticket` 兜底轮询通道，但服务端取到时被回「无效 ticketId」，故不采用。）**登录后补身份**：token 响应通常不带用户名，`CodeArtsOAuth._finish` 用签名身份接口（`caller_identity`，按区域不可用时回落 `current_user`）尽力补 `uid`/`user_name`/`nickname`（只补缺失项）；失败不阻断登录，昵称为空时统计明细的凭证列回退凭证 id 前缀。
 **节点白名单**：`CODEARTS_ALLOWED_ENDPOINTS` 含 snap 引擎、STS、福利网关、门户四个主机；AK/SK 签名请求只发往白名单。`CODEARTS_CHAT_MIN_INTERVAL`（热更项，默认 5s）独立 pacer。**并发上限（2026-10-01，`CODEARTS_MAX_CONCURRENCY`）**：上游对**每账号并发会话数**有硬限（实测 3），超出直接 `HTTP 400` + `TM.00001041 并发会话数已达上限(3个)`。此前聊天 pacer 声明 `allow_concurrent=True` 但**无上限**（桶内来多少放多少），第 4 个起全部撞 400；又因 `classify_status` 只在 429 分支查 `00001041`，这些 400 被判成 `INVALID`（换号也没用且不冷却），与客户端重试叠成风暴——2026-09-30 23:17 至 10-01 07:40 共 135 次，整体失败率约 77%。修复两处：`Pacer` 增按桶在途上限 `max_concurrency`（满则挂起等 `release` 让位；0/None 保持旧行为），CodeArts pacer 装配 `lambda: runtime.codearts_max_concurrency`（热更项，默认 3）；`classify_status` 把 400/429 带并发/限流标记判成可重试限流（与流内 `classify_error_code` 同判法；后续拆成两类，见本段末）：并发打满（`00001041`/`并发`）判 `CONCURRENCY`（固定 60s 模型级短冷却，不翻倍），其余（`tpm`/`429`/`rate limit`/`throttl`）判 `MODEL`。背景：打满是瞬态信号（在途排空即恢复，实测平均 9s、最大 38s），套 `MODEL` 的 600s 起步、翻倍到 2h 会把一次瞬态打满变成 10min 起的长时间不可用。**名额泄漏修复（2026-10-02）**：上条引入的 `max_concurrency` 依赖 `release` 与 `wait_turn` 严格配对，而 `release` 在 provider `stream_chat` 的 `finally` 里——`async for ... break` **不关闭** async generator（CPython 只在耗尽 / 显式 `aclose()` / GC 的 asyncgen finalizer 时才跑 `finally`）。executor `_stream_loop` 遇 `EventKind.ERROR` 的两处 `break` 于是让名额推迟归还；轮换重试每次重新 `wait_turn`，`_inflight` 单调累积，满 3 后新请求在 `wait_turn` 无限阻塞——表现为**「用了三次就限制」而非「并发三」**（复现：3 次流内错误后 `inflight=3`，第 4 个请求永久阻塞）。这推翻 Q45 原始判断（「延迟归还只会让节流略松、不会误排队」）：`max_concurrency=0` 时泄漏确实只是变松，配上上限后泄漏即**永久丢失许可**。
-修复：`provider.base.aclose_stream` 统一关闭，`stream_guarded` / `stream` / `_stream_loop` / `complete` / `ContinuationStream.__aiter__` 五处提前结束消费处全部显式关闭上游流。回归测试 `tests/test_stream_slot_release.py`（10 例，旧代码 6 例失败）。
+修复：`provider.base.aclose_stream` 统一关闭，`stream_guarded` / `stream` / `_stream_loop` / `complete` / `ContinuationStream.__aiter__` 五处提前结束消费处全部显式关闭上游流。回归测试 `tests/regression/test_stream_slot_release.py`（10 例，旧代码 6 例失败）。
 **节流窗口对齐上游口径（2026-10-02）**：泄漏修好后实测仍偶发 `TM.00001041`——上游限制的不是「同时在途 HTTP 数」而是「**每账号每约 60s 最多 3 个会话**」。证据（单账号、真实上游）：① 3 并发结束后名额已全部归还，**紧接着**再发 3 个全部 400；② 打满 3 并发后每 6s 探一个单请求，直到约 **68s** 才恢复；③ 完全顺序（零并发）、每请求换全新 `httpx` client 并显式关闭，仍前 3 个 OK、第 4 个起全 400；④ 间隔 30s 顺序发 6 个则 6/6 OK。即会话在 HTTP 流结束后仍滞留数十秒，纯在途上限挡不住「3 个刚结束就立刻再发 3 个」这类突发，`release` 一让位新请求就再次击穿。故 `Pacer` 增加**滑动窗口**口径：`window_seconds > 0` 时与 `max_concurrency` 组合成「同桶最近 `window_seconds` 秒内最多放行 N 次启动」，窗口内满额则挂起到最早一次启动滑出窗口（睡 `starts[0] + window_seconds - now`，醒来重查，`release` 只减在途计数、不提前让出窗口配额）。CodeArts pacer 装配 `window_seconds=lambda: runtime.codearts_request_window_seconds`（热更项，默认 60s；`0` 关闭窗口口径退回纯在途上限）。取 60s 落在实测恢复区间（60.7–68.6s）的**下沿**（略偏激进，调大可更稳）；代价是高频使用时账号吞吐降到约 3 次/分钟，超出部分排队而非报错。窗口模式配 `max_concurrency=0` 时不生效；`window_seconds` 与在途上限都保留，`0` 均可热更关闭。窗口准入**同时**受窗口与在途两个闸门约束：窗口满则等到最早一次启动滑出，仅因在途满（长流超过窗口）则等 `release` 唤醒——否则长响应会绕过在途上限再次超发。
 
 ### 3.17b CodeBuddy 国际版渠道（`codebuddy_intl`）
@@ -695,7 +701,7 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 - **覆盖面**：该渠道**全部**出站请求——聊天流、额度 / 模型拉取、后台任务（签到 / 成长 / 刷新 / 活跃上报：CodeBuddy 的这些子客户端复用 `client._short`，代理自动跟随）与 OAuth 登录。
 - **为什么启动期而非热更**：代理作用于连接池，运行中改值需重建在途连接池（涉及 6 个客户端 + 3 个 OAuth 流），风险与测试量都大；与上游端点同属启动期传输层配置（§3.1 端点是启动期）。
 
-无 schema 变更，compose 透传 `PROVIDER_PROXIES`；`tests/test_provider_proxy.py`（30 例）覆盖解析 / 工厂 / 6 客户端 + 3 OAuth 透传 / main 装配接线。
+无 schema 变更，compose 透传 `PROVIDER_PROXIES`；`tests/provider/test_proxy.py`（30 例）覆盖解析 / 工厂 / 6 客户端 + 3 OAuth 透传 / main 装配接线。
 
 ---
 
@@ -712,7 +718,7 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 
 **逐请求明细（`/api/stats/events`）的两套分页**：rowid 游标分页与「任意列排序」不兼容（游标只在按 rowid 走时成立）。故默认（`time` 降序）仍走游标、返回 `next_before`（`total` 为 null）；**按其它列排序 / 时间升序 / 显式 `offset`** 时改用 `LIMIT/OFFSET`、额外返回 `total`，此时忽略 `before`（`next_before` 恒 null）。明细只留 90 天，深 offset 成本可接受，故不做复合 keyset 游标。**前端**：`web/src/hooks/useSort.ts`（排序状态 + 每列首次点击方向）+ `web/src/components/SortableHead.tsx`（表头按钮 + 方向箭头 + `aria-sort`，列名后的 `ColumnHint` 置于按钮外，避免点提示误触排序）。切排序 / 改每页数量 / 切范围一律回到第一页。**不做**：服务端持久化排序偏好（仅页面内状态）。
 
-无 schema 变更，无配置变更。`tests/test_sorting.py` 覆盖白名单回落、`None` 排最后、SQL tiebreak、分组默认降序、明细两种分页与端到端参数透传。
+无 schema 变更，无配置变更。`tests/stats/test_sorting.py` 覆盖白名单回落、`None` 排最后、SQL tiebreak、分组默认降序、明细两种分页与端到端参数透传。
 
 ### 3.25 模型目录（OpenRouter 单一来源：价格 + 明细 + 能力排行）
 
@@ -745,7 +751,7 @@ UA 版本走 `ZEN_OPENCODE_VERSION` 配置（上游改阈值改 env，不硬编�
 
 **降级**：拉取失败 / 快照损坏 / 版本不符 / 过快照年龄上限，一律退化为空表：条目**不带** `benchmarks` 字段（不是 `null`），页面显示 `—`，模型列表与聊天不受影响。拉到空价表视为失败，不覆盖已有三张表。
 
-覆盖：`tests/test_benchmarks.py`（匹配规则含歧义拒配、三表建表逐条跳过、快照四种坏法与三表各自坏条目、三处端点注入、后台一轮换入三表与拉到空表不清旧值、启动预热仅在无快照时补拉）。
+覆盖：`tests/provider/test_benchmarks.py`（匹配规则含歧义拒配、三表建表逐条跳过、快照四种坏法与三表各自坏条目、三处端点注入、后台一轮换入三表与拉到空表不清旧值、启动预热仅在无快照时补拉）。
 
 ---
 
@@ -1026,6 +1032,10 @@ PRAGMA foreign_keys = ON;      -- api_keys 之外无外键（users 与 api_keys 
 ---
 
 ## 8. 测试策略（Q14=B + T-Q5）
+
+**目录组织**：`tests/` 按 `src/` 子包镜像（`api/ auth/ compat/ config/ db/ deploy/ engine/ provider/<渠道>/ scripts/ stats/ tasks/ webapp/`），每个目录一个 `__init__.py`。跨模块回归与纯补覆盖用例集中在 `tests/regression/`。逐字节等价的常量/纯函数收敛到 `tests/helpers/`；夹具按作用域放在 `tests/conftest.py` 或目录级 `conftest.py`；测试私有替身类放非收集模块 `_support.py`（不得以 `test_` 开头，否则被 pytest 当测试收集）。
+
+**真连上游豁免**：默认全部用例走 mock；需要真实探活上游的用例用 marker 显式标注（`@pytest.mark.real_upstream("zen" | "kilo" | "openrouter")`），`conftest` 据 marker 放行对应网络访问。marker 已在 `pyproject.toml` 注册（`--strict-markers` 生效，新增必须注册）。
 
 | 目标 | 覆盖 | 方式 |
 |---|---|---|
