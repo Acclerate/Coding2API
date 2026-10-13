@@ -50,10 +50,19 @@ def _ladder_value(text: str | None) -> list[tuple[int, float]] | None:
         items = json.loads(text)
     except ValueError:
         return None
+    # 合法 JSON 但不合形状（`"5"` / `null` / `[["x",5]]`）同样当脏数据：
+    # 迭代非列表会抛 TypeError、int(item[0]) 会抛 ValueError，两者都必须
+    # 归一为 None，否则 candidates()/pool_counts()/list_all() 一起崩。
+    if not isinstance(items, list):
+        return None
     ladder: list[tuple[int, float]] = []
     for item in items:
-        if isinstance(item, list) and len(item) == 2:
+        if not (isinstance(item, list) and len(item) == 2):
+            continue
+        try:
             ladder.append((int(item[0]), float(item[1])))
+        except (TypeError, ValueError):
+            continue
     return ladder
 
 
@@ -722,7 +731,7 @@ class GrowthRepository:
     def recent(self, credential_id: str, limit: int = 20) -> list[dict[str, Any]]:
         rows = self._db.connect().execute(
             "SELECT * FROM growth_events WHERE credential_id = ? ORDER BY ts DESC LIMIT ?",
-            (credential_id, max(1, limit))).fetchall()
+            (credential_id, max(1, min(200, limit)))).fetchall()
         return [dict(row) for row in rows]
 
 

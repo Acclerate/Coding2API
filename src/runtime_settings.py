@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import time
@@ -286,10 +287,33 @@ def _validate_webhook_urls(raw: str) -> None:
         raise InvalidSetting(
             f"alert_webhook_url 最多 {MAX_WEBHOOK_ENTRIES} 个地址")
     for entry in entries:
-        scheme = urlparse(entry).scheme.lower()
+        parsed = urlparse(entry)
+        scheme = parsed.scheme.lower()
         if scheme not in WEBHOOK_SCHEMES:
             raise InvalidSetting(
                 f"alert_webhook_url 只支持 http/https，收到 {entry!r}")
+        # SSRF 防护：地址由 admin 配置（受信边界），但热更成一个内网/回环/
+        # 链路本地（云元数据 169.254.169.254）地址后，后台任务会带 JSON
+        # POST 打内网。解析不出主机名或落在私网/保留段一律拒绝。
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            raise InvalidSetting(f"alert_webhook_url 缺少主机名: {entry!r}")
+        if _is_blocked_webhook_host(host):
+            raise InvalidSetting(
+                f"alert_webhook_url 不允许指向内网/回环/保留地址: {entry!r}")
+
+
+def _is_blocked_webhook_host(host: str) -> bool:
+    """主机名是否指向内网/回环/链路本地/保留地址（SSRF 黑名单）。"""
+    if host in ("localhost",) or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False                    # 域名：无法在写入期解析，交给运行时
+    return (address.is_private or address.is_loopback
+            or address.is_link_local or address.is_reserved
+            or address.is_multicast or address.is_unspecified)
 
 
 def _parse_bool(text: str) -> bool:
@@ -367,6 +391,10 @@ class RuntimeSettings:
         self._store = store
         self._overrides: dict[str, str] = {}
         self.reload()
+        # env 提供的 webhook 地址同样要过校验：否则 .env 里的
+        # `ALERT_WEBHOOK_URL=file:///etc/passwd`（或内网地址）会绕过
+        # `_coerce`/`_validate_webhook_urls`，只靠 httpx 运行时失败兜底。
+        _validate_webhook_urls(str(getattr(base, "alert_webhook_url", "") or ""))
 
     # ------------------------------------------------------------- 覆盖层
 

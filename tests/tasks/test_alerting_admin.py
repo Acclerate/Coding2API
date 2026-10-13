@@ -187,7 +187,31 @@ def test_alert_webhook_rejects_non_http_scheme_and_too_many(tmp_path):
     too_many = ",".join(f"https://h{i}" for i in range(20))
     with pytest.raises(InvalidSetting, match="最多"):
         runtime.set_many({"alert_webhook_url": too_many})
+    # SSRF：内网/回环/链路本地（云元数据）地址一律拒
+    for blocked in ("http://127.0.0.1:9000/x", "http://169.254.169.254/latest/meta-data",
+                    "http://10.0.0.5/hook", "http://[::1]:80/hook",
+                    "http://localhost/hook", "http://224.0.0.1/hook",
+                    "http://0.0.0.0/hook"):
+        with pytest.raises(InvalidSetting, match="内网/回环/保留"):
+            runtime.set_many({"alert_webhook_url": blocked})
+    # 无主机名
+    with pytest.raises(InvalidSetting, match="缺少主机名"):
+        runtime.set_many({"alert_webhook_url": "http:///nohost"})
     # 逗号分隔的合法多地址通过
     runtime.set_many({"alert_webhook_url": "https://a, http://b"})
     assert runtime.alert_webhook_url == "https://a, http://b"
+    db.close()
+
+
+def test_env_webhook_url_is_validated_at_load(tmp_path):
+    """env 提供的 ALERT_WEBHOOK_URL 也要过校验（不能只靠运行时失败兜底）。"""
+    from src.db.repo import RuntimeSettingsRepository
+    from src.runtime_settings import InvalidSetting, load_runtime_settings
+
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    base = Settings(_env_file=None, APP_SECRET=SECRET,
+                    ALERT_WEBHOOK_URL="http://169.254.169.254/latest")
+    with pytest.raises(InvalidSetting, match="内网/回环/保留"):
+        load_runtime_settings(base, RuntimeSettingsRepository(db))
     db.close()

@@ -97,6 +97,12 @@ def test_repo_expiry_ladder_tolerates_missing_and_dirty_values():
     assert _ladder_value("") is None
     assert _ladder_value("{not json") is None
     assert _ladder_value("[[123, 5], [9], 7, \"junk\", [1, 2, 3]]") == [(123, 5.0)]
+    # 合法 JSON 但非列表：迭代会抛 TypeError，必须归一为 None
+    assert _ladder_value("5") is None
+    assert _ladder_value("null") is None
+    assert _ladder_value("true") is None
+    # 元素形状对但类型不可转换（int("x") → ValueError）：跳过该行
+    assert _ladder_value("[[\"x\", 5], [7, \"y\"], [1, 2]]") == [(1, 2.0)]
 
 
 def test_repo_missing_credential_returns_none(repo):

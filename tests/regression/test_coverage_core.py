@@ -136,6 +136,38 @@ def test_transaction_commits_and_rolls_back(db):
         "SELECT COUNT(*) FROM api_keys").fetchone()[0] == 1          # k2 被回滚
 
 
+def test_transaction_nested_only_outermost_commits(db):
+    """嵌套 transaction()：内层退出不提交，异常也不回滚外层的未提交写入。"""
+    with db.transaction() as outer:
+        outer.execute("INSERT INTO api_keys (id, username, key_digest, preview, created_at) "
+                      "VALUES ('n1', 'u', 'd1', 'p', 1)")
+        # 内层正常退出：不得提前提交外层的写入
+        with db.transaction() as inner:
+            inner.execute("INSERT INTO api_keys (id, username, key_digest, preview, created_at) "
+                          "VALUES ('n2', 'u', 'd2', 'p', 1)")
+        assert db.connect().in_transaction is True
+        # 内层抛错：不得回滚外层已写入的 n1
+        with pytest.raises(RuntimeError), db.transaction():
+            raise RuntimeError("inner abort")
+        assert db.connect().execute(
+            "SELECT COUNT(*) FROM api_keys WHERE id IN ('n1','n2')").fetchone()[0] == 2
+    assert db.connect().execute(
+        "SELECT COUNT(*) FROM api_keys WHERE id IN ('n1','n2')").fetchone()[0] == 2
+
+
+def test_transaction_outer_rollback_discards_inner_writes(db):
+    """外层回滚时，内层已执行的写入一并丢弃。"""
+    with pytest.raises(RuntimeError), db.transaction() as outer:
+        outer.execute("INSERT INTO api_keys (id, username, key_digest, preview, created_at) "
+                      "VALUES ('r1', 'u', 'd1', 'p', 1)")
+        with db.transaction() as inner:
+            inner.execute("INSERT INTO api_keys (id, username, key_digest, preview, created_at) "
+                          "VALUES ('r2', 'u', 'd2', 'p', 1)")
+        raise RuntimeError("outer abort")
+    assert db.connect().execute(
+        "SELECT COUNT(*) FROM api_keys WHERE id IN ('r1','r2')").fetchone()[0] == 0
+
+
 def test_database_schema_is_idempotent(db):
     apply_schema(db.connect())
     apply_schema(db.connect())

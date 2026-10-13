@@ -28,3 +28,15 @@ def test_derive_key_is_stable_urlsafe_base64():
     assert key == derive_key("abc")
     assert key != derive_key("abd")
     assert len(base64.urlsafe_b64decode(key)) == 32
+
+def test_cipher_rejects_low_entropy_secret():
+    """够长但无熵的密钥同样拒绝（重复/周期/字符集过小）。"""
+    from src.db.crypto import WeakSecretError
+
+    for weak in ("a" * 20, "ab" * 10, "1234567890" * 2, "abcdefgh" * 3):
+        with pytest.raises(WeakSecretError, match="low-entropy"):
+            CredentialCipher(weak)
+
+def test_cipher_accepts_high_entropy_secret():
+    """字符集足够大的长密钥正常通过。"""
+    assert CredentialCipher("x9Q2mZ7pL4vT8wR1sK6n").encrypt(b"ok")

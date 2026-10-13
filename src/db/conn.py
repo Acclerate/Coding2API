@@ -58,14 +58,22 @@ class Database:
         SELECT 在锁外读到旧快照，两个写者都基于同一旧值更新 → 丢更新
         （`save_quota` 的 before/after、pin 切换都依赖读改写的一致性）。
         立即取写锁把整段纳入同一事务；`connect` 是线程本地连接，同一时刻只有
-        一个协程在用，`in_transaction` 保护嵌套调用不会重复 BEGIN。
+        一个协程在用。**嵌套调用只有最外层提交/回滚**（`tx_depth` 计数）：
+        否则内层退出时的无条件 `commit()` 会把外层尚未写完的工作提前提交，
+        内层异常时的 `rollback()` 又会丢弃外层的未提交写入。
         """
         conn = self.connect()
-        if not conn.in_transaction:
+        depth = getattr(self._local, "tx_depth", 0)
+        if depth == 0 and not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
+        self._local.tx_depth = depth + 1
         try:
             yield conn
         except BaseException:
-            conn.rollback()
+            if depth == 0:
+                conn.rollback()
             raise
-        conn.commit()
+        finally:
+            self._local.tx_depth = depth
+        if depth == 0:
+            conn.commit()
