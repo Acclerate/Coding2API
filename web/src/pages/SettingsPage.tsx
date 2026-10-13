@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api/client";
 import { formatAgo, formatDuration, taskReportLabel } from "../api/display";
+import { errorText } from "../lib/errors";
 import { useQueryClient, useSettings, useTasks } from "../api/hooks";
 import { useSessionContext } from "../Layout";
 import type { RuntimeSetting, TaskStatus } from "../api/types";
@@ -284,7 +285,7 @@ export function SettingsPage() {
       // （queryKey ["playground-models"]，TTL 内不会重取），不失效会显示旧列表。
       await client.invalidateQueries({ queryKey: ["playground-models"] });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "保存失败");
+      setError(errorText(caught, "保存失败，请稍后重试。"));
     } finally {
       setBusy(false);
     }
@@ -300,7 +301,7 @@ export function SettingsPage() {
       setDrafts({});
       await refresh();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "恢复失败");
+      setError(errorText(caught, "恢复失败，请稍后重试。"));
     } finally {
       setBusy(false);
     }

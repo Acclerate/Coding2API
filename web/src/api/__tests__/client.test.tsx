@@ -98,32 +98,4 @@ describe("api client", () => {
     await api.statsByProvider("alice", 5);
     await api.logout();
   });
-
-  it("models 与 chatCompletion 使用 Bearer 头", async () => {
-    const spy = vi.fn(async () => new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 }));
-    vi.stubGlobal("fetch", spy);
-
-    await api.models("sk-abc");
-    expect(spy).toHaveBeenCalledWith(
-      "/v1/models",
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: "Bearer sk-abc" }),
-      }),
-    );
-
-    const calls: { url: string; init?: RequestInit }[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        calls.push({ url: String(input), init });
-        return new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 });
-      }),
-    );
-    await api.chatCompletion("sk-abc", { model: "m" });
-    const chat = calls.at(-1)!;
-    expect(chat.url).toBe("/v1/chat/completions");
-    expect(chat.init?.headers).toMatchObject({ Authorization: "Bearer sk-abc" });
-
-
-  });
 });

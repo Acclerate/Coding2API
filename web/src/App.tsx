@@ -21,6 +21,17 @@ const LOADING = (
   <div className="grid h-full place-items-center text-sm text-[var(--color-ink-muted)]">载入中…</div>
 );
 
+/**
+ * admin-only 页面的路由守卫：非 admin 直接送回首页。
+ *
+ * 侧栏已隐藏这些入口，但地址栏直输 / 浏览器历史仍能到达；后端会 403，
+ * 用户看到的却是一片「无权限」报错。这里前置拦截，与侧栏可见性同一口径。
+ */
+function RequireAdmin({ isAdmin, children }: { isAdmin: boolean; children: React.ReactNode }) {
+  if (!isAdmin) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
 export function App() {
   const session = useSession();
 
@@ -56,10 +67,10 @@ export function App() {
           <Route path="/stats" element={<StatsPage />} />
           <Route path="/models" element={<ModelCatalogPage />} />
           <Route path="/playground" element={<PlaygroundPage />} />
-          <Route path="/users" element={<UsersPage />} />
-          <Route path="/audit" element={<AuditPage />} />
-          <Route path="/alerts" element={<AlertsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/users" element={<RequireAdmin isAdmin={session.data.is_admin}><UsersPage /></RequireAdmin>} />
+          <Route path="/audit" element={<RequireAdmin isAdmin={session.data.is_admin}><AuditPage /></RequireAdmin>} />
+          <Route path="/alerts" element={<RequireAdmin isAdmin={session.data.is_admin}><AlertsPage /></RequireAdmin>} />
+          <Route path="/settings" element={<RequireAdmin isAdmin={session.data.is_admin}><SettingsPage /></RequireAdmin>} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

@@ -12,7 +12,6 @@ import type {
   GrowthEvent,
   GrowthRunResult,
   ActivityReportResult,
-  ModelInfo,
   ModelCatalogResponse,
   ModelStats,
   CredentialStats,
@@ -222,20 +221,6 @@ export const api = {
                 sort?: string, order?: string, offset?: number) =>
     request<StatsEventsResponse>(
       `/api/stats/events${query({ username, since, before, limit, sort, order, offset })}`),
-
-  // ---------------------------------------------------------------- 模型
-  models: (apiKey: string) =>
-    request<{ object: string; data: ModelInfo[] }>("/v1/models", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    }),
-
-  // ------------------------------------------------------------ Playground
-  chatCompletion: (apiKey: string, body: unknown) =>
-    fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body),
-    }),
 };
 
 function query(params: Record<string, string | number | undefined>): string {

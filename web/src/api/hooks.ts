@@ -1,9 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
-  Credential,
   CredentialsResponse,
-  SessionInfo,
   StatsMetric,
 } from "../api/types";
 
@@ -210,11 +208,3 @@ export function useLogout() {
 }
 
 export { useQueryClient };
-
-export function isDisabled(credential: Credential): boolean {
-  return credential.disabled === 1;
-}
-
-export function sessionOf(data: SessionInfo | undefined): SessionInfo | undefined {
-  return data;
-}

@@ -18,7 +18,12 @@ const LOGIN_PROVIDERS: Provider[] = [
 type TabValue = "login" | "import";
 
 /** 只允许 http(s) 授权地址：上游返回的 auth_url 若为 `javascript:` / `data:`
- * 等被赋给弹窗 location 会在弹窗（继承本页 origin）执行脚本（M5）。 */
+ * 等被赋给弹窗 location 会在弹窗（继承本页 origin）执行脚本（M5）。
+ *
+ * 不做主机白名单：auth_url 由各渠道上游下发（如 codebuddy 的登录域名随账号
+ * 区域变化），写死域名会在渠道侧变更时直接打断登录，而这里的真实威胁是
+ * `javascript:` 之类的脚本执行（已由 scheme 校验挡住）——能把用户导去钓鱼站
+ * 的攻击者已经掌握了上游响应，收益有限。 */
 function safeAuthUrl(raw: string | undefined): string | null {
   if (!raw) return null;
   try {

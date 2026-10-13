@@ -3,9 +3,7 @@ import { KeyRound, TriangleAlert } from "lucide-react";
 import { api, ApiError } from "../api/client";
 import { useDialogFocus } from "../hooks/useDialogFocus";
 import { Button, Field, Input, Notice } from "../ui";
-
-/** 后端要求的最短密码长度（与 src/api/admin_auth.py 的 MIN_PASSWORD_LENGTH 一致）。 */
-export const MIN_PASSWORD_LENGTH = 8;
+import { MIN_PASSWORD_LENGTH } from "../lib/constants";
 
 /**
  * 修改密码对话框。

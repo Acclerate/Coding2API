@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { useSessionContext } from "../Layout";
 import type { ModelInfo } from "../api/types";
+import { errorText } from "../lib/errors";
 import { HelpBlock } from "../components/HelpBlock";
 import { PageHeader } from "../components/PageHeader";
 import { ModelPicker, modelValue, pickDefaultModel } from "../components/ModelPicker";
@@ -93,7 +94,10 @@ export function PlaygroundPage() {
         setUsage(body.usage ?? null);
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "请求失败");
+      // 后端 4xx/5xx 已在上面解析过 error.message（受控文案）；走到这里的是
+      // 网络层异常（fetch 抛 TypeError 等），其 message 是英文实现细节，
+      // 不该直接渲染给用户。
+      setError(errorText(caught, "请求失败，请稍后重试。"));
     } finally {
       setBusy(false);
     }

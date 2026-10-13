@@ -206,4 +206,32 @@ describe("App 路由守卫", () => {
     expect(await screen.findByTestId("activate-page")).toBeInTheDocument();
     expect(await screen.findByText("alice")).toBeInTheDocument();
   });
+
+  it("非 admin 直输 admin-only 路径被守卫送回首页", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/auth/session") {
+          return new Response(JSON.stringify({
+            username: "op", is_operator: true, is_admin: false, role: "operator",
+            must_change_password: false,
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ credentials: [], viewer: "op", is_admin: false }), {
+          status: 200,
+        });
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/users"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // 落到首页而不是用户管理
+    expect(await screen.findByTestId("credentials-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("users-page")).not.toBeInTheDocument();
+  });
 });

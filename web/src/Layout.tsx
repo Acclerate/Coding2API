@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Outlet, useLocation, useOutletContext } from "react-router-dom";
 import { GitBranch, Menu, X } from "lucide-react";
 import type { SessionInfo } from "./api/types";
+import { api } from "./api/client";
 import { Button } from "./components/ui/button";
 import { ChangePasswordDialog } from "./components/ChangePasswordDialog";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -47,13 +48,13 @@ export function Layout({ session }: { session: SessionInfo }) {
   }, [location.pathname]);
 
   const logout = async () => {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      credentials: "same-origin",
-      // CSRF 纵深：写请求带自定义头（与 api/client.ts 一致）
-      headers: { "X-Requested-With": "XMLHttpRequest" },
-    });
-    window.location.href = "/login";
+    // 走 api.logout()（带 CSRF 头）而不是裸 fetch：语义与其余写请求一致，
+    // 服务端若收紧写请求校验也不会漏掉这一处。
+    try {
+      await api.logout();
+    } finally {
+      window.location.href = "/login";
+    }
   };
 
   return (

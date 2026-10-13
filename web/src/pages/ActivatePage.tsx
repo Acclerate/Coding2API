@@ -4,9 +4,7 @@ import { ShieldCheck, TriangleAlert } from "lucide-react";
 import { api, ApiError } from "../api/client";
 import { BrandMark } from "../components/Sidebar";
 import { Button, Field, Input, Notice, Panel } from "../ui";
-
-/** 与后端 src/api/admin_auth.py 的 MIN_PASSWORD_LENGTH 一致。 */
-const MIN_PASSWORD_LENGTH = 8;
+import { MIN_PASSWORD_LENGTH } from "../lib/constants";
 
 /**
  * 账号激活页：用户凭一次性令牌自设密码。
