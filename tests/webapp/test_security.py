@@ -358,6 +358,32 @@ def test_login_throttle_prunes_expired_and_global_cap():
     assert len(throttle._events[("g", "")]) == 0              # 上一行 check 已清
 
 
+def test_login_throttle_evicts_keys_over_capacity():
+    """失败键超上限时的清理：先删过期键，仍超再淘汰最旧的（防内存 DoS）。"""
+    import time as _time
+
+    from src.auth.throttle import LoginThrottle
+
+    throttle = LoginThrottle()
+    throttle._MAX_KEYS = 2
+    # 过期键清理后回到容量内 → 提前返回，不再淘汰
+    throttle._events[("u", "stale")].append(_time.monotonic() - 61)
+    throttle._events[("g", "")].append(_time.monotonic())
+    throttle._events[("i", "1.1.1.1")].append(_time.monotonic())
+    throttle._evict_over_capacity(_time.monotonic())
+    assert ("u", "stale") not in throttle._events
+    assert len(throttle._events) == 2
+
+    # 全是新键、超容量 → 按最近失败时间淘汰最旧的（全局键保留）
+    throttle._events[("u", "old")].append(_time.monotonic() - 5)
+    throttle._events[("u", "new")].append(_time.monotonic())
+    throttle._events[("i", "2.2.2.2")].append(_time.monotonic())
+    throttle._evict_over_capacity(_time.monotonic())
+    assert len(throttle._events) == 2
+    assert ("u", "old") not in throttle._events
+    assert ("g", "") in throttle._events
+
+
 def test_host_allowed_public_base_url_edge_shapes():
     """PUBLIC_BASE_URL 无 scheme / path_host 为空时不炸也不误放行。"""
     from src.config import Settings
@@ -370,6 +396,25 @@ def test_host_allowed_public_base_url_edge_shapes():
     empty = Settings(_env_file=None, APP_SECRET=SECRET, PUBLIC_BASE_URL="/oops")
     assert _host_allowed("localhost", empty)
     assert not _host_allowed("evil.example", empty)
+
+
+def test_host_allowed_ipv6_literals_and_allowlist():
+    """IPv6 字面量 Host（`[::1]:8000`）剥括号后与白名单比对。
+
+    旧实现 `split(":")` 会把 `[::1]` 截成空串导致所有 IPv6 主机被 400；
+    ALLOWED_HOSTS 里的 IPv6 字面量同样要能命中。
+    """
+    from src.config import Settings
+    from src.main import _host_allowed
+
+    loopback = Settings(_env_file=None, APP_SECRET=SECRET)
+    assert _host_allowed("[::1]", loopback) is True
+    assert _host_allowed("[::1]:8000", loopback) is True
+    configured = Settings(_env_file=None, APP_SECRET=SECRET,
+                          ALLOWED_HOSTS="[2001:db8::1],example.com")
+    assert _host_allowed("[2001:db8::1]:443", configured) is True
+    assert _host_allowed("example.com:8443", configured) is True
+    assert _host_allowed("[2001:db8::2]", configured) is False
 
 
 def test_host_whitelist_rejects_foreign(app):

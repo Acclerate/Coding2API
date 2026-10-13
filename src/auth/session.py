@@ -41,7 +41,15 @@ def verify_session_token(token: str, secret: str, *,
     if not token or "." not in token:
         return None
     payload_b64, _, signature = token.partition(".")
-    if not hmac.compare_digest(_sign(payload_b64, secret), signature):
+    # Cookie 由客户端任意填写，可能含非 ASCII 字节：`_sign` 里
+    # `payload_b64.encode("ascii")` 会抛 UnicodeEncodeError，
+    # `hmac.compare_digest` 对非 ASCII str 会抛 TypeError——两者都必须
+    # 归一为「签名非法」而不是冒泡成 500（未认证请求可触发）。
+    try:
+        expected = _sign(payload_b64, secret)
+        if not hmac.compare_digest(expected, signature):
+            return None
+    except (TypeError, UnicodeError):
         return None
     padded = payload_b64 + "=" * (-len(payload_b64) % 4)
     try:

@@ -27,6 +27,18 @@ class Principal:
     # 此时 is_admin 仍由显式字段决定，保证既有测试与调用点语义不变。
     role: str = ""
 
+    def __post_init__(self) -> None:
+        """让 `is_admin` 与 `role` 互为一致，消除「双真相源」。
+
+        老调用点只传 `is_admin`（`Principal("root", True)`），新调用点只传
+        `role`；两者若不互相补全，就会出现 `Principal("u", True)` 得
+        `role == ""` 的 admin。这里在构造期补齐，后续读哪个字段都一致。
+        """
+        if not self.role and self.is_admin:
+            object.__setattr__(self, "role", ROLE_ADMIN)
+        elif self.role and not self.is_admin:
+            object.__setattr__(self, "is_admin", self.role == ROLE_ADMIN)
+
     @property
     def is_operator(self) -> bool:
         """凭证写操作的门槛：admin 与 operator 都算，viewer 不算。"""

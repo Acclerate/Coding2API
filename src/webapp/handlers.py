@@ -62,6 +62,8 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(NoHealthyCredential)
     async def _no_health(_request, error: NoHealthyCredential):
+        # str(error) 由 executor 用受控文案构造（_unavailable_message /
+        # _model_cooled_message），只带最后一次错误的受控标识，不含上游正文。
         return JSONResponse(status_code=503,
                             content=error_payload(str(error), "no_healthy_credential", 503))
 
@@ -122,7 +124,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.warning("上游传输层失败: %s: %s", type(error).__name__, error)
         return JSONResponse(
             status_code=UPSTREAM_ERROR_STATUS,
-            content=error_payload(f"upstream transport failed: {type(error).__name__}",
+            content=error_payload("upstream transport failed",
                                   "upstream_unavailable", UPSTREAM_ERROR_STATUS))
 
     @app.exception_handler(ThrottledError)

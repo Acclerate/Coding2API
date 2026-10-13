@@ -158,9 +158,9 @@ def test_model_allowed_handles_provider_suffix_and_default_model():
     # 省略模型名（空 / auto）时用默认模型判定，不能借空名绕过
     assert model_allowed("", "glm-*", default_model="glm-5.2") is True
     assert model_allowed("auto", "glm-*", default_model="kimi-k3") is False
-    # 没有可判定的模型名：交给引擎默认，放行
-    assert model_allowed("", "glm-*", default_model="") is True
-    assert model_allowed("auto", "glm-*") is True
+    # 无法判定模型名（默认模型也是空/auto）：白名单非空时 fail closed
+    assert model_allowed("", "glm-*", default_model="") is False
+    assert model_allowed("auto", "glm-*") is False
 
 def test_repository_round_trips_policy_columns(keys):
     created = keys.create("alice", "laptop", provider_binding="trae",

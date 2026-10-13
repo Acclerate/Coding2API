@@ -35,6 +35,8 @@ class LoginThrottle:
     _events: dict[tuple[str, str], deque[float]] = field(
         default_factory=lambda: defaultdict(deque), init=False
     )
+    # 失败键数量上限：用户名由客户端任意填写，不设界等于内存 DoS 入口。
+    _MAX_KEYS: int = field(default=4096, init=False, repr=False)
     # PBKDF2 并发上限：verify 是 CPU 密集同步调用，用信号量限制同时哈希数。
     # Python 3.10+ 信号量在首次 await 时绑定当前运行循环，无需显式传 loop。
     _pbkdf2: asyncio.Semaphore = field(init=False)
@@ -43,10 +45,34 @@ class LoginThrottle:
         self._pbkdf2 = asyncio.Semaphore(4)
 
     def _prune(self, key: tuple[str, str], now: float) -> None:
-        queue = self._events[key]
+        queue = self._events.get(key)
+        if not queue:
+            return
         cutoff = now - self.limits.window_seconds
         while queue and queue[0] <= cutoff:
             queue.popleft()
+
+    def _evict_over_capacity(self, now: float) -> None:
+        """失败键数量超上限时清理，避免用户名维度无界增长（内存 DoS）。
+
+        攻击者用任意用户名反复失败会为每个名字建一个 deque；`record_failure`
+        是唯一的开键入口，这里在开键后清一次：先删整个窗口都没再命中的键，
+        仍超上限再按「最近一次失败时间」淘汰最旧的（全局键始终保留）。
+        """
+        if len(self._events) <= self._MAX_KEYS:
+            return
+        cutoff = now - self.limits.window_seconds
+        stale = [k for k, q in self._events.items()
+                 if k != ("g", "") and (not q or q[-1] <= cutoff)]
+        for key in stale:
+            del self._events[key]
+        excess = len(self._events) - self._MAX_KEYS
+        if excess <= 0:
+            return
+        oldest = sorted((k for k in self._events if k != ("g", "")),
+                        key=lambda k: self._events[k][-1] if self._events[k] else 0.0)
+        for key in oldest[:excess]:
+            del self._events[key]
 
     def check(self, *, ip: str, username: str) -> None:
         """任一窗口超限即抛 ThrottledError；调用方应在校验密码前调用。"""
@@ -54,11 +80,11 @@ class LoginThrottle:
         self._prune(("g", ""), now)
         self._prune(("i", ip), now)
         self._prune(("u", username), now)
-        if len(self._events[("g", "")]) >= self.limits.max_global:
+        if len(self._events.get(("g", "")) or ()) >= self.limits.max_global:
             raise ThrottledError()
-        if len(self._events[("i", ip)]) >= self.limits.max_per_ip:
+        if len(self._events.get(("i", ip)) or ()) >= self.limits.max_per_ip:
             raise ThrottledError()
-        if username and len(self._events[("u", username)]) >= self.limits.max_per_user:
+        if username and len(self._events.get(("u", username)) or ()) >= self.limits.max_per_user:
             raise ThrottledError()
 
     def check_transport_windows(self, *, ip: str) -> None:
@@ -73,9 +99,9 @@ class LoginThrottle:
         now = time.monotonic()
         self._prune(("g", ""), now)
         self._prune(("i", ip), now)
-        if len(self._events[("g", "")]) >= self.limits.max_global:
+        if len(self._events.get(("g", "")) or ()) >= self.limits.max_global:
             raise ThrottledError()
-        if len(self._events[("i", ip)]) >= self.limits.max_per_ip:
+        if len(self._events.get(("i", ip)) or ()) >= self.limits.max_per_ip:
             raise ThrottledError()
 
     def record_failure(self, *, ip: str, username: str) -> None:
@@ -84,6 +110,7 @@ class LoginThrottle:
         self._events[("i", ip)].append(now)
         if username:
             self._events[("u", username)].append(now)
+        self._evict_over_capacity(now)
 
     def record_success(self, *, username: str) -> None:
         """成功登录清空该用户名的失败计数，不误伤同 IP 他人。"""

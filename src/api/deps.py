@@ -17,7 +17,7 @@ from fastapi import Request
 
 from ..auth.access import client_ip, ip_allowed
 from ..auth.api_key import key_expired
-from ..auth.csrf import check_csrf
+from ..auth.csrf import check_csrf, check_origin
 from ..auth.rbac import (
     ROLE_ADMIN,
     ForbiddenError,
@@ -211,6 +211,16 @@ async def api_key_user_anthropic(request: Request) -> ApiKeyPrincipal:
 async def csrf_protected(request: Request) -> None:
     """写操作 CSRF 校验（仅对带会话 cookie 的请求生效）。"""
     check_csrf(request)
+
+
+async def origin_protected(request: Request) -> None:
+    """无会话 Cookie 的写操作（登录）CSRF 校验：只查 Origin/Referer 同源。
+
+    登录发生在「还没有会话 Cookie」时，`csrf_protected` 会因无 Cookie 跳过，
+    于是跨站表单能强制把受害者登录进攻击者账号（login CSRF）。这里不依赖
+    Cookie，直接比对 Origin/Referer 与 Host 是否同源。
+    """
+    check_origin(request)
 
 
 async def read_json_body(request: Request) -> Any:

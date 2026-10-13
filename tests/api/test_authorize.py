@@ -259,6 +259,22 @@ def test_authorize_without_pending_login_still_rejected(tmp_path):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
 
+def test_authorize_rejects_revoked_session(tmp_path, monkeypatch):
+    """签名有效但发起人已禁用：不得完成兑换（与 principal_from_request 同口径）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start",
+                              json={"provider": "trae"}).json()
+        # Cookie 仍有效（签名/过期都 OK），但发起人已被禁用
+        monkeypatch.setattr(app.state.services.users, "is_active", lambda _u: False)
+        response = client.get(f"/authorize?refreshToken=RT&state={started['state']}")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
 def test_dump_request_bodies_writes_file(tmp_path):
     """诊断开关：dump_request_bodies=True 时 /v1 请求体落盘（main 291-293）。"""
     import json as _json

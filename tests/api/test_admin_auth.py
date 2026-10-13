@@ -25,6 +25,24 @@ def test_login_success_sets_httponly_cookie(tmp_path):
         assert "httponly" in cookie.lower() and "samesite=lax" in cookie.lower()
         assert client.get("/api/auth/session").json()["username"] == "root"
 
+def test_login_rejects_cross_origin_request(tmp_path):
+    """login CSRF：跨站 Origin 的登录请求必须 403（无 Cookie 也校验）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as client:
+        response = client.post("/api/auth/login",
+                               json={"username": "root", "password": "rootpw"},
+                               headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+        # 同源 Origin 放行
+        ok = client.post("/api/auth/login",
+                         json={"username": "root", "password": "rootpw"},
+                         headers={"Origin": "http://testserver"})
+        assert ok.status_code == 200
+
+
 def test_login_rejects_bad_password_and_unknown_user(tmp_path):
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
     app = build_app(settings)

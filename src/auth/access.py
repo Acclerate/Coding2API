@@ -128,7 +128,9 @@ def model_allowed(model: str | None, allowed_models: str | None, *,
     if not name or name == "auto":
         name = (default_model or "").strip().lower()
     if not name or name == "auto":
-        return True                     # 没有可判定的模型名：交给引擎默认
+        # 白名单非空但无法确定具体模型名（请求省略且 DEFAULT_MODEL 也是
+        # auto/空）：fail closed。否则省略模型名就能绕过白名单触达任意模型。
+        return False
     base = name.split("@", 1)[0]
     return any(fnmatch(base, pattern) or fnmatch(name, pattern)
                for pattern in patterns)

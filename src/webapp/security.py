@@ -13,6 +13,20 @@ from ..compat.openai.errors import error_payload
 from ..config import Settings
 
 
+def _hostname(host_header: str) -> str:
+    """从 Host/Origin 头取出主机名（小写，剥端口与 IPv6 方括号）。
+
+    IPv6 字面量形如 `[::1]:8000`：先按 `]` 切开取括号内，否则 `split(":")`
+    会在第一个冒号处截断成空串。`csrf._same_host` 用同一套规则（见
+    `test_security.py` 的 IPv6 用例）。
+    """
+    text = host_header.strip()
+    if text.startswith("["):
+        name, _, _ = text.partition("]")
+        return name.lstrip("[").strip().lower()
+    return text.split(":", 1)[0].strip().lower()
+
+
 def host_allowed(host_header: str, settings: Settings) -> bool:
     """Host 白名单（防 DNS rebinding）。
 
@@ -22,10 +36,9 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
     生产默认放行等于给 DNS rebinding 留免校验入口（M14）。
     只比较主机名，忽略端口。
     """
-    hostname = host_header.split(":", 1)[0].strip().lower().strip("[]")
+    hostname = _hostname(host_header)
     if settings.allowed_hosts:
-        allowed = {h.split(":", 1)[0].strip().lower().strip("[]")
-                   for h in settings.allowed_hosts.split(",") if h.strip()}
+        allowed = {_hostname(h) for h in settings.allowed_hosts.split(",") if h.strip()}
         return hostname in allowed
     allowed = {"localhost", "127.0.0.1", "::1"}
     if settings.allow_test_host:
@@ -33,7 +46,7 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
     base = settings.public_base_url
     if base.startswith(("http://", "https://")):
         base = base.split("://", 1)[1]
-    path_host = base.split("/", 1)[0].split(":", 1)[0].strip().lower().strip("[]")
+    path_host = _hostname(base.split("/", 1)[0])
     if path_host:
         allowed.add(path_host)
     return hostname in allowed

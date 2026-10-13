@@ -63,12 +63,14 @@ def _same_host(reference: str, request: Request) -> bool:
     return (reference_port or default_port) == (request_port_int or default_port)
 
 
-def check_csrf(request: Request) -> None:
-    """管理台写操作（session 认证）调用；无会话 cookie 的请求直接跳过。"""
-    if SESSION_COOKIE not in request.cookies:
-        return
-    if request.headers.get(X_REQUESTED_WITH, "").lower() == "xmlhttprequest":
-        return
+def check_origin(request: Request) -> None:
+    """只做 Origin/Referer 同源校验（不依赖会话 Cookie）。
+
+    `check_csrf` 对无 Cookie 的请求直接放行（/v1 走 API Key，不涉 Cookie）。
+    但**登录**恰恰发生在无 Cookie 时，若也放行则跨站表单可把受害者登录到
+    攻击者账号（login CSRF）。浏览器发起的跨站表单 POST 必带 Origin，因此
+    登录单独走这条：有 Origin/Referer 就查同源，两者都缺（curl/SDK）才放行。
+    """
     origin = request.headers.get("origin")
     if origin:
         if _same_host(origin, request):
@@ -79,4 +81,13 @@ def check_csrf(request: Request) -> None:
         if _same_host(referer, request):
             return
         raise CsrfRejectedError("cross-origin write rejected")
-    # 无 Origin/Referer：非浏览器客户端，SameSite=Lax 兜底
+    # 无 Origin/Referer：非浏览器客户端（curl、SDK、内部测试），放行
+
+
+def check_csrf(request: Request) -> None:
+    """管理台写操作（session 认证）调用；无会话 cookie 的请求直接跳过。"""
+    if SESSION_COOKIE not in request.cookies:
+        return
+    if request.headers.get(X_REQUESTED_WITH, "").lower() == "xmlhttprequest":
+        return
+    check_origin(request)

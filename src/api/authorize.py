@@ -7,6 +7,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ..auth.csrf import check_origin
 from ..auth.session import SESSION_COOKIE, verify_session_token
 from ..compat.openai.errors import error_payload
 from ..provider.trae.events import UpstreamProtocolViolation
@@ -43,16 +44,27 @@ def create_router(services: Services) -> APIRouter:
         - 同网段的其他人无法用自己的 refreshToken 顶掉别人进行中的登录；
         - 凭证记在发起人名下，不会被记错。
         """
+        # 唯一无鉴权的写端点：先做 Origin/Referer 同源校验，拒绝被诱导的
+        # 跨站顶层导航（同源导航缺头时仍放行，兼容部分浏览器/中间件）。
+        check_origin(request)
         raw = str(request.url)
         provider = services.registry.get("trae")
         pending: dict[str, tuple[float, str]] = request.app.state.pending_callbacks
         if provider is None:
             return JSONResponse(status_code=400, content=error_payload(
                 "no pending TRAE login in progress", "invalid_request", 400))
-        # 会话 Cookie → 发起人（回调为顶层导航，Lax Cookie 会带上）
+        # 会话 Cookie → 发起人（回调为顶层导航，Lax Cookie 会带上）。
+        # 与 deps.principal_from_request 同一套活跃性校验：签名有效还不够，
+        # 发起人必须仍存在且未被禁用、会话 epoch 未被改密/禁用作废，
+        # 否则被撤销权限的管理员仍能完成登录把凭证塞进池子。
         verified = verify_session_token(
             request.cookies.get(SESSION_COOKIE, ""), services.settings.app_secret)
-        username = verified[0] if verified is not None else ""
+        username = ""
+        if verified is not None:
+            candidate, epoch = verified
+            if (services.users.is_active(candidate)
+                    and services.users.session_epoch(candidate) == epoch):
+                username = candidate
         entry = pending.get(username) if username else None
         if entry is None:
             return JSONResponse(status_code=400, content=error_payload(

@@ -21,7 +21,14 @@ from ..auth.session import create_session_token
 from ..auth.users import create_password_hash, verify_password
 from ..compat.openai.request import InvalidRequest
 from ..config import Settings
-from .deps import SESSION_COOKIE, Services, csrf_protected, principal_from_request, request_ip
+from .deps import (
+    SESSION_COOKIE,
+    Services,
+    csrf_protected,
+    origin_protected,
+    principal_from_request,
+    request_ip,
+)
 
 MIN_PASSWORD_LENGTH = 8
 ACTIVATION_TTL_SECONDS = 24 * 3600
@@ -55,10 +62,11 @@ def create_router(services: Services) -> APIRouter:
 
     @router.post("/api/auth/login")
     async def login(request: Request, payload: dict,
-                    _csrf: None = Depends(csrf_protected)):
+                    _csrf: None = Depends(origin_protected)):
         # CSRF 校验对登录同样生效（login CSRF：跨站请求可把受害者登录到
-        # 攻击者账号）；无会话 cookie 的请求会被 csrf_protected 跳过，
-        # 因此 curl / 首次登录不受影响。
+        # 攻击者账号）。登录时还没有会话 Cookie，`csrf_protected` 会跳过，
+        # 因此这里用 `origin_protected`：只查 Origin/Referer 同源，无头
+        # （curl / SDK）才放行。
         username = str(payload.get("username") or "")
         password = str(payload.get("password") or "")
         ip = request_ip(request, services.settings)
