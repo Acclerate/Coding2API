@@ -101,7 +101,16 @@ def test_select_account_rejects_vanished_credential(admin_client):
 
     app.state.executor._deps.providers["codebuddy"] = Stub()
     original = app.state.credentials.credential_data
-    app.state.credentials.credential_data = lambda _cid: None  # type: ignore[method-assign]
+    present = original(credential_id)
+    calls = {"n": 0}
+
+    def vanishing(_cid):
+        # 首次（前置能力检查）仍可见，取到编辑锁后已消失——正是本用例要覆盖
+        # 的竞态：能力检查通过 ≠ 持锁后凭证还在。
+        calls["n"] += 1
+        return present if calls["n"] == 1 else None
+
+    app.state.credentials.credential_data = vanishing  # type: ignore[method-assign]
     try:
         response = client.post(f"/api/credentials/{credential_id}/accounts/select",
                                json={"account_id": "a1"})

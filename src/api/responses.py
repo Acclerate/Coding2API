@@ -17,17 +17,14 @@ from __future__ import annotations
 import time
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..auth.access import model_allowed
-from ..compat.openai.request import InvalidRequest
 from ..compat.responses.request import parse_responses_request
 from ..compat.responses.response import (
     ResponsesStreamTranslator,
     completion_to_response,
 )
-from .deps import ApiKeyPrincipal, Services, api_key_user, read_json_body
-from .streaming import with_keepalive
+from .deps import ApiKeyPrincipal, Services, api_key_user
+from .endpoints import dispatch_compat
 
 
 def create_router(services: Services) -> APIRouter:
@@ -37,27 +34,12 @@ def create_router(services: Services) -> APIRouter:
 
     @router.post("/v1/responses")
     async def responses(request: Request,
-                         principal: ApiKeyPrincipal = Depends(api_key_user)):
-        body = await read_json_body(request)
-        chat_request = parse_responses_request(body)
-        if not model_allowed(chat_request.model, principal.allowed_models,
-                             default_model=settings.default_model):
-            raise InvalidRequest(
-                f"model {chat_request.model!r} is not allowed for this api key")
-        binding = principal.provider_binding
-        if chat_request.stream:
-            # 与 chat 出口同样的前置校验：在 200 响应头发出前拒绝不可能成功的请求
-            target = executor.preflight(chat_request, binding)
-            translator = ResponsesStreamTranslator(target.model)
-            return StreamingResponse(
-                with_keepalive(executor.stream_guarded(chat_request,
-                                                       username=principal.username,
-                                                       translator=translator,
-                                                       provider_binding=binding)),
-                media_type="text/event-stream")
-        completion = await executor.complete(chat_request, username=principal.username,
-                                             provider_binding=binding)
-        return JSONResponse(completion_to_response(completion,
-                                                   created_at=int(time.time())))
+                        principal: ApiKeyPrincipal = Depends(api_key_user)):
+        return await dispatch_compat(
+            executor, settings, request, principal,
+            parse=parse_responses_request,
+            translator_for=ResponsesStreamTranslator,
+            convert=lambda completion: completion_to_response(
+                completion, created_at=int(time.time())))
 
     return router

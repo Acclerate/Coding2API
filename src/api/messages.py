@@ -18,15 +18,12 @@ from __future__ import annotations
 import math
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..auth.access import model_allowed
 from ..compat.anthropic.request import parse_messages_request
 from ..compat.anthropic.response import (
     AnthropicStreamTranslator,
     completion_to_message,
 )
-from ..compat.openai.request import InvalidRequest
 from ..engine.compress import estimate_messages
 from .deps import (
     ApiKeyPrincipal,
@@ -34,7 +31,7 @@ from .deps import (
     api_key_user_anthropic,
     read_json_body,
 )
-from .streaming import with_keepalive
+from .endpoints import dispatch_compat, ensure_model_allowed
 
 
 def create_router(services: Services) -> APIRouter:
@@ -45,26 +42,11 @@ def create_router(services: Services) -> APIRouter:
     @router.post("/v1/messages")
     async def messages(request: Request,
                        principal: ApiKeyPrincipal = Depends(api_key_user_anthropic)):
-        body = await read_json_body(request)
-        chat_request = parse_messages_request(body)
-        if not model_allowed(chat_request.model, principal.allowed_models,
-                             default_model=settings.default_model):
-            raise InvalidRequest(
-                f"model {chat_request.model!r} is not allowed for this api key")
-        binding = principal.provider_binding
-        if chat_request.stream:
-            # 与 chat 出口同样的前置校验：在 200 响应头发出前拒绝不可能成功的请求
-            target = executor.preflight(chat_request, binding)
-            translator = AnthropicStreamTranslator(target.model)
-            return StreamingResponse(
-                with_keepalive(executor.stream_guarded(chat_request,
-                                                       username=principal.username,
-                                                       translator=translator,
-                                                       provider_binding=binding)),
-                media_type="text/event-stream")
-        completion = await executor.complete(chat_request, username=principal.username,
-                                             provider_binding=binding)
-        return JSONResponse(completion_to_message(completion))
+        return await dispatch_compat(
+            executor, settings, request, principal,
+            parse=parse_messages_request,
+            translator_for=AnthropicStreamTranslator,
+            convert=completion_to_message)
 
     @router.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request,
@@ -75,12 +57,8 @@ def create_router(services: Services) -> APIRouter:
         只保证量级正确（客户端用它决定是否裁剪，不需要精确值）。
         `max_tokens` 等字段对计数无关，映射时一并忽略。
         """
-        body = await read_json_body(request)
-        chat_request = parse_messages_request(body)
-        if not model_allowed(chat_request.model, principal.allowed_models,
-                             default_model=settings.default_model):
-            raise InvalidRequest(
-                f"model {chat_request.model!r} is not allowed for this api key")
+        chat_request = parse_messages_request(await read_json_body(request))
+        ensure_model_allowed(chat_request, principal, settings)
         return {"input_tokens": math.ceil(estimate_messages(chat_request.messages))}
 
     return router

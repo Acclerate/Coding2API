@@ -8,12 +8,10 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..auth.access import model_allowed
-from ..compat.openai.request import InvalidRequest, parse_chat_request
-from .deps import ApiKeyPrincipal, Services, api_key_user, read_json_body
-from .streaming import with_keepalive
+from ..compat.openai.request import parse_chat_request
+from .deps import ApiKeyPrincipal, Services, api_key_user
+from .endpoints import dispatch_compat
 
 # dump 目录最多保留的文件数：诊断开关长期开着时不能无限侵占磁盘
 DUMP_KEEP_FILES = 200
@@ -46,25 +44,10 @@ def create_router(services: Services) -> APIRouter:
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request,
                                principal: ApiKeyPrincipal = Depends(api_key_user)):
-        body = await read_json_body(request)
-        if settings.dump_request_bodies:
-            dump_request_body(Path(settings.data_dir), body)
-        chat_request = parse_chat_request(body)
-        if not model_allowed(chat_request.model, principal.allowed_models,
-                             default_model=settings.default_model):
-            raise InvalidRequest(
-                f"model {chat_request.model!r} is not allowed for this api key")
-        binding = principal.provider_binding
-        if chat_request.stream:
-            # 前置校验：在 200 响应头发出前拒绝不可能成功的请求
-            executor.preflight(chat_request, binding)
-            return StreamingResponse(
-                with_keepalive(executor.stream_guarded(chat_request,
-                                                       username=principal.username,
-                                                       provider_binding=binding)),
-                media_type="text/event-stream")
-        return JSONResponse(await executor.complete(chat_request,
-                                                    username=principal.username,
-                                                    provider_binding=binding))
+        return await dispatch_compat(
+            executor, settings, request, principal,
+            parse=parse_chat_request,
+            on_body=(lambda body: dump_request_body(Path(settings.data_dir), body))
+            if settings.dump_request_bodies else None)
 
     return router

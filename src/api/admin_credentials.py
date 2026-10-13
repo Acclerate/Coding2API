@@ -77,6 +77,30 @@ def create_router(services: Services) -> APIRouter:
     registry = services.registry
     schedule_probe = services.schedule_probe
 
+    def provider_for(credential_id: str, capability: str | None = None,
+                     error: str | None = None):
+        """取凭证对应的上游 provider 与其凭证数据；缺失/不支持即 400。
+
+        集中了 7 个 handler 共用的三行前导（provider_of → registry.get →
+        credential_data）。以前逐份复写，漏掉任一判空就会把 None 传进上游
+        调用，报错从「凭证不存在」退化成难以理解的 AttributeError。
+
+        `capability` 为 None 时文案是 "credential not found"（探测端点），
+        否则是 "credential does not support {capability}"；`error` 可覆盖后者，
+        用于两处对外文案与能力名不一致的端点（"checkin status" / "growth center"
+        / "activity report" / "account switching"）。这些串是既有对外契约。
+        """
+        provider = registry.get(credentials.provider_of(credential_id) or "")
+        data = credentials.credential_data(credential_id)
+        # 能力检查用 getattr(...) is None 而非 hasattr：CodeBuddy 国际站以
+        # 类属性 `growth = None` 显式声明「不支持」，hasattr 会放它过去。
+        if provider is None or data is None or (
+                capability is not None and getattr(provider, capability, None) is None):
+            raise InvalidRequest(
+                error or ("credential not found" if capability is None
+                          else f"credential does not support {capability}"))
+        return provider, data
+
     @router.get("/api/credentials")
     async def list_credentials(sort: str | None = None, order: str | None = None,
                                principal=Depends(principal_from_request)):
@@ -176,11 +200,7 @@ def create_router(services: Services) -> APIRouter:
                                _csrf: None = Depends(csrf_protected),
                                principal=Depends(principal_from_request)):
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None:
-            raise InvalidRequest("credential not found")
+        provider, data = provider_for(credential_id)
         try:
             quota = await provider.probe_quota(data)
         except Exception as error:  # noqa: BLE001 - 探测失败 → unknown，不当作 0
@@ -200,11 +220,7 @@ def create_router(services: Services) -> APIRouter:
                                  _csrf: None = Depends(csrf_protected),
                                  principal=Depends(principal_from_request)):
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None or not hasattr(provider, "checkin"):
-            raise InvalidRequest("credential does not support checkin")
+        provider, data = provider_for(credential_id, "checkin")
         result = await provider.checkin(data)
         if result.ok and not result.already_checked_in:
             schedule_probe(credential_id)      # 只有真签到了才会发积分
@@ -220,11 +236,9 @@ def create_router(services: Services) -> APIRouter:
                              principal=Depends(principal_from_request)):
         """只读查询签到状态（连续天数 / 今日是否已签）；不产生任何写入。"""
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None or not hasattr(provider, "checkin_status"):
-            raise InvalidRequest("credential does not support checkin status")
+        provider, data = provider_for(
+            credential_id, "checkin_status",
+            error="credential does not support checkin status")
         return {"status": await provider.checkin_status(data)}
 
     @router.get("/api/credentials/{credential_id}/growth")
@@ -262,12 +276,10 @@ def create_router(services: Services) -> APIRouter:
         手动入口不另设开关，否则「保守部署」只挡得住定时任务。
         """
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        growth = getattr(provider, "growth", None)
-        if provider is None or data is None or growth is None:
-            raise InvalidRequest("credential does not support growth center")
+        provider, data = provider_for(
+            credential_id, "growth",
+            error="credential does not support growth center")
+        growth = provider.growth
         result = await growth(
             data, allow_irreversible=services.settings.growth_irreversible_actions)
         credentials.save_growth_result(credential_id, result.report)
@@ -291,12 +303,10 @@ def create_router(services: Services) -> APIRouter:
         管理台手动补报一次（用途就是部署后验证闭环）。结果记一行 growth_events。
         """
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        activity = getattr(provider, "activity", None)
-        if provider is None or data is None or activity is None:
-            raise InvalidRequest("credential does not support activity report")
+        provider, data = provider_for(
+            credential_id, "activity",
+            error="credential does not support activity report")
+        activity = provider.activity
         result = await activity(data)
         if result.ok:
             detail = result.message or "已上报一条对话事件"
@@ -314,11 +324,9 @@ def create_router(services: Services) -> APIRouter:
                                        order: str | None = None,
                                        principal=Depends(principal_from_request)):
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None or not hasattr(provider, "list_accounts"):
-            raise InvalidRequest("credential does not support account switching")
+        provider, data = provider_for(
+            credential_id, "list_accounts",
+            error="credential does not support account switching")
         accounts = await provider.list_accounts(data)
         rows = [{"account_id": a.account_id, "nickname": a.nickname,
                  "type": a.account_type} for a in accounts]
@@ -332,10 +340,9 @@ def create_router(services: Services) -> APIRouter:
                                         _csrf: None = Depends(csrf_protected),
                                         principal=Depends(principal_from_request)):
         require_operator(principal)
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        if provider is None or not hasattr(provider, "switch_account"):
-            raise InvalidRequest("credential does not support account switching")
+        provider, _ = provider_for(
+            credential_id, "switch_account",
+            error="credential does not support account switching")
         # 编辑锁（M12）：与 RefreshTask 的「读 → await → 整份覆写」互斥，否则
         # 刷新会把刚切好的账号覆盖回旧值（反之亦然）。
         async with credentials.edit_lock(credential_id):
