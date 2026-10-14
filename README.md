@@ -512,7 +512,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `CODEBUDDY_SANITIZE_CHANNEL_MARKERS` | `true` | 出站 `system`/`assistant` 正文命中「伪装其他厂商官方客户端」指纹串时替换为占位符（上游 11128 内容风控），只改出站副本；`false` 关闭 |
 | `REFRESH_SKEW_HOURS` | `24` | token 到期前该小时数窗口内预刷新。短寿命渠道自行封顶（CodeArts STS 只有 2h，封顶 45min） |
 | `TOKEN_EXPIRY_WARNING_SECONDS` | `3600` | 管理台 token 到期预警阈值；`≤0` 关闭预警。纯展示，不参与调度 |
-| `PACER_MIN_SECONDS` / `PACER_MAX_SECONDS` | `5` / `20` | 全局节流器随机等待区间（秒） |
+| `PACER_MIN_SECONDS` / `PACER_MAX_SECONDS` | `5` / `20` | 全局节流器随机等待区间（秒）。区间相等时（聊天节流器的 `*_CHAT_MIN_INTERVAL` 形态）额外**向上**抖动 ±25%，避免多实例精确同拍；下限不击穿 |
 | `AUTO_CONTINUE_MAX` | `10` | 上游以 `finish_reason=length` 截断时同凭证自动续写的最多次数；`0` 关闭 |
 | `CONTEXT_COMPRESS_ENABLED` | `true` | 按模型目录里的输入上限裁剪过长对话，避免撞上游硬限制；目录里查不到上限的模型不受影响 |
 | `CONTEXT_COMPRESS_RESERVE_TOKENS` | `4096` | 压缩预算里为模型回复预留的输出 token 数 |

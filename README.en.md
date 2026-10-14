@@ -422,7 +422,7 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `CODEBUDDY_SANITIZE_CHANNEL_MARKERS` | `true` | Neutralize official-client fingerprints in outbound `system`/`assistant` text (upstream 11128 content filter); outbound copy only |
 | `REFRESH_SKEW_HOURS` | `24` | Pre-refresh window; short-lived channels cap it (CodeArts 45 min) |
 | `TOKEN_EXPIRY_WARNING_SECONDS` | `3600` | Admin warning threshold; `≤0` disables (display only) |
-| `PACER_MIN_SECONDS` / `PACER_MAX_SECONDS` | `5` / `20` | Global pacer random wait (seconds) |
+| `PACER_MIN_SECONDS` / `PACER_MAX_SECONDS` | `5` / `20` | Global pacer random wait (seconds). When the bounds are equal (the `*_CHAT_MIN_INTERVAL` shape) the wait is additionally jittered **upwards** by ±25% so instances do not fire in lockstep; the lower bound is never breached |
 | `AUTO_CONTINUE_MAX` | `10` | Auto-continue attempts on `finish_reason=length`; `0` disables |
 | `CONTEXT_COMPRESS_ENABLED` | `true` | Trim over-long conversations to the catalog's input limit; models without a known limit are untouched |
 | `CONTEXT_COMPRESS_RESERVE_TOKENS` | `4096` | Output tokens reserved by the compression budget |

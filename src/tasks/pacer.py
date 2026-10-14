@@ -17,6 +17,10 @@
 上限（CodeArts 每账号 3），无上限放行会把第 4 个起全部打成 400 并发超限。
 0/None 表示不限（保持旧行为）。
 
+间隔本身**只向上扰动 ±`JITTER_RATIO`**（见 `next_interval`）：定值间隔
+（`min == max`，所有聊天节流器的形态）逐个账号精确 5s 同拍，多个实例
+会在同一时刻撞上上游；区间（`min < max`）本就随机，不再叠加。
+
 `window_seconds > 0` 时上限改用**滑动窗口**口径：同一个桶在最近
 `window_seconds` 秒内最多放行 `max_concurrency` 次请求启动。这是对齐
 CodeArts 实测行为的修正——它限制的不是「同时在途」，而是「每账号每约 60s
@@ -43,6 +47,13 @@ import time
 from collections.abc import Awaitable, Callable
 
 from ..config import live
+
+# 固定间隔（min == max）的抖动幅度：聊天节流器都装配成 `Pacer(5, 5)` 这类定值，
+# 不加抖动时相邻请求精确间隔 5s，跨进程 / 跨实例的请求会在同一时刻撞上上游。
+# **只向上抖**（`[low, low * (1 + ratio)]`）而不向下：low 是「最小间隔」下限，
+# 向下抖会击穿频率风控的护栏。`low < max` 的区间本身已均匀随机（文档承诺的
+# `[min, max]`），不再叠加，否则会越出该区间。
+JITTER_RATIO = 0.25
 
 
 def stable_key(provider: str, identity: str | None) -> str:
@@ -135,11 +146,17 @@ class Pacer:
         return value if value > 0 else 0.0
 
     def next_interval(self) -> float:
+        """本次相邻请求要间隔的秒数。
+
+        `min != max`：在 `[min, max]` 内均匀取值（文档承诺的区间，原样保留）。
+        `min == max`（聊天节流器的常态）：定值无从随机，加 `JITTER_RATIO`
+        的**向上**抖动避免精确同拍；下限（`min`）不可击穿。
+        """
         low, high = self._validate()
         if low == 0 and high == 0:
             return 0.0
         if low == high:
-            return low
+            return low * (1 + JITTER_RATIO * self._random.random())
         return self._random.uniform(low, high)
 
     def _capped(self) -> bool:
