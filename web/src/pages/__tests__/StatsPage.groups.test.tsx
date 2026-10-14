@@ -139,6 +139,38 @@ describe("StatsPage 分组与明细", () => {
     expect(screen.getByTestId("events-next")).toBeEnabled();
   });
 
+  it("请求明细：Token/延迟合并列下拉选子列即按其排序", async () => {
+    const spy = mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": { events: EVENTS_PAGE1.events, next_before: null, total: 7 },
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    // Token 列下拉选「命中率」→ 后端 sort=cache_rate（派生列也能排）
+    await userEvent.click(screen.getByTestId("event-sort-token"));
+    await userEvent.click(screen.getByTestId("event-sort-token-cache_rate"));
+    await waitFor(() => {
+      const last = spy.mock.calls.map((call) => String(call[0]))
+        .filter((url) => url.includes("/api/stats/events")).at(-1)!;
+      expect(last).toContain("sort=cache_rate");
+    });
+
+    // 延迟列下拉选「首字」→ 后端 sort=ttfb_ms
+    await userEvent.click(screen.getByTestId("event-sort-latency"));
+    await userEvent.click(screen.getByTestId("event-sort-latency-ttfb_ms"));
+    await waitFor(() => {
+      const last = spy.mock.calls.map((call) => String(call[0]))
+        .filter((url) => url.includes("/api/stats/events")).at(-1)!;
+      expect(last).toContain("sort=ttfb_ms");
+    });
+  });
+
   it("非管理员明细表无用户列", async () => {
     mockFetch({
       "/api/stats/overview": OVERVIEW,
@@ -216,10 +248,13 @@ describe("StatsPage 分组与明细", () => {
     expect(row).toHaveTextContent("95.0%");
     expect(row).toHaveTextContent("100");
     expect(row).toHaveTextContent("¥5.36");
-    // kimi-k3 28/30 = 93.3%，推算成本标 ≈
+    // 命中率列 = 命中 100 ÷ 输入 300 = 33.3%
+    expect(within(row).getByTestId("group-cache-rate")).toHaveTextContent("33.3%");
+    // kimi-k3 28/30 = 93.3%，推算成本标 ≈；未上报缓存 → 命中率显示 —
     row = within(screen.getByTestId("group-table")).getByText("kimi-k3").closest("tr")!;
     expect(row).toHaveTextContent("93.3%");
     expect(row).toHaveTextContent("≈¥2.68");
+    expect(within(row).getByTestId("group-cache-rate")).toHaveTextContent("—");
 
     // 按用户：alice 76/80 = 95.0%
     await userEvent.click(screen.getByTestId("group-tabs-user"));

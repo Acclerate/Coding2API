@@ -227,7 +227,7 @@ claude
 
 ### CC Switch 一键导入
 
-「API Key 管理」页在创建 Key 后可生成 [CC Switch](https://github.com/farion1231/cc-switch) 的 `ccswitch://` 导入深链（Claude Code / Codex CLI / OpenCode 三个目标各一个按钮），点一下即由桌面端弹确认框写入地址、Key 与模型。深链**只能由点击触发**（浏览器拦截自动跳转），且**含 Key 明文**，仅在创建 Key 的展示期内可用。协议与 `app` / `apiFormat` 取值见 CC Switch 用户手册「Deep Link Protocol」，需 CC Switch v4.0.10+。注意 **endpoint 形态随 `apiFormat` 而变**：Anthropic 格式（Claude Code）填到根、**不带 `/v1`**；两个 OpenAI 格式填到 `/v1`。本服务没有 Gemini 出口，故不提供 `app=gemini` 入口。
+「API Key 管理」页可生成 [CC Switch](https://github.com/farion1231/cc-switch) 的 `ccswitch://` 导入深链（Claude Code / Codex CLI / OpenCode 三个目标各一个按钮），点一下即由桌面端弹确认框写入地址、Key 与模型。两处入口：**创建 Key 成功后的对话框**（直接用刚生成的一次性明文 Key，关闭对话框即不再保留）与 **Key 列表每行的「导入 CC Switch」**（列表只存脱敏 `preview`，需粘贴创建时保存的完整 Key，只留在对话框内存里）。两处都可用「默认模型」下拉选择要写入的模型——与 Playground 同源（`/api/playground/models`），按渠道分组。深链**只能由点击触发**（浏览器拦截自动跳转），且**含 Key 明文**，故仅在用户主动打开、且已给出 Key 时生成。协议与 `app` / `apiFormat` 取值见 CC Switch 用户手册「Deep Link Protocol」，需 CC Switch v4.0.10+。注意 **endpoint 形态随 `apiFormat` 而变**：Anthropic 格式（Claude Code）填到根、**不带 `/v1`**；两个 OpenAI 格式填到 `/v1`。本服务没有 Gemini 出口，故不提供 `app=gemini` 入口。
 
 ### 余额查询
 
@@ -286,6 +286,8 @@ claude
 - **来源 IP 白名单**：逗号分隔的 IP 或 CIDR（如 `203.0.113.9,10.0.0.0/8`），留空 = 不限制；写入时校验并规范化（`10.0.0.1` → `10.0.0.1/32`），来源不在白名单返回 403。**默认不采信 `X-Forwarded-For`**（客户端可写）；仅 `TRUST_PROXY=true` 时按 XFF 判定、取**最后一个**条目，故只适用于「本服务前恰好一层受信反代」。
 - **模型白名单**：逗号分隔的模型名或 fnmatch glob（如 `glm-*,kimi-k3`），留空 = 不限制；匹配不区分大小写，`模型@渠道` 后缀不参与匹配，白名单外返回 400，`/v1/models` 也只列白名单内模型。
 - **到期时间**：epoch 秒，留空 = 永不过期，到期后立即 401（与「Key 不存在」统一文案，不泄露可枚举信息）。
+
+**导入 CC Switch**：Key 列表每行的「导入 CC Switch」按钮打开对话框，粘贴创建时保存的完整 Key（列表只存脱敏 `preview`，服务端不再保留明文，故必须由用户提供），再选一个默认模型，即可生成 Claude Code / Codex CLI / OpenCode 三个 `ccswitch://` 导入深链；默认模型下拉与 Playground 同源（`/api/playground/models`），按渠道分组。粘贴的 Key 只留在对话框内存中，关闭即清除。创建 Key 成功后的对话框内也提供同样的导入按钮（那里直接用刚生成的明文 Key）。
 
 ## 凭证暂停
 
@@ -382,7 +384,7 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 - **写入时定值**：成本在写明细时算好落库（`usage_events.cost_usd` / `cost_cny`），历史行**不随价表或汇率重算**；上线前历史两列为 `NULL`，可用 `scripts/backfill_cost.py --apply` 补齐（默认预览、写库前自动备份、幂等）。
 - **匹配不到就不计**：本地模型名按 OpenRouter 的 `id` / 展示名等值匹配（`src/model_match.py`，**命中不唯一就不配**），未匹配或未上报输入 token 的不计入，聚合值 `null` 显示 `—`（**不拿 0 冒充免费**），故成本是**下限**。
 
-**缓存命中率**：**Token 消耗**卡片在 token 分项后追加缓存命中率 = 命中 token ÷ 输入 token（保留 1 位小数）；**未上报或输入为 0 时显示 `—`**。
+**缓存命中率**：**Token 消耗**卡片在 token 分项后追加缓存命中率 = 命中 token ÷ 输入 token（保留 1 位小数）；**未上报或输入为 0 时显示 `—`**。**分组统计**表（「命中缓存」列后）与**请求明细**表（「命中」列后）各加一列只读的**命中率**，同公式、同占位规则（派生列不参与排序）。
 
 ### 积分记录
 
@@ -390,9 +392,11 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ### 分组维度与重新汇总
 
-**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（请求数 / 成功数 / 成功率 / 输入 / 输出 / 命中缓存 / Credit / 成本），对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
+**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（请求数 / 成功数 / 成功率 / 输入 / 输出 / 命中缓存 / 命中率 / Credit / 成本），对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
 
 **点行钻取**：点分组表任意一行，下方「请求明细」即按该行钻取（渠道 / 模型 / 凭证按同名列过滤，用户维度走作用域参数），条件叠加、可多个维度层层收窄，面板上方显示当前过滤标签并可一键清除。`GET /api/stats/events` 因此接受 `provider` / `model` / `credential_id` 三个过滤参数（`AND` 语义）。
+
+**明细表列合并**：请求明细把同类列并成一列，默认值一眼可读、悬停展开全部子项：**Token**（默认「输入 / 输出 · 命中率」，悬停含命中 token）、**延迟**（默认「耗时 / 首字」）。列数从 14 压到约 10，窄屏卡片也少一半字段。排序能力不丢：点合并列头弹出下拉选子列（Token → 输入 / 输出 / 命中 / 命中率，延迟 → 耗时 / 首字），选中即按该子列排序；**命中率**子列走后端 `sort=cache_rate`（命中 ÷ 输入，输入为 0 或未上报时为 `NULL`，与其它可空列同排序语义）。
 
 **导出 CSV**：明细面板右上「导出 CSV」（仅 admin / operator）按**当前时间范围 + 当前钻取过滤**导出逐请求明细，`GET /api/stats/events?format=csv`。文件带 UTF-8 BOM（Excel 认编码）、`\r\n` 换行、时间列 ISO 8601（UTC），并对以 `= + - @`（及制表符/回车）开头的**文本**单元格加前导单引号防公式注入（数值含负数原样）。单次导出上限 10000 行，超出截断并在响应头 `X-Export-Truncated: 1` 标出，页面提示收窄条件。
 

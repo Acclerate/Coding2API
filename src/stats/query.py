@@ -45,6 +45,11 @@ EVENT_SORT_COLUMNS: dict[str, str] = {
     "input_tokens": "e.input_tokens",
     "output_tokens": "e.output_tokens",
     "cached_tokens": "e.cached_tokens",
+    # 命中率是派生列：命中 ÷ 输入。输入为 0 / 未上报（NULL）时给 NULL——与其它
+    # 可空列同例（降序时 NULL 自然排最后），不拿「未上报」冒充 0%。CAST 成 REAL
+    # 走浮点除法（整数除法会截断成 0）。
+    "cache_rate": ("CASE WHEN e.input_tokens > 0 "
+                   "THEN CAST(e.cached_tokens AS REAL) / e.input_tokens ELSE NULL END"),
     "credit": "e.credit",
     "cost_cny": "e.cost_cny",
     "ttfb_ms": "e.ttfb_ms",

@@ -18,6 +18,8 @@ import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { ProviderIcon } from "../components/ProviderIcon";
 import { SortableHead } from "../components/SortableHead";
+import { SortMenuHead } from "../components/SortMenuHead";
+import { Tip } from "../components/Tip";
 import { UsageChart } from "../components/UsageChart";
 import { providerLabel } from "../api/providers";
 import { api } from "../api/client";
@@ -63,6 +65,24 @@ const METRICS = [
 const PAGE_SIZES = [10, 20, 50, 100];
 
 /**
+ * 请求明细的合并列：把同类列并成一列，默认值一眼可读，悬停展开全部子项。
+ *
+ * Token = 输入 / 输出 / 命中 / 命中率；延迟 = 耗时 / 首字。合并把列数从 14 压到
+ * 约 10（窄屏卡片也少一半字段），排序能力靠列头下拉选子列保留（见 SortMenuHead）。
+ */
+const TOKEN_COLUMNS = [
+  { key: "input_tokens", label: "输入" },
+  { key: "output_tokens", label: "输出" },
+  { key: "cached_tokens", label: "命中" },
+  { key: "cache_rate", label: "命中率" },
+] as const;
+
+const LATENCY_COLUMNS = [
+  { key: "latency_ms", label: "耗时" },
+  { key: "ttfb_ms", label: "首字" },
+] as const;
+
+/**
  * 分组统计的维度。后端各维度的行结构一致（分组键 + 同一组公共指标），
  * 前端按 key 取出分组键列即可，表格本身不分叉。
  *
@@ -97,6 +117,39 @@ function statusCell(row: UsageEventRow) {
     return <span className="text-ok">成功</span>;
   }
   return <span className="text-destructive">{usageErrorLabel(row.error_type)}</span>;
+}
+
+/**
+ * Token 合并列：默认「输入 / 输出 · 命中率」，悬停展开命中 token。
+ *
+ * 命中率复用 `formatCacheRate`（未上报 / 输入为 0 显示 —）；悬停详情用 `Tip`，
+ * 窄屏卡片模式下同样可用（点击单元格即可唤出）。
+ */
+function tokenCell(row: UsageEventRow) {
+  const rate = formatCacheRate(row.cached_tokens, row.input_tokens);
+  return (
+    <Tip content={
+      `输入 ${formatCompact(row.input_tokens)} · 输出 ${formatCompact(row.output_tokens)}`
+      + ` · 命中 ${formatCompact(row.cached_tokens)} · 命中率 ${rate}`
+    }>
+      <span className="tabular-nums">
+        {formatCompact(row.input_tokens)} / {formatCompact(row.output_tokens)}
+        <span className="text-muted-foreground"> · {rate}</span>
+      </span>
+    </Tip>
+  );
+}
+
+/** 延迟合并列：默认「耗时 / 首字」，悬停补字段名（两个都是 ms/s 的数字，靠提示消歧）。 */
+function latencyCell(row: UsageEventRow) {
+  return (
+    <Tip content={`耗时 ${formatLatency(row.latency_ms)} · 首字延迟 ${formatLatency(row.ttfb_ms)}`}>
+      <span className="tabular-nums">
+        {formatLatency(row.latency_ms)}
+        <span className="text-muted-foreground"> / {formatLatency(row.ttfb_ms)}</span>
+      </span>
+    </Tip>
+  );
 }
 
 export function StatsPage() {
@@ -466,6 +519,8 @@ export function StatsPage() {
                               active={groupSort.sort === "cached_tokens"}
                               direction={groupSort.order} onToggle={groupSort.toggle}
                               align="right" testId="sort-cached_tokens" />
+                {/* 命中率 = 命中 ÷ 输入，派生列不排序（与「成功率」同例） */}
+                <TableHead className="text-right">命中率</TableHead>
                 <SortableHead label="Credit" columnKey="credit"
                               active={groupSort.sort === "credit"} direction={groupSort.order}
                               onToggle={groupSort.toggle} align="right" testId="sort-credit" />
@@ -538,6 +593,10 @@ export function StatsPage() {
                   </TableCell>
                   <TableCell label="命中缓存" className="text-right tabular-nums">
                     {formatCompact(row.cached_tokens)}
+                  </TableCell>
+                  <TableCell label="命中率" className="text-right tabular-nums"
+                             data-testid="group-cache-rate">
+                    {formatCacheRate(row.cached_tokens, row.input_tokens)}
                   </TableCell>
                   <TableCell label="Credit" className="text-right tabular-nums">
                     {formatCredit(row.credit, row.credit_estimated)}
@@ -641,18 +700,10 @@ export function StatsPage() {
                   <SortableHead label="状态" columnKey="ok" active={eventSort.sort === "ok"}
                                 direction={eventSort.order} onToggle={toggleEventSort}
                                 testId="event-sort-ok" />
-                  <SortableHead label="输入" columnKey="input_tokens"
-                                active={eventSort.sort === "input_tokens"}
-                                direction={eventSort.order} onToggle={toggleEventSort}
-                                align="right" testId="event-sort-input_tokens" />
-                  <SortableHead label="输出" columnKey="output_tokens"
-                                active={eventSort.sort === "output_tokens"}
-                                direction={eventSort.order} onToggle={toggleEventSort}
-                                align="right" testId="event-sort-output_tokens" />
-                  <SortableHead label="命中" columnKey="cached_tokens"
-                                active={eventSort.sort === "cached_tokens"}
-                                direction={eventSort.order} onToggle={toggleEventSort}
-                                align="right" testId="event-sort-cached_tokens" />
+                  {/* Token 合并列：输入/输出/命中/命中率，列头下拉选子列排序 */}
+                  <SortMenuHead label="Token" options={[...TOKEN_COLUMNS]}
+                                activeKey={eventSort.sort} direction={eventSort.order}
+                                onToggle={toggleEventSort} testId="event-sort-token" />
                   <SortableHead label="Credit" columnKey="credit"
                                 active={eventSort.sort === "credit"}
                                 direction={eventSort.order} onToggle={toggleEventSort}
@@ -661,14 +712,10 @@ export function StatsPage() {
                                 active={eventSort.sort === "cost_cny"}
                                 direction={eventSort.order} onToggle={toggleEventSort}
                                 align="right" testId="event-sort-cost_cny" />
-                  <SortableHead label="首字延迟" columnKey="ttfb_ms"
-                                active={eventSort.sort === "ttfb_ms"}
-                                direction={eventSort.order} onToggle={toggleEventSort}
-                                align="right" testId="event-sort-ttfb_ms" />
-                  <SortableHead label="耗时" columnKey="latency_ms"
-                                active={eventSort.sort === "latency_ms"}
-                                direction={eventSort.order} onToggle={toggleEventSort}
-                                align="right" testId="event-sort-latency_ms" />
+                  {/* 延迟合并列：耗时/首字，列头下拉选子列排序 */}
+                  <SortMenuHead label="延迟" options={[...LATENCY_COLUMNS]}
+                                activeKey={eventSort.sort} direction={eventSort.order}
+                                onToggle={toggleEventSort} testId="event-sort-latency" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -694,14 +741,8 @@ export function StatsPage() {
                       {row.model}
                     </TableCell>
                     <TableCell label="状态">{statusCell(row)}</TableCell>
-                    <TableCell label="输入" className="text-right tabular-nums">
-                      {formatCompact(row.input_tokens)}
-                    </TableCell>
-                    <TableCell label="输出" className="text-right tabular-nums">
-                      {formatCompact(row.output_tokens)}
-                    </TableCell>
-                    <TableCell label="命中" className="text-right tabular-nums">
-                      {formatCompact(row.cached_tokens)}
+                    <TableCell label="Token" className="text-right">
+                      {tokenCell(row)}
                     </TableCell>
                     <TableCell label="Credit" className="text-right tabular-nums">
                       {formatCredit(row.credit, row.credit_estimated)}
@@ -710,11 +751,8 @@ export function StatsPage() {
                                title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
                       {formatMoney(row.cost_cny, "CNY")}
                     </TableCell>
-                    <TableCell label="首字延迟" className="text-right tabular-nums">
-                      {formatLatency(row.ttfb_ms)}
-                    </TableCell>
-                    <TableCell label="耗时" className="text-right tabular-nums">
-                      {formatLatency(row.latency_ms)}
+                    <TableCell label="延迟" className="text-right">
+                      {latencyCell(row)}
                     </TableCell>
                   </TableRow>
                 ))}

@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import {
   Check,
@@ -8,21 +7,13 @@ import {
   X,
 } from "lucide-react";
 import { useSessionContext } from "../Layout";
-import type { ModelInfo } from "../api/types";
+import { usePlaygroundModels } from "../api/hooks";
 import { errorText } from "../lib/errors";
 import { HelpBlock } from "../components/HelpBlock";
 import { PageHeader } from "../components/PageHeader";
 import { ModelPicker, modelValue, pickDefaultModel } from "../components/ModelPicker";
 import { buildSamplingParams, effortOptions } from "../lib/playgroundParams";
 import { Button, Card, Checkbox, Empty, Field, Input, Label, Notice, Panel, Select, Textarea } from "../ui";
-
-/** 通过会话鉴权的内部端点取数据，不需要用户自己造 API Key。 */
-async function fetchPlaygroundModels(signal?: AbortSignal) {
-  const response = await fetch("/api/playground/models", { credentials: "same-origin", signal });
-  if (!response.ok) throw new Error("模型列表加载失败");
-  const body = (await response.json()) as { data: ModelInfo[] };
-  return body.data;
-}
 
 export function PlaygroundPage() {
   const session = useSessionContext();
@@ -38,11 +29,8 @@ export function PlaygroundPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const modelsQuery = useQuery({
-    queryKey: ["playground-models"],
-    queryFn: ({ signal }) => fetchPlaygroundModels(signal),
-  });
-  const fetched = modelsQuery.data ?? [];
+  const modelsQuery = usePlaygroundModels();
+  const fetched = modelsQuery.data?.data ?? [];
 
   // 每个模型的受控值：单渠道模型带 @provider（该组选项即强制指定），
   // 多渠道模型用裸 id（走自动路由）。

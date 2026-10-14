@@ -1,8 +1,8 @@
-import { Check, ChevronDown, Copy, KeyRound, Plus, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, KeyRound, Plus, Share2, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "../api/client";
 import { Button as RawButton } from "../components/ui/button";
-import { useApiKeys, useQueryClient } from "../api/hooks";
+import { useApiKeys, usePlaygroundModels, useQueryClient } from "../api/hooks";
 import { formatTime } from "../api/display";
 import { cn } from "../lib/utils";
 import { useDialogFocus } from "../hooks/useDialogFocus";
@@ -10,9 +10,10 @@ import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { SortableHead } from "../components/SortableHead";
+import { buildSections, displayName, modelValue } from "../components/ModelPicker";
 import { PROVIDER_LABEL, PROVIDER_ORDER } from "../api/providers";
 import { buildCcSwitchLink, CCSWITCH_TARGETS } from "../lib/ccSwitch";
-import type { ApiKeyCreated } from "../api/types";
+import type { ApiKey, ApiKeyCreated } from "../api/types";
 import {
   Badge,
   Button,
@@ -372,34 +373,79 @@ function AnthropicEntry({ apiKey }: { apiKey: string }) {
   );
 }
 
-/** CC Switch 一键导入：生成 `ccswitch://` 深链，由用户点击交给桌面端导入。 */
-function CcSwitchEntry({ apiKey }: { apiKey: string }) {
-  const [model, setModel] = useState("");
-  const origin = window.location.origin;
-  const ready = apiKey !== "";
+/**
+ * 默认模型下拉：数据源与 Playground 同源（`/api/playground/models`），
+ * 按渠道分组（多渠道置顶 + 「仅 XX」），值语义与 Playground 一致
+ * （多渠道裸 id 走自动路由、单渠道 `id@provider` 强制指定）。
+ */
+function ModelSelect({
+  value,
+  onChange,
+  testid,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  testid: string;
+}) {
+  const modelsQuery = usePlaygroundModels();
+  const fetched = modelsQuery.data?.data ?? [];
+  const models = fetched.map((item) => ({ ...item, value: modelValue(item) }));
+  const sections = buildSections(models);
 
   return (
-    <ClientEntryPanel title="CC Switch 一键导入" testid="ccswitch-entry">
-      <p className="text-xs text-muted-foreground">
-        用 CC Switch 一键把本服务的地址、Key 与模型写进本地客户端。点击下方按钮会
-        唤起 CC Switch 并弹出导入确认框；需 CC Switch v4.0.10 及以上，且深链只能
-        由点击触发（浏览器会拦截自动跳转）。
-      </p>
-      <Field label="默认模型（可选）" hint="留空则不写入。Claude Code 无模型名时回落内置列表；非原生模型建议在此填本服务的模型名（如 glm-5.2）。">
-        <Input
-          value={model}
-          data-testid="ccswitch-model"
-          placeholder="例如 glm-5.2"
-          onChange={(event) => setModel(event.target.value)}
-        />
+    <Select
+      value={value}
+      data-testid={testid}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value="">不写入（留空）</option>
+      {sections.map((section) => (
+        <optgroup key={section.key} label={section.label}>
+          {section.items.map((item) => (
+            <option key={item.value} value={item.value}>
+              {displayName(item)}
+            </option>
+          ))}
+        </optgroup>
+      ))}
+    </Select>
+  );
+}
+
+/**
+ * CC Switch 导入按钮组：渲染在「明文 Key 存活」的上下文里——创建成功后的对话框，
+ * 或列表行的导入对话框（用户自己粘贴 Key）。深链含 Key 明文，故只在用户主动
+ * 打开、且已给出 Key 时生成。
+ */
+export function CcSwitchImportButtons({
+  apiKey,
+  testidPrefix = "ccswitch",
+  warning = "深链含 API Key 明文，勿分享、勿在不可信环境使用。",
+}: {
+  apiKey: string;
+  /** data-testid 前缀：列表行导入对话框用 `ccswitch-row`，避免与创建对话框撞名。 */
+  testidPrefix?: string;
+  warning?: string;
+}) {
+  const [model, setModel] = useState("");
+  const origin = window.location.origin;
+  const ready = apiKey.trim() !== "";
+
+  return (
+    <div className="space-y-3" data-testid={`${testidPrefix}-import`}>
+      <Field
+        label="默认模型（可选）"
+        hint="留空不写入。Claude Code 无模型名时回落内置列表；非原生模型建议选本服务模型。"
+      >
+        <ModelSelect value={model} onChange={setModel} testid={`${testidPrefix}-model`} />
       </Field>
       <div className="flex flex-wrap gap-2">
-        {CCSWITCH_TARGETS.map((target) => (
+        {CCSWITCH_TARGETS.map((target) =>
           ready ? (
             <RawButton key={target.app} size="sm" variant="default" asChild>
               <a
                 href={buildCcSwitchLink(target, { origin, apiKey, model })}
-                data-testid={`ccswitch-${target.app}`}
+                data-testid={`${testidPrefix}-${target.app}`}
               >
                 导入到 {target.label}
               </a>
@@ -408,20 +454,17 @@ function CcSwitchEntry({ apiKey }: { apiKey: string }) {
             <Button
               key={target.app}
               size="sm"
-              variant="primary"
+              variant="default"
               disabled
-              data-testid={`ccswitch-${target.app}`}
+              data-testid={`${testidPrefix}-${target.app}`}
             >
               导入到 {target.label}
             </Button>
-          )
-        ))}
+          ),
+        )}
       </div>
-      <Notice tone="warn">
-        深链含当前 API Key 明文，请勿分享或在不可信环境使用。Key 只在创建后的
-        展示期内可生成导入链接，关闭创建对话框后不再保留。
-      </Notice>
-    </ClientEntryPanel>
+      <Notice tone="warn">{warning}</Notice>
+    </div>
   );
 }
 
@@ -440,6 +483,9 @@ export function ApiKeysPage() {
   const [copied, setCopied] = useState(false);
   // 创建 Key 收进对话框（低频动作不常驻占屏），由「我的 API Key」右上角触发
   const [createOpen, setCreateOpen] = useState(false);
+  // 列表行「导入 CC Switch」对话框：列表只有脱敏 preview，明文由用户自己粘贴
+  const [importing, setImporting] = useState<ApiKey | null>(null);
+  const [importKey, setImportKey] = useState("");
 
   const keys = data?.api_keys ?? [];
 
@@ -495,6 +541,13 @@ export function ApiKeysPage() {
 
   const createDialogRef = useDialogFocus<HTMLDivElement>(closeCreate, createOpen);
 
+  const closeImport = () => {
+    setImporting(null);
+    // 用户粘贴的明文 Key 只应存在于导入对话框的生命周期内，关闭即抹掉
+    setImportKey("");
+  };
+  const importDialogRef = useDialogFocus<HTMLDivElement>(closeImport, importing !== null);
+
   return (
     <div className="space-y-6" data-testid="api-keys-page">
       <PageHeader
@@ -505,7 +558,6 @@ export function ApiKeysPage() {
       />
       <OpenAIEntry apiKey={created?.api_key ?? ""} />
       <AnthropicEntry apiKey={created?.api_key ?? ""} />
-      <CcSwitchEntry apiKey={created?.api_key ?? ""} />
 
       <Panel
         title="我的 API Key"
@@ -585,10 +637,21 @@ export function ApiKeysPage() {
                         </Button>
                       </span>
                     ) : (
-                      <Button size="sm" variant="ghost" onClick={() => setConfirming(key.id)}>
-                        <Trash2 className="mr-1 size-3.5" />
-                        删除
-                      </Button>
+                      <span className="inline-flex flex-wrap justify-end gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          data-testid={`import-ccswitch-${key.id}`}
+                          onClick={() => setImporting(key)}
+                        >
+                          <Share2 className="mr-1 size-3.5" />
+                          导入 CC Switch
+                        </Button>
+                        <Button size="sm" variant="ghost" onClick={() => setConfirming(key.id)}>
+                          <Trash2 className="mr-1 size-3.5" />
+                          删除
+                        </Button>
+                      </span>
                     )}
                   </TableCell>
                 </TableRow>
@@ -643,6 +706,13 @@ export function ApiKeysPage() {
                   <Button size="sm" variant="ghost" onClick={closeCreate}>
                     我已保存
                   </Button>
+                </div>
+                {/* 导入按钮与明文 Key 同生命周期：只在这里（对话框开着时）才有可用的深链 */}
+                <div className="mt-4 border-t border-border/70 pt-4">
+                  <CcSwitchImportButtons
+                    apiKey={created.api_key}
+                    warning="深链含 API Key 明文，勿分享、勿在不可信环境使用；关闭对话框后不再保留。"
+                  />
                 </div>
               </div>
             ) : (
@@ -711,6 +781,60 @@ export function ApiKeysPage() {
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 列表行「导入 CC Switch」对话框：明文 Key 由用户自己粘贴（列表只有脱敏 preview） */}
+      {importing && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm"
+          onClick={closeImport}
+        >
+          <div
+            ref={importDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="导入到 CC Switch"
+            data-testid="ccswitch-row-dialog"
+            onClick={(event) => event.stopPropagation()}
+            className="max-h-[90vh] w-full max-w-lg animate-in overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl fade-in-0 zoom-in-95"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <Share2 className="size-4 text-muted-foreground" />
+                导入到 CC Switch
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="关闭"
+                data-testid="ccswitch-row-close"
+                onClick={closeImport}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                本列表只保留脱敏预览（{importing.preview}），服务端不再存明文，故需
+                粘贴创建时保存的完整 Key 才能生成导入深链（CC Switch v4.0.10+）。
+              </p>
+              <Field label="API Key" hint="仅本次导入的内存中使用，关闭即清除，不落库、不上传。">
+                <Input
+                  value={importKey}
+                  data-testid="ccswitch-row-key"
+                  placeholder="sk-..."
+                  autoComplete="off"
+                  onChange={(event) => setImportKey(event.target.value)}
+                />
+              </Field>
+              <CcSwitchImportButtons
+                apiKey={importKey}
+                testidPrefix="ccswitch-row"
+                warning="深链含粘贴的 API Key 明文，勿分享、勿在不可信环境使用；关闭对话框后不再保留。"
+              />
+            </div>
           </div>
         </div>
       )}

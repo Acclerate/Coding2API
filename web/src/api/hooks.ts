@@ -46,6 +46,17 @@ export function useSettings(username?: string) {
   });
 }
 
+/**
+ * 会话鉴权的模型列表（`/api/playground/models`），与 Playground 页共用同一
+ * 缓存键，故两处只发一次请求。CC Switch 默认模型下拉用它——用户无需自造 Key。
+ */
+export function usePlaygroundModels() {
+  return useQuery({
+    queryKey: ["playground-models"],
+    queryFn: ({ signal }) => api.playgroundModels(signal),
+  });
+}
+
 /** OpenRouter 模型目录（模型列表页）不缓存太久的引用数据；与凭证/设置同区分。 */
 export function useModelCatalog(username?: string, sort?: string, order?: string) {
   return useQuery({

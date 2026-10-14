@@ -17,6 +17,7 @@ import type {
   GrowthRunResult,
   ActivityReportResult,
   ModelCatalogResponse,
+  ModelInfo,
   ModelStats,
   CredentialStats,
   ProbeResult,
@@ -209,6 +210,12 @@ export const api = {
   }) =>
     request<ApiKeyCreated>("/api/api-keys", { method: "POST", ...json(payload) }),
   deleteApiKey: (id: string) => request<{ ok: boolean }>(`/api/api-keys/${id}`, { method: "DELETE" }),
+  /**
+   * 会话鉴权的模型列表（与 Playground 同源 `/api/playground/models`）：
+   * 供「API Key 管理」页的 CC Switch 默认模型下拉使用，无需用户自己造 Key。
+   */
+  playgroundModels: (signal?: AbortSignal) =>
+    request<{ data: ModelInfo[] }>("/api/playground/models", { signal }),
 
   // ------------------------------------------------------------ 运行时配置
   settings: () => request<SettingsResponse>("/api/settings"),
