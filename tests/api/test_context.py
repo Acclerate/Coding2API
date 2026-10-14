@@ -50,10 +50,22 @@ def test_content_text_handles_parts_and_placeholders():
     assert _content_text("x") == "x"
     assert _content_text(None) == ""
     assert _content_text(5) == "5"
-    # 非字符串 text / 非文本 part 各按 100 字符占位
-    assert _content_text([{"text": "a"}, "b", {"image": 1}, {"text": 2}]) == "a" + "b" + "x" * 200
-    # 既不是 dict 也不是 str 的条目直接跳过，不占位
+    # 非文本 part 不再按固定 100 字符占位：只有能读出正文（text / image_url.url）
+    # 的 part 才计入，其余记 0——固定占位会让图片会话永远不触发压缩。
+    assert _content_text([{"text": "a"}, "b", {"image": 1}, {"text": 2}]) == "ab"
+    # 既不是 dict 也不是 str 的条目直接跳过
     assert _content_text([1, "a"]) == "a"
+
+
+def test_content_text_counts_image_url_bytes():
+    """图片按 base64 正文长度计入，而不是被当成 0 / 固定占位。"""
+    url = "data:image/png;base64," + "A" * 1000
+    content = [{"type": "text", "text": "看图"},
+               {"type": "image_url", "image_url": {"url": url}}]
+    assert _content_text(content) == "看图" + url
+    # 畸形 image_url（缺 url / url 非字符串）记 0，不抛异常
+    assert _content_text([{"type": "image_url", "image_url": {"url": 5}}]) == ""
+    assert _content_text([{"type": "image_url"}]) == ""
 
 
 def test_estimate_messages_counts_reasoning_tools_and_ids():
@@ -164,6 +176,26 @@ def test_compress_truncates_part_array_content():
                                min_keep_messages=1, safety_ratio=1.0)
     assert isinstance(result[-1]["content"], str)
     assert "内容过长已截断" in result[-1]["content"]
+
+
+def test_compress_never_truncates_image_parts():
+    """含图片的 content 不截断：截 base64 只会得到无效 data URL，
+    上游照样 400；原样保留交给上游裁决。"""
+    url = "data:image/png;base64," + "A" * 100_000
+    parts = [{"type": "text", "text": "看图"},
+             {"type": "image_url", "image_url": {"url": url}}]
+    result = compress_messages([_user(parts)],
+                               max_input_tokens=200, reserve_for_output=0,
+                               min_keep_messages=1, safety_ratio=1.0)
+    assert result[-1]["content"] is parts
+
+
+def test_image_part_counts_toward_budget():
+    """图片按 base64 正文长度计入估算：大图必须能触发压缩，而不是被当成 0。"""
+    url = "data:image/png;base64," + "A" * 100_000
+    messages = [_system("s"), _user([{"type": "image_url",
+                                      "image_url": {"url": url}}])]
+    assert estimate_messages(messages) > estimate_messages([_system("s")])
 
 
 # --------------------------------------------------------- 目录查上限 / 接线

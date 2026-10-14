@@ -167,8 +167,9 @@ def health_score(q: Quota | None) -> int | None:
 | `instructions` | 首条 `system` 消息 |
 | `input` 字符串 | `user` 消息 |
 | `input[].type=message`（`input_text`/`output_text` part） | `messages[]`；`developer` 角色改写为 `system` |
+| `input[].content[].type=input_image` | chat 的 `image_url` part（`image_url` 直传，`detail` 丢弃）；纯文本 part 折成字符串，含图时保留数组 |
 | `input[].type=function_call` | assistant 消息的 `tool_calls[]` |
-| `input[].type=function_call_output` | `tool` 消息 |
+| `input[].type=function_call_output` | `tool` 消息（part 数组可含 `input_image`） |
 | `input[].type=reasoning` | assistant 消息的 `reasoning_content`（仅明文部分） |
 | `tools[].type=function`（**扁平** `{name, description, parameters}`） | 嵌套 `{type:function, function:{...}}` |
 | `tool_choice` 字符串 / `{type:function,name}` | 同名 / 嵌套形式 |
@@ -181,14 +182,14 @@ def health_score(q: Quota | None) -> int | None:
 ### 3.8 Anthropic Messages 出口（Claude Code）
 `POST /v1/messages`（流式 + 非流式）与 `POST /v1/messages/count_tokens`，供只走 Anthropic 协议的客户端接入。与 `/v1/responses` 同一模式：新增 `compat/anthropic/{request,response}.py` + `api/messages.py`，**复用同一 executor**。**入站映射**（`request.py`，映射成内部 `ChatRequest.raw`，只实现 chat 子集）：
 - `system`（字符串或 text 块数组）→ 一条 `system` 消息，置于最前；空则丢弃。
-- `messages[].content` 为字符串时按角色直传；为块数组时：`text` → 文本、`tool_result` → `tool` 消息（`tool_use_id` → `tool_call_id`）、`image`/`document` → 显式 400。user 的连续块按类型**拆成多条**消息（文本与 tool_result 交替），assistant 的块**合并成一条**（`thinking` → `reasoning_content`、`tool_use` → `tool_calls`、`redacted_thinking` 丢弃）——与上游 chat 的消息模型对齐。
+- `messages[].content` 为字符串时按角色直传；为块数组时：`text` → 文本、`tool_result` → `tool` 消息（`tool_use_id` → `tool_call_id`；其 `content` 内的图片同样归一）、`image` → chat 的 `image_url` part（`source.type=base64` 拼成 `data:{media_type};base64,{data}`、`source.type=url` 直传）、`document` / `source.type=file` → 显式 400（chat 上游无对应表达）。user 的连续块按类型**拆成多条**消息（文本与 tool_result 交替），assistant 的块**合并成一条**（`thinking` → `reasoning_content`、`tool_use` → `tool_calls`、`redacted_thinking` 丢弃）——与上游 chat 的消息模型对齐。**纯文本内容仍折成字符串**（只有含图时才输出内容块数组），故无图请求的映射结果与加图片支持前**逐字节一致**，不会因本次改动击穿会话粘性指纹与上游前缀缓存。
 - `tools[].input_schema` → `function.parameters`；`tool_choice`：`auto`/`none` 直传，`any` → `required`，`tool` → `{"type":"function",...}`；`stop_sequences` → `stop`；`max_tokens`/`temperature`/`top_p` 直传，`top_k` 丢弃（chat 无等价物）。
 
 **出口翻译**（`response.py`，实现 executor 的 `StreamSink` 协议）：`message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（文本 `text_delta`、思考 `thinking_delta`、工具 `input_json_delta`）→ `message_delta`（`stop_reason` + usage）→ `message_stop`。Anthropic 协议**没有 `[DONE]` 哨兵**，`message_stop` 即流结束；thinking 块在 `content_block_stop` 前补一个占位 `signature_delta`（客户端要求，本网关不产真签名）。错误用 `event: error`（`_error_type_for` 把上游错误码映射成 Anthropic 错误类型）。**usage 缓存字段**：内部 `Usage.input_tokens` 是 OpenAI 口径的 `prompt_tokens`（**含**缓存命中），而 Anthropic 语义里 `input_tokens` 与 `cache_read_input_tokens` / `cache_creation_input_tokens` 互斥（`input_tokens` 只计未命中）。故 `_usage_payload` 与 `completion_to_message` 统一拆分：命中时 `input_tokens = max(0, prompt_tokens − cached_tokens)` 并另记 `cache_read_input_tokens = cached_tokens`，不减会让 Claude Code 重复计费；命中为 0/None 时不补占位字段。**鉴权**：`deps.api_key_user_anthropic` 先读 `x-api-key`（Anthropic SDK 的 `ANTHROPIC_API_KEY`），为空再回落 `Authorization: Bearer`（`ANTHROPIC_AUTH_TOKEN`），两者共用 `_api_key_principal`。客户端 Base URL 填到根，SDK 自行拼 `/v1/messages`。`count_tokens` 用与上下文压缩同一套启发式估算本地计数（不转发上游）。**CC Switch 一键导入深链**（前端 `web/src/lib/ccSwitch.ts`）：在「API Key 管理」页生成 `ccswitch://v1/import?resource=provider&…` 链接（`app` = `claude`/`codex`/`opencode`，对应三个出口协议），由用户点击触发桌面端导入确认。**endpoint 形态随 `apiFormat` 变**：`anthropic`（Claude Code）填到根、不带 `/v1`（与上面的约定一致），`openai_chat`/`openai_responses` 填到 `/v1`。深链含 Key 明文，仅在创建 Key 的展示期内可用；本网关无 Gemini 出口，故不提供 `app=gemini`。协议与取值依官方文档（CC Switch 用户手册「Deep Link Protocol」），需 v4.0.10+。
 ### 3.9 上下文压缩
 **动机**：上游对输入长度有硬限制（CodeBuddy `11115 prompt is too long: … tokens > … maximum`）。反代若原样转发，长会话必然撞墙，客户端只看到裸的 400，而换号无意义（每个号上限一样）。**只做确定性的「估算 → 裁剪」**，不做「超限后压缩再重试」的放大路径。实现分两层：纯函数 `engine/compress.py` + 装配闭包 `api/context.py`（`build_context_compressor`，由 main.py 注入 `ExecutorDeps.context_compress`）。
 
-- **token 估算**：中文 0.55 tok/字、数字 0.33、其他 0.25。刻意不用「3 字符 ≈ 1 token」的英文口径——它会把中文低估约 1.6 倍，于是「以为装得下、其实装不下」，压缩根本不触发。
+- **token 估算**：中文 0.55 tok/字、数字 0.33、其他 0.25。刻意不用「3 字符 ≈ 1 token」的英文口径——它会把中文低估约 1.6 倍，于是「以为装得下、其实装不下」，压缩根本不触发。**图片 part 按 URL/base64 正文长度计入**：早期实现对非文本 part 一律记 100 字符，而一张 1 MB 的图 base64 后约 1.4 M 字符，按 100 估等于「图片会话永不触发压缩」，会一路撞上游输入上限。
 - **预算**：`模型上限 × safety_ratio − reserve_for_output`。
 - **裁剪**：`system` 永久保留（丢了会改变模型行为）；`assistant.tool_calls` 与其后连续的 `tool` 结果**同组同生共死**（只删一半会让上游报 tool_call_id 找不到）；至少保留最近 `min_keep_messages` 条；其外从最新往最老贪心回填。裁剪后仍超限则截断最长的**非 system** 消息内容（留头尾 + 标记）。
 - **未知上限不压缩**：模型目录里查不到 `max_input_tokens` 时直接跳过——宁可不裁剪，也不拿一个猜的数字去砍用户上下文。故本功能对未知模型**零副作用**。

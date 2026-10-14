@@ -13,7 +13,9 @@ Claude Code / Anthropic SDK 会用的子集，其余显式 400（`InvalidRequest
   - `assistant` 的 text 块 → assistant 消息正文；`tool_use` 块 → chat
     `tool_calls`（`input` 对象序列化成 `arguments` JSON 串）；`thinking`
     块 → assistant 的 `reasoning_content`
-  - `image` / `document` 块本网关暂不支持 → 400
+  - `image` 块 → chat 的 `image_url` 内容块（`source.type=base64` 拼成
+    data URL，`source.type=url` 直传）；`document` 块仍不支持 → 400
+  - 纯文本内容折成字符串（与旧行为逐字节一致），含图片时保留内容块数组
 - `tools` 的 `{name, description, input_schema}` → chat
   `{type:"function", function:{name, description, parameters}}`
 - `tool_choice`：`auto`→`auto`、`any`→`required`、`tool`→指定函数
@@ -66,30 +68,79 @@ def _block_text(block: dict[str, Any], where: str) -> str:
     return text
 
 
-def _tool_result_text(content: Any) -> str:
-    """`tool_result.content`：字符串或 text 块数组 → 纯文本。
+def _image_part(block: dict[str, Any], where: str) -> dict[str, Any]:
+    """Anthropic `image` 块 → chat 的 `image_url` 内容块。
+
+    只做结构映射，不下载 / 不压缩 / 不改写图片字节（上游已实测接受 data URL
+    与 http(s) URL，见扫描报告 §4.15 实测表）。
+    """
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise InvalidRequest(f"{where}.source must be an object")
+    kind = source.get("type")
+    if kind == "base64":
+        media_type = source.get("media_type")
+        data = source.get("data")
+        if not isinstance(media_type, str) or not media_type:
+            raise InvalidRequest(f"{where}.source.media_type must be a non-empty string")
+        if not isinstance(data, str) or not data:
+            raise InvalidRequest(f"{where}.source.data must be a non-empty string")
+        return {"type": "image_url",
+                "image_url": {"url": f"data:{media_type};base64,{data}"}}
+    if kind == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            raise InvalidRequest(f"{where}.source.url must be a non-empty string")
+        return {"type": "image_url", "image_url": {"url": url}}
+    raise InvalidRequest(f"{where}.source.type {kind!r} is not supported by this gateway")
+
+
+def _text_part(block: dict[str, Any], where: str) -> dict[str, Any]:
+    return {"type": "text", "text": _block_text(block, where)}
+
+
+def _merge_parts(parts: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    """内容块数组 → chat content：纯文本折成字符串，含图片时保留数组。
+
+    纯文本折成字符串是为了与旧行为**逐字节一致**——历史请求（不含图片）经此
+    出口映射后必须与改动前完全相同，否则会话粘性指纹与上游前缀缓存都会失效。
+    """
+    if all(part.get("type") == "text" for part in parts):
+        return "".join(part["text"] for part in parts)
+    # 必须返回副本：调用方紧接着会 clear() 自己的 pending 列表，直接返回同一
+    # 对象会把已存入消息的 content 一并清空（数组 part 场景下表现为 content=[]）。
+    return list(parts)
+
+
+def _tool_result_text(content: Any) -> str | list[dict[str, Any]]:
+    """`tool_result.content`：字符串或 text/image 块数组。
 
     `is_error` 是纯客户端语义，chat 上游没有对应字段，按普通文本回灌。
+    纯文本结果仍返回字符串（旧行为不变）；含图片时返回内容块数组——chat 的
+    `tool` 消息带 `image_url` 数组已实测被上游接受（2026-10-15）。
     """
     if isinstance(content, str):
         return content
     if content is None:
         return ""
     if isinstance(content, list):
-        parts: list[str] = []
+        parts: list[dict[str, Any]] = []
         for index, block in enumerate(content):
             if not isinstance(block, dict):
                 raise InvalidRequest(f"tool_result.content[{index}] must be an object")
+            where = f"tool_result.content[{index}]"
             kind = block.get("type")
             if kind == "text":
-                parts.append(_block_text(block, f"tool_result.content[{index}]"))
-            elif kind in ("image", "document"):
+                parts.append(_text_part(block, where))
+            elif kind == "image":
+                parts.append(_image_part(block, where))
+            elif kind == "document":
                 raise InvalidRequest(
                     f"tool_result.content type {kind!r} is not supported by this gateway")
             else:
                 raise InvalidRequest(
                     f"unknown tool_result.content type {kind!r}")
-        return "".join(parts)
+        return _merge_parts(parts)
     raise InvalidRequest("tool_result.content must be a string or an array")
 
 
@@ -106,35 +157,43 @@ def _input_arguments(value: Any) -> str:
 
 
 def _user_messages(blocks: list[Any]) -> list[dict[str, Any]]:
-    """user 内容块 → 按顺序拆成 user / tool 消息。"""
-    messages: list[dict[str, Any]] = []
-    pending_text: list[str] = []
+    """user 内容块 → 按顺序拆成 user / tool 消息。
 
-    def flush_text() -> None:
-        if pending_text:
-            messages.append({"role": "user", "content": "".join(pending_text)})
-            pending_text.clear()
+    同一条 user 里 text 与图片相邻时合并进同一个 user 消息（保持图文顺序）；
+    遇到 `tool_result` 才 flush——它必须另起一条 `tool` 消息。
+    """
+    messages: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        # 非空即产出：pending 里可能是纯图片（`_merge_parts` 返回数组，非空）
+        if pending:
+            messages.append({"role": "user", "content": _merge_parts(pending)})
+            pending.clear()
 
     for index, block in enumerate(blocks):
         if not isinstance(block, dict):
             raise InvalidRequest(f"messages.content[{index}] must be an object")
+        where = f"messages.content[{index}]"
         kind = block.get("type")
         if kind == "text":
-            pending_text.append(_block_text(block, f"messages.content[{index}]"))
+            pending.append(_text_part(block, where))
+        elif kind == "image":
+            pending.append(_image_part(block, where))
         elif kind == "tool_result":
             tool_use_id = block.get("tool_use_id")
             if not isinstance(tool_use_id, str) or not tool_use_id:
                 raise InvalidRequest(
                     "tool_result.tool_use_id must be a non-empty string")
-            flush_text()
+            flush()
             messages.append({"role": "tool", "tool_call_id": tool_use_id,
                              "content": _tool_result_text(block.get("content"))})
-        elif kind in ("image", "document"):
+        elif kind == "document":
             raise InvalidRequest(
                 f"content block type {kind!r} is not supported by this gateway")
         else:
             raise InvalidRequest(f"unknown content block type {kind!r}")
-    flush_text()
+    flush()
     return messages
 
 

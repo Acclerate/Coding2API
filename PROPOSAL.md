@@ -70,6 +70,7 @@
 | credit 可得性 | CB 有 per-request；TRAE 只有账户总额 | 统计表 credit 可空；TRAE 按官方单价、CodeArts 福利模型按每日池 1:1 推算并标 `credit_estimated` |
 | 登录机制 | CB/Qoder/CodeArts 轮询或粘贴（后端出网）；TRAE 浏览器回调 | 三轨（poll / callback / paste），回调统一走主端口 |
 | 上游 SSE 格式变更 | 各渠道 SSE 形状不同 | 各渠道解析成中立事件；样本存 fixture 做契约测试 |
+| 图片能力标志不可信 | 七渠道出站均为 OpenAI `image_url` 内容块原样透传，上游全部接受（实测 2026-10-15）；而模型目录的 `supportsImages` 与实际行为不一致（CB `glm-5.0` 标 false 却能识图；`hunyuan-chat` 标 false 却接受并自行降级） | 入站统一归一为 `image_url` 透传，**不做模型能力门禁**，能否识图交上游裁决 |
 
 ## 3. 架构
 

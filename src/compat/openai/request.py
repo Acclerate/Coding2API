@@ -82,6 +82,33 @@ def validate_numeric_fields(raw: dict[str, Any]) -> None:
             require_finite_number(value, f"logit_bias[{token!r}]")
 
 
+def validate_content_parts(messages: list[Any]) -> None:
+    """校验 content 数组里的 `image_url` 内容块形状。
+
+    只校验本服务要读取的字段（`image_url.url`）：畸形图片是**客户端**错误，
+    放行会让上游回 400，而本服务按上游 4xx 冷却凭证——等于让一个写错的
+    客户端把健康账号打凉。其余 part 类型一律放行（宽松透传，语义交上游裁决）。
+    """
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image = part.get("image_url")
+            if not isinstance(image, dict):
+                raise InvalidRequest(
+                    f"messages[{index}].content[{part_index}].image_url must be an object")
+            url = image.get("url")
+            if not isinstance(url, str) or not url:
+                raise InvalidRequest(
+                    f"messages[{index}].content[{part_index}].image_url.url "
+                    "must be a non-empty string")
+
+
 @dataclass(slots=True)
 class ChatRequest:
     model: str
@@ -112,6 +139,7 @@ def parse_chat_request(body: Any) -> ChatRequest:
     # Responses 出口保持同一套边界。在 raw 副本上归一，不改动调用方 body。
     raw = dict(body)
     validate_numeric_fields(raw)
+    validate_content_parts(messages)
     for key in ("max_tokens", "max_completion_tokens"):
         if key in raw and raw[key] is not None:
             require_positive_int(raw[key], key, maximum=MAX_OUTPUT_TOKENS)

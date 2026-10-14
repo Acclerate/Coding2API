@@ -9,6 +9,9 @@
 - `input` 字符串 → 单条 `user`；数组 → 逐项按 `type` 映射
   （`message` / `function_call` / `function_call_output` / `reasoning`；
    其余 item 类型属 Responses 私有语义，无法无损表达 → 400）
+- content part：`input_text`/`text`/`output_text` → chat text；`input_image`
+  → chat `image_url`（`image_url` 直传，上游已实测接受 data URL 与 http URL）；
+  `input_file` 需服务端文件存储，本网关无此能力 → 400
 - `tools` 的 `{type:"function", name, description, parameters}` → chat
   `{type:"function", function:{...}}`；非 function 工具（web_search 等）→ 400
 - `reasoning.effort` → 顶层 `reasoning_effort`（出口侧字段名映射）
@@ -53,32 +56,60 @@ _UNSUPPORTED_ITEM_TYPES = (
 _DROPPED_ITEM_TYPES = ("reasoning", "compaction")
 
 
-def _text_content(value: Any) -> str:
-    """把 Responses 的 content（字符串或 part 数组）压成 chat 的字符串。
+def _content_part(part: dict[str, Any], where: str) -> dict[str, Any]:
+    """单个 content part → 内部归一形态（text / image_url）。
 
-    只接受 `input_text` / `text` part；图片/文件 part 会被上游 chat 拒绝，
-    转成占位符会静默丢信息 → 直接 400 让调用方知道。
+    图片归一为 chat 的 `image_url` 内容块：`image_url` 直传（上游实测接受
+    data URL 与 http(s) URL，见扫描报告 §4.15）。`file_id` 需要服务端文件
+    存储，本网关无此能力 → 显式 400 而不是静默丢图。
+    """
+    kind = part.get("type")
+    if kind in ("input_text", "text", "output_text"):
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise InvalidRequest(f"{where}.text must be a string")
+        return {"type": "text", "text": text}
+    if kind == "input_image":
+        url = part.get("image_url")
+        if not isinstance(url, str) or not url:
+            raise InvalidRequest(f"{where}.image_url must be a non-empty string")
+        return {"type": "image_url", "image_url": {"url": url}}
+    if kind in ("input_file", "image_url", "refusal"):
+        raise InvalidRequest(
+            f"content part type {kind!r} is not supported by this gateway")
+    raise InvalidRequest(f"unknown content part type {kind!r}")
+
+
+def _content_value(value: Any) -> str | list[dict[str, Any]]:
+    """Responses 的 content（字符串或 part 数组）→ chat content。
+
+    纯文本折成字符串（与旧行为逐字节一致，保住会话粘性与上游前缀缓存）；
+    含图片时保留内容块数组。
     """
     if isinstance(value, str):
         return value
     if not isinstance(value, list):
         raise InvalidRequest("message content must be a string or an array")
-    parts: list[str] = []
+    parts: list[dict[str, Any]] = []
     for index, part in enumerate(value):
         if not isinstance(part, dict):
             raise InvalidRequest(f"content[{index}] must be an object")
-        kind = part.get("type")
-        if kind in ("input_text", "text", "output_text"):
-            text = part.get("text")
-            if not isinstance(text, str):
-                raise InvalidRequest(f"content[{index}].text must be a string")
-            parts.append(text)
-        elif kind in ("input_image", "input_file", "image_url", "refusal"):
-            raise InvalidRequest(
-                f"content part type {kind!r} is not supported by this gateway")
-        else:
-            raise InvalidRequest(f"unknown content part type {kind!r}")
-    return "".join(parts)
+        parts.append(_content_part(part, f"content[{index}]"))
+    if all(part["type"] == "text" for part in parts):
+        return "".join(part["text"] for part in parts)
+    return parts
+
+
+def _text_content(value: Any) -> str:
+    """纯文本 content：只接受 `input_text` / `text` / `output_text`。
+
+    用于 `instructions` 这类只可能是文本的位置——出现图片 part 说明调用方
+    理解有误，直接 400 而不是静默丢弃。
+    """
+    mapped = _content_value(value)
+    if not isinstance(mapped, str):
+        raise InvalidRequest("image content is not supported here")
+    return mapped
 
 
 def _arguments_to_json(value: Any) -> str:
@@ -99,7 +130,7 @@ def _arguments_to_json(value: Any) -> str:
 
 
 def _message_item(item: dict[str, Any], role: str) -> dict[str, Any]:
-    content = _text_content(item.get("content"))
+    content = _content_value(item.get("content"))
     return {"role": role, "content": content}
 
 
@@ -119,19 +150,23 @@ def _function_call_output_item(item: dict[str, Any]) -> dict[str, Any]:
     call_id = item.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         raise InvalidRequest("function_call_output.call_id must be a non-empty string")
-    text = _function_call_output_text(item.get("output"))
+    text = _function_call_output_value(item.get("output"))
     return {"role": "tool", "tool_call_id": call_id, "content": text}
 
 
-def _function_call_output_text(output: Any) -> str:
+def _function_call_output_value(output: Any) -> str | list[dict[str, Any]]:
     """function_call_output.output 的四种线上形状：纯字符串、part 数组、
-    `{content}`（Codex 的 `FunctionCallOutputPayload`）与 `{content_items}`。"""
+    `{content}`（Codex 的 `FunctionCallOutputPayload`）与 `{content_items}`。
+
+    与 Anthropic 的 `tool_result.content` 一致：纯文本返回字符串（旧行为不变），
+    含图片时返回内容块数组（chat 的 `tool` 消息带 `image_url` 已实测被上游接受）。
+    """
     if isinstance(output, str):
         return output
     if output is None:
         return ""
     if isinstance(output, list):
-        return _text_content(output)
+        return _content_value(output)
     if isinstance(output, dict):
         content = output.get("content")
         if isinstance(content, str):
@@ -139,7 +174,7 @@ def _function_call_output_text(output: Any) -> str:
         items = output.get("content_items")
         if items is None:
             return ""
-        return _text_content(items)
+        return _content_value(items)
     raise InvalidRequest("function_call_output.output must be a string, object or array")
 
 

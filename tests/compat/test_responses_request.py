@@ -211,8 +211,16 @@ def test_stream_flag_flows_through():
     ({"input": [{"type": "message", "role": "user", "content": [5]}]},
      "content[0] must be an object"),
     ({"input": [{"type": "message", "role": "user",
-                 "content": [{"type": "input_image", "image_url": "x"}]}]},
-     "input_image"),
+                 "content": [{"type": "input_image"}]}]}, "image_url must be a non-empty"),
+    ({"input": [{"type": "message", "role": "user",
+                 "content": [{"type": "input_image", "image_url": ""}]}]},
+     "image_url must be a non-empty"),
+    ({"input": [{"type": "message", "role": "user",
+                 "content": [{"type": "input_file", "file_id": "f"}]}]},
+     "input_file"),
+    ({"input": [{"type": "message", "role": "user",
+                 "content": [{"type": "image_url", "image_url": "x"}]}]},
+     "image_url"),
     ({"input": [{"type": "message", "role": "user",
                  "content": [{"type": "input_text"}]}]}, "text must be a string"),
     ({"input": [{"type": "message", "role": "user", "content": [{"type": "z"}]}]},
@@ -271,3 +279,56 @@ def test_ignore_unknown_extra_fields():
     for key in ("client_metadata", "service_tier", "stream_options", "store",
                 "include", "input", "instructions"):
         assert key not in request.raw
+
+
+def test_input_image_maps_to_image_url():
+    """`input_image` → chat 的 image_url（上游实测接受 data URL 与 http URL）。"""
+    request = parse_responses_request({"input": [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "看图"},
+            {"type": "input_image", "image_url": "https://x/y.png", "detail": "high"},
+        ]}]})
+    assert request.raw["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "看图"},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+    ]}]
+
+
+def test_pure_text_content_still_folds_to_string():
+    """纯文本 part 仍折成字符串：无图请求的映射结果与改动前逐字节一致。"""
+    request = parse_responses_request({"input": [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "a"}, {"type": "output_text", "text": "b"},
+        ]}]})
+    assert request.raw["messages"] == [{"role": "user", "content": "ab"}]
+
+
+def test_image_in_instructions_is_rejected():
+    """`instructions` 只能是文本：出现图片 part 说明调用方理解有误，直接 400。"""
+    with pytest.raises(InvalidRequest, match="image content is not supported"):
+        parse_responses_request({"instructions": [
+            {"type": "input_image", "image_url": "https://x/y.png"}], "input": "hi"})
+
+
+def test_function_call_output_with_image_array():
+    """`function_call_output.output` 的 part 数组可含图片。"""
+    request = parse_responses_request({"input": [
+        {"type": "function_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "结果"},
+            {"type": "input_image", "image_url": "https://x/y.png"},
+        ]}]})
+    assert request.raw["messages"] == [{"role": "tool", "tool_call_id": "c1",
+                                        "content": [
+        {"type": "text", "text": "结果"},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+    ]}]
+
+
+def test_function_call_output_content_items_with_image():
+    """`{content_items: [...]}` 形态同样支持图片 part。"""
+    request = parse_responses_request({"input": [
+        {"type": "function_call_output", "call_id": "c1",
+         "output": {"content_items": [
+             {"type": "input_image", "image_url": "https://x/y.png"}]}}]})
+    assert request.raw["messages"][0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}}]

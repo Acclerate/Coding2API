@@ -61,23 +61,33 @@ def estimate_tokens(text: str) -> float:
     return total
 
 
-def _content_text(content: Any) -> str:
-    """一条 message 的 content（字符串或 part 数组）→ 纯文本（仅用于估算）。
+def _part_text(part: Any) -> str:
+    """单个 content part 的估算用文本。
 
-    非文本 part（图片/文件）按 100 字符占位计入，避免被当成 0 而低估体积到
-    「永远不触发压缩」。
+    图片 part 按 base64 正文长度计入：早期实现对非文本 part 一律记 100 字符，
+    而一张 1MB 的图 base64 后约 1.4M 字符，按 100 估等于「永远不触发压缩」——
+    图片会话会一路撞上游输入上限。上游按图片的实际 token 计费，这里用 base64
+    长度作代理（`estimate_tokens` 仍按字符类型加权）。
     """
+    if not isinstance(part, dict):
+        return part if isinstance(part, str) else ""
+    text = part.get("text")
+    if isinstance(text, str):
+        return text
+    if part.get("type") == "image_url":
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else None
+        if isinstance(url, str):
+            return url
+    return ""
+
+
+def _content_text(content: Any) -> str:
+    """一条 message 的 content（字符串或 part 数组）→ 估算用文本。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                parts.append(text if isinstance(text, str) else "x" * 100)
-            elif isinstance(part, str):
-                parts.append(part)
-        return "".join(parts)
+        return "".join(_part_text(part) for part in content)
     if content is None:
         return ""
     return str(content)
@@ -103,8 +113,21 @@ def estimate_messages(messages: list[dict[str, Any]]) -> float:
     return sum(_message_tokens(message) for message in messages)
 
 
+def _has_non_text_part(content: Any) -> bool:
+    """content 是否含非文本 part（图片等）。"""
+    return isinstance(content, list) and any(
+        not (isinstance(part, dict) and isinstance(part.get("text"), str))
+        for part in content)
+
+
 def _truncate_content(content: Any) -> Any:
-    """单条消息内容截断：字符串直接截；part 数组整体降级为纯文本。"""
+    """单条消息内容截断：字符串直接截；part 数组整体降级为纯文本。
+
+    **含图片的 content 不截**：截 base64 只会得到一段无效 data URL（上游照样
+    400），不如原样留给上游裁决；返回同一对象，调用方据此 `continue` 跳过。
+    """
+    if _has_non_text_part(content):
+        return content
     text = _content_text(content)
     if len(text) <= _TRUNCATE_HEAD + _TRUNCATE_TAIL:
         return content

@@ -353,3 +353,35 @@ def test_openai_chat_rejects_penalty_seed_n_and_logit_bias():
     assert parsed.raw["frequency_penalty"] == 2.0
     assert parsed.raw["seed"] == 42 and parsed.raw["n"] == 3
     assert parsed.raw["logit_bias"] == {"1": -100}
+
+def test_openai_chat_validates_image_url_parts():
+    """`image_url` 内容块只校验本服务要读的字段：畸形图片是客户端错误，
+    放行会让上游回 400，而本服务按上游 4xx 冷却凭证。"""
+    from src.compat.openai.request import InvalidRequest, parse_chat_request
+
+    good = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "看图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]}]}
+    parsed = parse_chat_request(good)
+    assert parsed.messages[0]["content"][1]["image_url"]["url"].startswith("data:")
+
+    for bad_content in (
+        [{"type": "image_url", "image_url": "https://x/y.png"}],
+        [{"type": "image_url", "image_url": {}}],
+        [{"type": "image_url", "image_url": {"url": ""}}],
+        [{"type": "image_url", "image_url": {"url": 5}}],
+        [{"type": "image_url"}],
+    ):
+        with pytest.raises(InvalidRequest, match="image_url"):
+            parse_chat_request({"messages": [{"role": "user", "content": bad_content}]})
+
+    # 非图片 part 一律放行（宽松透传，语义交上游裁决）
+    parse_chat_request({"messages": [{"role": "user", "content": [
+        {"type": "input_audio", "input_audio": {"data": "x"}}]}]})
+
+    # 直接调用校验函数：非 dict 消息 / 非数组 content 一律跳过。
+    # `parse_chat_request` 已先行保证消息是 dict，故这条防御分支只能从函数入口测。
+    from src.compat.openai.request import validate_content_parts
+
+    validate_content_parts([5, {"role": "user", "content": "hi"},
+                            {"role": "user", "content": None}])

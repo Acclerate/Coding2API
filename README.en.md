@@ -209,7 +209,7 @@ codex -c "model_providers.coding2api={ name='coding2api', base_url='http://127.0
       'your task'
 ```
 
-Supports streaming text, reasoning summaries, function tool calls and `finish_reason=length` → `response.incomplete`. `text.format` maps to chat's `response_format` (`text` / `json_object` pass through; `json_schema` is expanded). **Not supported**: `store=true`, `previous_response_id` (stateless server, not faked), Responses-only tools — explicit 400, never silently degraded. `include=["reasoning.encrypted_content"]` is accepted and ignored.
+Supports streaming text, reasoning summaries, function tool calls and `finish_reason=length` → `response.incomplete`. `text.format` maps to chat's `response_format` (`text` / `json_object` pass through; `json_schema` is expanded). Content parts map as `input_text`/`text`/`output_text` → chat text and `input_image` → chat `image_url` (the URL is passed through as-is). **Not supported**: `store=true`, `previous_response_id` (stateless server, not faked), `input_file` (needs server-side file storage), Responses-only tools — explicit 400, never silently degraded. `include=["reasoning.encrypted_content"]` is accepted and ignored.
 
 ### Anthropic Messages API (Claude Code)
 
@@ -221,7 +221,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-key     # or ANTHROPIC_API_KEY (sent via x-a
 claude
 ```
 
-**Auth**: both `x-api-key` and `Authorization: Bearer` are accepted. **Streaming**: `message_start` → `content_block_start/delta/stop` → `message_delta` (with `stop_reason` and usage) → `message_stop`; no `[DONE]` sentinel, and thinking blocks get a `signature_delta` before `content_block_stop`. **Cache hit**: usage is split Anthropic-style — `input_tokens` counts only misses, hits are reported separately as `cache_read_input_tokens` (the internal `input_tokens` is OpenAI's `prompt_tokens`, which includes hits), so Claude Code shows cached tokens instead of always 0. **`count_tokens`**: `POST /v1/messages/count_tokens` estimates input tokens locally. **Not supported**: image/document blocks and Anthropic-only server tools — explicit 400.
+**Auth**: both `x-api-key` and `Authorization: Bearer` are accepted. **Streaming**: `message_start` → `content_block_start/delta/stop` → `message_delta` (with `stop_reason` and usage) → `message_stop`; no `[DONE]` sentinel, and thinking blocks get a `signature_delta` before `content_block_stop`. **Cache hit**: usage is split Anthropic-style — `input_tokens` counts only misses, hits are reported separately as `cache_read_input_tokens` (the internal `input_tokens` is OpenAI's `prompt_tokens`, which includes hits), so Claude Code shows cached tokens instead of always 0. **`count_tokens`**: `POST /v1/messages/count_tokens` estimates input tokens locally. **Images**: `image` blocks (`source.type=base64` becomes a `data:` URL, `source.type=url` passes through) are normalized to chat `image_url` parts, and images inside `tool_result.content` are kept too — pure-text content is still folded into a string, so image-free requests map byte-for-byte as before. **Not supported**: `document` blocks (PDF, no chat equivalent), `source.type=file` and Anthropic-only server tools — explicit 400.
 
 ### CC Switch one-click import
 
