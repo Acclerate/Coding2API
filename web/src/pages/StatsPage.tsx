@@ -13,7 +13,6 @@ import {
   useStatsTimeline,
 } from "../api/hooks";
 import { formatCacheRate, formatCompact, formatCredit, formatLatency, formatMoney, formatNumber, formatTime, usageErrorLabel } from "../api/display";
-import { Notice } from "../ui";
 import { ModelTrendChart } from "../components/ModelTrendChart";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -22,11 +21,15 @@ import { SortableHead } from "../components/SortableHead";
 import { UsageChart } from "../components/UsageChart";
 import { providerLabel } from "../api/providers";
 import { api } from "../api/client";
+import { buildCustomRange, toLocalInput } from "../lib/customRange";
 import type { GroupStats, StatsDrill, UsageEventRow } from "../api/types";
 import {
   Button,
   Empty,
+  Field,
+  Input,
   Metric,
+  Notice,
   Panel,
   Select,
   Table,
@@ -43,6 +46,8 @@ const RANGES = [
   { value: "7d", label: "最近 7 天", seconds: 7 * 86400 },
   { value: "30d", label: "最近 30 天", seconds: 30 * 86400 },
   { value: "all", label: "全部", seconds: 0 },
+  // 自定义：两个 datetime-local 输入，起止任意。以「本地时区、精确到分钟」为准。
+  { value: "custom", label: "自定义", seconds: -1 },
 ];
 
 /** 图表指标筛选：默认请求次数；均值类（耗时/首字）后端按成功请求归一。 */
@@ -99,6 +104,9 @@ export function StatsPage() {
   // 默认最近 24 小时：「这个池子现在怎么样」是打开用量统计的第一问题，
   // 7 天会把当天的波动摊平（与凭证池页的实时气质一致）。
   const [range, setRange] = useState("24h");
+  // 自定义范围的原始输入（`datetime-local` 文本）。只在 range==="custom" 时参与取数。
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const [metric, setMetric] = useState("requests");
   const [groupDimension, setGroupDimension] = useState("provider");
   // 分组统计默认按请求数降序（「用得最多」才是分组表的用途）
@@ -130,9 +138,20 @@ export function StatsPage() {
     () => (seconds > 0 ? Math.floor(Date.now() / 1000) - seconds : undefined),
     [seconds],
   );
+  // 自定义范围：解析失败 / 起点≥终点时为 null（端点会提示，且不参与取数）
+  const custom = useMemo(
+    () => (range === "custom" ? buildCustomRange(customFrom, customTo) : null),
+    [range, customFrom, customTo],
+  );
+  // 自定义模式下以解析结果为准；否则用预设范围的 since（无 until）
+  const effectiveSince = range === "custom" ? custom?.since : since;
+  const effectiveUntil = range === "custom" ? custom?.until : undefined;
+  // 自定义输入非法（两个框都填了却解析不出）时，提示用户而不是静默退回全量
+  const customInvalid = range === "custom" && custom === null
+    && (customFrom.trim() !== "" || customTo.trim() !== "");
 
   const events = useStatsEvents(
-    drill.username, since, eventBefore, pageSize,
+    drill.username, effectiveSince, effectiveUntil, eventBefore, pageSize,
     eventSort.sort, eventSort.order, eventOffset,
     { provider: drill.provider, model: drill.model,
       credential_id: drill.credential_id });
@@ -147,6 +166,13 @@ export function StatsPage() {
   // 切时间范围 = 换了数据集：事件驱动重置分页（不监听 since 派生值，
   // 否则值随时间漂移会把正常翻页误重置）
   const changeRange = (value: string) => {
+    // 首次切到自定义且两个框都空：预填「最近 24 小时」，否则会先按全量查一次
+    if (value === "custom" && !customFrom && !customTo) {
+      const now = new Date();
+      const start = new Date(now.getTime() - 86400 * 1000);
+      setCustomFrom(toLocalInput(start));
+      setCustomTo(toLocalInput(now));
+    }
     setRange(value);
     setPageIndex(0);
     setCursors([undefined]);
@@ -192,7 +218,7 @@ export function StatsPage() {
     setExportNotice(null);
     try {
       const { blob, rowCount, truncated } = await api.statsEventsCsv(
-        drill.username, since,
+        drill.username, effectiveSince, effectiveUntil,
         { provider: drill.provider, model: drill.model,
           credential_id: drill.credential_id });
       const url = URL.createObjectURL(blob);
@@ -213,17 +239,24 @@ export function StatsPage() {
     }
   };
 
-  const overview = useStatsOverview(session.username, undefined, since);
+  const overview = useStatsOverview(session.username, undefined, effectiveSince,
+                                    effectiveUntil);
   const byProvider = useStatsByProvider(
-    session.username, undefined, since, groupSort.sort, groupSort.order);
+    session.username, undefined, effectiveSince, effectiveUntil,
+    groupSort.sort, groupSort.order);
   const byModel = useStatsByModel(
-    session.username, undefined, since, groupSort.sort, groupSort.order);
+    session.username, undefined, effectiveSince, effectiveUntil,
+    groupSort.sort, groupSort.order);
   const byUser = useStatsByUser(
-    session.username, undefined, since, groupSort.sort, groupSort.order);
+    session.username, undefined, effectiveSince, effectiveUntil,
+    groupSort.sort, groupSort.order);
   const byCredential = useStatsByCredential(
-    session.username, undefined, since, groupSort.sort, groupSort.order);
-  const timeline = useStatsTimeline(session.username, undefined, since, metric);
-  const modelTimeline = useStatsModelTimeline(session.username, undefined, since, metric);
+    session.username, undefined, effectiveSince, effectiveUntil,
+    groupSort.sort, groupSort.order);
+  const timeline = useStatsTimeline(session.username, undefined, effectiveSince,
+                                    effectiveUntil, metric);
+  const modelTimeline = useStatsModelTimeline(session.username, undefined, effectiveSince,
+                                              effectiveUntil, metric);
 
   // 四个维度一次性取数（各维度行结构一致），切 tab 只换渲染、不再发请求；
   // viewer 看不到用户/凭证 tab，若状态残留则回落到渠道维度
@@ -287,6 +320,43 @@ export function StatsPage() {
             testId="range-tabs"
           />
         </div>
+        {/* 自定义范围：两个 datetime-local，精确到分钟、按浏览器本地时区解析。
+            起点晚于终点时提示并暂停取数（见 buildCustomRange）。 */}
+        {range === "custom" && (
+          <div className="mt-3 flex flex-wrap items-end gap-3" data-testid="custom-range">
+            <Field label="开始时间">
+              <Input
+                type="datetime-local"
+                value={customFrom}
+                data-testid="custom-from"
+                className="w-52"
+                onChange={(event) => {
+                  setCustomFrom(event.target.value);
+                  setPageIndex(0);
+                  setCursors([undefined]);
+                }}
+              />
+            </Field>
+            <Field label="结束时间">
+              <Input
+                type="datetime-local"
+                value={customTo}
+                data-testid="custom-to"
+                className="w-52"
+                onChange={(event) => {
+                  setCustomTo(event.target.value);
+                  setPageIndex(0);
+                  setCursors([undefined]);
+                }}
+              />
+            </Field>
+            {customInvalid && (
+              <p className="pb-2 text-xs text-destructive" data-testid="custom-range-invalid">
+                开始时间须早于结束时间，且格式有效；已暂停取数。
+              </p>
+            )}
+          </div>
+        )}
       </Panel>
 
       <section

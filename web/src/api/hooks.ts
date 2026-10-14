@@ -116,59 +116,64 @@ export function useTasks(username?: string) {
   });
 }
 
-export function useStatsOverview(username?: string, target?: string, since?: number) {
+export function useStatsOverview(username?: string, target?: string, since?: number,
+                                 until?: number) {
   return useQuery({
-    queryKey: adminKey(username, "stats-overview", target, since),
-    queryFn: () => api.statsOverview(target, since),
+    queryKey: adminKey(username, "stats-overview", target, since, until),
+    queryFn: () => api.statsOverview(target, since, until),
+    // 换时间范围（含自定义窗口逐字段编辑）时保留上一批数据：页面在
+    // `overview.isLoading` 时整体切骨架屏，若不带占位数据，每次改时间都会把
+    // 筛选控件一起卸载重挂——用户正在编辑的输入框会消失。
+    placeholderData: keepPreviousData,
   });
 }
 
 export function useStatsByProvider(username?: string, target?: string, since?: number,
-                                   sort?: string, order?: string) {
+                                   until?: number, sort?: string, order?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-providers", target, since, sort, order),
-    queryFn: () => api.statsByProvider(target, since, sort, order),
+    queryKey: adminKey(username, "stats-providers", target, since, until, sort, order),
+    queryFn: () => api.statsByProvider(target, since, until, sort, order),
   });
 }
 
 export function useStatsByModel(username?: string, target?: string, since?: number,
-                               sort?: string, order?: string) {
+                                until?: number, sort?: string, order?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-models", target, since, sort, order),
-    queryFn: () => api.statsByModel(target, since, sort, order),
+    queryKey: adminKey(username, "stats-models", target, since, until, sort, order),
+    queryFn: () => api.statsByModel(target, since, until, sort, order),
   });
 }
 
 export function useStatsByUser(username?: string, target?: string, since?: number,
-                              sort?: string, order?: string) {
+                               until?: number, sort?: string, order?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-users", target, since, sort, order),
-    queryFn: () => api.statsByUser(target, since, sort, order),
+    queryKey: adminKey(username, "stats-users", target, since, until, sort, order),
+    queryFn: () => api.statsByUser(target, since, until, sort, order),
   });
 }
 
 /** 按凭证聚合：数据源是明细表（仅 90 天），非 admin/operator 看不到他人凭证。 */
 export function useStatsByCredential(username?: string, target?: string, since?: number,
-                                     sort?: string, order?: string) {
+                                     until?: number, sort?: string, order?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-credentials", target, since, sort, order),
-    queryFn: () => api.statsByCredential(target, since, sort, order),
+    queryKey: adminKey(username, "stats-credentials", target, since, until, sort, order),
+    queryFn: () => api.statsByCredential(target, since, until, sort, order),
   });
 }
 
 export function useStatsTimeline(username?: string, target?: string, since?: number,
-                                  metric?: string) {
+                                 until?: number, metric?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-timeline", target, since, metric),
-    queryFn: () => api.statsTimeline(target, since, metric as StatsMetric),
+    queryKey: adminKey(username, "stats-timeline", target, since, until, metric),
+    queryFn: () => api.statsTimeline(target, since, until, metric as StatsMetric),
   });
 }
 
 export function useStatsModelTimeline(username?: string, target?: string, since?: number,
-                                      metric?: string) {
+                                      until?: number, metric?: string) {
   return useQuery({
-    queryKey: adminKey(username, "stats-model-timeline", target, since, metric),
-    queryFn: () => api.statsModelTimeline(target, since, metric as StatsMetric),
+    queryKey: adminKey(username, "stats-model-timeline", target, since, until, metric),
+    queryFn: () => api.statsModelTimeline(target, since, until, metric as StatsMetric),
   });
 }
 
@@ -177,16 +182,18 @@ export function useStatsModelTimeline(username?: string, target?: string, since?
  * `username` 是**作用域收窄**（钻取到某个用户时才有值）：为空则按会话作用域
  * （admin/operator 看全量、viewer 看自己），传值则只看该用户（viewer 传了也
  * 会被后端强制改回自己）。 */
-export function useStatsEvents(username?: string, since?: number, before?: number,
-                               limit?: number, sort?: string, order?: string,
-                               offset?: number, filters?: StatsEventFilters) {
+export function useStatsEvents(username?: string, since?: number, until?: number,
+                               before?: number, limit?: number, sort?: string,
+                               order?: string, offset?: number,
+                               filters?: StatsEventFilters) {
   const provider = filters?.provider;
   const model = filters?.model;
   const credentialId = filters?.credential_id;
   return useQuery({
-    queryKey: adminKey(username, "stats-events", since, before, limit, sort, order,
+    queryKey: adminKey(username, "stats-events", since, until, before, limit, sort, order,
                        offset, provider, model, credentialId),
-    queryFn: () => api.statsEvents(username, since, before, limit, sort, order, offset,
+    queryFn: () => api.statsEvents(username, since, until, before, limit, sort, order,
+                                   offset,
                                    { provider, model, credential_id: credentialId }),
     placeholderData: keepPreviousData,
   });

@@ -52,3 +52,27 @@ def test_stats_requires_session(admin_client):
     _app, client = admin_client
     client.cookies.clear()
     assert client.get("/api/stats/overview").status_code == 401
+
+def test_stats_endpoints_accept_custom_window(admin_client):
+    """自定义窗口：`since` / `until` 透传到查询层（半开区间）。
+
+    用真实时刻写两条，落在不同小时桶；`until` 只留前一条，`since` 只留后一条。
+    """
+    app, client = admin_client
+    collector = app.state.stats_collector
+    collector.record(username="root", provider="trae", model="m", ok=True, now=1000)
+    collector.record(username="root", provider="trae", model="m", ok=True, now=9000)
+    assert client.get("/api/stats/overview",
+                      params={"until": 7200}).json()["requests"] == 1
+    assert client.get("/api/stats/overview",
+                      params={"since": 7200}).json()["requests"] == 1
+    assert client.get("/api/stats/by-provider",
+                      params={"until": 7200}).json()["providers"][0]["requests"] == 1
+    assert client.get("/api/stats/timeline",
+                      params={"until": 7200}).json()["points"][0]["trae"] == 1
+    assert len(client.get("/api/stats/events",
+                          params={"until": 7200}).json()["events"]) == 1
+    response = client.get("/api/stats/events", params={"until": 7200, "format": "csv"})
+    assert response.status_code == 200
+    assert response.headers["x-export-row-count"] == "1"
+

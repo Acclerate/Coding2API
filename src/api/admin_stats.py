@@ -41,57 +41,70 @@ def create_router(services: Services) -> APIRouter:
 
     @router.get("/api/stats/overview")
     async def stats_overview(principal=Depends(principal_from_request),
-                             username: str | None = None, since: int | None = None):
-        return stats_query.overview(username=_scope(principal, username), since=since)
+                             username: str | None = None, since: int | None = None,
+                             until: int | None = None):
+        return stats_query.overview(username=_scope(principal, username), since=since,
+                                    until=until)
 
     @router.get("/api/stats/by-provider")
     async def stats_by_provider(principal=Depends(principal_from_request),
                                 username: str | None = None, since: int | None = None,
+                                until: int | None = None,
                                 sort: str | None = None, order: str | None = None):
         return {"providers": stats_query.by_provider(
-            username=_scope(principal, username), since=since, sort=sort, order=order)}
+            username=_scope(principal, username), since=since, until=until,
+            sort=sort, order=order)}
 
     @router.get("/api/stats/by-model")
     async def stats_by_model(principal=Depends(principal_from_request),
                              username: str | None = None, since: int | None = None,
+                             until: int | None = None,
                              sort: str | None = None, order: str | None = None):
         return {"models": stats_query.by_model(
-            username=_scope(principal, username), since=since, sort=sort, order=order)}
+            username=_scope(principal, username), since=since, until=until,
+            sort=sort, order=order)}
 
     @router.get("/api/stats/timeline")
     async def stats_timeline(principal=Depends(principal_from_request),
                              username: str | None = None, since: int | None = None,
+                             until: int | None = None,
                              metric: str = "requests"):
         return {"points": stats_query.timeline(
-            username=_scope(principal, username), since=since, metric=metric)}
+            username=_scope(principal, username), since=since, until=until, metric=metric)}
 
     @router.get("/api/stats/model-timeline")
     async def stats_model_timeline(principal=Depends(principal_from_request),
                                    username: str | None = None, since: int | None = None,
+                                   until: int | None = None,
                                    metric: str = "requests"):
         return stats_query.model_timeline(
-            username=_scope(principal, username), since=since, metric=metric)
+            username=_scope(principal, username), since=since, until=until, metric=metric)
 
     @router.get("/api/stats/by-user")
     async def stats_by_user(principal=Depends(principal_from_request),
                             username: str | None = None, since: int | None = None,
+                            until: int | None = None,
                             sort: str | None = None, order: str | None = None):
         return {"users": stats_query.by_user(
-            username=_scope(principal, username), since=since, sort=sort, order=order)}
+            username=_scope(principal, username), since=since, until=until,
+            sort=sort, order=order)}
 
     @router.get("/api/stats/by-credential")
     async def stats_by_credential(principal=Depends(principal_from_request),
                                   username: str | None = None, since: int | None = None,
+                                  until: int | None = None,
                                   sort: str | None = None, order: str | None = None):
         # 凭证昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见，
         # 与明细端点同口径；provider 无隐私顾虑，无条件下发（前端画渠道 icon）
         return {"credentials": stats_query.by_credential(
-            username=_scope(principal, username), since=since, sort=sort, order=order,
+            username=_scope(principal, username), since=since, until=until,
+            sort=sort, order=order,
             include_credential_name=principal.is_operator)}
 
     @router.get("/api/stats/events")
     async def stats_events(principal=Depends(principal_from_request),
                            username: str | None = None, since: int | None = None,
+                           until: int | None = None,
                            before: int | None = None, limit: int = 50,
                            offset: int = 0, sort: str | None = None,
                            order: str | None = None,
@@ -107,7 +120,7 @@ def create_router(services: Services) -> APIRouter:
             # 且文件名/内容都带池级信息，viewer 不该有。
             require_operator(principal)
             rows = stats_query.export_events(
-                username=scope, since=since, include_credential_name=names,
+                username=scope, since=since, until=until, include_credential_name=names,
                 provider=provider, model=model, credential_id=credential_id)
             truncated = len(rows) > EXPORT_MAX_ROWS
             rows = rows[:EXPORT_MAX_ROWS]
@@ -120,7 +133,7 @@ def create_router(services: Services) -> APIRouter:
             }
             return StreamingResponse(
                 _csv_stream(rows), media_type="text/csv; charset=utf-8", headers=headers)
-        return stats_query.events(username=scope, since=since,
+        return stats_query.events(username=scope, since=since, until=until,
                                   before=before, limit=max(1, min(limit, 200)),
                                   offset=max(0, offset), sort=sort, order=order,
                                   provider=provider, model=model,

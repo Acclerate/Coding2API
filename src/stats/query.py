@@ -99,9 +99,18 @@ class StatsQuery:
     def _where(*, username: str | None = None, provider: str | None = None,
                model: str | None = None, credential_id: str | None = None,
                since: int | None = None, since_col: str = "ts",
+               until: int | None = None, until_col: str = "ts",
                before: int | None = None, before_col: str = "rowid",
                alias: str = "") -> tuple[str, list[Any]]:
-        """拼 WHERE 子句与参数。alias 为 JOIN 时的表前缀（如 "e."）。"""
+        """拼 WHERE 子句与参数。alias 为 JOIN 时的表前缀（如 "e."）。
+
+        `since` 与 `until` 是**同一个时间窗的两端**（半开区间 `[since, until)`），
+        区别只在取值列：明细表用 `ts`，小时汇总用 `hour_utc`。两者可单独给
+        （只给一端 = 单边不限），也可都不给（全部，与历史行为一致）。
+
+        `before` 是**游标**不是时间：它按 `rowid`（插入序）取「更小的一页」，
+        与 90 天时间窗无关，故与 `until` 分开、各用一列。
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if username is not None:
@@ -119,22 +128,31 @@ class StatsQuery:
         if since is not None:
             clauses.append(f"{alias}{since_col} >= ?")
             params.append(since)
+        if until is not None:
+            # 半开区间上界：`until` 本身不计入（与 since 的闭下界区分），
+            # 前端按此把「结束时间」当作瞬时右端点，前后两次查询不重叠
+            clauses.append(f"{alias}{until_col} < ?")
+            params.append(until)
         if before is not None:
             clauses.append(f"{alias}{before_col} < ?")
             params.append(before)
         return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
 
     def overview(self, *, username: str | None = None, provider: str | None = None,
-                 since: int | None = None) -> dict[str, Any]:
+                 since: int | None = None, until: int | None = None) -> dict[str, Any]:
         """总览。admin 传 username=None 看全局；普通用户只看自己。
 
         数据源是 `usage_hourly`（与 timeline/model-timeline 同源）：
         明细只留 90 天，读明细会让选「全部」时总览小于图表；小时汇总永久保留。
         代价：最近 ≤5 分钟未进汇总的请求不计入（retention 每 5 分钟 rollup），
         刷新一次即可。延迟类均值统一按 `ok_count` 归一（与图表同口径）。
+
+        `since` / `until`：自定义时间窗两端（半开 `[since, until)`），按小时桶
+        过滤，与 `timeline` 同口径。
         """
         where, params = self._where(username=username, provider=provider,
-                                    since=since, since_col="hour_utc")
+                                    since=since, since_col="hour_utc",
+                                    until=until, until_col="hour_utc")
 
         row = self._db.connect().execute(
             f"""
@@ -233,12 +251,14 @@ class StatsQuery:
         }
 
     def _group_hourly(self, key: str, *, username: str | None = None,
-                      since: int | None = None, sort: str | None = None,
+                      since: int | None = None, until: int | None = None,
+                      sort: str | None = None,
                       order: str | None = None) -> list[dict[str, Any]]:
         """在小时汇总上按 `key` 列聚合（渠道 / 模型 / 用户三个维度共用）。"""
         if key not in _GROUP_KEYS:
             raise ValueError(f"非法分组键: {key!r}")
-        where, params = self._where(username=username, since=since, since_col="hour_utc")
+        where, params = self._where(username=username, since=since, since_col="hour_utc",
+                                    until=until, until_col="hour_utc")
         rows = self._db.connect().execute(
             f"""
             SELECT {key} AS group_key, COALESCE(SUM(requests), 0) AS requests,
@@ -258,7 +278,8 @@ class StatsQuery:
         return [self._group_row(row, key) for row in rows]
 
     def _group_events(self, key: str, *, username: str | None = None,
-                      since: int | None = None, sort: str | None = None,
+                      since: int | None = None, until: int | None = None,
+                      sort: str | None = None,
                       order: str | None = None, include_credential_name: bool = False,
                       ) -> list[dict[str, Any]]:
         """在明细上按 `key` 列聚合。
@@ -274,7 +295,7 @@ class StatsQuery:
         if key not in _GROUP_KEYS:
             raise ValueError(f"非法分组键: {key!r}")
         where, params = self._where(username=username, since=since, since_col="ts",
-                                    alias="e.")
+                                    until=until, until_col="ts", alias="e.")
         # 分组键为空的行（无凭证的预热失败等）没有可归属对象，不参与分组；
         # _where 无条件时返回空串，这里补 WHERE 关键词
         clause = f"{where} AND e.{key} IS NOT NULL" if where else f"WHERE e.{key} IS NOT NULL"
@@ -307,28 +328,32 @@ class StatsQuery:
         return [self._group_row(row, key, ("provider", "credential_name")) for row in rows]
 
     def by_provider(self, *, username: str | None = None,
-                    since: int | None = None, sort: str | None = None,
+                    since: int | None = None, until: int | None = None,
+                    sort: str | None = None,
                     order: str | None = None) -> list[dict[str, Any]]:
         """按渠道聚合（读小时汇总，与总览/图表同源）。"""
-        return self._group_hourly("provider", username=username, since=since,
+        return self._group_hourly("provider", username=username, since=since, until=until,
                                   sort=sort, order=order)
 
     def by_model(self, *, username: str | None = None,
-                 since: int | None = None, sort: str | None = None,
+                 since: int | None = None, until: int | None = None,
+                 sort: str | None = None,
                  order: str | None = None) -> list[dict[str, Any]]:
         """按模型聚合（读小时汇总，与总览/图表同源）。"""
-        return self._group_hourly("model", username=username, since=since,
+        return self._group_hourly("model", username=username, since=since, until=until,
                                   sort=sort, order=order)
 
     def by_user(self, *, username: str | None = None,
-                since: int | None = None, sort: str | None = None,
+                since: int | None = None, until: int | None = None,
+                sort: str | None = None,
                 order: str | None = None) -> list[dict[str, Any]]:
         """按用户聚合（读小时汇总，与总览/图表同源）。"""
-        return self._group_hourly("username", username=username, since=since,
+        return self._group_hourly("username", username=username, since=since, until=until,
                                   sort=sort, order=order)
 
     def by_credential(self, *, username: str | None = None,
-                      since: int | None = None, sort: str | None = None,
+                      since: int | None = None, until: int | None = None,
+                      sort: str | None = None,
                       order: str | None = None,
                       include_credential_name: bool = False) -> list[dict[str, Any]]:
         """按凭证聚合（读明细表：小时汇总主键里没有 credential_id）。
@@ -337,11 +362,12 @@ class StatsQuery:
         显示凭证名；未授权/无昵称/凭证已删除时为 None，前端回退显示 ID 前 12 位）。
         """
         return self._group_events("credential_id", username=username, since=since,
-                                  sort=sort, order=order,
+                                  until=until, sort=sort, order=order,
                                   include_credential_name=include_credential_name)
 
     def timeline(self, *, username: str | None = None,
-                 since: int | None = None, metric: str = "requests") -> list[dict[str, Any]]:
+                 since: int | None = None, until: int | None = None,
+                 metric: str = "requests") -> list[dict[str, Any]]:
         """按小时的指标时间序列（usage_hourly 聚合，跨 model 汇总）。
 
         每个点含当日出现过的各渠道指标值（按 metric 变化：请求数 / 总 token /
@@ -351,7 +377,8 @@ class StatsQuery:
         会因缺键断线。
         """
         expr, _as_mean = self._metric_sql(metric)
-        where, params = self._where(username=username, since=since, since_col="hour_utc")
+        where, params = self._where(username=username, since=since, since_col="hour_utc",
+                                    until=until, until_col="hour_utc")
         rows = self._db.connect().execute(
             f"""
             SELECT hour_utc, provider,
@@ -377,6 +404,7 @@ class StatsQuery:
         ]
 
     def events(self, *, username: str | None = None, since: int | None = None,
+               until: int | None = None,
                before: int | None = None, limit: int = 50,
                include_credential_name: bool = False, sort: str | None = None,
                order: str | None = None, offset: int = 0,
@@ -417,8 +445,8 @@ class StatsQuery:
         )
         filters = {"provider": provider, "model": model, "credential_id": credential_id}
         if cursor_mode:
-            where, params = self._where(username=username, since=since, before=before,
-                                        alias="e.", **filters)
+            where, params = self._where(username=username, since=since, until=until,
+                                        before=before, alias="e.", **filters)
             rows = self._db.connect().execute(
                 f"""
                 SELECT {columns}
@@ -435,7 +463,8 @@ class StatsQuery:
                 "total": None,
             }
         # offset 模式：before 不参与（游标语义仅对 rowid 降序成立）
-        where, params = self._where(username=username, since=since, alias="e.", **filters)
+        where, params = self._where(username=username, since=since, until=until,
+                                    alias="e.", **filters)
         total = self._db.connect().execute(
             f"SELECT COUNT(*) AS n FROM usage_events e {where}", params).fetchone()["n"]
         rows = self._db.connect().execute(
@@ -453,6 +482,7 @@ class StatsQuery:
         }
 
     def export_events(self, *, username: str | None = None, since: int | None = None,
+                      until: int | None = None,
                       include_credential_name: bool = False,
                       provider: str | None = None, model: str | None = None,
                       credential_id: str | None = None,
@@ -464,7 +494,7 @@ class StatsQuery:
         告知用户「收窄条件」，而不是静默给一份不全的文件）。
         """
         where, params = self._where(
-            username=username, since=since, alias="e.",
+            username=username, since=since, until=until, alias="e.",
             provider=provider, model=model, credential_id=credential_id)
         name_expr = ("NULLIF(c.nickname, '')" if include_credential_name else "NULL")
         rows = self._db.connect().execute(
@@ -482,7 +512,8 @@ class StatsQuery:
         return [dict(row) for row in rows]
 
     def model_timeline(self, *, username: str | None = None,
-                       since: int | None = None, top: int = 6,
+                       since: int | None = None, until: int | None = None,
+                       top: int = 6,
                        metric: str = "requests") -> dict[str, Any]:
         """按小时的各模型指标趋势（usage_hourly 聚合）。
 
@@ -491,7 +522,8 @@ class StatsQuery:
         返回结构 {models, points} 不变。
         """
         expr, as_mean = self._metric_sql(metric)
-        where, params = self._where(username=username, since=since, since_col="hour_utc")
+        where, params = self._where(username=username, since=since, since_col="hour_utc",
+                                    until=until, until_col="hour_utc")
         rows = self._db.connect().execute(
             f"""
             SELECT hour_utc, model, SUM(requests) AS requests,

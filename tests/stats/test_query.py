@@ -235,6 +235,45 @@ def test_stats_overview_since_filter(stats):
     collector.record(username="u", provider="trae", model="m", ok=True, now=9000)
     assert query.overview(username="u", since=5000)["requests"] == 1
 
+def test_stats_until_is_exclusive_upper_bound(stats):
+    """until 是半开上界的排除端：同一时刻的数据既不在「..到 T」也不在「T..」重复计。
+
+    两条记录落在不同小时桶（1000 → 桶 0，9000 → 桶 7200）。until=7200 只留桶 0，
+    且 hour_utc < 7200 严格成立（7200 本身被排除）。
+    """
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True, now=1000)
+    collector.record(username="u", provider="trae", model="m", ok=True, now=9000)
+    assert query.overview(username="u", until=7200)["requests"] == 1
+    assert query.overview(username="u", since=7200)["requests"] == 1
+    # 两端都限：闭下界 7200 + 开上界 9000 → 含桶 7200，含桶 9000 被排除（此处仅 1 条）
+    assert query.overview(username="u", since=7200, until=9000)["requests"] == 1
+    # until 落在桶下界：桶 0（hour_utc=0）不满足 0 < 0，被排除
+    assert query.overview(username="u", until=0)["requests"] == 0
+
+def test_stats_until_filters_groups_and_timeline(stats):
+    """until 贯通分组（逐小时汇总与逐明细两条路径）与时间序列。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True, now=1000)
+    collector.record(username="u", provider="trae", model="m", ok=True, now=9000)
+    collector.rollup_hourly()
+    # 小时汇总路径：桶 0 与桶 7200，until=7200 只留桶 0
+    assert query.by_provider(username="u", until=7200)[0]["requests"] == 1
+    assert len(query.timeline(username="u", until=7200)) == 1
+    # 明细路径（ts 列）：凭证维度读 usage_events，until 也按 ts 过滤
+    by_cred = query.by_credential(username="u", until=7200)
+    assert sum(row["requests"] for row in by_cred) == 0  # 明细无 credential_id 不分组
+    events = query.events(username="u", until=7200)["events"]
+    assert [row["ts"] for row in events] == [1000]
+
+def test_stats_export_events_until_filter(stats):
+    """导出取数同样尊重 until（exports 与 events 共用 _where 的时间窗）。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True, now=1000)
+    collector.record(username="u", provider="trae", model="m", ok=True, now=9000)
+    rows = query.export_events(username="u", until=7200)
+    assert [row["ts"] for row in rows] == [1000]
+
 def test_stats_hourly_rolls_via_retention(stats):
     """record 即时累加汇总（总览/图表不必等一轮 retention）；rollup 幂等不双计。"""
     collector, query = stats

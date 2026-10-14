@@ -217,34 +217,44 @@ export const api = {
     request<ModelCatalogResponse>(`/api/model-catalog${query({ sort, order })}`),
 
   // ---------------------------------------------------------------- 统计
-  statsOverview: (username?: string, since?: number) =>
-    request<StatsOverview>(`/api/stats/overview${query({ username, since })}`),
-  statsByProvider: (username?: string, since?: number, sort?: string, order?: string) =>
+  // `since` / `until`：自定义时间窗两端（半开 `[since, until)`，epoch 秒）。
+  // 两者都省 = 全部；只给一端 = 单边不限。`until` 紧跟 `since`，避免调用点
+  // 在长参数列表里错位。
+  statsOverview: (username?: string, since?: number, until?: number) =>
+    request<StatsOverview>(`/api/stats/overview${query({ username, since, until })}`),
+  statsByProvider: (username?: string, since?: number, until?: number,
+                    sort?: string, order?: string) =>
     request<{ providers: ProviderStats[] }>(
-      `/api/stats/by-provider${query({ username, since, sort, order })}`),
-  statsByModel: (username?: string, since?: number, sort?: string, order?: string) =>
+      `/api/stats/by-provider${query({ username, since, until, sort, order })}`),
+  statsByModel: (username?: string, since?: number, until?: number,
+                 sort?: string, order?: string) =>
     request<{ models: ModelStats[] }>(
-      `/api/stats/by-model${query({ username, since, sort, order })}`),
-  statsByUser: (username?: string, since?: number, sort?: string, order?: string) =>
+      `/api/stats/by-model${query({ username, since, until, sort, order })}`),
+  statsByUser: (username?: string, since?: number, until?: number,
+                sort?: string, order?: string) =>
     request<{ users: UserStats[] }>(
-      `/api/stats/by-user${query({ username, since, sort, order })}`),
-  statsByCredential: (username?: string, since?: number, sort?: string, order?: string) =>
+      `/api/stats/by-user${query({ username, since, until, sort, order })}`),
+  statsByCredential: (username?: string, since?: number, until?: number,
+                      sort?: string, order?: string) =>
     request<{ credentials: CredentialStats[] }>(
-      `/api/stats/by-credential${query({ username, since, sort, order })}`),
-  statsTimeline: (username?: string, since?: number, metric?: StatsMetric) =>
-    request<{ points: TimelinePoint[] }>(`/api/stats/timeline${query({ username, since, metric })}`),
-  statsModelTimeline: (username?: string, since?: number, metric?: StatsMetric) =>
-    request<ModelTimelineResponse>(`/api/stats/model-timeline${query({ username, since, metric })}`),
-  statsEvents: (username?: string, since?: number, before?: number, limit?: number,
-                sort?: string, order?: string, offset?: number,
+      `/api/stats/by-credential${query({ username, since, until, sort, order })}`),
+  statsTimeline: (username?: string, since?: number, until?: number, metric?: StatsMetric) =>
+    request<{ points: TimelinePoint[] }>(
+      `/api/stats/timeline${query({ username, since, until, metric })}`),
+  statsModelTimeline: (username?: string, since?: number, until?: number,
+                       metric?: StatsMetric) =>
+    request<ModelTimelineResponse>(
+      `/api/stats/model-timeline${query({ username, since, until, metric })}`),
+  statsEvents: (username?: string, since?: number, until?: number, before?: number,
+                limit?: number, sort?: string, order?: string, offset?: number,
                 filters?: StatsEventFilters) =>
     request<StatsEventsResponse>(
-      `/api/stats/events${query({ username, since, before, limit, sort, order, offset,
-                                  ...filters })}`),
+      `/api/stats/events${query({ username, since, until, before, limit, sort, order,
+                                  offset, ...filters })}`),
   /** 明细 CSV 导出：返回文件内容与截断标记（响应头），由页面触发下载。 */
-  statsEventsCsv: async (username?: string, since?: number,
+  statsEventsCsv: async (username?: string, since?: number, until?: number,
                          filters?: StatsEventFilters): Promise<CsvExport> => {
-    const path = `/api/stats/events${query({ username, since, ...filters, format: "csv" })}`;
+    const path = `/api/stats/events${query({ username, since, until, ...filters, format: "csv" })}`;
     const response = await fetch(path, { credentials: "same-origin" });
     if (!response.ok) {
       // 与 request() 同口径地还原错误体，页面才能弹一致的中文提示
