@@ -176,7 +176,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 - **会话**：Cookie `SameSite=Lax` + 写操作 CSRF 校验（含 logout）；**无 Cookie 的写端点（登录 / `/authorize`）也做跨站防护**：登录按 Origin/Referer 同源校验（防 login CSRF），`/authorize` 按上游原样回显的 `loginTraceID` 绑定到**发起登录那一次**（TRAE 回调本就跨源，Origin/Referer 既拦不住真攻击也可能误杀真回调）；会话与 API Key 除签名 / 摘要外校验用户仍存在、启用且 epoch 一致。
 - **错误响应不回流上游正文**：`/v1` 与外层的错误文案只带受控标识（HTTP 状态码 / 上游业务码 / 异常类名），上游错误体摘要只进服务端日志；未匹配的 `/api`、`/v1` 路径返回 JSON 404（不落到 SPA 的 200 + HTML）。**日志脱敏**：不打印 Token、完整请求体；审计写 INFO（含操作人），**绝不记密码/令牌明文**。
 - **请求 ID 是客户端可写输入**：入站 `X-Request-ID` 按白名单字符集与长度（`[A-Za-z0-9._:-]{1,128}`）校验后才采信与回显，不合法一律丢弃改用自生成——否则日志与统计列会被人塞进换行/超长串。响应头回显最终 ID（含自生成值），不伪装成上游追踪。
-- **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。
+- **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。`/api/stats/events?format=csv`（整份明细导出）同样仅 admin/operator。
 - **热更配置写入即校验**：float 拒 NaN/±inf；字符串类有长度上限；告警 webhook 只接受 `http(s)` 并做 **SSRF 校验**（写入期拒字面量内网 / 回环 / 链路本地 / 保留 / 多播 / 未指定地址，**投递前再按 DNS 解析结果复核一次**、解析失败即阻断），外发载荷对 `nickname` 打码，多地址并发投递并加总预算。告警出站 client `trust_env=False`，不吃宿主代理环境变量。
 - **上游流解析有界**：SSE 单行与单帧缓冲设上限，非 2xx 错误体有界读取；OAuth state store 的 owner/consume 有 TTL 判定。**入站解析把关**：三个出站协议在入口拒绝越界数值字段（`max_tokens` ≤0 或超上限、`temperature`/`top_p` 为 NaN/Inf）与 JSON 里的 `NaN`/`Infinity`。
 - **OAuth 登录弹窗**只允许 `http(s)` scheme，弹窗 `opener` 置空。**库版本守卫**：`user_version` 高于本程序时 `apply_schema` 拒绝执行。`scripts/hash_password` / `create_user` 支持 `--password-stdin`；拒绝含 `:` / 换行的用户名。

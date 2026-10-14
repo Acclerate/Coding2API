@@ -301,6 +301,10 @@ The drawer under a credential's quota number lists the **net change between cons
 
 The **Grouped stats** panel tabs four dimensions (channel / model / user / credential) over one table (requests / ok / success rate / input / output / cached / credit / cost), endpoints `GET /api/stats/by-provider|by-model|by-user|by-credential`. Default sort is requests descending; **user and credential tabs are admin/operator only**. **Scope differs**: channel / model / user read the **hourly rollup** (permanent; the last 5 minutes are not yet counted); the **credential** dimension reads request detail (the rollup key has no `credential_id`), covering the **last 90 days**.
 
+**Click-to-drill**: clicking any group row drills the **Request detail** panel below into that dimension (channel / model / credential filter by the same-named column; the user dimension goes through the scope parameter). Conditions stack across dimensions, the active filters show as chips above the panel, and one click clears them. `GET /api/stats/events` therefore accepts `provider` / `model` / `credential_id` filters (AND semantics).
+
+**CSV export**: the **Export CSV** button (admin/operator only) exports request detail for the **current time range and drill filters**, via `GET /api/stats/events?format=csv`. The file carries a UTF-8 BOM (so Excel detects the encoding), `\r\n` line endings, ISO 8601 (UTC) timestamps, and prefixes a leading apostrophe on **text** cells starting with `= + - @` (or tab/CR) to block spreadsheet formula injection (numbers, negatives included, are left as-is). Export is capped at 10000 rows; beyond that it truncates and flags `X-Export-Truncated: 1` in the response headers, and the page tells the user to narrow the conditions.
+
 If history looks light (pre-upgrade detail not covered, or detail backfilled without re-rolling), run `python3 scripts/rollup_hourly.py --apply` (preview by default, backs up before writing, idempotent). It reports gaps and warns about intervals whose detail has passed the 90-day retention and cannot be restored.
 
 ### List sorting

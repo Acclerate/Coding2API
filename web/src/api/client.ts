@@ -28,6 +28,8 @@ import type {
   TimelinePoint,
   ModelTimelineResponse,
   StatsEventsResponse,
+  StatsEventFilters,
+  CsvExport,
   SettingsResponse,
   TasksResponse,
   UpstreamAuthPoll,
@@ -234,9 +236,37 @@ export const api = {
   statsModelTimeline: (username?: string, since?: number, metric?: StatsMetric) =>
     request<ModelTimelineResponse>(`/api/stats/model-timeline${query({ username, since, metric })}`),
   statsEvents: (username?: string, since?: number, before?: number, limit?: number,
-                sort?: string, order?: string, offset?: number) =>
+                sort?: string, order?: string, offset?: number,
+                filters?: StatsEventFilters) =>
     request<StatsEventsResponse>(
-      `/api/stats/events${query({ username, since, before, limit, sort, order, offset })}`),
+      `/api/stats/events${query({ username, since, before, limit, sort, order, offset,
+                                  ...filters })}`),
+  /** 明细 CSV 导出：返回文件内容与截断标记（响应头），由页面触发下载。 */
+  statsEventsCsv: async (username?: string, since?: number,
+                         filters?: StatsEventFilters): Promise<CsvExport> => {
+    const path = `/api/stats/events${query({ username, since, ...filters, format: "csv" })}`;
+    const response = await fetch(path, { credentials: "same-origin" });
+    if (!response.ok) {
+      // 与 request() 同口径地还原错误体，页面才能弹一致的中文提示
+      let code = "error";
+      let message = `导出失败（HTTP ${response.status}）`;
+      try {
+        const body = await response.json();
+        if (body?.error) {
+          code = body.error.code ?? code;
+          message = body.error.message ?? message;
+        }
+      } catch {
+        // 非 JSON 错误体（如反向代理的 HTML）：保留兜底文案
+      }
+      throw new ApiError(response.status, code, message);
+    }
+    return {
+      blob: await response.blob(),
+      rowCount: Number(response.headers.get("X-Export-Row-Count") ?? 0),
+      truncated: response.headers.get("X-Export-Truncated") === "1",
+    };
+  },
 };
 
 function query(params: Record<string, string | number | undefined>): string {

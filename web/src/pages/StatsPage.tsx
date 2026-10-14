@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Activity, BarChart3, Coins, CreditCard, Gauge, Timer, Wallet } from "lucide-react";
+import { Activity, BarChart3, Coins, CreditCard, Download, Gauge, Timer, Wallet, X } from "lucide-react";
 import { useSessionContext } from "../Layout";
 import { useSort } from "../hooks/useSort";
 import {
@@ -21,7 +21,8 @@ import { ProviderIcon } from "../components/ProviderIcon";
 import { SortableHead } from "../components/SortableHead";
 import { UsageChart } from "../components/UsageChart";
 import { providerLabel } from "../api/providers";
-import type { GroupStats, UsageEventRow } from "../api/types";
+import { api } from "../api/client";
+import type { GroupStats, StatsDrill, UsageEventRow } from "../api/types";
 import {
   Button,
   Empty,
@@ -109,6 +110,11 @@ export function StatsPage() {
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState(20);
   const [cursors, setCursors] = useState<(number | undefined)[]>([undefined]);
+  // 钻取：点分组表的行 → 只看该渠道/模型/用户/凭证的明细。空对象 = 未钻取。
+  const [drill, setDrill] = useState<StatsDrill>({});
+  // 导出反馈（行数/截断/失败），一次性展示，再次导出即覆盖
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   // 游标分页只在「按 rowid 降序」时成立：换列即改用 offset 分页
   const cursorMode = eventSort.sort === "time" && eventSort.order === "desc";
   const eventBefore = cursorMode
@@ -126,8 +132,10 @@ export function StatsPage() {
   );
 
   const events = useStatsEvents(
-    session.username, since, eventBefore, pageSize,
-    eventSort.sort, eventSort.order, eventOffset);
+    drill.username, since, eventBefore, pageSize,
+    eventSort.sort, eventSort.order, eventOffset,
+    { provider: drill.provider, model: drill.model,
+      credential_id: drill.credential_id });
   const eventRows = events.data?.events ?? [];
   // 游标模式看 next_before；offset 模式看 total（还有下一页 = 已加载 < 总数）
   const hasNextPage = cursorMode
@@ -154,6 +162,55 @@ export function StatsPage() {
     eventSort.toggle(columnKey);
     setPageIndex(0);
     setCursors([undefined]);
+  };
+
+  /**
+   * 应用钻取：**合并**而非替换——分组表各维度独立（渠道/模型/用户/凭证），
+   * 依次点行即可层层收窄（provider=trae AND model=glm-5.2），这正是钻取
+   * 相对「跳转看全量」的价值。换过滤即换数据集，分页回到第一页。
+   */
+  const applyDrill = (next: StatsDrill) => {
+    setDrill((prev) => ({ ...prev, ...next }));
+    setPageIndex(0);
+    setCursors([undefined]);
+  };
+
+  const clearDrill = () => {
+    setDrill({});
+    setPageIndex(0);
+    setCursors([undefined]);
+  };
+
+  const drillLabels: string[] = [];
+  if (drill.username) drillLabels.push(`用户：${drill.username}`);
+  if (drill.provider) drillLabels.push(`渠道：${providerLabel(drill.provider)}`);
+  if (drill.model) drillLabels.push(`模型：${drill.model}`);
+  if (drill.credential_id) drillLabels.push(`凭证：${drill.credential_id.slice(0, 12)}`);
+
+  const exportCsv = async () => {
+    setExporting(true);
+    setExportNotice(null);
+    try {
+      const { blob, rowCount, truncated } = await api.statsEventsCsv(
+        drill.username, since,
+        { provider: drill.provider, model: drill.model,
+          credential_id: drill.credential_id });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `coding2api-events-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setExportNotice(truncated
+        ? `已导出 ${rowCount} 条，达到上限被截断；请缩小时间范围或加筛选后重试。`
+        : `已导出 ${rowCount} 条明细。`);
+    } catch (error) {
+      setExportNotice(error instanceof Error ? `导出失败：${error.message}` : "导出失败。");
+    } finally {
+      setExporting(false);
+    }
   };
 
   const overview = useStatsOverview(session.username, undefined, since);
@@ -348,12 +405,33 @@ export function StatsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {groupRows.map((row) => (
-                <TableRow key={String(row[groupKey])}>
+              {groupRows.map((row) => {
+                // 点行 = 钻取到该维度的明细；分组键 → 明细过滤字段的映射：
+                // provider/model/credential_id 直接同名，用户维度走作用域 username
+                const keyValue = String(row[groupKey]);
+                const next: StatsDrill = group.value === "user"
+                  ? { username: keyValue }
+                  : group.value === "provider" ? { provider: keyValue }
+                    : group.value === "model" ? { model: keyValue }
+                      : { credential_id: keyValue };
+                return (
+                <TableRow key={keyValue}
+                          data-testid={`group-row-${keyValue}`}
+                          className="cursor-pointer"
+                          tabIndex={0}
+                          role="button"
+                          aria-label={`查看 ${keyValue} 的请求明细`}
+                          onClick={() => applyDrill(next)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              applyDrill(next);
+                            }
+                          }}>
                   <TableCell className="max-w-48 truncate"
                              title={groupKey === "credential_id"
                                ? (row.credential_id ?? undefined)
-                               : String(row[groupKey])}>
+                               : keyValue}>
                     {groupKey === "provider" ? (
                       <span className="inline-flex items-center gap-1.5">
                         <ProviderIcon provider={String(row.provider)} size={13} />
@@ -366,7 +444,7 @@ export function StatsPage() {
                         {credentialCellLabel(row.credential_name, row.credential_id)}
                       </span>
                     ) : (
-                      String(row[groupKey])
+                      keyValue
                     )}
                   </TableCell>
                   <TableCell className="text-right tabular-nums">{formatNumber(row.requests)}</TableCell>
@@ -388,7 +466,8 @@ export function StatsPage() {
                     {formatMoney(row.cost_cny, "CNY")}
                   </TableCell>
                 </TableRow>
-              ))}
+                );
+              })}
             </TableBody>
           </Table>
         )}
@@ -396,10 +475,11 @@ export function StatsPage() {
           {groupKey === "credential_id"
             ? "凭证分组取自逐请求明细（仅保留 90 天），无凭证的预热失败等请求不计入。"
             : "各维度数据源为小时汇总（永久保留），最近 5 分钟内的请求可能尚未计入。"}
+          {" "}点任意一行可钻取到下方「请求明细」。
         </p>
       </Panel>
 
-      <Panel title="请求明细" action={
+      <Panel data-testid="events-panel" title="请求明细" action={
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>共 {formatNumber(overview.data?.requests)} 条 · 保留 90 天</span>
           <label className="flex items-center gap-1.5">
@@ -415,8 +495,37 @@ export function StatsPage() {
               ))}
             </Select>
           </label>
+          {/* 导出限 admin/operator：整份明细落盘比翻页浏览的暴露面大 */}
+          {session.is_operator && (
+            <Button size="sm" variant="ghost" data-testid="events-export"
+                    disabled={exporting} onClick={exportCsv}>
+              <Download className="size-3.5" />
+              {exporting ? "导出中…" : "导出 CSV"}
+            </Button>
+          )}
         </div>
       }>
+        {drillLabels.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2" data-testid="drill-filters">
+            <span className="text-xs text-muted-foreground">钻取过滤</span>
+            {drillLabels.map((label) => (
+              <span key={label}
+                    className="inline-flex items-center rounded-md bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
+                {label}
+              </span>
+            ))}
+            <Button size="sm" variant="ghost" data-testid="drill-clear"
+                    onClick={clearDrill}>
+              <X className="size-3.5" />
+              清除
+            </Button>
+          </div>
+        )}
+        {exportNotice && (
+          <div data-testid="export-notice">
+            <Notice tone="muted" className="mb-3 text-xs">{exportNotice}</Notice>
+          </div>
+        )}
         {events.isError ? (
           <Notice tone="danger" data-testid="events-error">
             请求明细加载失败，请刷新重试；若刚升级服务，请确认后端已重启加载新端点。

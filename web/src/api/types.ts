@@ -247,6 +247,31 @@ export interface StatsEventsResponse {
   total: number | null;
 }
 
+/** 明细钻取过滤：分组表点行时带上，三者独立可叠加（AND）。 */
+export interface StatsEventFilters {
+  provider?: string;
+  model?: string;
+  credential_id?: string;
+}
+
+/**
+ * 钻取状态 = 三个明细过滤 + 可选的用户收窄。
+ *
+ * `username` 单独拿出来是因为它在后端对应**作用域**参数（`_scope`）而非明细
+ * 过滤列：operator 传它可看指定用户，viewer 传了也会被强制改回自己。
+ */
+export interface StatsDrill extends StatsEventFilters {
+  username?: string;
+}
+
+/** CSV 导出结果：文件内容 + 行数/截断（取自响应头）。 */
+export interface CsvExport {
+  blob: Blob;
+  rowCount: number;
+  /** 命中导出上限被截断：页面需提示用户收窄条件 */
+  truncated: boolean;
+}
+
 /** 三角色：与后端 src/auth/rbac.py 的 ROLE_* 字面量一致。 */
 export type Role = "admin" | "operator" | "viewer";
 

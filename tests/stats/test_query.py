@@ -403,6 +403,44 @@ def test_stats_events_empty(stats):
     _collector, query = stats
     assert query.events() == {"events": [], "next_before": None, "total": None}
 
+
+def test_stats_events_drilldown_filters(stats):
+    """钻取过滤：provider / model / credential_id 三者独立可叠加（AND）。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="glm-5.2", ok=True,
+                     credential_id="c1")
+    collector.record(username="u", provider="trae", model="kimi-k3", ok=True,
+                     credential_id="c2")
+    collector.record(username="u", provider="codebuddy", model="glm-5.2", ok=True,
+                     credential_id="c1")
+
+    by_provider = query.events(provider="trae")["events"]
+    assert {e["model"] for e in by_provider} == {"glm-5.2", "kimi-k3"}
+    by_model = query.events(model="glm-5.2")["events"]
+    assert {e["provider"] for e in by_model} == {"trae", "codebuddy"}
+    by_cred = query.events(credential_id="c1")["events"]
+    assert len(by_cred) == 2
+    # 叠加：trae + glm-5.2 只剩一条
+    combined = query.events(provider="trae", model="glm-5.2")["events"]
+    assert len(combined) == 1 and combined[0]["credential_id"] == "c1"
+    # offset 模式（非默认排序）同样带过滤
+    assert query.events(provider="trae", sort="ts", order="asc")["total"] == 2
+
+
+def test_export_events_orders_ascending_and_respects_filters(stats):
+    """导出固定旧→新（升序），并复用同一套过滤；多取一条供截断判断。"""
+    collector, query = stats
+    for index in range(3):
+        collector.record(username="u", provider="trae", model=f"m{index}", ok=True,
+                         credential_id="c1" if index < 2 else "c2")
+    rows = query.export_events()
+    assert [r["model"] for r in rows] == ["m0", "m1", "m2"]     # 升序
+    filtered = query.export_events(credential_id="c1")
+    assert [r["model"] for r in filtered] == ["m0", "m1"]
+    # limit 生效且多取一条（limit=1 → 返回 2 条供调用方判断截断）
+    assert len(query.export_events(limit=1)) == 2
+
+
 def test_stats_events_pagination_and_filters(stats):
     """明细查询：新→旧、rowid 游标翻页不漏不重、筛选组合生效。"""
     collector, query = stats
@@ -490,3 +528,89 @@ def test_stats_events_restrict_non_admin(tmp_path):
         assert [e["username"] for e in mine["events"]] == ["alice"]
         forced = client.get("/api/stats/events", params={"username": "bob"}).json()
         assert [e["username"] for e in forced["events"]] == ["alice"]
+
+
+# ------------------------------------------------------------- CSV 导出（4.11）
+
+def test_stats_events_csv_export(admin_client):
+    """CSV 导出：带 BOM、表头、公式防护，含行数/截断响应头。"""
+    _app, client = admin_client
+    collector = client.app.state.stats_collector
+    collector.record(username="other", provider="trae", model="=cmd|calc", ok=True,
+                     input_tokens=10, output_tokens=5, now=1_700_000_000)
+    collector.record(username="other", provider="codebuddy", model="m2", ok=False,
+                     error_type="rate_limit", now=1_700_000_100)
+
+    response = client.get("/api/stats/events", params={"format": "csv"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.headers["x-export-row-count"] == "2"
+    assert response.headers["x-export-truncated"] == "0"
+    assert "attachment" in response.headers["content-disposition"]
+    assert ".csv" in response.headers["content-disposition"]
+    text = response.text
+    assert text.startswith("\ufeff")                  # BOM 供 Excel 认 UTF-8
+    lines = text.lstrip("\ufeff").split("\r\n")
+    assert lines[0].startswith("时间,用户,渠道,凭证,模型")
+    # 模型列以 = 开头 → 加前导单引号防公式注入
+    assert "'=cmd|calc" in text
+    assert "失败" in text and "rate_limit" in text
+
+
+def test_stats_events_csv_export_filters_and_scope(admin_client):
+    """导出复用同一套钻取过滤与作用域。"""
+    _app, client = admin_client
+    collector = client.app.state.stats_collector
+    collector.record(username="other", provider="trae", model="glm", ok=True)
+    collector.record(username="other", provider="codebuddy", model="glm", ok=True)
+
+    filtered = client.get("/api/stats/events",
+                          params={"format": "csv", "provider": "trae"})
+    body = filtered.text.lstrip("\ufeff")
+    assert body.count("\r\n") == 2                    # 表头 + 1 行
+    assert "trae" in body and "codebuddy" not in body
+
+
+def test_stats_events_csv_export_requires_operator(tmp_path):
+    """viewer 导出被拒（403）；admin 放行。"""
+    from fastapi.testclient import TestClient
+
+    from src.auth.rbac import ROLE_ADMIN, ROLE_VIEWER
+    from src.auth.session import create_session_token
+    from src.auth.users import create_password_hash
+    from src.db.conn import Database
+    from src.db.migrate import apply_schema
+    from src.db.repo import UserRepository
+
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root", USERS_FILE=str(tmp_path / "none.txt"))
+    db = Database(settings.db_path)
+    apply_schema(db.connect())
+    users = UserRepository(db)
+    users.create("root", create_password_hash("x"), role=ROLE_ADMIN, enabled=True, now=1)
+    users.create("looker", create_password_hash("x"), role=ROLE_VIEWER, enabled=True, now=1)
+    db.close()
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("looker", SECRET))
+        assert client.get("/api/stats/events",
+                          params={"format": "csv"}).status_code == 403
+        # 同一 viewer 走 JSON 明细仍可用（只是看不到他人凭证昵称）
+        assert client.get("/api/stats/events").status_code == 200
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        assert client.get("/api/stats/events",
+                          params={"format": "csv"}).status_code == 200
+
+
+def test_stats_events_csv_export_truncates(admin_client, monkeypatch):
+    """超上限：只导出上限条，响应头标截断。"""
+    from src.api import admin_stats
+
+    _app, client = admin_client
+    collector = client.app.state.stats_collector
+    for index in range(3):
+        collector.record(username="other", provider="trae", model=f"m{index}", ok=True)
+    monkeypatch.setattr(admin_stats, "EXPORT_MAX_ROWS", 2)
+    response = client.get("/api/stats/events", params={"format": "csv"})
+    assert response.headers["x-export-row-count"] == "2"
+    assert response.headers["x-export-truncated"] == "1"

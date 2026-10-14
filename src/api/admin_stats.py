@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
-from ..auth.rbac import Principal
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+
+from ..auth.rbac import Principal, require_operator
+from ..stats.csv import CSV_BOM, EXPORT_HEADERS, csv_line, event_cells
+from ..stats.query import EXPORT_MAX_ROWS
 from .deps import Services, principal_from_request
 
 
@@ -15,6 +21,18 @@ def _scope(principal: Principal, username: str | None) -> str | None:
     全量统计（否则看不到自己维护的渠道整体健康）；viewer 才是严格自负。
     """
     return username if principal.is_operator else principal.username
+
+
+def _export_filename(now: int) -> str:
+    stamp = datetime.fromtimestamp(now, tz=UTC).strftime("%Y%m%d-%H%M%S")
+    return f"coding2api-events-{stamp}Z.csv"
+
+
+def _csv_stream(rows: list[dict]) -> Iterator[str]:
+    """把明细行编成 CSV 文本块（含 BOM 与表头）。"""
+    yield CSV_BOM + csv_line(list(EXPORT_HEADERS))
+    for row in rows:
+        yield csv_line(event_cells(row))
 
 
 def create_router(services: Services) -> APIRouter:
@@ -76,12 +94,37 @@ def create_router(services: Services) -> APIRouter:
                            username: str | None = None, since: int | None = None,
                            before: int | None = None, limit: int = 50,
                            offset: int = 0, sort: str | None = None,
-                           order: str | None = None):
+                           order: str | None = None,
+                           provider: str | None = None, model: str | None = None,
+                           credential_id: str | None = None,
+                           format: str = "json"):
         # 明细保留 90 天；单页上限 200，防止一次拉爆
         # 凭证昵称来自共享池：仅 admin/operator 可见，viewer 只看自己的记录
-        return stats_query.events(username=_scope(principal, username), since=since,
+        scope = _scope(principal, username)
+        names = principal.is_operator
+        if format == "csv":
+            # 导出仅 admin/operator：整份明细落盘比翻页浏览的暴露面大得多，
+            # 且文件名/内容都带池级信息，viewer 不该有。
+            require_operator(principal)
+            rows = stats_query.export_events(
+                username=scope, since=since, include_credential_name=names,
+                provider=provider, model=model, credential_id=credential_id)
+            truncated = len(rows) > EXPORT_MAX_ROWS
+            rows = rows[:EXPORT_MAX_ROWS]
+            now = int(datetime.now(tz=UTC).timestamp())
+            headers = {
+                "Content-Disposition": f'attachment; filename="{_export_filename(now)}"',
+                "X-Export-Row-Count": str(len(rows)),
+                "X-Export-Truncated": "1" if truncated else "0",
+                "Cache-Control": "no-store",
+            }
+            return StreamingResponse(
+                _csv_stream(rows), media_type="text/csv; charset=utf-8", headers=headers)
+        return stats_query.events(username=scope, since=since,
                                   before=before, limit=max(1, min(limit, 200)),
                                   offset=max(0, offset), sort=sort, order=order,
-                                  include_credential_name=principal.is_operator)
+                                  provider=provider, model=model,
+                                  credential_id=credential_id,
+                                  include_credential_name=names)
 
     return router

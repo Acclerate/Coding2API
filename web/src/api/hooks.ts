@@ -2,9 +2,9 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { api } from "../api/client";
 import type {
   CredentialsResponse,
+  StatsEventFilters,
   StatsMetric,
 } from "../api/types";
-
 /** Query key 约定：所有管理数据以 ["admin", username, ...] 开头。 */
 export function adminKey(username: string | undefined, ...rest: unknown[]) {
   return ["admin", username ?? "anonymous", ...rest] as const;
@@ -172,13 +172,22 @@ export function useStatsModelTimeline(username?: string, target?: string, since?
   });
 }
 
-/** 逐请求明细：排序切换 rowid 游标 / offset 两套分页（见后端 events 文档）。 */
+/** 逐请求明细：排序切换 rowid 游标 / offset 两套分页（见后端 events 文档）。
+ *
+ * `username` 是**作用域收窄**（钻取到某个用户时才有值）：为空则按会话作用域
+ * （admin/operator 看全量、viewer 看自己），传值则只看该用户（viewer 传了也
+ * 会被后端强制改回自己）。 */
 export function useStatsEvents(username?: string, since?: number, before?: number,
                                limit?: number, sort?: string, order?: string,
-                               offset?: number) {
+                               offset?: number, filters?: StatsEventFilters) {
+  const provider = filters?.provider;
+  const model = filters?.model;
+  const credentialId = filters?.credential_id;
   return useQuery({
-    queryKey: adminKey(username, "stats-events", since, before, limit, sort, order, offset),
-    queryFn: () => api.statsEvents(undefined, since, before, limit, sort, order, offset),
+    queryKey: adminKey(username, "stats-events", since, before, limit, sort, order,
+                       offset, provider, model, credentialId),
+    queryFn: () => api.statsEvents(username, since, before, limit, sort, order, offset,
+                                   { provider, model, credential_id: credentialId }),
     placeholderData: keepPreviousData,
   });
 }

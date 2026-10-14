@@ -57,6 +57,10 @@ EVENT_SORT_COLUMNS: dict[str, str] = {
 # 若有人把外部输入当 key 传进来，会当场炸而不是拼出注入语句。
 _GROUP_KEYS = frozenset({"provider", "model", "username", "credential_id"})
 
+# CSV 导出单次上限：明细只留 90 天，但全量导出（几万行）会一次性拉进内存并
+# 撑爆响应。超上限时明确告知「被截断、请收窄条件」，而不是静默给半份文件。
+EXPORT_MAX_ROWS = 10000
+
 
 def _group_order(sort: str | None, order: str | None) -> str:
     """分组统计的 `ORDER BY`：主列随 sort，并列时分组键升序（稳定次序）。"""
@@ -93,6 +97,7 @@ class StatsQuery:
 
     @staticmethod
     def _where(*, username: str | None = None, provider: str | None = None,
+               model: str | None = None, credential_id: str | None = None,
                since: int | None = None, since_col: str = "ts",
                before: int | None = None, before_col: str = "rowid",
                alias: str = "") -> tuple[str, list[Any]]:
@@ -105,6 +110,12 @@ class StatsQuery:
         if provider is not None:
             clauses.append(f"{alias}provider = ?")
             params.append(provider)
+        if model is not None:
+            clauses.append(f"{alias}model = ?")
+            params.append(model)
+        if credential_id is not None:
+            clauses.append(f"{alias}credential_id = ?")
+            params.append(credential_id)
         if since is not None:
             clauses.append(f"{alias}{since_col} >= ?")
             params.append(since)
@@ -336,7 +347,9 @@ class StatsQuery:
     def events(self, *, username: str | None = None, since: int | None = None,
                before: int | None = None, limit: int = 50,
                include_credential_name: bool = False, sort: str | None = None,
-               order: str | None = None, offset: int = 0) -> dict[str, Any]:
+               order: str | None = None, offset: int = 0,
+               provider: str | None = None, model: str | None = None,
+               credential_id: str | None = None) -> dict[str, Any]:
         """逐请求明细（默认新→旧，rowid 游标分页）。明细仅保留 90 天。
 
         **两种分页模式**：
@@ -349,6 +362,9 @@ class StatsQuery:
 
         之所以分两套：任意列排序与「rowid 游标」不兼容（游标只在按 rowid 走时
         成立）。明细只留 90 天，offset 的深翻页成本可接受。
+
+        `provider` / `model` / `credential_id`：钻取过滤（分组表点行 → 只看该
+        渠道/模型/凭证的明细）。三者独立、可叠加，`AND` 语义。
 
         `include_credential_name`：凭证昵称取自**全局共享池**（常含邮箱/手机），
         只对 admin/operator 返回；viewer 即便只看自己的记录也不该看到池里他人
@@ -367,9 +383,10 @@ class StatsQuery:
             "e.cost_usd, e.cost_cny, e.latency_ms, "
             f"e.ttfb_ms, e.request_id, {name_expr} AS credential_name"
         )
+        filters = {"provider": provider, "model": model, "credential_id": credential_id}
         if cursor_mode:
             where, params = self._where(username=username, since=since, before=before,
-                                        alias="e.")
+                                        alias="e.", **filters)
             rows = self._db.connect().execute(
                 f"""
                 SELECT {columns}
@@ -386,7 +403,7 @@ class StatsQuery:
                 "total": None,
             }
         # offset 模式：before 不参与（游标语义仅对 rowid 降序成立）
-        where, params = self._where(username=username, since=since, alias="e.")
+        where, params = self._where(username=username, since=since, alias="e.", **filters)
         total = self._db.connect().execute(
             f"SELECT COUNT(*) AS n FROM usage_events e {where}", params).fetchone()["n"]
         rows = self._db.connect().execute(
@@ -402,6 +419,35 @@ class StatsQuery:
             "next_before": None,
             "total": int(total),
         }
+
+    def export_events(self, *, username: str | None = None, since: int | None = None,
+                      include_credential_name: bool = False,
+                      provider: str | None = None, model: str | None = None,
+                      credential_id: str | None = None,
+                      limit: int = EXPORT_MAX_ROWS) -> list[dict[str, Any]]:
+        """导出用明细（旧→新，按 rowid 升序），最多 `limit + 1` 条。
+
+        与 `events()` 的差异：固定**升序**（导出文件从头读起更符合直觉）、不做
+        分页、不带 `rowid` 语义。多取一条供调用方判断是否被截断（超上限时明确
+        告知用户「收窄条件」，而不是静默给一份不全的文件）。
+        """
+        where, params = self._where(
+            username=username, since=since, alias="e.",
+            provider=provider, model=model, credential_id=credential_id)
+        name_expr = ("NULLIF(c.nickname, '')" if include_credential_name else "NULL")
+        rows = self._db.connect().execute(
+            f"""
+            SELECT e.ts, e.username, e.provider, e.credential_id, e.model,
+                   e.ok, e.error_type, e.input_tokens, e.output_tokens,
+                   e.reasoning_tokens, e.cached_tokens, e.credit, e.credit_estimated,
+                   e.cost_usd, e.cost_cny, e.ttfb_ms, e.latency_ms, e.request_id,
+                   {name_expr} AS credential_name
+            FROM usage_events e
+            LEFT JOIN credentials c ON c.id = e.credential_id
+            {where}
+            ORDER BY e.rowid ASC LIMIT ?
+            """, [*params, limit + 1]).fetchall()
+        return [dict(row) for row in rows]
 
     def model_timeline(self, *, username: str | None = None,
                        since: int | None = None, top: int = 6,
