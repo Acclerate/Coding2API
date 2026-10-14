@@ -668,6 +668,8 @@ export interface TaskStatus {
   interval_seconds: number;
   /** 开关类任务（目前只有活跃上报）的当前状态；其余恒为 true */
   enabled: boolean;
+  /** 此刻是否有一轮在跑（周期循环或另一次手动触发）；界面据此禁用按钮 */
+  running: boolean;
   /** 本进程内真实执行过的轮数（no-op 不计） */
   runs: number;
   last_started_at: number | null;
@@ -681,6 +683,18 @@ export interface TasksResponse {
   tasks: TaskStatus[];
   /** 服务端当前时间（epoch 秒）：算「距今多久」用服务端时钟，避免浏览器偏移 */
   server_time: number;
+}
+
+/**
+ * 手动触发一轮（POST /api/tasks/{key}/run）的返回：任务最新运行态 + 本轮结果。
+ *
+ * `ran=false` 有两种成因，界面文案必须区分：`busy=true` 是「已在跑、本次没
+ * 排上」，`busy=false` 是「跑了但是 no-op」（任务被关掉，`run_once` 返回
+ * None）。把后者说成「已运行」就是在谎报。
+ */
+export interface TaskRunResult extends TaskStatus {
+  ran: boolean;
+  busy: boolean;
 }
 
 /** 一条运维告警记录（GET /api/alerts，落库、重启不丢）。 */

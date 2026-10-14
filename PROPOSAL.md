@@ -164,7 +164,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 - 账号：`GET|POST /api/users`、`PATCH /api/users/{username}`、`POST /api/users/{username}/{disable|enable|reset-password}`（**不提供 DELETE**）；自助改密 `POST /api/auth/password`；无鉴权的一次性激活流 `GET|POST /api/auth/activate`；审计查询 `GET /api/audit`。
 - 凭证运维：`POST /api/credentials/{id}/checkin|toggle|revive|probe|accounts/select`、`PUT /api/credentials/{id}/limits`（限额护栏整体替换，全关时删行）、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|accounts`。
 - 凭证批量运维：`POST /api/credentials/batch`（`{action: probe|toggle|checkin|revive, ids: [...]}`，可选 `enabled` 用于 `toggle`）。逐条隔离执行——单条失败不影响其余条，响应含 `{total, succeeded, failed, results[]}`；`toggle`/`revive` 落一条汇总审计，`probe`/`checkin` 与单条端点同为只读语义、不写审计。
-- 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks`。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
+- 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`（手动跑一轮）。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
 
 实现以代码为准，使用说明见 [README.md](README.md)。
 

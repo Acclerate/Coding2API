@@ -1,12 +1,12 @@
-import { RotateCcw, Save, SlidersHorizontal } from "lucide-react";
+import { Play, RotateCcw, Save, SlidersHorizontal } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api/client";
 import { formatAgo, formatDuration, taskReportLabel } from "../api/display";
 import { errorText } from "../lib/errors";
-import { useQueryClient, useSettings, useTasks } from "../api/hooks";
+import { useQueryClient, useRunTask, useSettings, useTasks } from "../api/hooks";
 import { useSessionContext } from "../Layout";
-import type { RuntimeSetting, TaskStatus } from "../api/types";
+import type { RuntimeSetting, TaskRunResult, TaskStatus } from "../api/types";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Badge, Button, Card, EmptyState, Field, Input, Notice, Panel, Select, Tabs } from "../ui";
@@ -137,15 +137,24 @@ function SettingRow({
  *
  * 归属关系由后端下发（`RuntimeSetting.task`），前端不硬编码 key 列表——
  * 后端加任务/改归属不需要动这里。
+ *
+ * 「立即运行」按钮只在卡片处于前台 tab 时存在；运行中禁用并按 `task.running`
+ * （后端下发的「此刻有一轮在跑」）显示，避免连点打多轮上游。
  */
 function TaskCard({
   task,
   serverTime,
   rows,
+  running,
+  result,
+  onRun,
 }: {
   task: TaskStatus;
   serverTime: number;
   rows: ReactNode[];
+  running: boolean;
+  result: TaskRunResult | null;
+  onRun: () => void;
 }) {
   const tone = task.last_error ? "danger" : task.last_ok ? "ok" : "muted";
   const stateLabel = !task.enabled
@@ -155,6 +164,17 @@ function TaskCard({
       : task.last_ok
         ? "正常"
         : "尚未执行";
+  // 结果文案：区分「跑了」「没排上（已在跑）」「跑了但 no-op（被开关跳过）」。
+  // 三种都叫「已运行」就是在谎报——尤其第三种，任务其实一步没动。
+  const resultText = result
+    ? result.busy
+      ? "该任务正在运行中，本次未重复触发。"
+      : result.ran
+        ? result.last_ok === false
+          ? `已运行，但本轮失败：${result.last_error ?? "未知原因"}`
+          : `已运行一轮${result.last_report ? `：${taskReportLabel(result.last_report)}` : ""}。`
+        : "本轮未执行（任务已关闭或未到执行条件）。"
+    : null;
   return (
     <Card
       className="mb-3 gap-0 p-4 last:mb-0"
@@ -180,8 +200,31 @@ function TaskCard({
         {task.runs > 0 && (
           <span className="text-xs text-muted-foreground">已跑 {task.runs} 轮</span>
         )}
+        <Button
+          size="sm"
+          variant="default"
+          className="ml-auto"
+          data-testid={`task-run-${task.key}`}
+          // 关着的任务点了也是 no-op（后端会如实回 ran=false），直接禁用比
+          // 「点了没反应」更诚实；运行中禁用则防连点。
+          disabled={running || task.running || !task.enabled}
+          title={!task.enabled ? "任务已关闭，请先打开对应开关" : undefined}
+          onClick={onRun}
+        >
+          <Play className="mr-1 size-3" />
+          {task.running ? "运行中…" : "立即运行"}
+        </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">{task.description}</p>
+      {resultText && (
+        <p
+          className={`mt-1 text-xs ${result?.ran && result.last_ok === false ? "text-destructive" : "text-muted-foreground"}`}
+          data-testid={`task-run-result-${task.key}`}
+          role="status"
+        >
+          {resultText}
+        </p>
+      )}
       {task.last_error && (
         <p className="mt-1 text-xs text-destructive" data-testid={`task-error-${task.key}`}>
           最近失败：{task.last_error}
@@ -207,12 +250,17 @@ export function SettingsPage() {
   const session = useSessionContext();
   const { data, isLoading } = useSettings(session.username);
   const tasksQuery = useTasks(session.username);
+  const runTask = useRunTask(session.username);
   const client = useQueryClient();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<string | null>(null);
+  // 手动触发：正在跑的 key + 最近一次结果（按 key 存，切 tab 回来还在）
+  const [runningKey, setRunningKey] = useState<string | null>(null);
+  const [runResults, setRunResults] = useState<Record<string, TaskRunResult>>({});
+  const [runError, setRunError] = useState<{ key: string; text: string } | null>(null);
 
   const settings = useMemo(() => data?.settings ?? [], [data]);
   const tasks = useMemo(() => tasksQuery.data?.tasks ?? [], [tasksQuery.data]);
@@ -318,6 +366,19 @@ export function SettingsPage() {
     />
   );
 
+  const triggerRun = async (key: string) => {
+    setRunningKey(key);
+    setRunError(null);
+    try {
+      const result = await runTask.mutateAsync(key);
+      setRunResults((previous) => ({ ...previous, [key]: result }));
+    } catch (caught) {
+      setRunError({ key, text: errorText(caught, "触发失败，请稍后重试。") });
+    } finally {
+      setRunningKey(null);
+    }
+  };
+
   return (
     <div className="space-y-6" data-testid="settings-page">
       <PageHeader
@@ -402,11 +463,21 @@ export function SettingsPage() {
                 </div>
 
                 {activeTask ? (
-                  <TaskCard
-                    task={activeTask}
-                    serverTime={serverTime}
-                    rows={activeRows.map(renderSetting)}
-                  />
+                  <>
+                    <TaskCard
+                      task={activeTask}
+                      serverTime={serverTime}
+                      rows={activeRows.map(renderSetting)}
+                      running={runningKey === activeTask.key}
+                      result={runResults[activeTask.key] ?? null}
+                      onRun={() => void triggerRun(activeTask.key)}
+                    />
+                    {runError && runError.key === activeTask.key && (
+                      <div data-testid="task-run-error" role="alert">
+                        <Notice tone="danger">{runError.text}</Notice>
+                      </div>
+                    )}
+                  </>
                 ) : (
                   <>
                     <h3 className="text-xs font-semibold tracking-wide text-muted-foreground">

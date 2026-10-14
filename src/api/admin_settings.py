@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Request
 from ..auth.rbac import require_admin
 from ..compat.openai.request import InvalidRequest
 from ..runtime_settings import GATEWAY_GROUPS, InvalidSetting
+from ..tasks.runner import UnknownTaskError
 from .deps import Services, csrf_protected, principal_from_request
 
 logger = logging.getLogger(__name__)
@@ -74,5 +75,32 @@ def create_router(services: Services) -> APIRouter:
             "tasks": runner.task_status() if runner is not None else [],
             "server_time": int(time.time()),
         }
+
+    @router.post("/api/tasks/{key}/run")
+    async def run_task(key: str, request: Request,
+                       _csrf: None = Depends(csrf_protected),
+                       principal=Depends(principal_from_request)):
+        """手动运行一个后台任务一轮（管理台「立即运行」）。
+
+        与定时循环同一条路径（`TaskRunner._loop_specs` 单一来源），只多两点：
+        **不等间隔、不绕开关**。绕过时点窗口（`due()`）是因为手动就是
+        「立刻跑」；`activity` / `alert` 关闭时不绕——其 `run_once` 自身返回
+        None，响应里 `ran=false`，不把「关了」谎报成「跑过了」。
+
+        同步等结果返回（与 per-credential 的 probe / checkin / growth 手动
+        端点同口径）：管理台点完要能立刻看到 report / error，而不是先看到
+        「已触发」再轮询。任务正在跑时立刻返回 `busy=true`，不排队。
+        """
+        require_admin(principal)
+        runner = getattr(request.app.state, "task_runner", None)
+        if runner is None:
+            raise InvalidRequest("task runner not available")
+        try:
+            result = await runner.run_task(key)
+        except UnknownTaskError as error:
+            raise InvalidRequest(f"unknown task {error.key!r}") from error
+        logger.info("管理员 %s 手动运行后台任务 %s（ran=%s busy=%s）",
+                    principal.username, key, result["ran"], result["busy"])
+        return result
 
     return router

@@ -116,6 +116,23 @@ export function useTasks(username?: string) {
   });
 }
 
+/**
+ * 手动运行一个后台任务一轮（管理台「立即运行」）。
+ *
+ * 成功后失效任务运行态：后端已把这一轮记入 status，立刻回读才不会等到
+ * 下一次 30 秒轮询才看到结果。返回的 `TaskRunResult` 供调用点直接展示
+ * 「跑了 / 没排上 / 被开关跳过」，无需再读缓存。
+ */
+export function useRunTask(username?: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (key: string) => api.runTask(key),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: adminKey(username, "tasks") });
+    },
+  });
+}
+
 export function useStatsOverview(username?: string, target?: string, since?: number,
                                  until?: number) {
   return useQuery({

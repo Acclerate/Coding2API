@@ -32,6 +32,7 @@ import type {
   CsvExport,
   SettingsResponse,
   TasksResponse,
+  TaskRunResult,
   UpstreamAuthPoll,
   UpstreamAuthStart,
   UserStats,
@@ -215,6 +216,9 @@ export const api = {
     request<SettingsResponse>("/api/settings", { method: "PUT", ...json({ values }) }),
   /** 后台任务运行态（进程内）：与 /api/settings 同页展示。 */
   tasks: () => request<TasksResponse>("/api/tasks"),
+  /** 手动运行一个后台任务一轮（管理台「立即运行」）；同步等结果返回。 */
+  runTask: (key: string) =>
+    request<TaskRunResult>(`/api/tasks/${encodeURIComponent(key)}/run`, { method: "POST" }),
   /** 运维告警记录：后台评估命中后落库，倒序回看。 */
   alerts: (sort?: string, order?: string) =>
     request<AlertsResponse>(`/api/alerts${query({ sort, order })}`),

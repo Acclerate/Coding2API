@@ -2,8 +2,8 @@ import { screen, waitFor, within } from "@testing-library/react";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../SettingsPage";
-import { jsonResponse, mockFetch, renderPage, settle } from "@/test-utils";
-import { SETTINGS, SERVER_TIME, body, mockAll, switchTab, tasksBody, withSettings } from "@/test-utils/settings";
+import { jsonResponse, mockFetch, renderPage, settle, userEvent } from "@/test-utils";
+import { SETTINGS, SERVER_TIME, body, mockAll, runBody, switchTab, tasksBody, withSettings } from "@/test-utils/settings";
 
 describe("SettingsPage", () => {
   beforeEach(() => {
@@ -72,6 +72,7 @@ describe("SettingsPage", () => {
               description: "兜底重拉各渠道模型表。",
               interval_seconds: 1800,
               enabled: true,
+              running: false,
               runs: 0,
               last_started_at: null,
               last_finished_at: null,
@@ -85,6 +86,7 @@ describe("SettingsPage", () => {
               description: "拉取 OpenRouter 模型目录。",
               interval_seconds: 86400,
               enabled: true,
+              running: false,
               runs: 0,
               last_started_at: null,
               last_finished_at: null,
@@ -224,6 +226,89 @@ describe("SettingsPage", () => {
     renderPage(<SettingsPage />);
     await settle();
     expect(screen.getByTestId("no-settings")).toBeInTheDocument();
+  });
+
+  it("点「立即运行」触发后端并展示本轮结果", async () => {
+    const spy = mockAll();
+    renderPage(<SettingsPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("task-run-quota_probe"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-run-result-quota_probe")).toHaveTextContent("已运行一轮");
+    });
+    // 打到了正确的端点，且带了写请求所需的 CSRF 头
+    const call = spy.mock.calls.find(([, init]) => init?.method === "POST");
+    expect(String(call?.[0])).toContain("/api/tasks/quota_probe/run");
+    expect((call?.[1]?.headers as Record<string, string>)["X-Requested-With"]).toBe("XMLHttpRequest");
+  });
+
+  it("已在跑的任务：按钮禁用并显示运行中，不重复触发", async () => {
+    mockAll(undefined, () => jsonResponse(runBody("quota_probe", { busy: true, ran: false })));
+    renderPage(<SettingsPage />);
+    await settle();
+
+    // 默认数据里 running=false，按钮可点；点后拿到 busy 返回
+    await userEvent.click(screen.getByTestId("task-run-quota_probe"));
+    await waitFor(() => {
+      expect(screen.getByTestId("task-run-result-quota_probe")).toHaveTextContent(
+        "正在运行中，本次未重复触发",
+      );
+    });
+  });
+
+  it("被开关跳过的任务：按钮禁用且不谎报已运行", async () => {
+    mockAll();
+    renderPage(<SettingsPage />);
+    await settle();
+    await switchTab("settings-tabs-activity");
+
+    // activity 在样例数据里 enabled=false
+    expect(screen.getByTestId("task-run-activity")).toBeDisabled();
+    expect(screen.getByTestId("task-run-activity")).toHaveAttribute(
+      "title",
+      "任务已关闭，请先打开对应开关",
+    );
+  });
+
+  it("后端回 ran=false（no-op）时如实说「本轮未执行」", async () => {
+    mockAll(undefined, () => jsonResponse(runBody("quota_probe", { ran: false, busy: false })));
+    renderPage(<SettingsPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("task-run-quota_probe"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-run-result-quota_probe")).toHaveTextContent("本轮未执行");
+    });
+  });
+
+  it("本轮失败时展示错误原文", async () => {
+    mockAll(undefined, () => jsonResponse(runBody("quota_probe", {
+      last_ok: false,
+      last_error: "上游 500",
+    })));
+    renderPage(<SettingsPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("task-run-quota_probe"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-run-result-quota_probe")).toHaveTextContent("上游 500");
+    });
+  });
+
+  it("触发请求本身失败时给出兜底文案", async () => {
+    mockAll(undefined, () => jsonResponse({ error: { code: "invalid", message: "任务不存在" } }, 400));
+    renderPage(<SettingsPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("task-run-quota_probe"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-run-error")).toHaveTextContent("任务不存在");
+    });
   });
 
   it("管理员可见导航入口，非管理员不可见", async () => {

@@ -13,7 +13,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from ..config import live
 from .activity import ActivityTask
@@ -25,9 +25,29 @@ from .pacer import Pacer
 from .quota_probe import QuotaProbeTask
 from .refresh import RefreshTask
 from .retention import RetentionTask
-from .status import TASK_SPECS, TaskStatusStore
+from .status import TASK_BY_KEY, TASK_SPECS, TaskStatusStore
 
 logger = logging.getLogger(__name__)
+
+
+class UnknownTaskError(Exception):
+    """请求手动运行一个不存在的任务 key（或该任务未装配）。"""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"unknown task {key!r}")
+        self.key = key
+
+
+class _LoopSpec(NamedTuple):
+    """一条周期循环：任务 key + 一轮协程 + 当前生效间隔的取值器。
+
+    `key` 同时是运行态（TaskStatusStore）与配置归属（HOT_SETTINGS.task）的
+    连接键；展示名与描述从 `TASK_BY_KEY` 取，不在这里重复一份。
+    """
+
+    key: str
+    runner: Callable[[], Awaitable[object]]
+    interval: Callable[[], float]
 
 
 class TaskRunner:
@@ -98,6 +118,11 @@ class TaskRunner:
         # 进程内运行态（管理台「任务与配置」页）：共享实例由 build_app 注入，
         # 未注入时自建（测试与一次性装配直接构造 TaskRunner）。
         self.status = status or TaskStatusStore()
+        # 正在真跑的 key 集合：周期循环与手动触发互斥。手动触发**不排队**
+        # ——任务已在跑时立刻返回「运行中」，而不是攒一堆重复请求在锁后等
+        # （连点十次会打十轮上游）。asyncio 单线程下「查 + 加」之间没有 await，
+        # 是原子的，不需要额外锁。
+        self._running: set[str] = set()
 
     @property
     def _quota_interval(self) -> float:
@@ -152,38 +177,78 @@ class TaskRunner:
                             "启动额度探测", key="quota_probe")
         await self._guarded(self._refresh.run_once(),
                             "启动 token 预刷新", key="refresh")
-        loops: list[tuple[str, str, Callable[[], Awaitable[object]],
-                          Callable[[], float]]] = [
-            ("quota_probe", "额度探测", lambda: self._quota_probe.run_once(),
-             lambda: self._quota_interval),
-            ("refresh", "token 预刷新", self._refresh.run_once,
-             lambda: self._refresh_interval),
-            ("retention", "明细清理", self._sync_retention,
-             lambda: self._retention_interval),
-            ("checkin", "每日签到", self._sync_checkin, lambda: 600.0),  # 全天每 10 分钟签到一次
+        for spec in self._loop_specs():
+            self._tasks.append(asyncio.create_task(
+                self._loop(TASK_BY_KEY[spec.key].name, spec.runner, spec.interval,
+                           key=spec.key)))
+
+    def _loop_specs(self, *, manual: bool = False) -> list[_LoopSpec]:
+        """当前装配的全部周期循环（key + 一轮协程 + 间隔取值器）。
+
+        周期循环与手动触发**共用这一份清单**：`start()` 据此建循环，
+        `run_task()` 据此解析手动请求。两处各写一份会让「手动能跑但定时没
+        接线」（或反之）——加任务时只改一处，两处行为不会漂移。
+
+        可选任务（growth / activity / model_catalog / …）未装配时整条跳过，
+        与 `task_status()` 的过滤口径一致。
+
+        `manual=True` 时**绕过时点窗口**（`due()`）：手动就是「立刻跑」，
+        不再问「到点了没」。开关类（activity 的 `enabled`）不绕——关着时
+        `run_once` 自身返回 None，记 no-op。
+        """
+        specs: list[_LoopSpec] = [
+            _LoopSpec("quota_probe", lambda: self._quota_probe.run_once(),
+                      lambda: self._interval_seconds("quota_probe")),
+            _LoopSpec("refresh", self._refresh.run_once,
+                      lambda: self._interval_seconds("refresh")),
+            _LoopSpec("retention", self._sync_retention,
+                      lambda: self._interval_seconds("retention")),
+            # 全天每 10 分钟签到一次（周期固定，不可热更）
+            _LoopSpec("checkin", self._sync_checkin,
+                      lambda: self._interval_seconds("checkin")),
         ]
         if self._growth is not None:
-            loops.append(("growth", "成长中心", self._sync_growth,
-                          lambda: self._growth_interval))
+            specs.append(_LoopSpec("growth", self._sync_growth,
+                                   lambda: self._interval_seconds("growth")))
         if self._activity is not None:
-            loops.append(("activity", "活跃上报", self._sync_activity,
-                          lambda: float(self._activity_interval)))
+            activity = ((lambda: self._sync_activity(manual=True)) if manual
+                        else self._sync_activity)
+            specs.append(_LoopSpec("activity", activity,
+                                   lambda: self._interval_seconds("activity")))
         if self._model_catalog is not None:
-            loops.append(("model_catalog", "渠道模型列表刷新", self._model_catalog,
-                          lambda: self._model_catalog_interval))
+            specs.append(_LoopSpec("model_catalog", self._model_catalog,
+                                   lambda: self._interval_seconds("model_catalog")))
         if self._openrouter_catalog is not None:
-            loops.append(("openrouter_catalog", "模型目录刷新（OpenRouter）",
-                          self._openrouter_catalog,
-                          lambda: self._openrouter_catalog_interval))
+            specs.append(_LoopSpec("openrouter_catalog", self._openrouter_catalog,
+                                   lambda: self._interval_seconds("openrouter_catalog")))
         if self._alert is not None:
-            loops.append(("alert", "运维告警", self._sync_alert,
-                          lambda: self._alert_interval))
+            specs.append(_LoopSpec("alert", self._sync_alert,
+                                   lambda: self._interval_seconds("alert")))
         if self._backup is not None:
-            loops.append(("backup", "数据库备份", self._sync_backup,
-                          lambda: self._backup_interval))
-        for key, name, runner, interval in loops:
-            self._tasks.append(asyncio.create_task(
-                self._loop(name, runner, interval, key=key)))
+            specs.append(_LoopSpec("backup", self._sync_backup,
+                                   lambda: self._interval_seconds("backup")))
+        return specs
+
+    async def run_task(self, key: str) -> dict[str, Any]:
+        """手动运行一个后台任务一轮，返回该任务的最新运行态。
+
+        语义（与既有 per-credential 手动动作 probe / checkin / growth 同口径）：
+
+        - **绕过 due() / 时点窗口**：手动就是「立刻跑」，不再问「到点了没」。
+        - **不绕开关**：activity / alert 关闭时其 `run_once` 自身返回 None，
+          本轮记 `ran=False`（页面按钮同时按 `enabled` 禁用，两条路径一致）。
+        - **不排队**：任务正在跑（周期循环或另一次手动）时立刻返回
+          `ran=False, busy=True`，而不是攒一串重复请求在锁后等。
+        - 等结果返回后再回响应：调用方（管理台）要能立刻看到 report / error。
+        """
+        spec = next((item for item in self._loop_specs(manual=True)
+                     if item.key == key), None)
+        if spec is None:
+            raise UnknownTaskError(key)
+        if key in self._running:
+            return {**self._task_item(key), "ran": False, "busy": True}
+        _ok, ran = await self._run_guarded(spec.runner, TASK_BY_KEY[key].name, key=key)
+        return {**self._task_item(key), "ran": ran, "busy": False}
 
     async def _sync_growth(self) -> object:
         """成长中心一轮：领礼物 / 派 Buddy / 任务 / 补登 / 兑换 / 抽奖 / 盲盒。"""
@@ -191,16 +256,17 @@ class TaskRunner:
             raise RuntimeError("growth task not configured")
         return await self._growth.run_once()
 
-    async def _sync_activity(self) -> object:
+    async def _sync_activity(self, *, manual: bool = False) -> object:
         """活跃上报：仅启用且处于配置小时窗口内才执行，成功凭证当日封账。
 
         「是否启用」每轮现读：关掉再打开不需要重启，也不必重建循环。
+        `manual=True`（管理台「立即运行」）绕过时点窗口：手动就是立刻跑。
         """
         if self._activity is None:
             raise RuntimeError("activity task not configured")
         if not self._activity_enabled():
             return None
-        if not self._activity.due():
+        if not manual and not self._activity.due():
             return None
         return await self._activity.run_once()
 
@@ -260,7 +326,31 @@ class TaskRunner:
                 await asyncio.sleep(seconds)
             except asyncio.CancelledError:
                 raise
-            await self._guarded(runner(), name, key=key)
+            await self._run_guarded(runner, name, key=key)
+
+    async def _run_guarded(self, runner: Callable[[], Awaitable[object]], name: str,
+                           *, key: str | None = None) -> tuple[bool, bool]:
+        """跑一轮并标记「运行中」，返回 `(是否成功, 是否真跑了一轮)`。
+
+        `key` 非空时在真跑期间占住该 key：手动触发撞上周期循环（或反之）
+        时立刻返回「运行中」，不并发打两轮上游。
+
+        「是否真跑」以运行态计数是否增加判定（`_guarded` 对 no-op 不入账）：
+        activity 关闭时 `run_once` 返回 None，本轮就不算跑过——页面显示
+        「未运行」，与定时循环同一口径。
+        """
+        if key is None:
+            ok = await self._guarded(runner(), name)
+            return ok, ok
+        if key in self._running:
+            return False, False
+        self._running.add(key)
+        try:
+            before = self.status.runs(key)
+            ok = await self._guarded(runner(), name, key=key)
+            return ok, self.status.runs(key) > before
+        finally:
+            self._running.discard(key)
 
     async def _guarded(self, awaitable: Awaitable[object], name: str,
                        key: str | None = None) -> bool:
@@ -290,36 +380,31 @@ class TaskRunner:
         """管理台「任务与配置」页：每个已装配任务的上次真跑 + 当前周期/开关。
 
         周期与开关是**当前生效值**（热更后立刻反映），不是装配时的快照。
+        装配判断复用 `_loop_specs()`（与 `start()` / `run_task()` 同一份清单），
+        顺序仍按 `TASK_SPECS`（前端 tab 顺序稳定）。
         """
-        items: list[dict[str, Any]] = []
-        for spec in TASK_SPECS:
-            if spec.key == "growth" and self._growth is None:
-                continue
-            if spec.key == "activity" and self._activity is None:
-                continue
-            if spec.key == "model_catalog" and self._model_catalog is None:
-                continue
-            if spec.key == "openrouter_catalog" and self._openrouter_catalog is None:
-                continue
-            if spec.key == "alert" and self._alert is None:
-                continue
-            if spec.key == "backup" and self._backup is None:
-                continue
-            run = self.status.get(spec.key)
-            items.append({
-                "key": spec.key,
-                "name": spec.name,
-                "description": spec.description,
-                "interval_seconds": self._interval_seconds(spec.key),
-                "enabled": self._task_enabled(spec.key),
-                "runs": self.status.runs(spec.key),
-                "last_started_at": run.started_at if run is not None else None,
-                "last_finished_at": run.finished_at if run is not None else None,
-                "last_ok": run.ok if run is not None else None,
-                "last_report": run.report if run is not None else None,
-                "last_error": run.error if run is not None else None,
-            })
-        return items
+        assembled = {spec.key for spec in self._loop_specs()}
+        return [self._task_item(spec.key)
+                for spec in TASK_SPECS if spec.key in assembled]
+
+    def _task_item(self, key: str) -> dict[str, Any]:
+        """一个任务的最新运行态（`task_status()` 与手动触发响应的共同形状）。"""
+        spec = TASK_BY_KEY[key]
+        run = self.status.get(key)
+        return {
+            "key": spec.key,
+            "name": spec.name,
+            "description": spec.description,
+            "interval_seconds": self._interval_seconds(spec.key),
+            "enabled": self._task_enabled(spec.key),
+            "running": spec.key in self._running,
+            "runs": self.status.runs(spec.key),
+            "last_started_at": run.started_at if run is not None else None,
+            "last_finished_at": run.finished_at if run is not None else None,
+            "last_ok": run.ok if run is not None else None,
+            "last_report": run.report if run is not None else None,
+            "last_error": run.error if run is not None else None,
+        }
 
     def _interval_seconds(self, key: str) -> float:
         if key == "quota_probe":
