@@ -128,6 +128,10 @@ Every `id` in `GET /v1/models` is the canonical key; requests are translated bac
 - **Streaming usage frame**: after the finish chunk and before `data: [DONE]`, a `choices: []` usage frame (standard OpenAI shape) lets stream-reading clients show tok/s, context occupancy and session totals; nothing is sent when the upstream reported no usage (never a fake `0`), and unreported fields are `null`.
 - **Reasoning tokens need `reasoning_effort`**: CodeBuddy defaults to `medium` when the client omits it (the upstream would otherwise write the whole reasoning pass into the visible answer); explicit values pass through untouched.
 
+### Playground advanced parameters
+
+The Playground request form carries optional `temperature` / `max_tokens` / `reasoning_effort` inputs; **leaving one empty omits the key entirely** (each channel then applies its own default). Client-side validation matches `compat/openai/request.py` (`temperature` up to 1000, `max_tokens` a positive integer up to 4,000,000) so nothing passes the UI only to be rejected as a 400. The `reasoning_effort` control appears only when the model metadata reports `supports_reasoning` or a `default_effort`, offers the standard levels (`low`/`medium`/`high`, plus the upstream-declared default if it is outside that set), and starts at "not sent" — the upstream decides whether a given level is acceptable.
+
 ## Channels
 
 > CodeBuddy (incl. international) / TRAE / Qoder / CodeArts need credentials; **OpenCode Zen and Kilo Gateway are credential-less free tiers** — the pool holds one virtual placeholder row (so scheduling / cooldown / stats work as usual), the quota column reads "free tier (no quota API)", and health stays "no probe" (unknown ≠ exhausted). The virtual row **re-seeds on restart after deletion**; use *pause* to disable permanently.

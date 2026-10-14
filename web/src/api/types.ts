@@ -531,7 +531,8 @@ export interface ModelInfo {
   supports_images?: boolean;
   supports_tool_call?: boolean;
   supports_reasoning?: boolean;
-  default_effort?: number;
+  /** 上游为该模型配置的默认推理档位（字符串，如 `high` / `medium`；无则为空串/缺失） */
+  default_effort?: string;
   /** 多渠道模型才有：按渠道给出倍率与**该渠道实际请求的 key**（raw key 永不改动） */
   by_provider?: Record<string, { credit_rate?: number; raw_id?: string }>;
   /** 能力分（Artificial Analysis 指数）：匹配不到该模型的第三方成绩时整个字段缺失 */

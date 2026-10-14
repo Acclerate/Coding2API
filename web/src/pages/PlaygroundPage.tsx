@@ -13,7 +13,8 @@ import { errorText } from "../lib/errors";
 import { HelpBlock } from "../components/HelpBlock";
 import { PageHeader } from "../components/PageHeader";
 import { ModelPicker, modelValue, pickDefaultModel } from "../components/ModelPicker";
-import { Button, Card, Checkbox, Empty, Field, Label, Notice, Panel, Textarea } from "../ui";
+import { buildSamplingParams, effortOptions } from "../lib/playgroundParams";
+import { Button, Card, Checkbox, Empty, Field, Input, Label, Notice, Panel, Select, Textarea } from "../ui";
 
 /** 通过会话鉴权的内部端点取数据，不需要用户自己造 API Key。 */
 async function fetchPlaygroundModels(signal?: AbortSignal) {
@@ -28,6 +29,9 @@ export function PlaygroundPage() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [stream, setStream] = useState(true);
+  const [temperature, setTemperature] = useState("");
+  const [maxTokens, setMaxTokens] = useState("");
+  const [effort, setEffort] = useState("");
   const [answer, setAnswer] = useState("");
   const [reasoning, setReasoning] = useState("");
   const [usage, setUsage] = useState<Record<string, unknown> | null>(null);
@@ -48,9 +52,29 @@ export function PlaygroundPage() {
   const selectedInfo =
     models.find((item) => item.value === selectedModel) ??
     models.find((item) => item.value === selectedModel.split("@")[0]);
+  // 该模型可选的推理档位候选；null = 不适用，控件不渲染
+  const efforts = effortOptions(selectedInfo);
+  // 换模型时清空推理档位：档位是模型相关参数，沿用上一个模型的选择
+  // 既可能落在新模型的枚举之外，也会悄悄改变请求行为。值没变时不动，
+  // 避免重复点同一行把用户刚选的档位抹掉。
+  const pickModel = (value: string) => {
+    if (value !== selectedModel) setEffort("");
+    setModel(value);
+  };
 
   const send = async (event: React.FormEvent) => {
     event.preventDefault();
+    // 推理档位随模型能力变化：当前模型不适用（控件不渲染）时，即使 state 里
+    // 还留着上一个模型选的档位也不发送，避免把无关参数塞给不支持的模型。
+    const built = buildSamplingParams({
+      temperature,
+      maxTokens,
+      effort: effortOptions(selectedInfo) ? effort : "",
+    });
+    if (built.error) {
+      setError(built.error);
+      return;
+    }
     setBusy(true);
     setError(null);
     setAnswer("");
@@ -69,6 +93,7 @@ export function PlaygroundPage() {
           model: selectedModel,
           messages: [{ role: "user", content: prompt }],
           stream,
+          ...built.params,
         }),
       });
       if (response.status === 401) {
@@ -125,8 +150,8 @@ export function PlaygroundPage() {
             <ModelPicker
               models={models}
               value={selectedModel}
-              onChange={setModel}
-              onPin={setModel}
+              onChange={pickModel}
+              onPin={pickModel}
               loading={modelsQuery.isFetching && fetched.length === 0}
             />
           </Field>
@@ -228,6 +253,61 @@ export function PlaygroundPage() {
             />
             流式输出
           </Label>
+
+          {/* 高级参数：留空即不发送该键，由渠道走各自的默认值 */}
+          <div className="grid gap-3 sm:grid-cols-3" data-testid="playground-advanced">
+            <Field label="temperature" hint="留空不发送；0–2 是 OpenAI 惯例，本服务只做有限值透传">
+              <Input
+                type="number"
+                step="0.1"
+                min="0"
+                value={temperature}
+                placeholder="渠道默认"
+                data-testid="param-temperature"
+                onChange={(event) => setTemperature(event.target.value)}
+              />
+            </Field>
+            <Field
+              label="max_tokens"
+              hint={
+                selectedInfo?.max_output_tokens !== undefined
+                  ? `留空不发送；该模型上限 ${selectedInfo.max_output_tokens.toLocaleString()}`
+                  : "留空不发送"
+              }
+            >
+              <Input
+                type="number"
+                step="1"
+                min="1"
+                value={maxTokens}
+                placeholder="渠道默认"
+                data-testid="param-max-tokens"
+                onChange={(event) => setMaxTokens(event.target.value)}
+              />
+            </Field>
+            {efforts && (
+              <Field
+                label="reasoning_effort"
+                hint={
+                  selectedInfo?.default_effort
+                    ? `该模型默认档位 ${selectedInfo.default_effort}；留空不发送，渠道可能自补默认`
+                    : "留空不发送；档位由上游裁决，不支持的值会返回上游错误"
+                }
+              >
+                <Select
+                  value={effort}
+                  data-testid="param-effort"
+                  onChange={(event) => setEffort(event.target.value)}
+                >
+                  <option value="">不发送</option>
+                  {efforts.map((level) => (
+                    <option key={level} value={level}>{level}</option>
+                  ))}
+                </Select>
+              </Field>
+            )}
+          </div>
+
           <Button type="submit" variant="primary" disabled={busy} data-testid="send-request" className="gap-1.5">
             {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
             {busy ? "请求中…" : "发送"}

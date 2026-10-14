@@ -587,4 +587,100 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByTestId("model-option-qmodel_38max@qoder")).toBeInTheDocument();
     expect(screen.queryByTestId("model-option-dmodel@qoder")).not.toBeInTheDocument();
   });
+
+  const REASONING_MODELS = {
+    object: "list",
+    data: [
+      { id: "thinker", object: "model", owned_by: "Coding2API", providers: ["codebuddy"],
+        supports_reasoning: true, default_effort: "medium", max_output_tokens: 8192 },
+      { id: "plain", object: "model", owned_by: "Coding2API", providers: ["codebuddy"] },
+    ],
+  };
+
+  /** 记录 chat 请求体的 fetch mock（模型列表按需返回）。 */
+  function spyChat(models: unknown) {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, init });
+        if (url.includes("/api/playground/models")) return jsonResponse(models);
+        return jsonResponse({
+          choices: [{ message: { content: "ok" } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        });
+      }),
+    );
+    return calls;
+  }
+
+  function chatBody(calls: { url: string; init?: RequestInit }[]) {
+    // 取**最后一次** chat 调用：切换模型后重发时，`find` 会命中最先那次
+    const chat = calls.filter((item) => item.url.includes("/api/playground/chat/completions")).at(-1);
+    return JSON.parse((chat!.init as RequestInit).body as string) as Record<string, unknown>;
+  }
+
+  it("高级参数留空时请求体不含这三个键（交给渠道默认）", async () => {
+    const calls = spyChat(MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+    await fillPromptAndSend("hi");
+
+    const body = chatBody(calls);
+    expect(body).not.toHaveProperty("temperature");
+    expect(body).not.toHaveProperty("max_tokens");
+    expect(body).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("填写高级参数后进入请求体；未标推理能力的模型不渲染档位控件", async () => {
+    const calls = spyChat(REASONING_MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    // 默认选中第一条（有推理元数据）：控件在，默认值为「不发送」，并提示上游默认档位
+    expect(screen.getByTestId("param-effort")).toHaveValue("");
+    expect(screen.getByTestId("playground-advanced")).toHaveTextContent("该模型默认档位 medium");
+    expect(screen.getByTestId("playground-advanced")).toHaveTextContent("该模型上限 8,192");
+
+    await userEvent.type(screen.getByTestId("param-temperature"), "0.7");
+    await userEvent.type(screen.getByTestId("param-max-tokens"), "256");
+    await userEvent.selectOptions(screen.getByTestId("param-effort"), "high");
+    await fillPromptAndSend("hi");
+
+    expect(chatBody(calls)).toMatchObject({
+      temperature: 0.7, max_tokens: 256, reasoning_effort: "high",
+    });
+
+    // 切到无推理元数据的模型：档位控件消失，且请求体不再带 reasoning_effort
+    await userEvent.click(screen.getByTestId("model-option-plain@codebuddy"));
+    expect(screen.queryByTestId("param-effort")).not.toBeInTheDocument();
+    await fillPromptAndSend("hi");
+    const body = chatBody(calls);
+    expect(body).not.toHaveProperty("reasoning_effort");
+    expect(body).toHaveProperty("temperature", 0.7);
+  });
+
+  it("切换模型清空推理档位，不把上一个模型的档位带给新模型", async () => {
+    spyChat(REASONING_MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await userEvent.selectOptions(screen.getByTestId("param-effort"), "high");
+    expect(screen.getByTestId("param-effort")).toHaveValue("high");
+    await userEvent.click(screen.getByTestId("model-option-plain@codebuddy"));
+    await userEvent.click(screen.getByTestId("model-option-thinker@codebuddy"));
+    expect(screen.getByTestId("param-effort")).toHaveValue("");
+  });
+
+  it("非法数值拦住发送并给出提示，不发请求", async () => {
+    const calls = spyChat(MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await userEvent.type(screen.getByTestId("param-temperature"), "2000");
+    await fillPromptAndSend("hi");
+    expect(screen.getByTestId("playground-error")).toHaveTextContent("温度需在 0–1000 之间");
+    expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(false);
+  });
 });

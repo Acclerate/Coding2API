@@ -130,6 +130,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - **流式带 usage 帧**：收尾时在 finish chunk 之后、`data: [DONE]` 之前补一帧 `choices: []` 的 usage（OpenAI 标准形态），只从流里读用量的客户端据此显示 tok/s、上下文占用率与会话 token 统计；上游没上报时不补（不发 0 占位），非流式出口的 `usage` 同理，未上报字段一律为 `null`。
 - **思考 token 需客户端带 `reasoning_effort`**：CodeBuddy 渠道在客户端**未给**时补 `medium`（上游缺此字段会把整段思考以「可见推演」写进正文）；显式给的值原样透传、不被覆盖。
 
+### Playground 高级参数
+
+Playground 请求表单可选填 `temperature` / `max_tokens` / `reasoning_effort`，**留空即不发送该键**（各渠道自取其默认）。前端校验边界与 `compat/openai/request.py` 一致（`temperature` ≤ 1000、`max_tokens` 为 ≤ 4,000,000 的正整数），不会出现「界面放行、后端 400」。`reasoning_effort` 控件只在模型元数据给出 `supports_reasoning` 或 `default_effort` 时出现，候选为标准三档（`low`/`medium`/`high`，上游声明的默认档若不在其中则追加），默认选中「不发送」——某个档位是否被接受由上游裁决。
+
 ## 渠道
 
 > CodeBuddy（含国际版）/ TRAE / Qoder / CodeArts 需填凭证；**OpenCode Zen 与 Kilo Gateway 是无凭证的免费层渠道**——池里是一条虚拟占位行（让调度 / 冷却 / 统计照常工作），额度列显示「免费层（无额度接口）」，健康度恒为「无探测」（未知 ≠ 耗尽）。虚拟行**删除后重启会复活**，永久停用请用「暂停」。
