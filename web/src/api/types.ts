@@ -216,6 +216,8 @@ export interface UsageEventRow {
   latency_ms: number | null;
   /** 首字延迟（TTFB）：请求开始到首个内容帧；无帧（如预热失败）时为 null */
   ttfb_ms: number | null;
+  /** 请求 ID（与响应头 X-Request-ID 同值）；老库历史行为 null */
+  request_id: string | null;
 }
 
 export interface StatsEventsResponse {

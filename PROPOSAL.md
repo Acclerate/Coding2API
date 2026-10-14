@@ -79,7 +79,7 @@
 
 - **请求面**（鉴权 = API Key）：`/v1/chat/completions` · `/v1/responses` · `/v1/messages` · `/v1/models` · `/v1/user/balance` → 协议层（OpenAI / Responses / Anthropic 规范化与适配、模型名解析 `name` ｜ `name@provider`）→ 执行引擎（调度器 · 冷却状态机 · 会话粘性 · 截断续写 · 统计采集）→ 中立事件流 → 七个 Provider。
 - **管理面**（鉴权 = 会话 Cookie + RBAC）：React 管理台 → `/api/*`，含用户管理、审计、凭证运维、API Key、统计、任务与配置。
-- **后台面**（无 HTTP 入口，`TaskRunner` 起 9 类循环）：额度探测 · token 预刷新 · 每日签到 · 成长中心 · 活跃上报 · 明细清理 · 渠道模型列表刷新 · 模型目录刷新（OpenRouter）· 运维告警 → Provider 客户端 → 上游。
+- **后台面**（无 HTTP 入口，`TaskRunner` 起 10 类循环）：额度探测 · token 预刷新 · 每日签到 · 成长中心 · 活跃上报 · 明细清理 · 数据库备份 · 渠道模型列表刷新 · 模型目录刷新（OpenRouter）· 运维告警 → Provider 客户端 → 上游。
 
 **为什么按平面切**：请求面全程无状态、可并发，且不知道「人」是谁（只认 Key 的归属用户）；管理面与请求面**共用同一个执行引擎与仓储**，不做独立服务——自托管小实例里进程隔离只换来部署复杂度。两个鉴权面互不替代：API Key 进不了管理台，会话 Cookie 也进不了 `/v1`。后台面与请求面**共用 Provider 客户端与节流器**：各渠道风控按最小间隔生效，不能因为「后台签到」与「前台对话」是两条代码路径就各发各的。三面共享一份 SQLite，故升级只需重启**一个**进程。
 
@@ -133,13 +133,13 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ## 4. 数据模型
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCHEMA_VERSION = 18`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCHEMA_VERSION = 19`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
 
 | 表 | 用途 |
 |---|---|
 | `api_keys` | API Key（SHA-256 摘要 + 预览 + 渠道绑定 `provider_binding` + 来源 IP 白名单 `allowed_ips` + 模型白名单 `allowed_models` + 到期 `expires_at`） |
 | `credentials` | 加密凭证（`data_enc` 走 Fernet）+ 调度状态（`enabled`/`disabled`/`pinned`/`health`/`cooling_until`/`err_count`）+ 额度与到期阶梯 + token 到期列 + 成长中心最近结果 |
-| `usage_events` | 请求明细（token / credit / 缓存命中 / 成本 / 耗时 / 首字延迟），保留 90 天 |
+| `usage_events` | 请求明细（token / credit / 缓存命中 / 成本 / 耗时 / 首字延迟 / 请求 ID），保留 90 天 |
 | `usage_hourly` | 小时汇总（永久保留），渠道 / 模型 / 用户维度统计读此表 |
 | `growth_events` | 成长中心每轮一行汇报（仅 CodeBuddy）；活跃上报复用同表 |
 | `credit_events` | 两次额度探测之间的**净变化**（含 `window_start` 与归因已知度 `source`），不是动作归因 |
@@ -174,6 +174,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCH
 - **API Key 仅存摘要**，明文只在创建时返回一次；可按 Key 限定渠道绑定、来源 IP 白名单（默认**不信** `X-Forwarded-For`，仅 `TRUST_PROXY=true` 时取 XFF 最后一个条目）、模型白名单（fnmatch，无法判定模型名时 fail closed）与到期时间。
 - **会话**：Cookie `SameSite=Lax` + 写操作 CSRF 校验（含 logout）；**无 Cookie 的写端点（登录 / `/authorize`）也做跨站防护**：登录按 Origin/Referer 同源校验（防 login CSRF），`/authorize` 按上游原样回显的 `loginTraceID` 绑定到**发起登录那一次**（TRAE 回调本就跨源，Origin/Referer 既拦不住真攻击也可能误杀真回调）；会话与 API Key 除签名 / 摘要外校验用户仍存在、启用且 epoch 一致。
 - **错误响应不回流上游正文**：`/v1` 与外层的错误文案只带受控标识（HTTP 状态码 / 上游业务码 / 异常类名），上游错误体摘要只进服务端日志；未匹配的 `/api`、`/v1` 路径返回 JSON 404（不落到 SPA 的 200 + HTML）。**日志脱敏**：不打印 Token、完整请求体；审计写 INFO（含操作人），**绝不记密码/令牌明文**。
+- **请求 ID 是客户端可写输入**：入站 `X-Request-ID` 按白名单字符集与长度（`[A-Za-z0-9._:-]{1,128}`）校验后才采信与回显，不合法一律丢弃改用自生成——否则日志与统计列会被人塞进换行/超长串。响应头回显最终 ID（含自生成值），不伪装成上游追踪。
 - **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。
 - **热更配置写入即校验**：float 拒 NaN/±inf；字符串类有长度上限；告警 webhook 只接受 `http(s)` 并做 **SSRF 校验**（写入期拒字面量内网 / 回环 / 链路本地 / 保留 / 多播 / 未指定地址，**投递前再按 DNS 解析结果复核一次**、解析失败即阻断），外发载荷对 `nickname` 打码，多地址并发投递并加总预算。告警出站 client `trust_env=False`，不吃宿主代理环境变量。
 - **上游流解析有界**：SSE 单行与单帧缓冲设上限，非 2xx 错误体有界读取；OAuth state store 的 owner/consume 有 TTL 判定。**入站解析把关**：三个出站协议在入口拒绝越界数值字段（`max_tokens` ≤0 或超上限、`temperature`/`top_p` 为 NaN/Inf）与 JSON 里的 `NaN`/`Infinity`。

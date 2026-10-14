@@ -52,6 +52,9 @@ services:
       ALERT_ERROR_RATE_THRESHOLD: ${ALERT_ERROR_RATE_THRESHOLD:-0.5}
       ALERT_ERROR_RATE_MIN_REQUESTS: ${ALERT_ERROR_RATE_MIN_REQUESTS:-20}
       ALERT_ERROR_RATE_WINDOW_MINUTES: ${ALERT_ERROR_RATE_WINDOW_MINUTES:-15}
+      # SQLite 备份后台任务：周期（分钟）与保留份数；0 份表示不清理
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-1440}
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
       # 到期排序窗口（秒）：把距到期 ≤ 该值的积分加总，多的账号先用；≤0 关闭
       QUOTA_EXPIRY_WINDOW_SECONDS: ${QUOTA_EXPIRY_WINDOW_SECONDS:-129600}
       # 次到期排序窗口（秒）：主窗口打平（含都为 0）时才比较；≤0 关闭该级
@@ -144,6 +147,10 @@ services:
       DATA_DIR: ${DATA_DIR:-/app/data}
     ports:
       - "${PORT:-8000}:8000"
+    # 停机排空窗口：docker 发 SIGTERM 后等这么久再 SIGKILL。必须 >= 应用侧
+    # uvicorn --timeout-graceful-shutdown(30，见 src/main.py GRACEFUL_SHUTDOWN_SECONDS)，
+    # 留 5s 余量让 uvicorn 排空完成、统计落库，再被强杀。
+    stop_grace_period: 35s
     volumes:
       # 凭证与统计（SQLite）与用户文件分开挂载
       - ./data:/app/data

@@ -152,6 +152,11 @@ class Settings(BaseSettings):
     alert_error_rate_threshold: float = 0.5
     alert_error_rate_min_requests: int = 20
     alert_error_rate_window_minutes: int = 15
+    # SQLite 备份后台任务：周期性把主库一致性快照（VACUUM INTO）写进
+    # DATA_DIR/backups/，保留最近 BACKUP_KEEP 份。默认每日一次、留 7 份。
+    # 备份周期取整日是因为库本身不大（几十 MB 量级），更密只是白占磁盘。
+    backup_interval_minutes: int = 1440
+    backup_keep: int = 7
     pacer_min_seconds: float = 5
     pacer_max_seconds: float = 20
     # CodeBuddy 聊天最小间隔：同渠道同凭证的「顺序连发」之间的最小请求间隔，

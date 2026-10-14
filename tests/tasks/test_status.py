@@ -242,6 +242,28 @@ def test_task_status_includes_growth_when_assembled(repo):
     assert growth["interval_seconds"] == 600.0     # 下限 5 分钟，10 分钟生效
 
 
+def test_task_status_includes_backup_when_assembled(repo, tmp_path):
+    """装配 backup 后出现在清单里，周期/保留份数现读热更值。"""
+    from src.tasks.backup import BackupTask
+
+    credentials, db = repo
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": StubProvider()}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": StubProvider()}),
+        refresh=RefreshTask(credentials, {"codebuddy": StubProvider()}, skew_seconds=1),
+        retention=RetentionTask(StatsCollector(db)),
+        backup=BackupTask(tmp_path / "x.sqlite3"),
+        backup_interval_minutes=120,
+    )
+    item = next(i for i in runner.task_status() if i["key"] == "backup")
+    assert item["name"] == "数据库备份"
+    assert item["interval_seconds"] == 7200.0
+    assert item["enabled"] is True
+    # 未装配时不出现
+    runner_without = _runner(repo, StubProvider())
+    assert "backup" not in [i["key"] for i in runner_without.task_status()]
+
+
 def test_runner_reuses_injected_status_store(repo):
     store = TaskStatusStore()
     runner = _runner(repo, StubProvider(), status=store)

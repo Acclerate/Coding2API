@@ -35,7 +35,9 @@ SCHEMA_NAME = "schema.sql"
 # 18：usage_events 新增 cost_usd / cost_cny，usage_hourly 新增 cost_usd_sum /
 # cost_cny_sum / cost_known（成本估算：OpenRouter 刊例价 × 当时汇率，写入时定值）。
 # 老库补列后历史行成本为 NULL（显示 —），不随汇率/价表变化重算。
-SCHEMA_VERSION = 18
+# 19：usage_events 新增 request_id（请求 ID：响应头 X-Request-ID 同值，用于把
+# 用户报的请求与明细/上游日志对齐）。老库补列后历史行为 NULL。
+SCHEMA_VERSION = 19
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -77,6 +79,8 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("usage_hourly", "cost_usd_sum REAL"),
     ("usage_hourly", "cost_cny_sum REAL"),
     ("usage_hourly", "cost_known INTEGER NOT NULL DEFAULT 0"),
+    # 请求 ID（响应头 X-Request-ID 同值）：老库补列后历史行为 NULL。
+    ("usage_events", "request_id TEXT"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。

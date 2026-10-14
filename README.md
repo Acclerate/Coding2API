@@ -238,7 +238,7 @@ claude
 
 ### 池健康检查
 
-`GET /health` 只回 `{"status":"ok"}`（进程存活，适合容器存活探针）；`GET /healthz` 额外给出凭证池计数，供外部监控在池子耗尽时提前告警——那是「服务活着但用不了」的状态，存活探针看不出来。两个端点都不鉴权。
+`GET /health` 只回 `{"status":"ok"}`（进程存活，适合容器存活探针）；`GET /healthz` 额外给出凭证池计数，**并在 `ready == 0` 时回 HTTP 503**（就绪探针）——那是「进程活着但没有可用凭证」的状态，对话请求必然 503，负载均衡/外部监控应据此摘流量。计数在两种状态下都返回，监控可读到「为什么不可用」。两个端点都不鉴权。
 
 ```json
 {
@@ -247,7 +247,9 @@ claude
 }
 ```
 
-五类计数互斥且合计 = `total`，与调度器同一口径。`ready=0` 时对话请求直接返回 503，值得配置告警。
+五类计数互斥且合计 = `total`，与调度器同一口径。`ready=0` 时 `/healthz` 返回 503 且 `status` 为 `unavailable`；请把**存活**探针配在 `/health`（恒 200），把 `/healthz` 用作就绪/告警——把容器 healthcheck 指到 `/healthz` 会在池子耗尽时把容器标成 unhealthy，而重启并不能修好一个没有可用凭证的池子。
+
+> 升级注意：`/healthz` 的 HTTP 状态从「恒 200」变为「ready=0 时 503」。只判 HTTP 200 的外部监控会在此后开始报警，这是预期行为；若你只想要计数、不想被状态码影响，改读 `/health` + 自行解析计数即可。
 
 ## API Key 的绑定、白名单、来源 IP 与到期时间
 
@@ -320,6 +322,8 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 **明细失败类型**是受控枚举（后端 `CONTROLLED_ERROR_TYPES`，界面只展示中文翻译）：模型级冷却耗尽记「该模型暂时不可用」（`model_unavailable`，换个模型即可用），凭证池真耗尽才记「无可用凭证」（`no_healthy_credential`）——两者对外错误码相同（`no_healthy_credential` 503），仅统计口径区分。
 
+**请求 ID（`X-Request-ID`）**：每个请求都在响应头带一个 `X-Request-ID`（任何响应都带，含被拒的 413 / 400）。入站 `X-Request-ID` 合法则沿用（便于与客户端日志对齐），否则自生成；合法字符集 `[A-Za-z0-9._:-]`、长度 1–128，越界即丢弃改用自生成（客户端可写，不校验会被塞入换行/超长串）。该 ID 随请求落进 `usage_events.request_id`，统计页「请求明细」的**时间列悬停**可见——用于把用户报的一个请求与这行明细对齐。老库历史行为 `NULL`（不回填）。**不透传到上游**：各渠道出站头语义不同（qoder 的 `X-Request-ID` 是 uid 派生的防重放值，trae/codearts 有指纹敏感头），统一改写会破坏既有契约。
+
 统计页 **Credit 消耗**列：CodeBuddy 是上游**真值**；TRAE 的 `token_usage` 帧只有 token 数，credit 按官方单价**推算**并标 `≈`；CodeArts 福利模型按每日池 1:1 扣减推算，同样标 `≈`。单价表集中在 `src/provider/trae/pricing.py` 与 `src/provider/codearts/units.py`，未收录的模型不推算（显示 `—`）。历史明细可分别用 `scripts/backfill_trae_credit.py` / `scripts/convert_codearts_credit_unit.py` 补齐。
 
 **成本（估算，≈）**：按 token × 公开刊例价估算，不是上游真实扣费。单价取自 **OpenRouter 公开模型目录**（`pricing.prompt` / `completion` / `input_cache_read`，USD / 百万 token），按 `(输入−命中)×输入价 + 命中×缓存价 + 输出×输出价` 折算美元，再按**写入时生效的汇率**（`USD_CNY_RATE`）折人民币。
@@ -347,7 +351,7 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ## 后台任务
 
-额度探测、token 预刷新、每日签到、成长中心、活跃上报、明细清理、渠道模型列表刷新、模型目录刷新（OpenRouter）、运维告警共 9 类，由 `TaskRunner` 自动调度，失败互不影响。每类任务的上次执行时间、最近结果与错误在管理台**「任务与配置」页**查看（30 秒自动刷新），运行态只存在于**本次进程**内，重启归零。
+额度探测、token 预刷新、每日签到、成长中心、活跃上报、明细清理、数据库备份、渠道模型列表刷新、模型目录刷新（OpenRouter）、运维告警共 10 类，由 `TaskRunner` 自动调度，失败互不影响。每类任务的上次执行时间、最近结果与错误在管理台**「任务与配置」页**查看（30 秒自动刷新），运行态只存在于**本次进程**内，重启归零。
 
 **渠道模型列表刷新**（`MODEL_CATALOG_MINUTES`，默认 30、下限 5）是兜底保鲜：模型表本身按「谁访问 `/v1/models` 或 Playground 谁刷新、TTL 300s」更新，这条只保证**没人访问时也会更新**。周期取 30 分钟是跟 zen 免费模型判活缓存对齐——再密也不会让 zen 多探活。
 
@@ -358,6 +362,31 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端对话事件，账号长期只被本网关自动调用时会断连登。`ACTIVITY_REPORT_ENABLED=true` 时，后台任务在每天 `ACTIVITY_REPORT_HOUR`（默认 10 点）所在整点窗口为每个账号补发**一条** `chat_request_send` 事件续上连登——与积分、调度无关，上报失败不影响聊天请求。凭证行内菜单也可手动补报一次。适用于 CodeBuddy 与 CodeBuddy 国际版。
 
 > ⚠️ **风险与限制**：官方活动条款禁止用模拟器 / 脚本篡改活动数据，处罚为**取消资格并追回已发礼品**。默认关闭，开启前请自行评估账号风险。事件名与请求形状依赖上游实现，**上游改版即失效**，不承诺任何收益，不作为可靠性功能。实测（2026-09-21）：缺少 `userId` 时上游返回 HTTP 200 `{"code":0}` 却**静默丢弃**；OAuth 凭证的 `user_id`/`account_uid` 可能为空，此时回落取 bearer JWT 的 `sub`，仍缺失则跳过（不编造）。
+
+### 数据库备份与恢复
+
+**后台自动备份**（`BACKUP_INTERVAL_MINUTES`，默认 1440 分钟 = 每日一次）把主库一致性快照写进 `DATA_DIR/backups/`，并只保留最近 `BACKUP_KEEP` 份（默认 7）。
+
+- **用 `VACUUM INTO` 而不是复制文件**：WAL 模式下主库文件不含尚未 checkpoint 的已提交事务，直接 `cp` 会丢数据。`VACUUM INTO` 读一份一致性快照并重写成**紧凑、无 WAL 的独立库**，恢复时只需原子替换主库。
+- **落盘即校验**：写完立刻 `PRAGMA integrity_check`，不过则删掉半成品并记日志——一个写坏的备份比没有备份更危险。产物 `0600`、目录 `0700`（库内是凭证密文与明文用量/审计）。
+- **失败不影响服务**：备份是普通后台任务，异常只记日志、进任务卡片，不拖垮聊天请求。
+
+**手动备份**（升级/迁移前留一份）：
+
+```bash
+python3 scripts/backup_db.py                 # 备份到 DATA_DIR/backups/，保留 7 份
+python3 scripts/backup_db.py --keep 14       # 保留 14 份（0 = 不清理）
+python3 scripts/backup_db.py --out /path/dir # 指定备份目录
+```
+
+**恢复**（**先停服**，脚本不做「服务是否在跑」探测——容器/权限都可能误判）：
+
+```bash
+python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3            # 预览：只校验，不改动
+python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --apply    # 校验 → 安全副本 → 原子替换
+```
+
+恢复流程：校验备份完整性（不过直接拒绝，绝不把坏文件换进生产库）→ 给现有主库做一份 `.pre-restore-<时间戳>` 安全副本（同样走 `VACUUM INTO`，不漏 WAL 中未 checkpoint 的事务）→ 原子替换主库 → 删除 `-wal`/`-shm` 残留（它们属于旧库，留着会损坏新库）。**恢复后重启服务。**
 
 ## 配置
 
@@ -391,6 +420,8 @@ CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端�
 | `ALERT_ERROR_RATE_THRESHOLD` | `0.5` | 上游错误率阈值：统计窗内失败占比达到该值且样本足够时告警；`0` 关闭 |
 | `ALERT_ERROR_RATE_MIN_REQUESTS` | `20` | 错误率最小样本数：窗内请求数少于该值不判 |
 | `ALERT_ERROR_RATE_WINDOW_MINUTES` | `15` | 错误率统计窗（分钟），数据源为 `usage_events` 明细 |
+| `BACKUP_INTERVAL_MINUTES` | `1440` | 数据库备份后台任务周期（分钟），下限 60；`VACUUM INTO` 一致性快照落 `DATA_DIR/backups/` |
+| `BACKUP_KEEP` | `7` | 备份保留份数：只留最近这么多份，更旧的按时间删除；`0` 表示不清理 |
 | `QUOTA_EXPIRY_WINDOW_SECONDS` | `129600` | 主到期排序窗口：把距到期 ≤ 该秒数的积分加总，多的账号先用；CodeBuddy 与 TRAE 都按包独立到期、都参与；`≤0` 关闭整套到期排序 |
 | `QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS` | `604800` | 次到期排序窗口：主窗口打平时才比较；`≤0` 关闭该级 |
 | `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL：优先按请求体显式会话标识，无则回落消息前缀指纹；手动 pin 优先；带 `user_id` 时不派生前缀兜底键；`≤0` 关闭 |
@@ -439,9 +470,9 @@ CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端�
 
 ### 管理台热更（「任务与配置」页）
 
-上表中带「可热更」语义的 **39 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
+上表中带「可热更」语义的 **41 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
 
-`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`。
+`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`。
 
 要点：**优先级 `DB 覆盖值 > .env`**——改过后 .env 对该项不再生效，页面标「DB 覆盖」，点「恢复默认」删掉覆盖行才回落 .env。值存 `runtime_settings` 表（纯 key/value），新增可热更项无需迁移；白名单外的 key、非法类型 / 越界值写入前即拒。启动期项（`APP_SECRET` / `PORT` / `DATA_DIR` / `USERS_FILE` / `OPENROUTER_MODELS_URL` / 上游端点白名单）**不在**白名单。接口 `GET /api/settings` 读快照、`PUT /api/settings` 写（admin + CSRF），传 `null` 恢复默认。该页同时展示**后台任务运行态**，页面按 tab 组织；运行态是**进程内**的（`GET /api/tasks`，admin，页面每 30 秒刷新），重启归零。
 
@@ -467,7 +498,7 @@ sudo systemctl restart coding2api       # systemd
 **确认升级已生效**（先查版本，再查路由）：
 
 ```bash
-# 1) schema 版本已迁移（期望 18）且账号已导入
+# 1) schema 版本已迁移（期望 19）且账号已导入
 sqlite3 data/coding2api.sqlite3 "PRAGMA user_version; SELECT username, role, enabled FROM users;"
 # 2) 路由存在：期望 401（未登录），404 = 旧后端进程
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users

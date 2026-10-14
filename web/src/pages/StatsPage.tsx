@@ -484,7 +484,8 @@ export function StatsPage() {
               <TableBody>
                 {eventRows.map((row) => (
                   <TableRow key={row.rowid} data-testid="event-row">
-                    <TableCell className="whitespace-nowrap tabular-nums">
+                    <TableCell className="whitespace-nowrap tabular-nums"
+                               title={row.request_id ? `请求 ID：${row.request_id}` : undefined}>
                       {formatTime(row.ts)}
                     </TableCell>
                     {session.is_operator && <TableCell>{row.username}</TableCell>}

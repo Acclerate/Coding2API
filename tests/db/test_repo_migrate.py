@@ -83,6 +83,8 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     assert "credit_estimated" in events_columns
     # 成本估算两列（OpenRouter 刊例价 × 当时汇率）：老库补列后历史行为 NULL
     assert {"cost_usd", "cost_cny"} <= events_columns
+    # 请求 ID（响应头 X-Request-ID 同值）：老库补列后历史行为 NULL
+    assert "request_id" in events_columns
     hourly_columns = {row[1] for row in db.connect().execute("PRAGMA table_info(usage_hourly)")}
     assert "ttfb_sum" in hourly_columns
     assert "credit_estimated_known" in hourly_columns

@@ -54,6 +54,9 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
     TaskSpec("alert", "运维告警",
              "周期评估四类风险（池耗尽 / 任务连续失败 / token 临近到期 / 上游"
              "错误率骤升），命中落站内记录并可推送 webhook；周期见「运维告警周期」。"),
+    TaskSpec("backup", "数据库备份",
+             "周期性把主库一致性快照（VACUUM INTO）写进 DATA_DIR/backups/，"
+             "并只保留最近 N 份；周期与保留份数见「备份周期」「备份保留份数」。"),
 )
 
 TASK_BY_KEY: dict[str, TaskSpec] = {spec.key: spec for spec in TASK_SPECS}

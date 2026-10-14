@@ -451,6 +451,35 @@ def test_systemd_unit_sends_logs_to_journal():
     assert "APP_SECRET=" not in text
 
 
+def test_graceful_shutdown_timeout_consistent_across_entrypoints():
+    """停机排空时长必须处处一致，且容器/systemd 窗口 >= 应用侧排空窗口。
+
+    三条启动路径（Docker CMD → src.main:run、systemd/launchd → uvicorn CLI）
+    各写一遍同一个数字，最容易漂移；漂移的后果是「本地排空 30s、生产无限等」
+    或「应用还在排空就被 SIGKILL、长流统计丢失」。这里把它们对一遍。
+    """
+    import re as _re
+
+    from src.main import GRACEFUL_SHUTDOWN_SECONDS
+
+    assert GRACEFUL_SHUTDOWN_SECONDS > 0
+    # launchd 与 systemd 直接跑 uvicorn CLI，必须显式带同一个 flag
+    for path in (ROOT / "scripts" / "launchd-server.sh", SYSTEMD_UNIT):
+        text = path.read_text(encoding="utf-8")
+        found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
+        assert found, f"{path.name} 缺 --timeout-graceful-shutdown"
+        assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, path.name
+    # Docker：stop_grace_period 是容器给进程的停机窗口，必须 >= 应用排空窗口
+    compose = COMPOSE.read_text(encoding="utf-8")
+    grace = _re.search(r"stop_grace_period: (\d+)s", compose)
+    assert grace, "compose 缺 stop_grace_period"
+    assert int(grace.group(1)) >= GRACEFUL_SHUTDOWN_SECONDS
+    # systemd 的 TimeoutStopSec 同理（>= 排空窗口，否则提前 SIGKILL）
+    unit = SYSTEMD_UNIT.read_text(encoding="utf-8")
+    stop = _re.search(r"TimeoutStopSec=(\d+)", unit)
+    assert stop and int(stop.group(1)) >= GRACEFUL_SHUTDOWN_SECONDS
+
+
 def test_newsyslog_install_script_is_executable():
     """安装脚本必须可执行，否则 README 里的用法会失败。"""
     script = ROOT / "scripts" / "install-newsyslog.sh"

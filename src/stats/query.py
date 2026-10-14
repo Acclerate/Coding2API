@@ -365,7 +365,7 @@ class StatsQuery:
             "e.ok, e.error_type, e.input_tokens, e.output_tokens, "
             "e.reasoning_tokens, e.cached_tokens, e.credit, e.credit_estimated, "
             "e.cost_usd, e.cost_cny, e.latency_ms, "
-            f"e.ttfb_ms, {name_expr} AS credential_name"
+            f"e.ttfb_ms, e.request_id, {name_expr} AS credential_name"
         )
         if cursor_mode:
             where, params = self._where(username=username, since=since, before=before,

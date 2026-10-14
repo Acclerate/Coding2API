@@ -310,12 +310,14 @@ describe("StatsPage", () => {
             model: "deepseek-v4.1-flash", credential_id: null, credential_name: null,
             ok: 1, error_type: null, input_tokens: 1000, output_tokens: 200,
             cached_tokens: null, credit: 0.05, credit_estimated: 1,
-            cost_usd: null, cost_cny: null, latency_ms: 400, ttfb_ms: 120 },
+            cost_usd: null, cost_cny: null, latency_ms: 400, ttfb_ms: 120,
+            request_id: "req_a" },
           { rowid: 1, ts: BASE_TS, username: "root", provider: "codebuddy",
             model: "glm-5.2", credential_id: null, credential_name: null,
             ok: 1, error_type: null, input_tokens: 10, output_tokens: 5,
             cached_tokens: null, credit: 1.5, credit_estimated: 0,
-            cost_usd: null, cost_cny: null, latency_ms: 300, ttfb_ms: 150 },
+            cost_usd: null, cost_cny: null, latency_ms: 300, ttfb_ms: 150,
+            request_id: null },
         ],
         next_before: null,
       },
@@ -356,6 +358,27 @@ describe("StatsPage", () => {
     expect(within(table).getByText("120 ms")).toBeInTheDocument();
     expect(screen.getByTestId("events-prev")).toBeDisabled();
     expect(screen.getByTestId("events-next")).toBeEnabled();
+  });
+
+  it("请求明细的时间单元格带请求 ID 提示（老库历史行无提示）", async () => {
+    mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": EVENTS_PAGE1,
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    const table = screen.getByTestId("events-table");
+    // 首行（带 request_id）时间单元格带提示；第二行（request_id=null）不带
+    const withId = within(table).getByTitle("请求 ID：req_page1");
+    expect(withId).toBeInTheDocument();
+    const rowsWithTitle = table.querySelectorAll("[title^='请求 ID：']");
+    expect(rowsWithTitle).toHaveLength(1);
   });
 
   it("运维角色看全量统计，用户列与管理员一致可见", async () => {

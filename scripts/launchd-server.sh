@@ -25,5 +25,8 @@ if ! "$ROOT/scripts/build-web.sh"; then
 fi
 
 echo "launchd-server: 启动后端…"
+# --timeout-graceful-shutdown 必须与 src/main.py 的 GRACEFUL_SHUTDOWN_SECONDS 一致：
+# 这条路径直接跑 uvicorn CLI（不经 src.main:run），漏了它本地就是「无限等」，
+# 与 Docker/systemd 行为不一致（kickstart -k 会一直卡到被强杀）。
 exec /opt/homebrew/bin/uv run python -m uvicorn src.main:build_app \
-    --factory --host 127.0.0.1 --port 8000
+    --factory --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 30

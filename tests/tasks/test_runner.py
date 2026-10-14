@@ -213,6 +213,73 @@ def test_build_runner_clamps_intervals(repo):
     assert runner._quota_interval == 60
     assert runner._refresh_interval >= 60
     assert runner._retention_interval >= 60
+    assert runner._backup_interval >= 3600      # 备份下限 60 分钟
+
+
+def test_build_runner_wires_backup_task(repo, tmp_path):
+    """backup 传入时接线：周期从配置读，对象原样挂上。"""
+    from src.tasks.backup import BackupTask
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET,
+                      BACKUP_INTERVAL_MINUTES=120, BACKUP_KEEP=3)
+    task = BackupTask(tmp_path / "x.sqlite3", keep=lambda: config.backup_keep)
+    runner = build_runner(credentials, {}, StatsCollector(db), config, backup=task)
+    assert runner._backup is task
+    assert runner._backup_interval == 120 * 60
+    assert runner._backup._keep() == 3
+
+
+async def test_runner_backup_loop_runs_in_thread(repo, tmp_path):
+    """备份循环体把同步磁盘 IO 放进线程池（不能卡事件循环）。"""
+    from src.tasks.backup import BackupTask
+
+    credentials, _db = repo
+    provider = StubProvider()
+    db_path = tmp_path / "coding2api.sqlite3"
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        backup=BackupTask(db_path),
+    )
+    report = await runner._sync_backup()
+    assert report["backup"].startswith("coding2api-")
+    assert (tmp_path / "backups").is_dir()
+
+
+async def test_runner_backup_without_task_raises(repo):
+    """未装配 backup 时 _sync_backup 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="backup task not configured"):
+        await runner._sync_backup()
+
+
+async def test_runner_starts_backup_loop_when_assembled(repo, tmp_path):
+    """装配 backup 后必须真的多起一条循环。"""
+    from src.tasks.backup import BackupTask
+
+    credentials, _db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        backup=BackupTask(tmp_path / "x.sqlite3"),
+    )
+    await runner.start()
+    try:
+        assert len(runner._tasks) == 5
+    finally:
+        await runner.stop()
 
 
 async def test_providers_release_http_pools_on_shutdown(tmp_path):
@@ -356,6 +423,8 @@ def test_run_entry_point_starts_uvicorn(monkeypatch, tmp_path):
     assert captured["port"] == 9123
     assert captured["log_level"] == "warning"
     assert captured["app"] is not None
+    # 停机排空：不给 timeout_graceful_shutdown 就是无限等（长流卡住直到 SIGKILL）
+    assert captured["timeout_graceful_shutdown"] == main.GRACEFUL_SHUTDOWN_SECONDS
 
 
 async def test_loop_executes_runner_after_interval(repo):

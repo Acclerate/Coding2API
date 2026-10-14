@@ -215,6 +215,14 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("alert_error_rate_window_minutes", int, "错误率统计窗（分钟）",
                "计算上游错误率的时间窗；0 表示只看当前瞬间（无样本，不触发）。",
                minimum=0, task="alert"),
+    # SQLite 备份：改周期时人就在看这个任务最近备份了什么。
+    HotSetting("backup_interval_minutes", int, "备份周期（分钟）",
+               "后台把主库一致性快照（VACUUM INTO）写进 DATA_DIR/backups/ 的"
+               "一轮间隔；默认每日一次。库不大，更密只是白占磁盘。下限 60 分钟。",
+               minimum=60, task="backup", floor=60),
+    HotSetting("backup_keep", int, "备份保留份数",
+               "只保留最近这么多份备份，更旧的按时间删除；0 表示不清理（只备份）。",
+               minimum=0, task="backup"),
 )
 
 HOT_BY_KEY: dict[str, HotSetting] = {item.key: item for item in HOT_SETTINGS}
@@ -684,6 +692,16 @@ class RuntimeSettings:
     @property
     def alert_error_rate_window_minutes(self) -> int:
         return int(self.get("alert_error_rate_window_minutes"))
+
+    # ---------------------------------------------------------- SQLite 备份
+
+    @property
+    def backup_interval_minutes(self) -> int:
+        return int(self.get("backup_interval_minutes"))
+
+    @property
+    def backup_keep(self) -> int:
+        return int(self.get("backup_keep"))
 
     # ---------------------------------------------------------- 透明委托
 

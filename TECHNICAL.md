@@ -24,8 +24,8 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | `pyproject.toml` | — | uv 项目；`[tool.pytest.ini_options]` 设 coverage 目标 |
 | 仓库根 | `Dockerfile`、`docker-compose.yml` | compose build context 依赖根目录 |
 | `src/` | `main.py` `config.py` `runtime_settings.py` `version.py` | FastAPI 组装·lifespan·路由挂载（只做接线）／pydantic-settings 全部 env + `live()` 归一化标量·取值器／运行时配置覆盖层（DB 覆盖 > env + 白名单校验 + snapshot）／版本号（`pyproject.toml` 唯一真源，读不到回落常量） |
-| `src/webapp/` | `limits.py` `security.py` `handlers.py` `logging.py` `static.py` | 请求体上限 ASGI 中间件（登录 8KB / 其余 16MB）／Host 白名单 + 安全响应头（CSP·nosniff）／异常 → HTTP 响应（稳定机器可读错误码）／root logger 配置／前端产物定位 + SPA catch-all（排除 `/api`、`/v1`） |
-| `src/db/` | `schema.sql` `conn.py` `migrate.py` `repo.py` `crypto.py` | DDL 定稿（只加不改）／线程本地连接 + WAL + busy_timeout + `transaction()`／启动执行 `schema.sql` + `_MIGRATION_COLUMNS`·`_MIGRATION_DROPS`／凭证·API Key·用户·审计·告警·积分流水持久化（手写 SQL）／Fernet 加解密 |
+| `src/webapp/` | `limits.py` `security.py` `request_id.py` `handlers.py` `logging.py` `static.py` | 请求体上限 ASGI 中间件（登录 8KB / 其余 16MB）／Host 白名单 + 安全响应头（CSP·nosniff）／请求 ID ASGI 中间件（最外层，任意响应含 413/400 都带 `X-Request-ID`）／异常 → HTTP 响应（稳定机器可读错误码）／root logger 配置／前端产物定位 + SPA catch-all（排除 `/api`、`/v1`） |
+| `src/db/` | `schema.sql` `conn.py` `migrate.py` `repo.py` `crypto.py` `backup.py` | DDL 定稿（只加不改）／线程本地连接 + WAL + busy_timeout + `transaction()`／启动执行 `schema.sql` + `_MIGRATION_COLUMNS`·`_MIGRATION_DROPS`／凭证·API Key·用户·审计·告警·积分流水持久化（手写 SQL）／Fernet 加解密／备份·恢复核心（`VACUUM INTO` 一致性快照 + `integrity_check` + 0600 + 保留 N 份，任务与 `scripts/` 共用） |
 | `src/auth/` | `users.py` `bootstrap.py` `session.py` `api_key.py` `csrf.py` `throttle.py` `rbac.py` `access.py` | DbUserStore + UsersFileStore（users.txt 导入）／启动引导（导入 → `ADMIN_USERNAMES` 提权 → 无活跃 admin 报错）／会话 Cookie 签发校验（手写 HMAC，payload 带 `session_epoch`）／`sk-` 生成 + SHA-256 摘要 + 常量时间校验／写操作 CSRF／登录限流（三级窗口 + PBKDF2 并发上限）／三角色 `admin`·`operator`·`viewer`／来源 IP 与模型白名单（纯函数） |
 | `src/provider/` | `base.py` `proxy.py` `naming.py` `token_expiry.py` `openai_chunk.py` `fixtures/` | Provider 协议·Event·ErrKind·Quota·HealthScore·异常族／按渠道出站代理（解析 `PROVIDER_PROXIES` + `build_client`）／模型名归一（七渠道三字段）／到期提取（`expires_at` → JWT `exp`）／标准 OpenAI chunk 共享原语（choices 校验 + 空 tool_call 判定）／真实样本（`codebuddy/*.sse`、`trae/*.sse`） |
 | `src/provider/codebuddy/` | `client.py` `intl.py` `events.py` `credential.py` `headers.py` `oauth.py` `checkin.py` `activity.py` `growth.py` `growth_runner.py` `refresh.py` | 上游 HTTP + SSE 流 + 额度探测 + 内容风控指纹清洗／国际版子类（仅覆渠道 id 与能力 None）／OpenAI 风格 SSE → Event + 状态与业务码分类／凭证类型与解析／上游技术常量与请求头／设备码轮询／签到 + 连续天数／活跃上报协议层／成长中心协议层（15 端点）／成长中心编排（7 类领取的顺序与失败判定）／token 刷新 + 多账号切换 |
@@ -36,9 +36,9 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | `src/provider/codearts/` | `signer.py` `dpop.py` `client.py` `events.py` `credential.py` `units.py` `backfill.py` `auth.py` `oauth.py` | 华为云 SDK-HMAC-SHA256（纯函数，便于固定向量测试）／ES256 P-256 DPoP JWS（低 S 归一化）／上游 + 私有 SSE 还原 + 福利·余额／SSE → 增量 Event（OpenAI chunk 与累计全文双形状）／凭证解析（AK/SK/STS/DPoP/refresh）／「套餐·剩余量」单位与到期解析／历史 usage 回填／OAuth2 PKCE 登录／回调链接粘贴换 token 适配 |
 | `src/engine/` | `scheduler.py` `executor.py` `affinity.py` `continuation.py` `compress.py` `model_resolver.py` `sse.py` | 选号 + 冷却状态机 + pin（纯逻辑，操作 Candidate）／执行 + 模型目录收窄 + 轮换重试 + fallback 链 + 统计埋点／会话粘性／截断续写／上下文压缩裁剪（纯函数）／`"glm-5.2"`·`"glm-5.2@trae"`·`auto` → 候选集 + fallback 组解析／SSE 帧解析 + 行长上限 |
 | `src/compat/` | `openai/{request,response,errors}.py` `responses/{request,response}.py` `anthropic/{request,response}.py` | ChatRequest 校验·chunk 聚合·OpenAI error shape／Responses 出口（Codex CLI 子集）／Anthropic Messages 出口（Claude Code 子集） |
-| `src/tasks/` | `pacer.py` `quota_probe.py` `checkin.py` `growth.py` `activity.py` `refresh.py` `retention.py` `alerting.py` `status.py` `runner.py` | 全局节流器（随机区间 + 按桶并发上限 + 滑动窗口）／启动立即一轮 + 每 `QUOTA_PROBE_MINUTES`／全天每 10 分钟签到、成功即封账（支持渠道回填 `seal_until`）／成长中心（仅 CB）落 `growth_events`／活跃上报（CB 与 CB 国际版，默认关闭）／每 `REFRESH_INTERVAL_MINUTES` 预刷新／每 5 分钟小时汇总重算 + 90 天前明细清理／运维告警（四类规则 + webhook + 落库）／任务清单 `TASK_SPECS` + 进程内运行态／后台任务调度，接入应用生命周期 |
+| `src/tasks/` | `pacer.py` `quota_probe.py` `checkin.py` `growth.py` `activity.py` `refresh.py` `retention.py` `backup.py` `alerting.py` `status.py` `runner.py` | 全局节流器（随机区间 + 按桶并发上限 + 滑动窗口）／启动立即一轮 + 每 `QUOTA_PROBE_MINUTES`／全天每 10 分钟签到、成功即封账（支持渠道回填 `seal_until`）／成长中心（仅 CB）落 `growth_events`／活跃上报（CB 与 CB 国际版，默认关闭）／每 `REFRESH_INTERVAL_MINUTES` 预刷新／每 5 分钟小时汇总重算 + 90 天前明细清理／每 `BACKUP_INTERVAL_MINUTES` 备份主库（`VACUUM INTO`，落线程池）/运维告警（四类规则 + webhook + 落库）／任务清单 `TASK_SPECS` + 进程内运行态／后台任务调度，接入应用生命周期 |
 | `src/stats/` | `backfill.py` `collector.py` `query.py` | 历史成本一次性回填与重算（`scripts/backfill_cost.py` 复用）／`usage_events` 写入（脱敏）+ 小时汇总双写·重算／`overview`·`by-*`·`timeline`·`model-timeline`·`events` |
-| `src/` 顶层 | `sorting.py` `benchmarks.py` `pricing.py` `model_match.py` | 列表排序 `sort`/`order` 白名单解析（db 与 api 共用）／OpenRouter 单一源：刊例价 + 明细元数据 + 能力指数 + 落盘快照／单请求成本估算（USD→CNY）／本地模型名 ↔ OpenRouter 条目匹配（仅 benchmarks·pricing 用） |
+| `src/` 顶层 | `sorting.py` `benchmarks.py` `pricing.py` `model_match.py` `request_context.py` | 列表排序 `sort`/`order` 白名单解析（db 与 api 共用）／OpenRouter 单一源：刊例价 + 明细元数据 + 能力指数 + 落盘快照／单请求成本估算（USD→CNY）／本地模型名 ↔ OpenRouter 条目匹配（仅 benchmarks·pricing 用）／请求 ID 的 contextvar + 白名单校验 + 自生成（中间件设置、统计写入现读） |
 | `src/api/` | `deps.py` `endpoints.py` `chat.py` `responses.py` `messages.py` `context.py` `models.py` `model_merge.py` `model_catalog.py` `balance.py` `authorize.py` `admin_credentials.py` `admin_keys.py` `admin_settings.py` `admin_users.py` `admin_audit.py` `admin_alerts.py` `admin_model_catalog.py` `activate.py` `admin_stats.py` `admin_auth.py` `playground.py` `streaming.py` | Services 容器 + 鉴权·会话·CSRF 依赖／三个 /v1 出口共用的 `dispatch_compat` 骨架／`POST /v1/chat/completions`·`/v1/responses`·`/v1/messages`／请求入口的上下文压缩接线／`GET /v1/models`（按凭证加载 + SWR + 缓存·TTL + 落盘 + 黑名单 + 白名单）／模型归一·合并·命名·对外 id 消歧·别名表（纯函数）／模型目录落盘快照 + 别名预热／`GET /v1/user/balance`／`GET /authorize`（TRAE 回调落点）／凭证 CRUD·toggle·pin·probe·checkin·成长·账号切换／API Key CRUD（渠道绑定 + 双白名单 + 到期）／`GET`/`PUT /api/settings` + `GET /api/tasks`／用户管理／审计查询／告警回看／模型目录只读查看／一次性令牌激活流／统计查询／登录·登出·会话·自助改密 + 上游登录 start·poll·complete·cancel／会话调试端点（无需 API Key）／SSE 流包装（长空隙插心跳帧） |
 | `src/audit/actions.py` | — | 审计动作常量 + 中文标签 |
 | `web/` | — | React 前端 |
@@ -383,7 +383,7 @@ class Scheduler:
 客户端断连：生成器被关闭/取消时统计 `error_type=client_disconnect`，关闭上游流；例外：`[DONE]` 已产出后的收尾断开（客户端拿到回调即关连接，框架在结束帧 `more_body=False` 前有一拍竞态会把它判为断开）按成功记账。
 
 ## 8. 数据库
-DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 18`，共 11 张表：`api_keys` / `credentials` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
+DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 19`，共 11 张表：`api_keys` / `credentials` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
 
 ```sql
 -- conn.py 打开时执行
@@ -396,6 +396,8 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 - 加密：`Fernet(base64.urlsafe_b64encode(sha256(APP_SECRET).digest()))`；APP_SECRET 丢失 = 凭证全部不可解，只能重录。启动时按熵拒掉弱密钥（长度 ≥16、不同字符数 ≥8，另拒重复字符 / 短周期重复串）。
 - 运行时配置覆盖层 `runtime_settings(key, value, updated_at)`：纯 key/value，只存「管理台改过」的 key，未出现的 key 回落 env。键集合随版本演进（新增可热更项无需迁移）；值的类型与范围由 `HOT_SETTINGS` 白名单校验，白名单外/类型非法的行在读取时被忽略并记日志。
 - 模型列表与模型目录不占表：模型列表是「进程内 TTL 缓存 + `DATA_DIR/model_catalog.json` 落盘快照」，OpenRouter 目录是 `DATA_DIR/openrouter_catalog.json`（见 §9.4）；签到去重由 `CheckinTask` 的当日作用域集合实现。
+
+**备份与恢复**（`src/db/backup.py`，任务与 `scripts/` 共用）：`VACUUM INTO` 把主库写成一致性快照（WAL 下直接 `cp` 会丢未 checkpoint 的事务），落盘后立即 `PRAGMA integrity_check`（不过则删半成品并抛错），产物 `0600` 目录 `0700`；后台任务每 `BACKUP_INTERVAL_MINUTES` 备份一次、按 mtime 保留最近 `BACKUP_KEEP` 份。恢复 `scripts/restore_db.py`：先校验备份 → 给现有主库做 `.pre-restore-<ts>` 一致性安全副本 → 同目录临时文件 `os.replace` 原子替换 → 删 `-wal`/`-shm` 残留（属旧库，留着会损坏新库）；默认预览，`--apply` 才写。**不做「服务在跑」探测**（容器/权限都可能误判），文档要求恢复前先停服、恢复后重启。
 
 **迁移纪律**（`migrate.py`）：
 - 启动时读 `schema.sql` 逐条 `CREATE TABLE IF NOT EXISTS`（只加不改）。
@@ -448,6 +450,7 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 - **TRAE credit 为推算值**（`credit_estimated`）：TRAE 上游 `token_usage` 只给 token 数、无单请求积分，按官方计费公式（`(输入−缓存)×输入价 + 输出×输出价 + 缓存×缓存价`，单价为积分/百万，见 `src/provider/trae/pricing.py`）折算；展示层加 `≈`。CodeBuddy 的 credit 是上游真值，恒不标推算。与「刊例 × 折扣」不符的模型走 `pricing.MEASURED_EFFECTIVE_OVERRIDE`（缓存命中价需单独实测，如 DeepSeek-V4.1-Flash 实测缓存价高于刊例）。
 - **成本（估算）**：按 `token × 公开刊例价` 估算，不是上游真实扣费。单价取自 OpenRouter 公开目录（`pricing.prompt` / `completion` / `input_cache_read`，抓取时乘 1e6 转 USD / 百万 token），按 `(输入−命中)×输入价 + 命中×缓存价 + 输出×输出价` 折算美元，再按**写入时生效的汇率**（`USD_CNY_RATE`）折人民币。**写入时定值**（`usage_events.cost_usd` / `cost_cny`），历史行不随价表 / 汇率重算。**匹配不到就不计**（未匹配或未上报输入 token 的 `cost_known=0` → 回 `None`、显示 `—`，不拿 0 冒充免费），故成本是**下限**。
 - **缓存命中率** = 命中 token ÷ 输入 token（保留 1 位小数）；未上报或输入为 0 时显示 `—`。
+- **请求 ID（`request_id`）**：每个请求带一个 `X-Request-ID`（`src/webapp/request_id.py` 挂在最外层，任意响应含 413/400 都带头）。入站头合法（`[A-Za-z0-9._:-]{1,128}`）则沿用，否则 `uuid4().hex` 自生成；ID 经 `src/request_context.py` 的 contextvar 传递，`StatsCollector.record` 现读落进 `usage_events.request_id`（跨引擎层，不为一个可观测性字段给所有中间层加参数）。`events` 端点透出该列，统计页时间列悬停展示。**不透传上游**（各渠道出站头语义不同，见 `request_context.py` 模块注释）。
 - **延迟均值只算成功请求**（分子 `SUM(latency_ms WHERE ok=1)` 与分母 `ok_count` 配对）。
 - **回填脚本**：`scripts/backfill_trae_credit.py`（TRAE 推算积分）、`scripts/convert_codearts_credit_unit.py`（CodeArts token→积分，**只能跑一次**）、`scripts/backfill_cost.py`（成本，默认预览、写库前自动备份、幂等）、`scripts/rollup_hourly.py`（小时汇总重算）。均先报告缺口，再 `--apply` 写库。
 ### 9.8 列表排序
@@ -464,6 +467,7 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 | 成长中心（growth） | 每 `GROWTH_INTERVAL_MINUTES`（默认 60，下限 5） | 仅 CodeBuddy：7 类领取；结果落 `growth_events` + 回写 `credentials.growth_last_result` |
 | 活跃上报（activity，默认关闭） | 每 10 分钟醒一次，仅 `ACTIVITY_REPORT_HOUR`（默认 10 点）窗口内执行 | CodeBuddy 与 CodeBuddy 国际版：补发一条 `chat_request_send` 续连登；按「endpoint + userId」隔离、当日封账；成功落一行 `growth_events` |
 | 明细清理（retention） | 每 5 分钟 | `usage_events` 全量重算小时汇总（幂等 upsert，与 record 的增量双写对账）+ 90 天前明细清理；同期限回收 `credit_events` / `audit_events` / `alert_events` / `growth_events`（否则无界增长）。整轮跑在 `asyncio.to_thread`（全表 GROUP BY 是同步 SQLite，直接在事件循环执行会卡住并发请求） |
+| 数据库备份（backup） | 每 `BACKUP_INTERVAL_MINUTES`（默认 1440，下限 60） | `VACUUM INTO` 写主库一致性快照到 `DATA_DIR/backups/` + `integrity_check` + 0600，保留最近 `BACKUP_KEEP`（默认 7）份。整轮跑在 `asyncio.to_thread`（同步磁盘 IO） |
 | 渠道模型列表刷新（注入协程，`api/models.py::list_models`） | 每 `MODEL_CATALOG_MINUTES`（默认 30，下限 5） | 兜底重拉各渠道模型表（TTL 门禁 + 逐渠道 publish + 落盘快照）。周期跟 zen 判活缓存（30 分钟）对齐——更密不会让 zen 多探一次 |
 | 模型目录刷新（OpenRouter，注入协程） | 每 `OPENROUTER_CATALOG_MINUTES`（默认 1440，下限 60） | 拉 OpenRouter → 建三张表 → 落盘 → 就地换入 |
 | 运维告警（alert） | 每 `ALERT_INTERVAL_MINUTES`（默认 5，下限 1） | 评估四类风险（池耗尽 / 任务连续失败 / token 临近到期 / 上游错误率骤升），命中落 `alert_events` 并可推送 webhook；同 `(规则, 对象)` 在静默窗内只报一次 |
@@ -564,7 +568,7 @@ sudo systemctl restart coding2api       # systemd
 **诊断顺序**（先确认版本，再查业务）：
 
 ```bash
-# 1) schema 版本已迁移（期望 18）且账号已导入
+# 1) schema 版本已迁移（期望 19）且账号已导入
 sqlite3 data/coding2api.sqlite3 "PRAGMA user_version; SELECT username, role, enabled FROM users;"
 # 2) 路由存在：期望 401（未登录），404 = 旧后端进程
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users

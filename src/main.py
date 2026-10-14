@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from .api import (
     activate,
@@ -92,6 +93,7 @@ from .provider.zen.client import ZenClient, ZenProvider
 from .runtime_settings import load_runtime_settings
 from .stats.collector import StatsCollector
 from .stats.query import StatsQuery
+from .tasks.backup import BackupTask
 from .tasks.pacer import Pacer
 from .tasks.runner import build_runner
 from .version import app_version
@@ -100,9 +102,15 @@ from .webapp import static as _static
 from .webapp.handlers import register_exception_handlers
 from .webapp.limits import BodySizeLimitMiddleware
 from .webapp.logging import configure_logging
+from .webapp.request_id import RequestIdMiddleware
 from .webapp.security import host_allowed, security_middleware
 
 logger = logging.getLogger(__name__)
+
+# SIGTERM 后允许在途请求（含长流）收尾的最长秒数。三处必须一致：
+# 本常量、deploy/systemd 的 TimeoutStopSec、docker-compose 的 stop_grace_period
+# （后者是容器给进程的停机窗口，必须 >= 本值，否则 SIGKILL 会打断排空）。
+GRACEFUL_SHUTDOWN_SECONDS = 30
 
 # --------------------------------------------------------------- 向后兼容再导出
 # 这些名字历史上住在 main.py，测试与外部脚本直接 import。真实定义已移到
@@ -505,6 +513,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               credit_events=credit_events,
                               audit=audit,
                               alerts=alerts,
+                              backup=BackupTask(config.db_path,
+                                                keep=lambda: runtime.backup_keep),
                               model_catalog=_refresh_channel_models,
                               openrouter_catalog=_refresh_model_catalog,
                               openrouter_catalog_minutes=(
@@ -658,14 +668,23 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
 
     @app.get("/healthz")
     async def healthz():
-        """池健康：进程存活 + 凭证池四类计数（互斥，合计 = total）。
+        """就绪探针：可用凭证数为 0 时回 503（ready>0 回 200）。
 
-        `/health` 只回答「进程还在吗」，适合做容器存活探针；`/healthz` 额外
-        暴露可用凭证数，供外部监控在池子耗尽（ready=0）时提前告警——那是
-        服务「活着但用不了」的状态，存活探针看不出来。
+        `/health` 只回答「进程还在吗」（恒 200，容器存活探针用）；`/healthz`
+        额外暴露凭证池计数，并在 `ready == 0` 时回 503——那是「进程活着但没有
+        任何可用凭证」的状态，对话请求必然 503，负载均衡/外部监控应据此摘流量。
+        计数在两种状态下都返回，监控可读到「为什么不可用」。
+
+        注意：容器 healthcheck 请继续用 `/health`（存活语义）。把探针指到
+        `/healthz` 会在池子耗尽时把容器标成 unhealthy，而重启并不能修好一个
+        没有可用凭证的池子。
         """
-        return {"status": "ok", "service": "coding2api", "version": app_version(),
-                "credentials": services.credentials.pool_counts()}
+        counts = services.credentials.pool_counts()
+        ready = counts["ready"] > 0
+        payload = {"status": "ok" if ready else "unavailable",
+                   "service": "coding2api", "version": app_version(),
+                   "credentials": counts}
+        return JSONResponse(status_code=200 if ready else 503, content=payload)
 
     # 路由挂载（src/api 各模块；静态资源最后注册，catch-all 会匹配所有路径）
     app.include_router(admin_auth.create_router(services))
@@ -690,6 +709,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     _static.register_spa_routes(app)
 
     app.add_middleware(BodySizeLimitMiddleware)
+    # 请求 ID 必须比 BodySizeLimitMiddleware 更外层：请求体超限时后者自己造
+    # 413 响应（不经过更内层的 security），只有最外层才能保证**任何**响应
+    # （含 413 / Host 校验 400）都带上 X-Request-ID。
+    app.add_middleware(RequestIdMiddleware)
     return app
 
 
@@ -758,7 +781,12 @@ def run() -> None:
     # 应用日志（审计、上游错误等）在此之前无 handler 会被丢弃
     configure_logging(config.log_level)
     uvicorn.run(
-        build_app(config), host=config.host, port=config.port, log_level=config.log_level.lower()
+        build_app(config), host=config.host, port=config.port,
+        log_level=config.log_level.lower(),
+        # 收到 SIGTERM 后先停止接受新连接，给在途请求（含长流）最多
+        # GRACEFUL_SHUTDOWN_SECONDS 秒收尾，再强关。默认 None 是无限等，
+        # 配合容器/launchd 的停机超时会变成「卡住直到被 SIGKILL」。
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 
 
