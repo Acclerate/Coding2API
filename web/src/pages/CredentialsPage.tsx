@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  Tag,
   Timer,
   ToggleLeft,
   Trash2,
@@ -38,6 +39,7 @@ import {
   sortGroups,
   STATE_ORDER,
   stateOptions,
+  tagOptions,
 } from "../lib/credentialList";
 import type { GroupSort } from "../lib/credentialList";
 import { api } from "../api/client";
@@ -46,6 +48,7 @@ import { useCredentials, useQueryClient } from "../api/hooks";
 import { PoolOverview } from "../components/PoolOverview";
 import { AddCredentialDialog } from "../components/AddCredentialDialog";
 import { CredentialLimitsDialog } from "../components/CredentialLimitsDialog";
+import { CredentialTagsDialog } from "../components/CredentialTagsDialog";
 import { ToastViewport, useToasts } from "../components/Toast";
 import { ColumnHint, LongTextTip } from "../components/Tip";
 import { PageHeader } from "../components/PageHeader";
@@ -297,6 +300,7 @@ interface Actions {
   activity: (credential: Credential) => void;
   credits: (credential: Credential) => void;
   limits: (credential: Credential) => void;
+  tags: (credential: Credential) => void;
 }
 
 export function CredentialsPage() {
@@ -315,7 +319,9 @@ export function CredentialsPage() {
   const [addOpen, setAddOpen] = useState(false);
   // 限额护栏对话框：一次只编辑一条（存凭证 id，轮询替换列表后仍能取到最新值）
   const [limitsFor, setLimitsFor] = useState<string | null>(null);
-  // 列表筛选：池子一大就没有「找到某个号」的路径，这里收搜索 + 渠道 + 状态三件套。
+  // 标签编辑对话框：同样存 id，取最新快照
+  const [tagsFor, setTagsFor] = useState<string | null>(null);
+  // 列表筛选：池子一大就没有「找到某个号」的路径，这里收搜索 + 渠道 + 状态 + 标签四件套。
   // 筛选是纯展示层收敛，不改后端排序（后端仍按 sort/order 给全量）。
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   // 组排序：默认全站渠道顺序（固定，不随轮询跳动）；可切到「额度从高到低」，
@@ -373,6 +379,7 @@ export function CredentialsPage() {
     () => stateOptions(credentials, now, filters.state),
     [credentials, now, filters.state],
   );
+  const tagCounts = useMemo(() => tagOptions(credentials), [credentials]);
   // 选中集合与当前列表求交：凭证被删除 / 轮询后消失时，残留 id 自动失效，
   // 不会出现「批量操作 3 条，其中 1 条已不存在」。用 filtered 而不是 credentials：
   // 筛选后不可见的行不应被批量动作带上（用户看不见就不会预期它被执行）。
@@ -390,9 +397,15 @@ export function CredentialsPage() {
     () => credentials.find((item) => item.id === limitsFor) ?? null,
     [credentials, limitsFor],
   );
+  // 标签对话框当前编辑的凭证：同上，按 id 取最新快照
+  const tagsCredential = useMemo(
+    () => credentials.find((item) => item.id === tagsFor) ?? null,
+    [credentials, tagsFor],
+  );
   // 是否有任何筛选生效：决定「N / 总数」计数与「清空」入口是否出现
   const filtering =
-    filters.query.trim() !== "" || filters.provider !== ANY || filters.state !== ANY;
+    filters.query.trim() !== "" || filters.provider !== ANY ||
+    filters.state !== ANY || filters.tag !== ANY;
 
   /**
    * 更新筛选并同步展开态。
@@ -404,7 +417,8 @@ export function CredentialsPage() {
    */
   const applyFilters = (next: typeof filters) => {
     setFilters(next);
-    if (next.query.trim() !== "" || next.provider !== ANY || next.state !== ANY) {
+    if (next.query.trim() !== "" || next.provider !== ANY ||
+        next.state !== ANY || next.tag !== ANY) {
       setExpanded(new Set(groupByProvider(
         credentials.filter((item) => matchesFilters(item, next, now)), now,
       ).map((group) => group.provider)));
@@ -633,6 +647,7 @@ export function CredentialsPage() {
       })(),
     // 只开对话框；保存与刷新由对话框自己回调（见 CredentialLimitsDialog）
     limits: (credential) => setLimitsFor(credential.id),
+    tags: (credential) => setTagsFor(credential.id),
   };
 
   if (isLoading) return <PageSkeleton variant="cards" />;
@@ -689,8 +704,9 @@ export function CredentialsPage() {
         ) : (
           <>
             {/* 筛选工具条：池子一大，「找到某个号」就没有路径了。搜索 + 渠道 +
-                状态三件套都是纯展示层收敛，不改后端排序（后端仍按 sort/order
-                给全量）。「筛选后 N / 总数」只在真的筛了才出现，不筛时不制造噪声。 */}
+                状态 + 标签四件套都是纯展示层收敛，不改后端排序（后端仍按
+                sort/order 给全量）。「筛选后 N / 总数」只在真的筛了才出现，
+                不筛时不制造噪声。 */}
             <div className="flex flex-wrap items-center gap-2 pb-3" data-testid="credentials-toolbar">
               <div className="relative">
                 <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -731,6 +747,24 @@ export function CredentialsPage() {
                   </option>
                 ))}
               </Select>
+              {/* 标签筛选：只在池里真的出现过标签时才渲染——没有任何标签时
+                  多一个恒为「全部标签」的下拉只是噪声。 */}
+              {tagCounts.length > 0 && (
+                <Select
+                  value={filters.tag}
+                  data-testid="credential-tag-filter"
+                  aria-label="按标签筛选"
+                  className="h-8 w-40 text-xs"
+                  onChange={(event) => applyFilters({ ...filters, tag: event.target.value })}
+                >
+                  <option value={ANY}>全部标签（{credentials.length}）</option>
+                  {tagCounts.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}（{option.count}）
+                    </option>
+                  ))}
+                </Select>
+              )}
               {/* 组排序：只重排「渠道组」，不动组内行序（行序仍由列头 / 后端 sort 决定）。
                   默认「额度从高到低」——先看还能打最多的渠道；额度排序时无额度接口的
                   免费层垫底（它们没有「剩余额度」可比）。 */}
@@ -1098,6 +1132,19 @@ export function CredentialsPage() {
         />
       )}
 
+      {canWrite && tagsCredential && (
+        <CredentialTagsDialog
+          credential={tagsCredential}
+          onClose={() => setTagsFor(null)}
+          onSaved={(message) => {
+            setTagsFor(null);
+            showNotice(message);
+            void refresh();
+          }}
+          onError={(message) => showError(message)}
+        />
+      )}
+
       {canWrite && (
         <AddCredentialDialog
           open={addOpen}
@@ -1441,6 +1488,24 @@ function Row({
               <Badge tone="muted">限额</Badge>
             </span>
           )}
+          {/* 标签紧贴昵称（它是这一行的记号）：最多显示两个，多余的收成 +N 并
+              在 title 里给全量，避免长标签把昵称挤到省略号。 */}
+          {credential.tags.length > 0 && (
+            <span
+              className="flex shrink-0 items-center gap-1"
+              data-testid={`tags-${credential.id}`}
+              title={credential.tags.join(" / ")}
+            >
+              {credential.tags.slice(0, 2).map((tag) => (
+                <Badge key={tag} tone="muted">{tag}</Badge>
+              ))}
+              {credential.tags.length > 2 && (
+                <span className="text-xs text-muted-foreground">
+                  +{credential.tags.length - 2}
+                </span>
+              )}
+            </span>
+          )}
         </div>
       </TableCell>
       <TableCell>
@@ -1629,6 +1694,10 @@ function Row({
                     <DropdownMenuItem onSelect={() => actions.limits(credential)}>
                       <Gauge className="size-4" />
                       {credential.limits ? "编辑限额" : "设置限额"}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => actions.tags(credential)}>
+                      <Tag className="size-4" />
+                      {credential.tags.length ? "编辑标签" : "设置标签"}
                     </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem

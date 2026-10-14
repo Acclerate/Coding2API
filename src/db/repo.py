@@ -24,6 +24,7 @@ from ..engine.scheduler import (
 from ..provider.base import Quota, health_score
 from ..provider.token_expiry import credential_token_times
 from ..sorting import sort_rows, sql_order
+from ..tags import tags_text, tags_value
 
 
 def _new_id(prefix: str) -> str:
@@ -193,7 +194,8 @@ class CredentialRepository:
     # ------------------------------------------------------------- 写入
 
     def add(self, *, provider: str, credential_data: dict, nickname: str = "",
-            added_by: str = "", now: int | None = None) -> str:
+            added_by: str = "", now: int | None = None,
+            tags: list[str] | None = None) -> str:
         credential_id = _new_id("cred")
         payload = json.dumps(credential_data, ensure_ascii=False).encode("utf-8")
         created = int(now if now is not None else time.time())
@@ -201,11 +203,18 @@ class CredentialRepository:
         with self._db.transaction() as conn:
             conn.execute(
                 "INSERT INTO credentials (id, provider, nickname, data_enc, created_at, added_by, "
-                "token_expires_at, token_issued_at) VALUES (?,?,?,?,?,?,?,?)",
+                "token_expires_at, token_issued_at, tags) VALUES (?,?,?,?,?,?,?,?,?)",
                 (credential_id, provider, nickname, self._cipher.encrypt(payload),
-                 created, added_by, expires_at, issued_at),
+                 created, added_by, expires_at, issued_at, tags_text(tags or [])),
             )
         return credential_id
+
+    def set_tags(self, credential_id: str, tags: list[str]) -> bool:
+        """整体替换一条凭证的标签（空列表 = 清空）。返回是否命中该凭证。"""
+        with self._db.transaction() as conn:
+            cursor = conn.execute("UPDATE credentials SET tags = ? WHERE id = ?",
+                                  (tags_text(tags), credential_id))
+        return cursor.rowcount > 0
 
     def delete(self, credential_id: str) -> bool:
         with self._db.transaction() as conn:
@@ -536,7 +545,8 @@ class CredentialRepository:
             "SELECT id, provider, nickname, enabled, disabled, disabled_reason, pinned, "
             "health, cooling_until, err_count, quota_remaining, quota_total, quota_cycle_end, "
             "quota_probed_at, growth_last_run_at, growth_last_result, created_at, added_by, "
-            "quota_expiry_ladder, quota_packages, data_enc, token_expires_at, token_issued_at "
+            "quota_expiry_ladder, quota_packages, data_enc, token_expires_at, token_issued_at, "
+            "tags "
             "FROM credentials ORDER BY created_at").fetchall()
         cooling_rows = self._db.connect().execute(
             "SELECT credential_id, model, cooling_until, hits, reason "
@@ -564,6 +574,9 @@ class CredentialRepository:
             ladder = _ladder_value(row["quota_expiry_ladder"])
             rec["quota_expiry_ladder"] = ladder
             rec["quota_packages"] = _packages_value(row["quota_packages"])
+            # 标签以列表下发（库里是逗号分隔文本）：展示层不必知道存储形态，
+            # 脏数据由 tags_value 读路径容错滤掉。
+            rec["tags"] = tags_value(row["tags"])
             primary, secondary = expiry_windows(expiring_window, expiring_secondary_window)
             rec["quota_expiring_credits"] = (
                 None if ladder is None else expiring_credits(ladder, primary, now))

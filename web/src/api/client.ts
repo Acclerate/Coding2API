@@ -151,6 +151,12 @@ export const api = {
       method: "PUT",
       ...json(limits),
     }),
+  /** 整体替换一条凭证的标签（空数组 = 清空）。 */
+  setCredentialTags: (id: string, tags: string[]) =>
+    request<{ tags: string[] }>(`/api/credentials/${id}/tags`, {
+      method: "PUT",
+      ...json({ tags }),
+    }),
   /** 批量运维：一次对多条凭证执行同一动作，后端逐条隔离返回结果。 */
   batchCredentials: (action: BatchAction, ids: string[], enabled?: boolean) =>
     request<BatchResult>("/api/credentials/batch", {

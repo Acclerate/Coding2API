@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     token_issued_at  INTEGER,                   -- access token 签发 epoch（JWT iat）：进度条满量程与「最后续期」
     growth_last_run_at INTEGER,                    -- 成长中心最近一轮执行时间（仅 CodeBuddy）
     growth_last_result TEXT,                       -- 该轮一行中文汇报
+    tags             TEXT NOT NULL DEFAULT '',     -- 逗号分隔的运维标签（纯展示筛选，不参与调度）
     created_at       INTEGER NOT NULL,
     added_by         TEXT                          -- 应用层校验存在于 users 表
 );

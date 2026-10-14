@@ -114,6 +114,7 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     created_at: 1_700_000_000,
     added_by: "root",
     limits: null,
+    tags: [],
     ...overrides,
   };
 }

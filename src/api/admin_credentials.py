@@ -23,12 +23,14 @@ from ..audit.actions import (
     ACTION_CREDENTIAL_PIN,
     ACTION_CREDENTIAL_REVIVE,
     ACTION_CREDENTIAL_SWITCH_ACCOUNT,
+    ACTION_CREDENTIAL_TAGS,
     ACTION_CREDENTIAL_TOGGLE,
 )
 from ..auth.rbac import require_operator
 from ..compat.openai.request import InvalidRequest
 from ..provider.base import GrowthResult, GrowthStep, StepStatus
 from ..sorting import sort_rows
+from ..tags import parse_tags
 from .deps import Services, csrf_protected, principal_from_request
 
 logger = logging.getLogger(__name__)
@@ -255,10 +257,15 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(f"unknown provider {provider_id!r}")
         credential_data = registry[provider_id].import_credential(
             payload.get("credential") or {})
+        try:
+            # 导入时可选带标签（列表页「添加」对话框不填即为空）
+            tags = parse_tags(payload.get("tags"))
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
         credential_id = credentials.add(provider=provider_id,
                                         credential_data=credential_data,
                                         nickname=str(payload.get("nickname") or ""),
-                                        added_by=principal.username)
+                                        added_by=principal.username, tags=tags)
         logger.info("管理员 %s 新增凭证 %s（上游 %s）", principal.username, credential_id,
                     provider_id)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_IMPORT,
@@ -319,6 +326,28 @@ def create_router(services: Services) -> APIRouter:
                               target=credential_id, detail=_limits_detail(limits))
         record = services.limits.get(credential_id)
         return {"limits": record.as_dict() if record is not None else None}
+
+    @router.put("/api/credentials/{credential_id}/tags")
+    async def set_credential_tags(credential_id: str, payload: dict,
+                                  _csrf: None = Depends(csrf_protected),
+                                  principal=Depends(principal_from_request)):
+        """整体替换一条凭证的标签（空列表 = 清空）。
+
+        标签只影响列表展示与筛选，不参与调度/鉴权，因此不触发任何缓存失效
+        （与限额护栏不同：那个要 `limit_guard.invalidate()`）。
+        """
+        require_operator(principal)
+        try:
+            tags = parse_tags(payload.get("tags"))
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
+        if not credentials.set_tags(credential_id, tags):
+            raise InvalidRequest("credential not found")
+        logger.info("管理员 %s 设置凭证 %s 标签: %s", principal.username, credential_id,
+                    ",".join(tags) or "（清空）")
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_TAGS,
+                              target=credential_id, detail=",".join(tags) or "（清空）")
+        return {"tags": tags}
 
     @router.post("/api/credentials/pin")
     async def pin_credential(payload: dict,

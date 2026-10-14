@@ -5,7 +5,7 @@
  * 没有分组看不出渠道结构，每行还复读同样的渠道名与周期语义。这里把三件事抽成
  * 可单测的纯函数，`CredentialsPage` 只负责渲染：
  *
- * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态；
+ * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态 × 标签；
  * - 分组：按渠道聚合，组顺序与全站渠道顺序一致（`providerRank`）；
  * - 计数：给筛选控件提供「各项各有多少条」，让零计数的筛选项不占位。
  *
@@ -28,17 +28,32 @@ export interface CredentialFilters {
   provider: string;
   /** 状态筛选：`ANY` 或 `CredentialState` */
   state: string;
+  /** 标签筛选：`ANY` 或某个标签（**精确匹配**，大小写不敏感） */
+  tag: string;
 }
 
 /** 默认筛选：全部可见（页面首屏即池子全貌）。 */
-export const DEFAULT_FILTERS: CredentialFilters = { query: "", provider: ANY, state: ANY };
+export const DEFAULT_FILTERS: CredentialFilters = {
+  query: "", provider: ANY, state: ANY, tag: ANY,
+};
+
+/**
+ * 标签比对用的大小写不敏感键。
+ *
+ * 后端按大小写不敏感去重但保留首次写法，故同一标签在库里只会有一种写法；
+ * 这里再归一一次是为了前端筛选下拉与行内徽章在任何写法下都能对上。
+ */
+function tagKey(tag: string): string {
+  return tag.trim().toLowerCase();
+}
 
 /**
  * 单条凭证是否通过筛选。
  *
  * 搜索同时匹配昵称、渠道展示名与凭证 id：用户可能记得「主账号」「TRAE」或
  * 后端给的 id，任一种都该能找到。渠道名参与匹配是有意的——按渠道筛选之外，
- * 直接打字「codebuddy」也应当收敛。
+ * 直接打字「codebuddy」也应当收敛。**标签不参与搜索**：它是结构化维度，
+ * 已经单列一个下拉；混进搜索词会让「查一个恰好叫『生产』的昵称」变得不可能。
  */
 export function matchesFilters(
   credential: Credential,
@@ -47,6 +62,10 @@ export function matchesFilters(
 ): boolean {
   if (filters.provider !== ANY && credential.provider !== filters.provider) return false;
   if (filters.state !== ANY && credentialState(credential, now) !== filters.state) return false;
+  if (filters.tag !== ANY && !(credential.tags ?? []).some(
+    (tag) => tagKey(tag) === tagKey(filters.tag))) {
+    return false;
+  }
   const needle = filters.query.trim().toLowerCase();
   if (!needle) return true;
   const fields = [credential.nickname, credential.id, providerLabel(credential.provider)];
@@ -206,6 +225,34 @@ export const STATE_ORDER: CredentialState[] = [
   "off",
   "exhausted",
 ];
+
+/**
+ * 标签筛选项：列表里出现过的标签（带计数），按**首次出现顺序**排。
+ *
+ * 不像渠道那样有全站固定顺序（标签是用户自由起的），按出现顺序排能让常用标签
+ * 稳定地留在原位；同一条凭证上的多个标签合计只算一次。
+ */
+export function tagOptions(credentials: Credential[]): CountedOption[] {
+  const counts = new Map<string, { label: string; count: number }>();
+  for (const credential of credentials) {
+    // 同一条凭证内的重复标签（老数据/大小写不一）只算一次——下拉里的数字是
+    // 「携带该标签的凭证数」，不是标签出现次数。
+    const seenHere = new Set<string>();
+    for (const tag of credential.tags ?? []) {
+      const key = tagKey(tag);
+      if (seenHere.has(key)) continue;
+      seenHere.add(key);
+      const seen = counts.get(key);
+      if (seen) seen.count += 1;
+      else counts.set(key, { label: tag.trim(), count: 1 });
+    }
+  }
+  return [...counts.entries()].map(([value, item]) => ({
+    value,
+    label: item.label,
+    count: item.count,
+  }));
+}
 
 /**
  * 状态筛选项：五态带计数。

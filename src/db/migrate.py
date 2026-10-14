@@ -42,7 +42,9 @@ SCHEMA_NAME = "schema.sql"
 # EXISTS 对老库同样生效），无需迁移动作；缺行 = 不受限，老库行为不变。
 # 21：alert_events 新增 resolved_at（告警迟滞状态机确认恢复后写入；老库补列
 # 后历史行为 NULL，不影响既有记录展示与静默去重）。
-SCHEMA_VERSION = 21
+# 22：credentials 新增 tags（逗号分隔的运维标签，仅用于列表展示与筛选，
+# 不参与调度/鉴权）。默认 ''，老库补列后全部凭证「无标签」，行为不变。
+SCHEMA_VERSION = 22
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -89,6 +91,9 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 告警恢复时刻（迟滞状态机确认恢复后写入）：老库补列后历史行为 NULL
     # （全部视为「仍在告警中」/未恢复，不影响既有记录展示）。
     ("alert_events", "resolved_at INTEGER"),
+    # 运维标签（仅列表展示与筛选，不参与调度）：老库补 '' 后全部凭证无标签，
+    # 筛选界面默认「全部标签」下行为与补列前一致。
+    ("credentials", "tags TEXT NOT NULL DEFAULT ''"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。

@@ -10,6 +10,7 @@ import {
   providerOptions,
   sortGroups,
   stateOptions,
+  tagOptions,
 } from "../credentialList";
 import type { Credential } from "../../api/types";
 
@@ -54,11 +55,29 @@ describe("matchesFilters", () => {
   it("多个条件是 AND 关系", () => {
     const item = credential({ provider: "trae", nickname: "备用" });
     expect(
-      matchesFilters(item, { query: "备用", provider: "trae", state: "ready" }, NOW),
+      matchesFilters(item, { ...DEFAULT_FILTERS, query: "备用", provider: "trae", state: "ready" }, NOW),
     ).toBe(true);
     expect(
-      matchesFilters(item, { query: "备用", provider: "codebuddy", state: "ready" }, NOW),
+      matchesFilters(item, { ...DEFAULT_FILTERS, query: "备用", provider: "codebuddy", state: "ready" }, NOW),
     ).toBe(false);
+  });
+
+  it("标签筛选精确匹配（大小写不敏感），且不参与搜索词", () => {
+    const item = credential({ id: "cred_t", nickname: "主账号", tags: ["Prod", "备用"] });
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: "prod" }, NOW)).toBe(true);
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: " 备用 " }, NOW)).toBe(true);
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: "生" }, NOW)).toBe(false);
+    // 无标签凭证在任一标签筛选下都被剔除
+    expect(matchesFilters(credential({ tags: [] }), { ...DEFAULT_FILTERS, tag: "prod" }, NOW))
+      .toBe(false);
+    // 标签是结构化维度：不该被搜索词命中（否则「搜昵称叫『生产』的号」变得不可能）
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, query: "prod" }, NOW)).toBe(false);
+  });
+
+  it("tags 缺失（老后端）时不因 undefined 崩，按无标签处理", () => {
+    const legacy = { ...credential(), tags: undefined } as unknown as Credential;
+    expect(matchesFilters(legacy, DEFAULT_FILTERS, NOW)).toBe(true);
+    expect(matchesFilters(legacy, { ...DEFAULT_FILTERS, tag: "prod" }, NOW)).toBe(false);
   });
 });
 
@@ -284,5 +303,30 @@ describe("stateOptions", () => {
   it("ANY 不是具体状态，不会被当成选中项保留", () => {
     const options = stateOptions([credential({ id: "a" })], NOW, ANY);
     expect(options.map((option) => option.value)).toEqual(["ready"]);
+  });
+});
+
+describe("tagOptions", () => {
+  it("按首次出现顺序列出标签与计数，大小写不敏感合并", () => {
+    const options = tagOptions([
+      credential({ id: "a", tags: ["生产", "prod"] }),
+      credential({ id: "b", tags: ["prod", "PROD"] }),
+      credential({ id: "c", tags: [] }),
+    ]);
+    // prod / PROD 合并成一个，标签取首次写法
+    expect(options).toEqual([
+      { value: "生产", label: "生产", count: 1 },
+      { value: "prod", label: "prod", count: 2 },
+    ]);
+  });
+
+  it("无标签的池没有标签项", () => {
+    expect(tagOptions([credential({ tags: [] })])).toEqual([]);
+    expect(tagOptions([])).toEqual([]);
+  });
+
+  it("老后端缺 tags 字段（undefined）不崩", () => {
+    const legacy = { ...credential(), tags: undefined } as unknown as Credential;
+    expect(tagOptions([legacy])).toEqual([]);
   });
 });

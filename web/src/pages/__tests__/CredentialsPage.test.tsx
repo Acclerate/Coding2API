@@ -1027,6 +1027,206 @@ describe("CredentialsPage", () => {
     const quota = within(row).getByTitle("账户剩余（单调递减）");
     expect(quota).toHaveTextContent("62 / 100");
   });
+
+  it("标签筛选：下拉按标签收敛，清空后回到全部", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "p", provider: "trae", tags: ["生产"] }),
+        makeCredential({ id: "b", provider: "trae", tags: ["备用", "生产"] }),
+        makeCredential({ id: "n", provider: "codebuddy", tags: [] }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    expect(screen.getByTestId("row-p")).toBeInTheDocument();
+
+    // 无标签的池不渲染该下拉；这里有两个标签，选项带计数
+    const select = screen.getByTestId("credential-tag-filter");
+    expect(within(select).getByRole("option", { name: "生产（2）" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "备用（1）" })).toBeInTheDocument();
+
+    await userEvent.selectOptions(select, "生产");
+    expect(screen.getByTestId("credential-filter-count")).toHaveTextContent("筛选后 2 / 3");
+    expect(screen.getByTestId("row-p")).toBeInTheDocument();
+    expect(screen.getByTestId("row-b")).toBeInTheDocument();
+    expect(screen.queryByTestId("row-n")).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(select, "备用");
+    expect(screen.getByTestId("credential-filter-count")).toHaveTextContent("筛选后 1 / 3");
+    expect(screen.getByTestId("row-b")).toBeInTheDocument();
+    expect(screen.queryByTestId("row-p")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("credential-clear-filters"));
+    expect(screen.queryByTestId("credential-filter-count")).not.toBeInTheDocument();
+  });
+
+  it("池里没有任何标签时不渲染标签下拉（不留恒为全部的空控件）", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "a" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    expect(screen.queryByTestId("credential-tag-filter")).not.toBeInTheDocument();
+  });
+
+  it("行内最多显示两个标签，多余收成 +N 且 title 给全量", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "many", tags: ["一", "二", "三", "四"] }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    const tags = screen.getByTestId("tags-many");
+    expect(within(tags).getByText("一")).toBeInTheDocument();
+    expect(within(tags).getByText("二")).toBeInTheDocument();
+    expect(within(tags).getByText("+2")).toBeInTheDocument();
+    expect(within(tags).queryByText("三")).not.toBeInTheDocument();
+    expect(tags).toHaveAttribute("title", "一 / 二 / 三 / 四");
+  });
+
+  it("无标签的行不渲染标签容器", async () => {
+    mockFetch({ "/api/credentials": listBody([makeCredential({ id: "none" })]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    expect(screen.queryByTestId("tags-none")).not.toBeInTheDocument();
+  });
+
+  it("通过菜单设置标签：保存调用 PUT 并提示，本地先拦超限输入", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/credentials/cred_1/tags" && init?.method === "PUT") {
+        return jsonResponse({ tags: ["生产"] });
+      }
+      return jsonResponse(listBody([makeCredential({ id: "cred_1", tags: [] })]));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "设置标签" }));
+
+    const dialog = await screen.findByTestId("credential-tags-dialog");
+    expect(dialog).toHaveTextContent("不影响调度");
+
+    // 超长标签：本地拦住，不发请求
+    await userEvent.type(screen.getByTestId("credential-tags-input"), "x".repeat(25));
+    await userEvent.click(screen.getByTestId("credential-tags-save"));
+    expect(screen.getByTestId("credential-tags-error")).toHaveTextContent("最长 24 个字符");
+    expect(fetchSpy).not.toHaveBeenCalledWith(
+      "/api/credentials/cred_1/tags",
+      expect.objectContaining({ method: "PUT" }),
+    );
+
+    // 改成合法标签（含全角逗号）：去重后预览两项，保存发出 PUT
+    await userEvent.clear(screen.getByTestId("credential-tags-input"));
+    await userEvent.type(screen.getByTestId("credential-tags-input"), "生产，备用，生产");
+    const preview = screen.getByTestId("credential-tags-preview");
+    expect(preview).toHaveTextContent("生产");
+    expect(preview).toHaveTextContent("备用");
+    await userEvent.click(screen.getByTestId("credential-tags-save"));
+
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/credentials/cred_1/tags",
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+  });
+
+  it("标签保存失败时提示后端错误，不清空对话框", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === "/api/credentials/cred_1/tags" && init?.method === "PUT") {
+          return jsonResponse({ error: { message: "标签最多 16 条" } }, 400);
+        }
+        return jsonResponse(listBody([makeCredential({ id: "cred_1" })]));
+      }),
+    );
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "设置标签" }));
+    await screen.findByTestId("credential-tags-dialog");
+
+    await userEvent.type(screen.getByTestId("credential-tags-input"), "生产");
+    await userEvent.click(screen.getByTestId("credential-tags-save"));
+
+    expect(await screen.findByTestId("credentials-error")).toHaveTextContent("标签最多 16 条");
+    expect(screen.getByTestId("credential-tags-dialog")).toBeInTheDocument();
+  });
+
+  it("编辑已有标签：输入框预填并支持清空", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/credentials/cred_1/tags" && init?.method === "PUT") {
+        return jsonResponse({ tags: [] });
+      }
+      return jsonResponse(listBody([makeCredential({ id: "cred_1", tags: ["生产", "备用"] })]));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "编辑标签" }));
+
+    const input = await screen.findByTestId("credential-tags-input");
+    expect(input).toHaveValue("生产, 备用");
+
+    await userEvent.clear(input);
+    await userEvent.click(screen.getByTestId("credential-tags-save"));
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/credentials/cred_1/tags",
+        expect.objectContaining({ method: "PUT", body: JSON.stringify({ tags: [] }) }),
+      ),
+    );
+  });
+
+  it("标签对话框可用取消/Esc 关闭且不发请求", async () => {
+    const fetchSpy = mockFetch({ "/api/credentials": listBody([makeCredential({ id: "cred_1" })]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "设置标签" }));
+    const input = await screen.findByTestId("credential-tags-input");
+    // 先点进输入框：下拉菜单关闭时会异步把焦点还给触发按钮，
+    // Esc 若落在对话框之外，焦点陷阱的 keydown 监听收不到。
+    await userEvent.click(input);
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByTestId("credential-tags-dialog")).not.toBeInTheDocument(),
+    );
+    // 没有发出标签写请求（Esc 只关闭对话框）
+    expect(fetchSpy.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "PUT"))
+      .toBe(false);
+  });
+
+  it("只读用户看不到标签设置入口", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "cred_1", tags: ["生产"] })], false),
+    });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    await expandCredentialGroups();
+    expect(screen.queryByTestId("actions-cred_1")).not.toBeInTheDocument();
+    // 但标签徽章与筛选对只读用户可见
+    expect(screen.getByTestId("tags-cred_1")).toBeInTheDocument();
+    expect(screen.getByTestId("credential-tag-filter")).toBeInTheDocument();
+  });
 });
 
 

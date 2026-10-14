@@ -120,6 +120,8 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     assert tuple(legacy_cost) == (0, None)        # 老库历史行无成本（cost_known=0）
     cred_columns = {row[1] for row in db.connect().execute("PRAGMA table_info(credentials)")}
     assert "quota_expiry_ladder" in cred_columns
+    # 运维标签列（仅展示筛选，不参与调度）：老库补 '' 后全部凭证无标签
+    assert "tags" in cred_columns
     # 额度包明细（展示用）也是本次新增列
     assert "quota_packages" in cred_columns
     # 废弃表被 _MIGRATION_DROPS 清理（schema.sql 删定义对老库无效）
@@ -257,6 +259,41 @@ def test_legacy_db_upgrade_adds_credit_events_table(tmp_path):
 
     assert db.connect().execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     db.close()
+
+def test_legacy_db_upgrade_adds_credential_tags(tmp_path):
+    """老库升级：credentials 无 tags 列时幂等补列，历史行取默认空串。
+
+    `NOT NULL DEFAULT ''`：补列后全部凭证「无标签」，列表筛选默认「全部标签」
+    下行为与补列前完全一致，不需要回填。
+    """
+    db = Database(tmp_path / "legacy.sqlite3")
+    conn = sqlite3.connect(db.path)
+    conn.execute(
+        "CREATE TABLE credentials (id TEXT PRIMARY KEY, provider TEXT NOT NULL,"
+        " data_enc BLOB NOT NULL, created_at INTEGER NOT NULL)")
+    conn.execute("INSERT INTO credentials (id, provider, data_enc, created_at)"
+                 " VALUES ('cred_old', 'trae', x'00', 1)")
+    conn.commit()
+    conn.close()
+
+    apply_schema(db.connect())
+    columns = {row[1] for row in db.connect().execute("PRAGMA table_info(credentials)")}
+    assert "tags" in columns
+    # 历史行保留且取默认空串（读路径 tags_value('') == []）
+    from src.tags import tags_value
+
+    assert tags_value(db.connect().execute(
+        "SELECT tags FROM credentials WHERE id = 'cred_old'").fetchone()[0]) == []
+    # 补列后可写可读
+    db.connect().execute("UPDATE credentials SET tags = '生产,备用' WHERE id = 'cred_old'")
+    db.connect().commit()
+    assert db.connect().execute(
+        "SELECT tags FROM credentials WHERE id = 'cred_old'").fetchone()[0] == "生产,备用"
+    from src.db.migrate import SCHEMA_VERSION
+
+    assert db.connect().execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    db.close()
+
 
 def test_legacy_db_upgrade_adds_api_key_policy_columns(tmp_path):
     """老库升级：api_keys 无 provider_binding / allowed_ips 时幂等补列。

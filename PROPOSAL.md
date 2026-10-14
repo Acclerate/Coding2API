@@ -134,12 +134,12 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ## 4. 数据模型
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 21`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 22`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
 
 | 表 | 用途 |
 |---|---|
 | `api_keys` | API Key（SHA-256 摘要 + 预览 + 渠道绑定 `provider_binding` + 来源 IP 白名单 `allowed_ips` + 模型白名单 `allowed_models` + 到期 `expires_at`） |
-| `credentials` | 加密凭证（`data_enc` 走 Fernet）+ 调度状态（`enabled`/`disabled`/`pinned`/`health`/`cooling_until`/`err_count`）+ 额度与到期阶梯 + token 到期列 + 成长中心最近结果 |
+| `credentials` | 加密凭证（`data_enc` 走 Fernet）+ 调度状态（`enabled`/`disabled`/`pinned`/`health`/`cooling_until`/`err_count`）+ 额度与到期阶梯 + token 到期列 + 成长中心最近结果 + 运维标签 `tags`（仅展示筛选，不参与调度） |
 | `credential_limits` | 凭证级限额护栏（保留积分 / 每日 token / 每日 credit / 按模型 token）；**缺行 = 不受限** |
 | `usage_events` | 请求明细（token / credit / 缓存命中 / 成本 / 耗时 / 首字延迟 / 请求 ID），保留 90 天 |
 | `usage_hourly` | 小时汇总（永久保留），渠道 / 模型 / 用户维度统计读此表 |

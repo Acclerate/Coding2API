@@ -402,7 +402,7 @@ class Scheduler:
 客户端断连：生成器被关闭/取消时统计 `error_type=client_disconnect`，关闭上游流；例外：`[DONE]` 已产出后的收尾断开（客户端拿到回调即关连接，框架在结束帧 `more_body=False` 前有一拍竞态会把它判为断开）按成功记账。
 
 ## 8. 数据库
-DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 21`，共 12 张表：`api_keys` / `credentials` / `credential_limits` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
+DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 22`，共 12 张表：`api_keys` / `credentials` / `credential_limits` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
 
 ```sql
 -- conn.py 打开时执行
@@ -417,6 +417,8 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 - 模型列表与模型目录不占表：模型列表是「进程内 TTL 缓存 + `DATA_DIR/model_catalog.json` 落盘快照」，OpenRouter 目录是 `DATA_DIR/openrouter_catalog.json`（见 §9.4）；签到去重由 `CheckinTask` 的当日作用域集合实现。
 
 **备份与恢复**（`src/db/backup.py`，任务与 `scripts/` 共用）：`VACUUM INTO` 把主库写成一致性快照（WAL 下直接 `cp` 会丢未 checkpoint 的事务），落盘后立即 `PRAGMA integrity_check`（不过则删半成品并抛错），产物 `0600` 目录 `0700`；后台任务每 `BACKUP_INTERVAL_MINUTES` 备份一次、按 mtime 保留最近 `BACKUP_KEEP` 份。恢复 `scripts/restore_db.py`：先校验备份 → 给现有主库做 `.pre-restore-<ts>` 一致性安全副本 → 同目录临时文件 `os.replace` 原子替换 → 删 `-wal`/`-shm` 残留（属旧库，留着会损坏新库）；默认预览，`--apply` 才写。**不做「服务在跑」探测**（容器/权限都可能误判），文档要求恢复前先停服、恢复后重启。
+
+**凭证标签**（`credentials.tags`，v22 新增列；纯函数在 `src/tags.py`）：逗号分隔文本，`MAX_TAGS=16` / `MAX_TAG_LENGTH=24`。**写入口校验、读路径容错**——`parse_tags` 对超长/超量/非字符串项抛 `ValueError`（端点转成 400），`tags_value` 对库里手工改坏的越界项只丢弃、不抛错，避免一条脏标签让整页凭证列表失败。去重按**大小写不敏感**但保留首次写法。半角/全角逗号与分号都当分隔符（中文输入法极易打出全角逗号）；含分隔符的**列表项**在写入前被拒（存进去会被读回时拆成两条，读写不等价）。**标签不参与调度与鉴权**——它是给人看的收敛维度，一旦影响选号，改名就会静默改变线上流量。端点 `PUT /api/credentials/{id}/tags`（整体替换，空数组 = 清空，`require_operator`），审计动作 `credential.tags`；导入 `POST /api/credentials` 也可选带 `tags`。列表响应里 `tags` 是**数组**（不是存储文本），前端筛选与徽章直接用。
 
 **迁移纪律**（`migrate.py`）：
 - 启动时读 `schema.sql` 逐条 `CREATE TABLE IF NOT EXISTS`（只加不改）。

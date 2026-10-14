@@ -81,6 +81,8 @@ export interface Credential {
   added_by: string | null;
   /** 凭证级限额护栏；null = 未配置（不受限） */
   limits: CredentialLimits | null;
+  /** 运维标签（仅列表展示与筛选，不参与调度）；无标签为空数组 */
+  tags: string[];
 }
 
 /** 凭证级限额护栏（全部按北京自然日；0/null = 该护栏关闭）。 */
