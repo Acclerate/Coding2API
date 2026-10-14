@@ -440,7 +440,7 @@ export function StatsPage() {
         {groupRows.length === 0 ? (
           <Empty data-testid="no-group-stats">该范围内没有请求</Empty>
         ) : (
-          <Table data-testid="group-table">
+          <Table data-testid="group-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label={group.value === "provider" ? "渠道" : groupLabel}
@@ -498,7 +498,8 @@ export function StatsPage() {
                               applyDrill(next);
                             }
                           }}>
-                  <TableCell className="max-w-48 truncate"
+                  <TableCell label={group.value === "provider" ? "渠道" : groupLabel}
+                             className="max-w-48 truncate"
                              title={groupKey === "credential_id"
                                ? (row.credential_id ?? undefined)
                                : keyValue}>
@@ -517,21 +518,31 @@ export function StatsPage() {
                       keyValue
                     )}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{formatNumber(row.requests)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{formatNumber(row.ok_count)}</TableCell>
+                  <TableCell label="请求数" className="text-right tabular-nums">
+                    {formatNumber(row.requests)}
+                  </TableCell>
+                  <TableCell label="成功数" className="text-right tabular-nums">
+                    {formatNumber(row.ok_count)}
+                  </TableCell>
                   {/* 成功率：请求数为 0 无意义（不渲染 0% 冒充数据） */}
-                  <TableCell className="text-right tabular-nums" data-testid="group-success-rate">
+                  <TableCell label="成功率" className="text-right tabular-nums" data-testid="group-success-rate">
                     {row.requests > 0
                       ? `${((row.ok_count / row.requests) * 100).toFixed(1)}%`
                       : "—"}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{formatCompact(row.input_tokens)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{formatCompact(row.output_tokens)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{formatCompact(row.cached_tokens)}</TableCell>
-                  <TableCell className="text-right tabular-nums">
+                  <TableCell label="输入 token" className="text-right tabular-nums">
+                    {formatCompact(row.input_tokens)}
+                  </TableCell>
+                  <TableCell label="输出 token" className="text-right tabular-nums">
+                    {formatCompact(row.output_tokens)}
+                  </TableCell>
+                  <TableCell label="命中缓存" className="text-right tabular-nums">
+                    {formatCompact(row.cached_tokens)}
+                  </TableCell>
+                  <TableCell label="Credit" className="text-right tabular-nums">
                     {formatCredit(row.credit, row.credit_estimated)}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums"
+                  <TableCell label="成本" className="text-right tabular-nums"
                              title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
                     {formatMoney(row.cost_cny, "CNY")}
                   </TableCell>
@@ -604,7 +615,7 @@ export function StatsPage() {
           <Empty data-testid="no-events">该范围内没有请求明细</Empty>
         ) : (
           <>
-            <Table data-testid="events-table">
+            <Table data-testid="events-table" cards>
               <TableHeader>
                 <TableRow>
                   <SortableHead label="时间" columnKey="ts" active={eventSort.sort === "ts"}
@@ -663,34 +674,48 @@ export function StatsPage() {
               <TableBody>
                 {eventRows.map((row) => (
                   <TableRow key={row.rowid} data-testid="event-row">
-                    <TableCell className="whitespace-nowrap tabular-nums"
+                    <TableCell label="时间" className="whitespace-nowrap tabular-nums"
                                title={row.request_id ? `请求 ID：${row.request_id}` : undefined}>
                       {formatTime(row.ts)}
                     </TableCell>
-                    {session.is_operator && <TableCell>{row.username}</TableCell>}
-                    <TableCell>
+                    {session.is_operator && (
+                      <TableCell label="用户">{row.username}</TableCell>
+                    )}
+                    <TableCell label="渠道">
                       <span className="inline-flex items-center gap-1.5">
                         <ProviderIcon provider={row.provider} size={13} />
                         {providerLabel(row.provider)}
                       </span>
                     </TableCell>
-                    <TableCell className="max-w-40 truncate" title={row.credential_id ?? undefined}>
+                    <TableCell label="凭证" className="max-w-40 truncate" title={row.credential_id ?? undefined}>
                       {credentialCellLabel(row.credential_name, row.credential_id)}
                     </TableCell>
-                    <TableCell className="max-w-48 truncate" title={row.model}>{row.model}</TableCell>
-                    <TableCell>{statusCell(row)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{formatCompact(row.input_tokens)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{formatCompact(row.output_tokens)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{formatCompact(row.cached_tokens)}</TableCell>
-                    <TableCell className="text-right tabular-nums">
+                    <TableCell label="模型" className="max-w-48 truncate" title={row.model}>
+                      {row.model}
+                    </TableCell>
+                    <TableCell label="状态">{statusCell(row)}</TableCell>
+                    <TableCell label="输入" className="text-right tabular-nums">
+                      {formatCompact(row.input_tokens)}
+                    </TableCell>
+                    <TableCell label="输出" className="text-right tabular-nums">
+                      {formatCompact(row.output_tokens)}
+                    </TableCell>
+                    <TableCell label="命中" className="text-right tabular-nums">
+                      {formatCompact(row.cached_tokens)}
+                    </TableCell>
+                    <TableCell label="Credit" className="text-right tabular-nums">
                       {formatCredit(row.credit, row.credit_estimated)}
                     </TableCell>
-                    <TableCell className="text-right tabular-nums"
+                    <TableCell label="成本" className="text-right tabular-nums"
                                title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
                       {formatMoney(row.cost_cny, "CNY")}
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{formatLatency(row.ttfb_ms)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{formatLatency(row.latency_ms)}</TableCell>
+                    <TableCell label="首字延迟" className="text-right tabular-nums">
+                      {formatLatency(row.ttfb_ms)}
+                    </TableCell>
+                    <TableCell label="耗时" className="text-right tabular-nums">
+                      {formatLatency(row.latency_ms)}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

@@ -134,7 +134,7 @@ export function AuditPage() {
           />
         ) : (
           <>
-            <Table data-testid="audit-table">
+            <Table data-testid="audit-table" cards>
               <TableHeader>
                 <TableRow>
                   <SortableHead label="时间" columnKey="ts" active={sort === "ts"}
@@ -153,22 +153,24 @@ export function AuditPage() {
               <TableBody>
                 {events.map((event) => (
                   <TableRow key={event.id} data-testid={`audit-row-${event.id}`}>
-                    <TableCell className="whitespace-nowrap text-xs">
+                    <TableCell label="时间" className="whitespace-nowrap text-xs">
                       {formatTime(event.ts)}
                     </TableCell>
-                    <TableCell className="text-xs">{event.actor}</TableCell>
-                    <TableCell>
+                    <TableCell label="操作者" className="text-xs">{event.actor}</TableCell>
+                    <TableCell label="动作">
                       {/* 失败动作对读屏不可见（颜色语义）：加「失败」文案 */}
                       <Badge tone={event.ok ? "muted" : "danger"}>
                         {labels[event.action] ?? event.action}
                         {!event.ok && "（失败）"}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-xs">{event.target ?? "—"}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
+                    <TableCell label="对象" className="text-xs">{event.target ?? "—"}</TableCell>
+                    <TableCell label="详情" className="text-xs text-muted-foreground">
                       {event.detail || "—"}
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{event.ip ?? "—"}</TableCell>
+                    <TableCell label="来源 IP" className="font-mono text-xs">
+                      {event.ip ?? "—"}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

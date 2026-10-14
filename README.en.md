@@ -20,6 +20,7 @@ upstreams, with a shared credential pool, unified scheduling, and per-user usage
 - **Growth center** (CodeBuddy only): travel gifts, Buddy dispatch, task rewards, streak repair, streak redemption, blind boxes; irreversible steps off via `GROWTH_IRREVERSIBLE_ACTIONS=false`; runnable from the admin UI.
 - **Privacy-preserving stats**: no conversation content stored; 90-day request detail, permanent hourly rollups; per user / channel / model / credential views; cost estimated from OpenRouter list prices (CNY primary).
 - **Admin security**: login rate limiting, CSRF checks, body limits, Host allowlist.
+- **Responsive tables**: wide tables (credentials, request detail, model list, …) turn into one card per row below 768px — column names collapse into a row of tappable sort chips and each cell shows its field name inline. The DOM is unchanged, so screen-reader semantics match the wide layout.
 
 Protocol-level implementation (private envelopes, signing, gate spoofing) is in [`TECHNICAL.md`](TECHNICAL.md) (Chinese).
 

@@ -57,7 +57,7 @@ export function AlertsPage() {
             data-testid="no-alerts"
           />
         ) : (
-          <Table data-testid="alerts-table">
+          <Table data-testid="alerts-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="时间" columnKey="ts" active={sort === "ts"}
@@ -76,10 +76,10 @@ export function AlertsPage() {
             <TableBody>
               {alerts.map((alert) => (
                 <TableRow key={alert.id} data-testid={`alert-row-${alert.id}`}>
-                  <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                  <TableCell label="时间" className="whitespace-nowrap text-xs tabular-nums">
                     {formatTime(alert.ts)}
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="级别">
                     {alert.resolved_at !== null ? (
                       <Badge tone="ok" dot>
                         已恢复
@@ -90,12 +90,14 @@ export function AlertsPage() {
                       </Badge>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs">
+                  <TableCell label="规则" className="text-xs">
                     {ALERT_RULE_LABEL[alert.rule] ?? alert.rule}
                   </TableCell>
-                  <TableCell className="font-mono text-xs">{alert.scope || "—"}</TableCell>
-                  <TableCell className="text-xs">{alert.message}</TableCell>
-                  <TableCell>
+                  <TableCell label="对象" className="font-mono text-xs">
+                    {alert.scope || "—"}
+                  </TableCell>
+                  <TableCell label="说明" className="text-xs">{alert.message}</TableCell>
+                  <TableCell label="推送">
                     {alert.delivered === 1 ? (
                       <Badge tone="ok" dot>
                         已推送

@@ -530,7 +530,7 @@ export function ApiKeysPage() {
             data-testid="no-keys"
           />
         ) : (
-          <Table data-testid="keys-table">
+          <Table data-testid="keys-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="名称" columnKey="name" active={sort === "name"}
@@ -554,25 +554,27 @@ export function ApiKeysPage() {
             <TableBody>
               {keys.map((key) => (
                 <TableRow key={key.id}>
-                  <TableCell>{key.name || "—"}</TableCell>
-                  <TableCell className="font-mono text-xs">{key.preview}</TableCell>
-                  <TableCell className="text-xs" data-testid={`key-binding-${key.id}`}>
+                  <TableCell label="名称">{key.name || "—"}</TableCell>
+                  <TableCell label="Key" className="font-mono text-xs">{key.preview}</TableCell>
+                  <TableCell label="渠道" className="text-xs" data-testid={`key-binding-${key.id}`}>
                     {providerBindingLabel(key.provider_binding)}
                   </TableCell>
-                  <TableCell className="font-mono text-xs" data-testid={`key-ips-${key.id}`}>
+                  <TableCell label="来源 IP" className="font-mono text-xs" data-testid={`key-ips-${key.id}`}>
                     {key.allowed_ips || "不限制"}
                   </TableCell>
-                  <TableCell className="font-mono text-xs" data-testid={`key-models-${key.id}`}>
+                  <TableCell label="模型白名单" className="font-mono text-xs" data-testid={`key-models-${key.id}`}>
                     {key.allowed_models || "不限制"}
                   </TableCell>
-                  <TableCell className="text-xs" data-testid={`key-expires-${key.id}`}>
+                  <TableCell label="到期" className="text-xs" data-testid={`key-expires-${key.id}`}>
                     {key.expires_at ? formatTime(key.expires_at) : "永不过期"}
                   </TableCell>
-                  <TableCell className="text-xs">{formatTime(key.created_at)}</TableCell>
-                  <TableCell className="text-xs">
+                  <TableCell label="创建时间" className="text-xs">
+                    {formatTime(key.created_at)}
+                  </TableCell>
+                  <TableCell label="最后使用" className="text-xs">
                     {key.last_used_at ? formatTime(key.last_used_at) : "从未使用"}
                   </TableCell>
-                  <TableCell className="text-right">
+                  <TableCell label="操作" className="text-right">
                     {confirming === key.id ? (
                       <span className="inline-flex gap-2">
                         <Button size="sm" variant="danger" onClick={() => remove(key.id)}>

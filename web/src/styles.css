@@ -229,6 +229,146 @@ body,
   }
 }
 
+/* ============================================================================
+ * 窄屏表 → 卡片（<768px，仅 `Table cards` 打开的表）
+ *
+ * 解决问题：控制台表格列多（凭证表 7 列、明细表 12 列），窄屏只剩两条路——
+ * 横向滚动（每列都看不全）或压缩字号。这里改成「一行 = 一张卡」：
+ *   - thead 的列名变成一排可点（仍可排序）的小片，不再占整行高度；
+ *   - 每个数据格在自己行首用 `data-label` 显示字段名（CSS ::before，不加节点）；
+ *   - 卡片之间靠表面 + 边框分层，行内字段用虚线分隔。
+ *
+ * **DOM 不变**（仍是 table/tr/td，读屏与测试拿到的结构与宽屏一致）；
+ * 仅在媒体查询内改 display/布局，宽屏零影响。
+ * ========================================================================== */
+@media (max-width: 767.98px) {
+  table[data-table-cards] {
+    display: block;
+  }
+
+  /* ---- 列名 → 可换行的排序片 ---- */
+  table[data-table-cards] > thead {
+    display: block;
+    padding-bottom: 0.25rem;
+  }
+  table[data-table-cards] > thead tr {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    border: 0;
+    background: transparent;
+  }
+  /* 片仍是按钮的容器：点它照样触发排序，只是去掉了表头的高与底色 */
+  table[data-table-cards] > thead th {
+    display: inline-flex;
+    height: auto;
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--border);
+    border-radius: 9999px;
+    background: var(--muted);
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  table[data-table-cards] > thead th:hover {
+    background: var(--accent);
+  }
+  /* 空表头（列占位）不产生空片 */
+  table[data-table-cards] > thead th:empty {
+    display: none;
+  }
+
+  /* ---- 行 → 卡片；行内的列头（凭证表按渠道分组）也走「片」这一套 ---- */
+  table[data-table-cards] > tbody {
+    display: block;
+  }
+  table[data-table-cards] > tbody tr:has(> th) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    padding-bottom: 0.25rem;
+    border: 0;
+    background: transparent;
+  }
+  table[data-table-cards] > tbody tr:has(> th) > th {
+    display: inline-flex;
+    height: auto;
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--border);
+    border-radius: 9999px;
+    background: var(--muted);
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+
+  /* 渠道组头（跨列的自定义仪表盘）维持原样：它自己就是一整块内容，不该被再包一层卡片 */
+  table[data-table-cards] > tbody tr:has(> td[colspan]) {
+    display: block;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  table[data-table-cards] > tbody tr {
+    display: block;
+    margin-bottom: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--panel);
+    box-shadow: var(--elevation-sm);
+  }
+  table[data-table-cards] > tbody tr:hover {
+    background: var(--panel);
+  }
+  table[data-table-cards] > tbody tr:last-child {
+    margin-bottom: 0;
+  }
+
+  /* ---- 单元格 → 「字段名 : 值」一行 ---- */
+  table[data-table-cards] > tbody td {
+    display: flex;
+    /* 表格布局下的列宽约束（w-8 / max-w-* 之类）在卡片里只会把「字段名 : 值」
+       挤成两行；宽度统一交给 flex 分配。未分层规则优先于 Tailwind utilities。 */
+    width: auto;
+    max-width: none;
+    gap: 0.75rem;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 0.375rem 0;
+    border-bottom: 1px dashed var(--border);
+    white-space: normal;
+    text-align: left;
+  }
+  table[data-table-cards] > tbody td:last-child,
+  table[data-table-cards] > tbody td[colspan] {
+    border-bottom: 0;
+  }
+  table[data-table-cards] > tbody td[colspan] {
+    display: block;
+    padding: 0;
+  }
+  /* 字段名只在窄屏卡片里出现；用 ::before 从属性取值，不新增 DOM 节点 */
+  table[data-table-cards] > tbody td[data-label]::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--ink-muted);
+    white-space: nowrap;
+  }
+  /* 值靠右对齐、允许换行；数字格仍自带 tabular-nums */
+  table[data-table-cards] > tbody td > * {
+    min-width: 0;
+  }
+  /* 空占位格（如不支持成长中心的渠道）不生成空行 */
+  table[data-table-cards] > tbody td:empty {
+    display: none;
+  }
+}
+
 /* 无障碍：用户要求减少动效时，关闭非必要过渡/动画 */
 @media (prefers-reduced-motion: reduce) {
   *,

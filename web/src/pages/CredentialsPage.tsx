@@ -848,6 +848,7 @@ export function CredentialsPage() {
               // 滚到第 20 行时列名与操作按钮还在，不必回顶确认「这一列到底是什么」。
               <Table
                 data-testid="credentials-table"
+                cards
                 containerClassName="max-h-[70vh] overflow-auto"
               >
                 <TableBody>
@@ -1462,7 +1463,7 @@ function Row({
       {/* 选择格：与 ColumnHeaderRow 的空表头一一对应（列数恒定）。
           checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。 */}
       {canWrite && (
-        <TableCell className="w-8">
+        <TableCell label="选择" className="w-8">
           <Checkbox
             checked={selected}
             disabled={busy}
@@ -1472,7 +1473,7 @@ function Row({
           />
         </TableCell>
       )}
-      <TableCell>
+      <TableCell label="凭证">
         {/* 渠道名不在这里重复：它已在组头（按渠道分组后，同一组内所有行的渠道名
             完全相同）。昵称单独占一行，「已指定」紧贴昵称。 */}
         <div className="flex min-w-0 items-center gap-2">
@@ -1508,7 +1509,7 @@ function Row({
           )}
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell label="状态 / 健康度">
         {/* 状态 + 健康度合并成一列：两个 Badge 同行，附加说明换行小字 */}
         <div className="space-y-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -1525,7 +1526,7 @@ function Row({
           )}
         </div>
       </TableCell>
-      <TableCell className="text-xs">
+      <TableCell label="额度" className="text-xs">
         <div className="flex flex-wrap items-baseline gap-x-2">
           {/* 数字与积分记录入口同处一个 inline-flex：按钮跟数字做行内居中对齐，
               而不是与整行 baseline 对齐（图标按钮没有文字基线，会明显偏低）。 */}
@@ -1581,11 +1582,11 @@ function Row({
           </div>
         )}
       </TableCell>
-      <TableCell className="text-xs">
+      <TableCell label="token 剩余" className="text-xs">
         <TokenExpiry credential={credential} view={tokenExpiry} />
       </TableCell>
       {showGrowth && (
-        <TableCell className="text-xs text-muted-foreground">
+        <TableCell label="成长中心" className="text-xs text-muted-foreground">
           {credential.growth_last_result ? (
             // 汇报可能很长（多步领取串成一行）：限宽单行截断，hover 看全文
             <LongTextTip content={credential.growth_last_result}>
@@ -1605,7 +1606,7 @@ function Row({
           列数恒定，操作列才落在同一列上（表格是 auto 布局）。 */}
       {!showGrowth && <TableCell aria-hidden />}
       {canWrite && (
-        <TableCell>
+        <TableCell label="操作">
           <div className="flex items-center justify-end gap-1">
             {confirming ? (
               <>
@@ -1760,7 +1761,7 @@ function CreditDrawer({
           还没有记录。余额变化会在下一轮额度探测时写入（首次探测只建立基线）。
         </Empty>
       ) : (
-        <Table data-testid="credit-drawer-table">
+        <Table data-testid="credit-drawer-table" cards>
           <TableHeader>
             <TableRow>
               <SortableHead label="观测时间" columnKey="ts" active={sort === "ts"}
@@ -1780,11 +1781,14 @@ function CreditDrawer({
           <TableBody>
             {events.map((event) => (
               <TableRow key={event.id} data-testid={`credit-event-${event.id}`}>
-                <TableCell className="text-xs">{formatTime(event.ts)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">
+                <TableCell label="观测时间" className="text-xs">
+                  {formatTime(event.ts)}
+                </TableCell>
+                <TableCell label="区间起点" className="text-xs text-muted-foreground">
                   {event.window_start ? formatTime(event.window_start) : "—"}
                 </TableCell>
                 <TableCell
+                  label="变化"
                   className={`text-xs ${
                     event.delta === null
                       ? "text-muted-foreground"
@@ -1797,7 +1801,7 @@ function CreditDrawer({
                 >
                   {creditEventLabel(event)}
                 </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
+                <TableCell label="说明" className="text-xs text-muted-foreground">
                   {CREDIT_SOURCE_LABEL[event.source] ?? event.source}
                 </TableCell>
               </TableRow>

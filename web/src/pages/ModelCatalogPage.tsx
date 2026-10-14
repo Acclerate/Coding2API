@@ -268,6 +268,7 @@ export function ModelCatalogPage() {
             <div className="mt-3">
               <Table
                 data-testid="model-catalog-table"
+                cards
                 containerClassName="max-h-[70vh] overflow-auto"
               >
                 {/* [&_th]:bg-muted：吸顶表头必须不透明，否则滚动时行内容会从
@@ -298,32 +299,32 @@ export function ModelCatalogPage() {
                     const caps = capabilities(row);
                     return (
                       <TableRow key={row.id} data-testid={`model-row-${row.id}`}>
-                        <TableCell className="max-w-[17rem]">
+                        <TableCell label="模型" className="max-w-[17rem]">
                           <div className="font-medium break-words">{row.name ?? row.id}</div>
                           <div className="font-mono text-xs break-all text-muted-foreground">
                             {row.id}
                           </div>
                         </TableCell>
-                        <TableCell className="text-xs tabular-nums">
+                        <TableCell label="上下文 / 输出" className="text-xs tabular-nums">
                           <div title="上下文窗口上限">{limitLine(row.context)}</div>
                           <div className="text-muted-foreground" title="单次输出上限">
                             {limitLine(row.max_output)}
                           </div>
                         </TableCell>
-                        <TableCell className="max-w-[9rem] text-xs whitespace-normal break-keep">
+                        <TableCell label="模态" className="max-w-[9rem] text-xs whitespace-normal break-keep">
                           {modalityText(row.input_modalities)} →{" "}
                           {modalityText(row.output_modalities)}
                         </TableCell>
-                        <TableCell className="max-w-[12rem] text-xs whitespace-normal break-keep">
+                        <TableCell label="能力" className="max-w-[12rem] text-xs whitespace-normal break-keep">
                           {caps.length === 0 ? "—" : caps.join(" · ")}
                         </TableCell>
-                        <TableCell className="text-xs tabular-nums">
+                        <TableCell label="能力分" className="text-xs tabular-nums">
                           {benchmarkLine(row)}
                         </TableCell>
-                        <TableCell className="text-xs">
+                        <TableCell label="知识截止" className="text-xs">
                           {row.knowledge ?? "—"}
                         </TableCell>
-                        <TableCell className="text-right tabular-nums">
+                        <TableCell label="价格" className="text-right tabular-nums">
                           <div title="输入 单价 · 输出 单价">
                             <span className="text-muted-foreground">输入 </span>
                             {formatUnitPrice(row.input, currency, rate)}

@@ -215,7 +215,7 @@ export function UsersPage() {
             data-testid="no-users"
           />
         ) : (
-          <Table data-testid="users-table">
+          <Table data-testid="users-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="用户名" columnKey="username" active={sort === "username"}
@@ -234,13 +234,13 @@ export function UsersPage() {
             <TableBody>
               {users.map((user) => (
                 <TableRow key={user.username} data-testid={`user-row-${user.username}`}>
-                  <TableCell className="font-medium">
+                  <TableCell label="用户名" className="font-medium">
                     {user.username}
                     {user.username === session.username && (
                       <span className="ml-1.5 text-xs text-muted-foreground">（我）</span>
                     )}
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="角色">
                     <Select
                       value={user.role}
                       disabled={busy === user.username}
@@ -255,7 +255,7 @@ export function UsersPage() {
                       ))}
                     </Select>
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="状态">
                     {user.enabled ? (
                       <Badge tone="ok">启用</Badge>
                     ) : (
@@ -272,11 +272,13 @@ export function UsersPage() {
                       </span>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
+                  <TableCell label="创建者" className="text-xs text-muted-foreground">
                     {user.created_by ?? "引导导入"}
                   </TableCell>
-                  <TableCell className="text-xs">{formatTime(user.created_at)}</TableCell>
-                  <TableCell className="text-right">
+                  <TableCell label="创建时间" className="text-xs">
+                    {formatTime(user.created_at)}
+                  </TableCell>
+                  <TableCell label="操作" className="text-right">
                     <span className="inline-flex gap-1.5">
                       <Button
                         size="sm"

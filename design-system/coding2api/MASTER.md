@@ -122,7 +122,7 @@
 | `ToastViewport` + `useToasts` | 操作结果浮层（顶部居中，`web/src/components/Toast.tsx`）：数秒自动消失、可手动关闭；`danger` 用 `role=alert`、其余 `role=status`；同 `testId` 只保留最新一条；语气用 `Badge`/`Notice` 同款 tint 底 + `-ink` 图标（亮色口径色描边叠白底对比过低，不可只用描边） |
 | `EmptyState` | 空态：图标 + 标题 + 描述 + 可选操作 |
 | `Tabs` | 分段器；激活项 `bg-background` + `shadow-sm` |
-| `Table` | 圆角容器 + 表头底色 + 行 hover；移动端横向滚动 |
+| `Table` | 圆角容器 + 表头底色 + 行 hover；移动端横向滚动。窄屏（<768px）可开 `cards` 转卡片：列名变排序片、每格用 `TableCell label` 显示字段名（DOM 不变，见 `styles.css`「窄屏表 → 卡片」） |
 | `PageHeader` | eyebrow（可选）+ 标题 + 说明 + 右侧操作槽 |
 | `PageSkeleton` | 加载骨架，替代纯文字「载入中…」 |
 
