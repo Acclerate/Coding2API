@@ -107,9 +107,9 @@ export function UsersPage() {
   const report = (caught: unknown, fallback: string) => {
     const message = caught instanceof ApiError ? caught.message : "";
     if (message.includes("last active admin")) {
-      setError("不能移除最后一个活跃管理员，否则将无人能管理此系统。");
+      setError("不能移除最后一个活跃管理员，否则无人能管理系统。");
     } else if (/your own|yourself/.test(message)) {
-      setError("不能对自己执行此操作，请让另一位管理员处理。");
+      setError("不能对自己执行此操作，请让另一位管理员处理");
     } else {
       setError(fallback);
     }
@@ -172,7 +172,7 @@ export function UsersPage() {
       <PageHeader
         eyebrow="管理"
         title="用户管理"
-        description="创建账号、分配角色、停用或重置密码。新建账号会得到一次性激活链接，由本人自设密码——系统里不存在管理员已知的共享密码。"
+        description="创建账号、分配角色、停用或重置密码。新建账号得到一次性激活链接、由本人自设密码——没有管理员已知的共享密码。"
         icon={<KeyRound className="size-5" />}
       />
 
@@ -211,7 +211,7 @@ export function UsersPage() {
           <EmptyState
             icon={<KeyRound className="size-5" />}
             title="还没有用户"
-            description="点右上角「新建用户」创建账号，系统会生成一次性激活链接由本人自设密码。"
+            description="点右上角「新建用户」创建账号，系统生成一次性激活链接由本人自设密码。"
             data-testid="no-users"
           />
         ) : (
@@ -320,7 +320,7 @@ export function UsersPage() {
 
       <Notice tone="muted">
         角色：{ROLE_LABELS.admin} 可管理用户与配置；{ROLE_LABELS.operator}{" "}
-        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码都会立即使其所有会话失效。
+        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码会立即令其所有会话失效。
       </Notice>
 
       {createOpen && (

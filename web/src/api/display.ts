@@ -446,13 +446,13 @@ export function usageErrorLabel(errorType: string | null | undefined): string {
 
 
 export const PROBE_FAILURE_LABEL: Record<ProbeFailureReason, string> = {
-  credential_rejected: "凭证被渠道拒绝，需要重新登录该账号",
+  credential_rejected: "凭证被渠道拒绝，需重新登录",
   rate_limited: "渠道限流，稍后重试",
-  upstream_unavailable: "渠道服务异常，与本账号凭证无关",
+  upstream_unavailable: "渠道服务异常，与凭证无关",
   upstream_rejected: "渠道拒绝了这次请求",
-  upstream_response_invalid: "渠道响应格式与预期不符，可能是官方接口变更",
+  upstream_response_invalid: "渠道响应格式与预期不符（疑似接口变更）",
   upstream_timeout: "渠道响应超时",
-  network_unreachable: "连不上渠道服务器，检查本机网络或代理",
+  network_unreachable: "连不上渠道服务器，检查网络或代理",
   unknown_error: "未知错误",
 };
 

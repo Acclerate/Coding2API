@@ -208,7 +208,7 @@ function BatchToastContent({
  */
 function batchRowReason(action: BatchAction, row: BatchResult["results"][number]): string {
   if (row.error) {
-    if (row.error === "credential not found") return "凭证不存在（可能已被删除）";
+    if (row.error === "credential not found") return "凭证不存在（可能已删除）";
     if (row.error === "action_failed") return "执行失败，详见服务端日志";
     if (row.error.startsWith("credential does not support")) return "该渠道不支持此操作";
     return row.error;
@@ -260,8 +260,8 @@ const STATE_TEXT: Record<CredentialState, string> = {
 
 /** 一句话汇报：登录失效要单独提示「重新登录」，不能与普通失败混同。 */
 function growthNotice(result: GrowthRunResult): string {
-  if (result.session_dead) return "登录态已失效，请重新登录该渠道";
-  return result.report || (result.ok ? "成长中心执行完成" : "成长中心执行未完全成功");
+  if (result.session_dead) return "登录态已失效，需重新登录该渠道";
+  return result.report || (result.ok ? "成长中心执行完成" : "成长中心未完全成功");
 }
 
 /** 成长中心浮层内容：一句话汇报 + 逐步结果。步骤是结构化清单，信息量大，
@@ -283,7 +283,7 @@ function GrowthToastContent({ result }: { result: GrowthRunResult }) {
         ))}
       </ul>
       {result.session_dead && (
-        <div className="text-xs">登录态已失效，需重新登录该渠道后才能继续领取。</div>
+        <div className="text-xs">登录态已失效，需重新登录该渠道后才能领取。</div>
       )}
     </div>
   );
@@ -524,13 +524,13 @@ export function CredentialsPage() {
     // 会话失效被硬禁用的凭证：重新登录后用「恢复」放回池子，
     // 不必删除重建（以前只能删除）。
     revive: (credential) =>
-      void run(() => api.reviveCredential(credential.id), "已恢复该凭证，可重新参与调度。"),
+      void run(() => api.reviveCredential(credential.id), "已恢复该凭证，可参与调度。"),
     toggle: (credential) =>
       void run(
         () => api.toggleCredential(credential.id, credential.enabled !== 1),
         // 文案与「已暂停」状态一致：只摘对话流量，后台任务不受影响
         credential.enabled === 1
-          ? "已暂停该凭证的对话流量；签到 / 刷新 / 探测照常运行。"
+          ? "已暂停该凭证的对话流量；签到 / 刷新 / 探测照常。"
           : "已恢复该凭证的对话流量。",
       ),
     pin: (credential) =>
@@ -657,7 +657,7 @@ export function CredentialsPage() {
       <PageHeader
         eyebrow="控制台"
         title="凭证管理"
-        description="凭证是调度池里可被选中的渠道账号。登录渠道授权或粘贴 JSON 导入后，可在此探测剩余额度、签到或启停；顶部池概况按健康度四态说明这个池现在还剩多少能打的号。"
+        description="凭证＝调度池里可被选中的渠道账号。登录授权或粘贴 JSON 导入后可探测额度、签到、启停；顶部池概况按健康度四态说明还剩多少可用。"
         icon={<Database className="size-5" />}
       />
       {/* 池概览（原「池仪表盘」页内容合并于此）：统计卡 + 健康度四态分布 */}
@@ -672,7 +672,7 @@ export function CredentialsPage() {
           <Notice tone="muted">
             还没有凭证。点凭证池右上角「添加凭证」登录渠道账号（CodeBuddy / TRAE /
             Qoder / CodeArts），或直接粘贴凭证 JSON 导入；OpenCode Zen / Kilo
-            Gateway 免费层在对话框里一键添加即可。
+            Gateway 免费层在对话框里一键添加。
           </Notice>
         </div>
       )}
@@ -698,7 +698,7 @@ export function CredentialsPage() {
           <EmptyState
             icon={<Database className="size-5" />}
             title="还没有凭证"
-            description="用右上角「添加凭证」登录渠道账号或导入凭证 JSON，即可让调度池开始工作。"
+            description="用右上角「添加凭证」登录渠道账号或导入凭证 JSON 即可开始调度。"
             data-testid="no-credentials"
           />
         ) : (
@@ -840,7 +840,7 @@ export function CredentialsPage() {
               <EmptyState
                 icon={<Search className="size-5" />}
                 title="没有匹配的凭证"
-                description="换个关键词，或清空渠道 / 状态筛选查看全部。"
+                description="换个关键词或清空筛选查看全部。"
                 data-testid="no-credential-match"
               />
             ) : (
@@ -995,7 +995,7 @@ export function CredentialsPage() {
                                   )}
                                   <span
                                     className="min-w-0"
-                                    title="组内各号额度合计（只统计有额度接口的号；免费层无此接口，显示 —）"
+                                    title="组内各号额度合计（只统计有额度接口的号；免费层 —）"
                                   >
                                     <span className="block text-[11px] leading-tight text-muted-foreground">
                                       额度合计
@@ -1374,18 +1374,18 @@ function ColumnHeaderRow({
       {canWrite && <TableHead className="w-8" aria-hidden />}
       <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
                     direction={order} onToggle={toggle} testId={`sort-${provider}-nickname`}
-                    hint={<ColumnHint text="昵称；「已指定」表示调度器优先使用该凭证（全局唯一）。渠道名与数量在分组标题行，行内不再重复。" />} />
+                    hint={<ColumnHint text="昵称；「已指定」＝调度器优先用该凭证（全局唯一）。渠道名与数量在分组标题行。" />} />
       <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
                     direction={order} onToggle={toggle} testId={`sort-${provider}-health`}
-                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽；已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期自动恢复。健康度：剩余积分占比四态（已知百分比/未探测/无探测/已耗尽）。未探测＝探测失败或渠道未给额度信息（点「探测」可重试），≠已耗尽；无探测＝免费层上游根本没有额度接口。调度器优先选百分比高者，打平时再用账户剩余积分多者。" />} />
+                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。" />} />
       <SortableHead label="额度" columnKey="quota_remaining"
                     active={sort === "quota_remaining"} direction={order}
                     onToggle={toggle} testId={`sort-${provider}-quota_remaining`}
-                    hint={<ColumnHint text="剩余 / 总量。周期语义按渠道不同（CodeBuddy 本周期剩余、TRAE 账户剩余单调递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口），悬浮额度数字查看本行的口径。到期额度行＝调度窗口内即将过期、会被优先消耗的额度；主窗口（36h）打平时才比较次窗口（7 天）。数字后的下箭头展开该凭证的积分记录（两次额度探测之间的净变化）。" />} />
+                    hint={<ColumnHint text="剩余 / 总量。周期口径按渠道（CodeBuddy 本周期剩余、TRAE 账户剩余递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口）；悬浮额度看口径。到期额度行＝窗口内即将过期、优先消耗；主窗口（36h）打平才比次窗口（7 天）。下箭头展开积分记录。" />} />
       <SortableHead label="token 剩余" columnKey="token_expires_at"
                     active={sort === "token_expires_at"} direction={order}
                     onToggle={toggle} testId={`sort-${provider}-token_expires_at`}
-                    hint={<ColumnHint text="access token 距离到期还有多久，取自凭证本身（为 0 表示渠道未给到期信息，显示 —）。预刷新任务每小时检查一次，进入 24 小时窗口即自动续期；「已过期」意味着上游会拒绝该凭证，需重新登录。" />} />
+                    hint={<ColumnHint text="access token 距到期还有多久，取自凭证本身（0 表示渠道未给到期信息，显示 —）。预刷新任务每小时检查，进入 24 小时窗口自动续期；「已过期」＝上游会拒绝，需重登。" />} />
       {/* 成长中心列只在支持的渠道出现：其余渠道后端没有 growth 能力，常驻一列只会整列「—」。
           **但列数必须恒定**：表格是 auto 布局，少一格会重算整张表的列宽，下面展开的组
           就会整列错位（操作列从 1207 跳到 926）。故不支持的渠道用一个空占位格顶住，
@@ -1394,12 +1394,12 @@ function ColumnHeaderRow({
         <SortableHead label="成长中心" columnKey="growth_last_run_at"
                       active={sort === "growth_last_run_at"} direction={order}
                       onToggle={toggle} testId={`sort-${provider}-growth_last_run_at`}
-                      hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时单行截断，悬浮看全文。" />} />
+                      hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时截断，悬浮看全文。" />} />
       ) : (
         <TableHead aria-hidden />
       )}
       {canWrite && (
-        <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻按钮。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录入口在额度列数字后的下箭头。" /></span></TableHead>
+        <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录在额度列下箭头。" /></span></TableHead>
       )}
     </TableRow>
   );
@@ -1552,7 +1552,7 @@ function Row({
                 size="icon"
                 aria-label="积分记录"
                 aria-expanded={creditsOpen}
-                title="积分记录：两次额度探测之间的净变化"
+                title="积分记录：两次额度探测的净变化"
                 data-testid={`credits-${credential.id}`}
                 onClick={() => actions.credits(credential)}
                 // 与数字同处一个 inline-flex items-center：图标按钮没有文字基线，
@@ -1668,7 +1668,7 @@ function Row({
                     {supportsGrowth(credential.provider) && (
                       <DropdownMenuItem
                         onSelect={() => actions.growth(credential)}
-                        title="手动跑一轮成长中心领取（与定时任务同一条路径）"
+                        title="手动跑一轮成长中心领取（与定时任务同一路径）"
                       >
                         <Sparkles className="size-4" /> 成长中心
                       </DropdownMenuItem>

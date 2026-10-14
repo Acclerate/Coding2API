@@ -64,7 +64,7 @@ export function AuditPage() {
       <PageHeader
         eyebrow="运维"
         title="审计日志"
-        description="登录、账号变动与凭证写操作留痕。失败登录同样记录——「谁在什么时候试了哪个账号」正是审计的价值。日志绝不包含密码或令牌。"
+        description="登录、账号变动与凭证写操作留痕；失败登录同样记录——「谁在何时试了哪个账号」正是审计价值。不含密码与令牌。"
         icon={<ScrollText className="size-5" />}
       />
 
@@ -129,7 +129,7 @@ export function AuditPage() {
           <EmptyState
             icon={<ScrollText className="size-5" />}
             title="没有符合条件的记录"
-            description="调整上方筛选条件后再试，或清空筛选查看全部。"
+            description="调整或清空筛选查看全部。"
             data-testid="no-audit"
           />
         ) : (
@@ -205,7 +205,7 @@ export function AuditPage() {
       </Panel>
 
       <Notice tone="muted">
-        日志保留期与请求明细一致（默认 90 天），由后台清理任务统一裁剪。
+        日志保留期与请求明细一致（默认 90 天），由后台清理任务裁剪。
       </Notice>
     </div>
   );

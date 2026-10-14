@@ -168,12 +168,12 @@ function TaskCard({
   // 三种都叫「已运行」就是在谎报——尤其第三种，任务其实一步没动。
   const resultText = result
     ? result.busy
-      ? "该任务正在运行中，本次未重复触发。"
+      ? "该任务正在运行，本次未重复触发"
       : result.ran
         ? result.last_ok === false
           ? `已运行，但本轮失败：${result.last_error ?? "未知原因"}`
-          : `已运行一轮${result.last_report ? `：${taskReportLabel(result.last_report)}` : ""}。`
-        : "本轮未执行（任务已关闭或未到执行条件）。"
+          : `已运行一轮${result.last_report ? `：${taskReportLabel(result.last_report)}` : ""}`
+        : "本轮未执行（任务已关闭或未到执行条件）"
     : null;
   return (
     <Card
@@ -208,7 +208,7 @@ function TaskCard({
           // 关着的任务点了也是 no-op（后端会如实回 ran=false），直接禁用比
           // 「点了没反应」更诚实；运行中禁用则防连点。
           disabled={running || task.running || !task.enabled}
-          title={!task.enabled ? "任务已关闭，请先打开对应开关" : undefined}
+          title={!task.enabled ? "任务已关闭，先打开对应开关" : undefined}
           onClick={onRun}
         >
           <Play className="mr-1 size-3" />
@@ -384,13 +384,13 @@ export function SettingsPage() {
       <PageHeader
         eyebrow="管理"
         title="任务与配置"
-        description="后台任务最近跑得怎么样、下一次什么时候跑，和它自己的周期/开关放在一起；这里改的值存进数据库并立即生效，无需重启。"
+        description="后台任务的运行情况、周期与开关；改的值存进数据库并立即生效，无需重启。"
         icon={<SlidersHorizontal className="size-5" />}
       />
 
       <Notice tone="warn">
-        覆盖优先级：<strong>数据库覆盖值 &gt; .env</strong>。因此直接改 .env 对已被覆盖的项无效——
-        请先在这里「恢复默认」，或直接改本页的值。启动期项（密钥、端口、数据目录、上游白名单）
+        覆盖优先级：<strong>数据库覆盖值 &gt; .env</strong>。直接改 .env 对已覆盖的项无效——
+        请先在此「恢复默认」，或直接改本页的值。启动期项（密钥、端口、数据目录、上游白名单）
         不在本页，改它们必须重启。
       </Notice>
 
@@ -437,7 +437,7 @@ export function SettingsPage() {
           <EmptyState
             icon={<SlidersHorizontal className="size-5" />}
             title="没有可热更配置"
-            description="当前没有可在线调整的配置项。"
+            description="当前没有可在线调整的配置。"
             data-testid="no-settings"
           />
         ) : (

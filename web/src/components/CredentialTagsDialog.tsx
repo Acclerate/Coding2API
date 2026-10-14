@@ -124,7 +124,7 @@ export function CredentialTagsDialog({
 
         <Field
           label="标签"
-          hint={`逗号分隔，最多 ${MAX_TAGS} 个、每个不超过 ${MAX_TAG_LENGTH} 字符；留空即清除标签。标签只用于列表筛选，不影响调度。`}
+          hint={`逗号分隔，最多 ${MAX_TAGS} 个、每个不超 ${MAX_TAG_LENGTH} 字符；留空即清除。标签只用于筛选，不影响调度。`}
         >
           <Input
             value={raw}
@@ -157,7 +157,7 @@ export function CredentialTagsDialog({
         )}
 
         <Notice tone="muted">
-          标签是给运维看的记号，不参与选号、不改变任何请求行为。
+          标签是给运维看的记号，不参与选号、不改变请求行为。
         </Notice>
 
         <div className="mt-4 flex justify-end gap-2">

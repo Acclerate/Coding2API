@@ -66,7 +66,7 @@ export function CredentialLimitsDialog({
         daily_credits: parseLimit(dailyCredits),
         per_model_tokens: parsePerModel(perModel),
       });
-      onSaved("限额已保存，下一次选号即生效。");
+      onSaved("限额已保存，下次选号生效。");
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "限额保存失败");
     } finally {
@@ -107,13 +107,13 @@ export function CredentialLimitsDialog({
 
         <Notice tone="muted">
           全部留空 = 不受限。护栏在选号前判定，触顶的凭证不再参与对话流量；
-          按模型 token 只停对应模型，其余模型照常可用。当日按北京时间自然日统计。
+          按模型 token 只停对应模型。当日按北京时间自然日统计。
         </Notice>
 
         <div className="mt-4 space-y-4">
           <Field
             label="保留积分（账户剩余积分 ≤ 该值时停用）"
-            hint="给号留底：余额跌到该值就换别的号，避免把额度跑空。留空关闭。"
+            hint="给号留底：余额跌到该值就换号，避免跑空。留空关闭。"
           >
             <Input
               type="number"
@@ -138,7 +138,7 @@ export function CredentialLimitsDialog({
             />
           </Field>
 
-          <Field label="每日积分上限" hint="当日累计 credit 达到该值即停用。留空关闭。">
+          <Field label="每日积分上限" hint="当日累计 credit 到该值即停用。留空关闭。">
             <Input
               type="number"
               min="0"
@@ -152,7 +152,7 @@ export function CredentialLimitsDialog({
 
           <Field
             label="按模型 token 上限"
-            hint="每行一条 `模型=上限`，例如 glm-5=500000。达到上限只停该模型。"
+            hint="每行一条 `模型=上限`，如 glm-5=500000。到上限只停该模型。"
           >
             <textarea
               rows={3}

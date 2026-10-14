@@ -135,14 +135,14 @@ export function AddCredentialDialog({
       if (started.flow === "callback") {
         // TRAE：浏览器完成授权后 302 回本服务的 /authorize，那里直接落库。
         // 前端无法轮询渠道，改为轮询凭证列表，出现新凭证即视为完成。
-        onNotice("已在新标签页打开授权页。完成授权后本页会自动刷新出凭证。");
+        onNotice("已在新标签页打开授权页，完成后本页自动刷新出凭证。");
         const deadline = Date.now() + 5 * 60 * 1000;
         const baseline = credentialCountRef.current;
         const timer = window.setInterval(async () => {
           const after = (await api.credentials()).credentials.length;
           if (after > baseline || Date.now() > deadline) {
             stopPolling(provider);
-            onNotice(after > baseline ? "登录成功，凭证已保存。" : "授权超时，请重新发起登录。");
+            onNotice(after > baseline ? "登录成功，凭证已保存。" : "授权超时，请重新登录。");
           }
         }, 3000);
         loginTimersRef.current[provider] = timer;
@@ -156,13 +156,13 @@ export function AddCredentialDialog({
         setPasteProvider(provider);
         setPasteUrl("");
         onNotice(
-          "已在新标签页打开华为云授权页。授权后会跳到一个打不开的本地地址（127.0.0.1），"
-          + "把地址栏里的整条链接复制粘贴到下方即可完成登录。",
+          "已在新标签页打开华为云授权页。授权后会跳到打不开的本地地址（127.0.0.1），"
+          + "把整条链接粘贴到下方即可。",
         );
         return;
       }
 
-      onNotice("已在新标签页打开授权页，完成后此页会自动检测。");
+      onNotice("已在新标签页打开授权页，完成后自动检测。");
       const interval = (started.interval ?? 5) * 1000;
       const timer = window.setInterval(async () => {
         try {
@@ -211,7 +211,7 @@ export function AddCredentialDialog({
     if (!pasteProvider) return;
     const state = loginStatesRef.current[pasteProvider];
     if (!state) {
-      onError("登录会话已失效，请重新发起登录。");
+      onError("登录会话已失效，请重新登录。");
       return;
     }
     setBusy(true);
@@ -238,7 +238,7 @@ export function AddCredentialDialog({
     try {
       parsed = JSON.parse(raw);
     } catch {
-      setImportError('凭证必须是合法 JSON。CodeBuddy 可填 {"token":"..."}，TRAE 填完整凭证对象。');
+      setImportError('凭证必须是合法 JSON。CodeBuddy 可填 {"token":"..."}，TRAE 填完整凭证对象');
       return;
     }
     setBusy(true);
@@ -330,9 +330,9 @@ export function AddCredentialDialog({
             </div>
             <p className="text-xs text-muted-foreground">
               CodeBuddy 走设备码轮询（自动检测完成）；TRAE 走浏览器回调
-              （授权后由 <code>/authorize</code> 直接落库，本对话框轮询凭证列表检测完成，
-              期间请勿关闭对话框）；Qoder 走设备码登录；CodeArts 走 OAuth2 授权码登录
-              （授权后把浏览器地址栏里打不开的 127.0.0.1 回调链接粘回本对话框）。
+              （授权后由 <code>/authorize</code> 直接落库，本对话框轮询凭证列表，
+              期间勿关闭对话框）；Qoder 走设备码登录；CodeArts 走 OAuth2 授权码登录
+              （授权后把地址栏打不开的 127.0.0.1 回调链接粘回本对话框）。
             </p>
             {pasteProvider && (
               <div className="space-y-2" data-testid="paste-callback">
@@ -368,7 +368,7 @@ export function AddCredentialDialog({
             <div className="border-t border-border pt-3">
               <div className="mb-2 text-xs text-muted-foreground">
                 OpenCode Zen / Kilo Gateway 免费层无需凭证/登录，删除其虚拟凭证后点下方按钮补回
-                （要永久停用请改用「暂停」）。
+                （永久停用请改用「暂停」）。
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -380,7 +380,7 @@ export function AddCredentialDialog({
                     setBusy(true);
                     try {
                       await api.importCredential("zen", {}, "OpenCode Zen");
-                      onImported("已添加 OpenCode Zen 免费渠道。");
+                      onImported("已添加 OpenCode Zen 免费渠道");
                     } catch (caught) {
                       onError(caught instanceof Error ? caught.message : "添加失败");
                     } finally {
@@ -399,7 +399,7 @@ export function AddCredentialDialog({
                     setBusy(true);
                     try {
                       await api.importCredential("kilo", {}, "Kilo Gateway");
-                      onImported("已添加 Kilo Gateway 免费渠道。");
+                      onImported("已添加 Kilo Gateway 免费渠道");
                     } catch (caught) {
                       onError(caught instanceof Error ? caught.message : "添加失败");
                     } finally {

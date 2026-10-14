@@ -253,7 +253,7 @@ describe("SettingsPage", () => {
     await userEvent.click(screen.getByTestId("task-run-quota_probe"));
     await waitFor(() => {
       expect(screen.getByTestId("task-run-result-quota_probe")).toHaveTextContent(
-        "正在运行中，本次未重复触发",
+        "正在运行，本次未重复触发",
       );
     });
   });
@@ -268,7 +268,7 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("task-run-activity")).toBeDisabled();
     expect(screen.getByTestId("task-run-activity")).toHaveAttribute(
       "title",
-      "任务已关闭，请先打开对应开关",
+      "任务已关闭，先打开对应开关",
     );
   });
 

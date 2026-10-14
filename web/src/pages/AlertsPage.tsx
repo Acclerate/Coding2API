@@ -39,7 +39,7 @@ export function AlertsPage() {
       <PageHeader
         eyebrow="运维"
         title="运维告警"
-        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可选推送 webhook；同一条告警在静默窗内只记一次，连续未命中确认恢复后标「已恢复」并外推恢复通知。"
+        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可推送 webhook；同一告警静默窗内只记一次，恢复后标「已恢复」并推送。"
         icon={<BellRing className="size-5" />}
       />
 
@@ -53,7 +53,7 @@ export function AlertsPage() {
           <EmptyState
             icon={<BellRing className="size-5" />}
             title="暂无告警记录"
-            description="后台任务评估命中风险后会在此落库；一切正常时这里保持空白。"
+            description="后台评估命中风险后在此落库；一切正常时保持空白。"
             data-testid="no-alerts"
           />
         ) : (
@@ -116,8 +116,8 @@ export function AlertsPage() {
       </Panel>
 
       <Notice tone="muted">
-        告警记录与请求明细同一保留期（默认 90 天），由后台清理任务统一裁剪。
-        配置 webhook 地址与各规则阈值见「任务与配置」页的「运维告警」卡片。
+        告警记录与请求明细同一保留期（默认 90 天），由后台清理任务裁剪。
+        webhook 地址与各规则阈值见「任务与配置」页的「运维告警」卡片。
       </Notice>
     </div>
   );

@@ -64,7 +64,7 @@ export function ActivatePage() {
       setDone(true);
     } catch (caught) {
       const message = caught instanceof ApiError ? caught.message : "";
-      setError(message.includes("activation") ? "链接无效或已过期，请向管理员索取新链接。" : "设置失败，请稍后重试。");
+      setError(message.includes("activation") ? "链接无效或已过期，请向管理员索取新链接" : "设置失败，请稍后重试");
       setPending(false);
     }
   };
@@ -83,7 +83,7 @@ export function ActivatePage() {
               <Notice tone="danger">
                 <span className="inline-flex items-center gap-1.5">
                   <TriangleAlert className="size-3.5" />
-                  链接无效或已过期，请向管理员索取新的激活链接。
+                  链接无效或已过期，请向管理员索取新激活链接。
                 </span>
               </Notice>
             </div>

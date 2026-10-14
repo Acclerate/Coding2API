@@ -100,7 +100,7 @@ function benchmarkLine(row: ModelCatalogEntry) {
   const score = (value: number | undefined): string =>
     value === undefined ? "—" : value.toLocaleString("zh-CN");
   return (
-    <div title="Artificial Analysis 指数（智能 / 编程 / 智能体），经 OpenRouter 公开接口；非本服务实测">
+    <div title="Artificial Analysis 指数（智能 / 编程 / 智能体），非本服务实测">
       <div>智 {score(b.intelligence_index)}</div>
       <div className="text-muted-foreground">编 {score(b.coding_index)}</div>
       <div className="text-muted-foreground">体 {score(b.agentic_index)}</div>
@@ -199,7 +199,7 @@ export function ModelCatalogPage() {
       <PageHeader
         eyebrow="控制台"
         title="模型列表"
-        description="OpenRouter 的模型目录：既列出统计页「成本（估算）」所用刊例价（输入 / 输出 / 缓存读，原始单位 USD / 百万 token），也带出上下文、模态、能力、知识截止等元数据；「能力分」列是 Artificial Analysis 指数（经 OpenRouter 公开接口），非本服务实测。三份数据同一次抓取、同一个后台任务周期落盘，这里只读展示。"
+        description="OpenRouter 模型目录：统计页「成本（估算）」的刊例价来源（输入 / 输出 / 缓存读，USD / 百万 token）与上下文、模态、知识截止等元数据；「能力分」来自 Artificial Analysis。"
         icon={<Boxes className="size-5" />}
       />
 
@@ -215,13 +215,13 @@ export function ModelCatalogPage() {
         <Metric
           label="能力分来源"
           value="Artificial Analysis"
-          hint="经 OpenRouter 公开接口分发，非本服务实测；与价格同一次抓取"
+          hint="经 OpenRouter 公开接口分发，非本服务实测"
           icon={<Trophy className="size-4" />}
         />
         <Metric
           label="汇率"
           value={`1 USD = ${formatNumber(rate)} CNY`}
-          hint="成本折算汇率（可在「任务与配置」热更，仅影响之后写入的请求）"
+          hint="可在「任务与配置」热更，仅影响之后写入的请求"
           icon={<CircleDollarSign className="size-4" />}
         />
       </section>
@@ -229,7 +229,7 @@ export function ModelCatalogPage() {
       {isError ? (
         <div data-testid="model-catalog-error">
           <Notice tone="danger">
-            模型列表加载失败，请刷新重试；若刚升级服务，请确认后端已重启加载新端点。
+            模型列表加载失败，请刷新重试；若刚升级服务，请确认后端已重启。
           </Notice>
         </div>
       ) : models.length === 0 ? (
@@ -262,7 +262,7 @@ export function ModelCatalogPage() {
             <Empty data-testid="no-model-match">
               {query.trim()
                 ? `没有匹配「${query}」的模型`
-                : "当前渠道没有可用模型（未接入渠道或全部暂停）"}
+                : "当前渠道没有可用模型（未接入或全部暂停）"}
             </Empty>
           ) : (
             <div className="mt-3">
@@ -285,7 +285,7 @@ export function ModelCatalogPage() {
                     <SortableHead label="能力分" columnKey="intelligence"
                                   active={sort === "intelligence"} direction={order}
                                   onToggle={toggle} testId="sort-intelligence"
-                                  hint={<ColumnHint text="Artificial Analysis 三项指数（智 / 编 / 体），经 OpenRouter 公开接口，非本服务实测。点列头按「智」（综合智能指数）排序；无分数的行排在末尾。" />} />
+                                  hint={<ColumnHint text="Artificial Analysis 三项指数（智 / 编 / 体），非本服务实测。点列头按「智」排序；无分数行排末尾。" />} />
                     <SortableHead label="知识截止" columnKey="knowledge"
                                   active={sort === "knowledge"} direction={order}
                                   onToggle={toggle} testId="sort-knowledge" />
@@ -377,10 +377,10 @@ export function ModelCatalogPage() {
 
       <Notice tone="muted" className="items-start gap-1 px-3 py-2.5 text-xs">
         <p>
-          模型 id 为 OpenRouter 的 id（含厂商前缀，如 z-ai/glm-5.3），与本服务对外模型名（归一键）并不总是逐个相同；未匹配到定价的模型成本显示 —。价格为「按 token × 公开刊例价」的估算依据，不是上游真实扣费；匹配口径见「用量统计」页。
+          模型 id 为 OpenRouter 的 id（含厂商前缀，如 z-ai/glm-5.3），与本服务对外模型名（归一键）不总是逐个相同；未匹配到定价的模型成本显示 —。价格为「按 token × 公开刊例价」的估算，不是上游真实扣费；匹配口径见「用量统计」页。
         </p>
         <p>
-          本表是 OpenRouter 公开收录的范围（数百个模型），较此前 models.dev 目录小；上游没有刊例价的模型（如部分国产渠道模型）成本显示 —。价格列上行是「输入 / 输出」单价、下行是「缓存读 / 缓存写」单价（未声明缓存价时显示 —）。币种：原始单位为 USD / 百万 token；切到人民币按当前汇率（1 USD = {formatNumber(rate)} CNY）折算，历史成本按写入时汇率定值，不随本页变化重算。OpenRouter 不提供原厂发布时间（上游的 `created` 是「收录进 OpenRouter 的时间」，不是发布日），故本表只列知识截止、不列发布日期。
+          本表是 OpenRouter 公开收录的范围（数百个模型）。价格列上行是「输入 / 输出」单价、下行是「缓存读 / 缓存写」单价（未声明缓存价时显示 —）。原始单位为 USD / 百万 token；切到人民币按当前汇率（1 USD = {formatNumber(rate)} CNY）折算，历史成本按写入时汇率定值、不重算。OpenRouter 的 `created` 是收录时间、不是发布日，故本表只列知识截止。
         </p>
       </Notice>
     </div>

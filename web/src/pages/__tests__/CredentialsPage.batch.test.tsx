@@ -144,7 +144,7 @@ describe("CredentialsPage 批量运维", () => {
     expect(toast).toHaveTextContent("探测完成：成功 1 / 2，失败 1");
     const failure = within(toast).getByTestId("batch-failure");
     // 失败行用昵称而不是裸 id，并翻译成可操作的中文
-    expect(failure).toHaveTextContent("备用号：凭证被渠道拒绝，需要重新登录该账号");
+    expect(failure).toHaveTextContent("备用号：凭证被渠道拒绝，需重新登录");
   });
 
   it("执行前就失败的原因（凭证不存在 / 渠道不支持）翻译成人话", async () => {
@@ -178,7 +178,7 @@ describe("CredentialsPage 批量运维", () => {
     const toast = await screen.findByTestId("credentials-batch-result");
     const failures = within(toast).getAllByTestId("batch-failure");
     const text = failures.map((node) => node.textContent).join("\n");
-    expect(text).toContain("凭证不存在（可能已被删除）");
+    expect(text).toContain("凭证不存在（可能已删除）");
     expect(text).toContain("该渠道不支持此操作");
     expect(text).toContain("执行失败，详见服务端日志");
     // 未知 error 原样透传（后端契约里的稳定枚举，不该被前端吞掉）
@@ -231,7 +231,7 @@ describe("CredentialsPage 批量运维", () => {
     await userEvent.click(screen.getByTestId("batch-revive"));
     const toast = await screen.findByTestId("credentials-batch-result");
     expect(within(toast).getByTestId("batch-failure"))
-      .toHaveTextContent("cred_deleted：凭证不存在（可能已被删除）");
+      .toHaveTextContent("cred_deleted：凭证不存在（可能已删除）");
   });
 
   it("请求整体失败时走 error 浮层", async () => {
