@@ -422,6 +422,32 @@ export interface CheckinResult {
   status: CheckinStatus | null;
 }
 
+/** 批量动作：与后端 `BATCH_ACTIONS` 同口径（只收已有单条端点的动作）。 */
+export type BatchAction = "probe" | "toggle" | "checkin" | "revive";
+
+/**
+ * 批量执行结果的一行。
+ *
+ * `detail` 的形状随动作变化（probe → ProbeResult，checkin → CheckinResult，
+ * toggle/revive → 无）。逐条成功与否看 `ok`，失败原因看 `error`——两者分开
+ * 是因为「探测完成但上游拒绝」是 ok=false 的**正常结果**（detail 里有 reason），
+ * 而 error 表示这条根本没执行到上游（凭证不存在 / 渠道不支持 / 意外异常）。
+ */
+export interface BatchResultRow {
+  id: string;
+  ok: boolean;
+  error?: string;
+  detail?: ProbeResult | CheckinResult;
+}
+
+export interface BatchResult {
+  action: BatchAction;
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: BatchResultRow[];
+}
+
 /**
  * 模型能力分：Artificial Analysis 的三项指数，经 OpenRouter 公开接口分发。
  *

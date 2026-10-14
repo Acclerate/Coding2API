@@ -79,12 +79,13 @@ import {
   tokenExpiryView,
 } from "../api/display";
 import type { CredentialState, TokenExpiryView } from "../api/display";
-import type { Credential, CreditEvent, GrowthRunResult } from "../api/types";
+import type { BatchAction, BatchResult, Credential, CreditEvent, GrowthRunResult } from "../api/types";
 import { providerLabel } from "../api/providers";
 import {
   Badge,
   Button,
   Card,
+  Checkbox,
   Empty,
   EmptyState,
   Input,
@@ -139,6 +140,81 @@ function supportsGrowth(provider: string): boolean {
 /** 套餐到期日：只要日期，时分秒对"哪个包先过期"没用。 */
 function packageExpiry(epoch: number | null): string {
   return epoch === null ? "—" : new Date(epoch * 1000).toLocaleDateString("zh-CN");
+}
+
+/**
+ * 批量动作的中文名与结果措辞。
+ *
+ * `verb` 用于操作条按钮与 toast 标题；`done` 用于结果句。放一张表而不是散在
+ * 各处的 if/else：动作名要在按钮、确认文案、结果汇总三处保持一致，写歪一处
+ * 就会出现「批量探测」按钮却弹出「批量签到完成」。
+ */
+const BATCH_ACTION_LABEL: Record<BatchAction, { verb: string; done: string }> = {
+  probe: { verb: "探测额度", done: "探测完成" },
+  checkin: { verb: "每日签到", done: "签到完成" },
+  toggle: { verb: "暂停", done: "已暂停" },
+  revive: { verb: "恢复", done: "已恢复" },
+};
+
+/**
+ * 批量结果浮层：成功数 + 失败明细。
+ *
+ * 失败原因**逐条列出**而不是只报「失败 3 条」：批量失败几乎总是同一类原因
+ * （凭证失效 / 渠道不支持），但混批时可能几种并存，只给计数等于让用户自己
+ * 去翻是哪几条。列表上限 5 条，更多的折成「另有 N 条」。
+ */
+function BatchToastContent({
+  result,
+  names,
+}: {
+  result: BatchResult;
+  names: Map<string, string>;
+}) {
+  const label = BATCH_ACTION_LABEL[result.action];
+  const failures = result.results.filter((row) => !row.ok);
+  return (
+    <div className="space-y-1">
+      <div className="font-medium">
+        {label.done}：成功 {result.succeeded} / {result.total}
+        {result.failed > 0 && `，失败 ${result.failed}`}
+      </div>
+      {failures.length > 0 && (
+        <ul className="space-y-0.5 text-xs text-muted-foreground">
+          {failures.slice(0, 5).map((row) => (
+            <li key={row.id} data-testid="batch-failure">
+              {names.get(row.id) ?? row.id.slice(0, 12)}：
+              {batchRowReason(result.action, row)}
+            </li>
+          ))}
+          {failures.length > 5 && <li>另有 {failures.length - 5} 条失败</li>}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 一条批量失败的中文原因。
+ *
+ * 三种来源的优先级：`error`（没执行到上游：凭证不存在 / 渠道不支持 / 意外异常）
+ * → probe 的 `reason`（执行了但上游拒绝，是正常结果）→ checkin 的 `message`。
+ * 顺序不能颠倒：probe 失败时 detail.reason 与 error 不会同时存在，但若未来
+ * 两者都在，`error` 更接近「这条根本没跑」的事实。
+ */
+function batchRowReason(action: BatchAction, row: BatchResult["results"][number]): string {
+  if (row.error) {
+    if (row.error === "credential not found") return "凭证不存在（可能已被删除）";
+    if (row.error === "action_failed") return "执行失败，详见服务端日志";
+    if (row.error.startsWith("credential does not support")) return "该渠道不支持此操作";
+    return row.error;
+  }
+  if (action === "probe" && row.detail && "reason" in row.detail) {
+    return probeFailureLabel(row.detail.reason);
+  }
+  if (action === "checkin" && row.detail && "message" in row.detail && row.detail.message) {
+    return row.detail.message;
+  }
+  return "失败";
 }
 
 /** 成长中心步骤状态的人话标签；idle 不是失败（无事可做），必须与 failed 分开显示。 */
@@ -245,6 +321,10 @@ export function CredentialsPage() {
   // 首屏铺开全部行反而看不出结构。筛选生效时自动展开命中的渠道（见 applyFilters），
   // 否则「搜完却看不到结果」。
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // 批量运维的多选集合。只存 id：凭证列表每 30s 轮询替换，存对象会拿到过期快照。
+  // 删除/筛选变化后残留的 id 在渲染时与当前列表求交（见 selectedIds），
+  // 不主动清理——清理需要 effect，而求交是纯计算，没有「状态不同步」的窗口。
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   // 操作结果统一走顶部居中浮层（toast），不再以插入式横幅撑开页面：
   // error 与 notice 各占一个槽位，同类提示只保留最新一条。
   const { toasts, push, dismiss } = useToasts();
@@ -287,6 +367,18 @@ export function CredentialsPage() {
   const stateCounts = useMemo(
     () => stateOptions(credentials, now, filters.state),
     [credentials, now, filters.state],
+  );
+  // 选中集合与当前列表求交：凭证被删除 / 轮询后消失时，残留 id 自动失效，
+  // 不会出现「批量操作 3 条，其中 1 条已不存在」。用 filtered 而不是 credentials：
+  // 筛选后不可见的行不应被批量动作带上（用户看不见就不会预期它被执行）。
+  const selectedIds = useMemo(
+    () => filtered.filter((credential) => selected.has(credential.id)),
+    [filtered, selected],
+  );
+  // 批量结果里要把 id 换成人能认出的昵称
+  const credentialNames = useMemo(
+    () => new Map(credentials.map((item) => [item.id, item.nickname || item.id.slice(0, 12)])),
+    [credentials],
   );
   // 是否有任何筛选生效：决定「N / 总数」计数与「清空」入口是否出现
   const filtering =
@@ -351,6 +443,57 @@ export function CredentialsPage() {
     } finally {
       setBusy(false);
     }
+  };
+
+  /**
+   * 批量动作：一次提交所有选中项，结果**逐条**汇报。
+   *
+   * 与逐行循环调单条端点的区别在于错误处理：这里一次请求拿到「成功 N / 失败 M」
+   * 与失败明细，而不是在第 3 条报错时丢掉前两条的结果。选中集合在成功后清空——
+   * 同一批号再点一次「签到」没有意义；失败项也一并清空，避免用户以为要重试
+   * 却把成功项又跑一遍（失败原因通常需要先修凭证）。
+   */
+  const runBatch = async (action: BatchAction, enabled?: boolean) => {
+    const ids = selectedIds.map((credential) => credential.id);
+    if (ids.length === 0) return;
+    setBusy(true);
+    try {
+      const result = await api.batchCredentials(action, ids, enabled);
+      const tone = result.failed > 0 ? "warn" : "ok";
+      push({
+        tone,
+        testId: "credentials-batch-result",
+        content: <BatchToastContent result={result} names={credentialNames} />,
+      });
+      setSelected(new Set());
+      await refresh();
+    } catch (caught) {
+      showError(caught instanceof Error ? caught.message : "批量操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 勾选 / 取消勾选一条；用于行内 checkbox 与组头「全选本渠道」。 */
+  const toggleSelected = (credentialId: string, checked: boolean) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (checked) next.add(credentialId);
+      else next.delete(credentialId);
+      return next;
+    });
+  };
+
+  /** 组头「全选本渠道」：把该组所有行一次性纳入 / 移出选中集合。 */
+  const toggleGroupSelected = (ids: string[], checked: boolean) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      for (const id of ids) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
   };
 
   const actions: Actions = {
@@ -611,6 +754,42 @@ export function CredentialsPage() {
               )}
             </div>
 
+            {/* 批量操作条：只在有选中项时出现，不占常驻高度。选中集合与当前
+                筛选结果求交（selectedIds），因此「筛选后勾选、再改筛选」不会
+                把已隐藏的行带进批量动作。 */}
+            {canWrite && selectedIds.length > 0 && (
+              <div
+                data-testid="credentials-batch-bar"
+                className="mb-3 flex flex-wrap items-center gap-2 rounded-md bg-muted/50 px-3 py-2"
+              >
+                <span className="text-xs text-muted-foreground" data-testid="batch-selected-count">
+                  已选 <strong className="tabular-nums text-foreground">{selectedIds.length}</strong> 个
+                </span>
+                {(["probe", "checkin", "toggle", "revive"] as BatchAction[]).map((action) => (
+                  <Button
+                    key={action}
+                    size="sm"
+                    variant="default"
+                    disabled={busy}
+                    data-testid={`batch-${action}`}
+                    onClick={() =>
+                      void runBatch(action, action === "toggle" ? false : undefined)}
+                  >
+                    {BATCH_ACTION_LABEL[action].verb}
+                  </Button>
+                ))}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  data-testid="batch-clear"
+                  onClick={() => setSelected(new Set())}
+                >
+                  取消选择
+                </Button>
+              </div>
+            )}
+
             {filtered.length === 0 ? (
               <EmptyState
                 icon={<Search className="size-5" />}
@@ -642,7 +821,18 @@ export function CredentialsPage() {
                     // 保持恒定**：不支持的渠道由操作列 colSpan 吃掉那一格。表格是 auto
                     // 布局，列数一变就重算列宽，展开的下一组会整列错位。
                     const showGrowth = supportsGrowth(group.provider);
-                    const columnCount = canWrite ? 6 : 5;
+                    // 列数随「是否显示操作列」与「选择列」变化：表格是 auto 布局，
+                    // 列数一变就重算列宽，展开的下一组会整列错位。选择列只在可写
+                    // （canWrite）时出现，与 ColumnHeaderRow / Row 的渲染条件严格一致。
+                    // canWrite：选择 + 凭证 + 状态 + 额度 + token + 成长 + 操作 = 7；
+                    // viewer：去掉选择与操作两列 = 5。
+                    const columnCount = canWrite ? 7 : 5;
+                    // 本组是否已全选：决定组头 checkbox 的勾选态。用 group.items
+                    // （组内全部行）而不是 filtered，因为组头「全选本渠道」的语义
+                    // 就是这一渠道下的所有账号。
+                    const groupIds = group.items.map((item) => item.id);
+                    const allSelected = groupIds.length > 0
+                      && groupIds.every((id) => selected.has(id));
                     // 额度合计的进度条：剩余 / 总量（免费层两者皆 null，不出条）
                     const quotaPct =
                       group.remaining !== null && group.total !== null && group.total > 0
@@ -658,13 +848,28 @@ export function CredentialsPage() {
                             colSpan={columnCount}
                             className="bg-muted/40 p-0"
                           >
-                            <button
-                              type="button"
-                              data-testid={`group-toggle-${group.provider}`}
-                              aria-expanded={!isCollapsed}
-                              onClick={() => toggleGroup(group.provider)}
-                              className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-                            >
+                            {/* 组头「全选本渠道」的 checkbox 必须在 button **外面**：
+                                checkbox 嵌进 button 会形成嵌套交互元素，读屏与键盘
+                                焦点都会打架（点 checkbox 会连带展开/折叠该组）。 */}
+                            <div className="flex items-center">
+                              {canWrite && (
+                                <span className="pl-3">
+                                  <Checkbox
+                                    checked={allSelected}
+                                    aria-label={`全选 ${providerLabel(group.provider)} 的账号`}
+                                    data-testid={`group-select-${group.provider}`}
+                                    onCheckedChange={(checked) =>
+                                      toggleGroupSelected(groupIds, checked === true)}
+                                  />
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                data-testid={`group-toggle-${group.provider}`}
+                                aria-expanded={!isCollapsed}
+                                onClick={() => toggleGroup(group.provider)}
+                                className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                              >
                               {/* 身份：折叠箭头 + 品牌图标 + 渠道名 + 账号数 */}
                               <span className="flex w-48 shrink-0 items-center gap-2">
                                 <ChevronRight
@@ -809,6 +1014,7 @@ export function CredentialsPage() {
                                 )}
                               </span>
                             </button>
+                            </div>
                           </TableCell>
                         </TableRow>
                         {!isCollapsed && (
@@ -832,6 +1038,8 @@ export function CredentialsPage() {
                                   canWrite={canWrite}
                                   showGrowth={showGrowth}
                                   busy={busy}
+                                  selected={selected.has(credential.id)}
+                                  onSelect={toggleSelected}
                                   confirming={confirmDelete === credential.id}
                                   creditsOpen={creditEvents?.credentialId === credential.id}
                                   onConfirmDelete={setConfirmDelete}
@@ -1088,6 +1296,9 @@ function ColumnHeaderRow({
       data-testid={`column-header-${provider}`}
       className="hover:bg-transparent [&>th]:sticky [&>th]:top-0 [&>th]:z-10 [&>th]:h-9 [&>th]:bg-muted"
     >
+      {/* 选择列：列头留空（每行的 checkbox 由 Row 渲染，组头的全选在组标题行）。
+          必须与 Row 的 checkbox 格一一对应，否则表格 auto 布局会整列错位。 */}
+      {canWrite && <TableHead className="w-8" aria-hidden />}
       <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
                     direction={order} onToggle={toggle} testId={`sort-${provider}-nickname`}
                     hint={<ColumnHint text="昵称；「已指定」表示调度器优先使用该凭证（全局唯一）。渠道名与数量在分组标题行，行内不再重复。" />} />
@@ -1130,6 +1341,8 @@ function Row({
   canWrite,
   showGrowth,
   busy,
+  selected,
+  onSelect,
   confirming,
   creditsOpen,
   onConfirmDelete,
@@ -1143,6 +1356,8 @@ function Row({
   canWrite: boolean;
   showGrowth: boolean;
   busy: boolean;
+  selected: boolean;
+  onSelect: (credentialId: string, checked: boolean) => void;
   confirming: boolean;
   creditsOpen: boolean;
   onConfirmDelete: (id: string | null) => void;
@@ -1172,6 +1387,19 @@ function Row({
   // 只会挤在「操作」列里——同行内的 colSpan 不生效，整行高度会被拉坏。
   return (
     <TableRow data-testid={`row-${credential.id}`}>
+      {/* 选择格：与 ColumnHeaderRow 的空表头一一对应（列数恒定）。
+          checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。 */}
+      {canWrite && (
+        <TableCell className="w-8">
+          <Checkbox
+            checked={selected}
+            disabled={busy}
+            aria-label={`选择 ${credential.nickname || credential.id.slice(0, 12)}`}
+            data-testid={`select-${credential.id}`}
+            onCheckedChange={(checked) => onSelect(credential.id, checked === true)}
+          />
+        </TableCell>
+      )}
       <TableCell>
         {/* 渠道名不在这里重复：它已在组头（按渠道分组后，同一组内所有行的渠道名
             完全相同）。昵称单独占一行，「已指定」紧贴昵称。 */}

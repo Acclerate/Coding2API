@@ -1,10 +1,15 @@
-"""管理台凭证运维：CRUD / toggle / pin / probe / checkin / 成长中心 / 账号切换。
+"""管理台凭证运维：CRUD / toggle / pin / probe / checkin / 成长中心 / 账号切换 / 批量。
 
 探测失败原因翻译（describe_probe_failure）在此，因为只有这里返回探测结果。
+
+批量端点（`POST /api/credentials/batch`）与单条端点共用同一组动作实现
+（`probe_credential_once` / `checkin_credential_once`），避免「批量版」与
+「单条版」两套逻辑各自漂移——比如探测失败的 reason 翻译只在单条版修好。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -31,6 +36,29 @@ ACCOUNT_SORT_KEYS = {
     "nickname": lambda row: row["nickname"] or None,
     "account_id": lambda row: row["account_id"],
     "type": lambda row: row["type"],
+}
+
+# 批量端点支持的动作。刻意只收「已有单条端点」的动作：
+# - `refresh`（token 预刷新）没有单条入口，且一次性 refresh_token 由后台任务
+#   按 skew 窗口驱动，批量强刷会白耗票据；
+# - `delete` 破坏性太强，需要单独的二次确认流，不走通用批量通道。
+BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive"})
+
+# 单次批量的上限：一次点「全部探测」最多打多少个上游。上限存在的原因是
+# 探测/签到都会真的出网，没有上限时前端一个「全选」就能把整池凭证的请求
+# 同时排进事件循环。
+BATCH_MAX_IDS = 200
+
+# 批量的在途并发上限。后台任务用 Pacer 严格串行化上游请求，但那是跨任务
+# 节流；批量端点由操作员手动触发，若完全串行则 50 个号要等几分钟才返回。
+# 折中：限制同时在途的凭证数，既不打爆上游，也不至于让请求长时间挂住。
+BATCH_CONCURRENCY = 4
+
+# 批量动作 → 审计动作。探测 / 签到是只读语义（与单条端点一致，不写审计），
+# 只有真正改动凭证状态的 toggle / revive 落一条汇总流水。
+BATCH_AUDIT_ACTIONS = {
+    "toggle": ACTION_CREDENTIAL_TOGGLE,
+    "revive": ACTION_CREDENTIAL_REVIVE,
 }
 
 
@@ -69,6 +97,43 @@ def describe_probe_failure(error: Exception) -> str:
     if isinstance(error, (httpx.TransportError, OSError)):
         return "network_unreachable"          # 其余传输层失败（读中断 / TLS 中止）
     return "unknown_error"
+
+
+async def probe_credential_once(credentials, provider, data, credential_id: str) -> dict:
+    """探测一条凭证并把结果写回额度 / 健康度，返回对外响应体。
+
+    单条与批量端点共用这一份实现：探测失败是**正常结果**而不是异常——
+    降级为 `{"probed": False, "reason": ...}`，调用方（单条端点）照旧回 200。
+    两处各写一份时，`describe_probe_failure` 的修正只落在一处，另一处继续
+    把 Python 类名当 reason 吐给用户。
+    """
+    try:
+        quota = await provider.probe_quota(data)
+    except Exception as error:  # noqa: BLE001 - 探测失败 → unknown，不当作 0
+        credentials.mark_probe_failed(credential_id)
+        reason = describe_probe_failure(error)
+        logger.info("额度探测失败 %s: %s", credential_id, reason)
+        # detail 只在**服务端日志**里带上游原文（可能是 2048 字的响应体摘要）；
+        # 对外只回受控 reason，避免上游回显请求头/正文时泄露凭证片段。
+        logger.info("额度探测失败详情 %s: %s", credential_id, str(error)[:200])
+        return {"probed": False, "reason": reason}
+    credentials.save_quota(credential_id, quota)
+    return {"probed": True, "remaining": quota.remaining, "total": quota.total,
+            "cycle_end": quota.cycle_end}
+
+
+async def checkin_credential_once(credentials, provider, data, credential_id: str,
+                                  schedule_probe) -> dict:
+    """签到一条凭证，返回对外响应体（单条与批量共用）。"""
+    result = await provider.checkin(data)
+    if result.ok and not result.already_checked_in:
+        schedule_probe(credential_id)      # 只有真签到了才会发积分
+    # already_checked_in 必须透传：前端靠它区分「刚签到」与「今天已签过」
+    return {"ok": result.ok, "credit": result.credit, "code": result.code,
+            "message": result.message,
+            "already_checked_in": result.already_checked_in,
+            # 渠道可选的活动状态（连续天数/今日积分）；无此能力的渠道为 None
+            "status": result.status}
 
 
 def create_router(services: Services) -> APIRouter:
@@ -201,19 +266,7 @@ def create_router(services: Services) -> APIRouter:
                                principal=Depends(principal_from_request)):
         require_operator(principal)
         provider, data = provider_for(credential_id)
-        try:
-            quota = await provider.probe_quota(data)
-        except Exception as error:  # noqa: BLE001 - 探测失败 → unknown，不当作 0
-            credentials.mark_probe_failed(credential_id)
-            reason = describe_probe_failure(error)
-            logger.info("额度探测失败 %s: %s", credential_id, reason)
-            # detail 只在**服务端日志**里带上游原文（可能是 2048 字的响应体摘要）；
-            # 对外只回受控 reason，避免上游回显请求头/正文时泄露凭证片段。
-            logger.info("额度探测失败详情 %s: %s", credential_id, str(error)[:200])
-            return {"probed": False, "reason": reason}
-        credentials.save_quota(credential_id, quota)
-        return {"probed": True, "remaining": quota.remaining, "total": quota.total,
-                "cycle_end": quota.cycle_end}
+        return await probe_credential_once(credentials, provider, data, credential_id)
 
     @router.post("/api/credentials/{credential_id}/checkin")
     async def checkin_credential(credential_id: str,
@@ -221,15 +274,88 @@ def create_router(services: Services) -> APIRouter:
                                  principal=Depends(principal_from_request)):
         require_operator(principal)
         provider, data = provider_for(credential_id, "checkin")
-        result = await provider.checkin(data)
-        if result.ok and not result.already_checked_in:
-            schedule_probe(credential_id)      # 只有真签到了才会发积分
-        # already_checked_in 必须透传：前端靠它区分「刚签到」与「今天已签过」
-        return {"ok": result.ok, "credit": result.credit, "code": result.code,
-                "message": result.message,
-                "already_checked_in": result.already_checked_in,
-                # 渠道可选的活动状态（连续天数/今日积分）；无此能力的渠道为 None
-                "status": result.status}
+        return await checkin_credential_once(credentials, provider, data,
+                                             credential_id, schedule_probe)
+
+    @router.post("/api/credentials/batch")
+    async def batch_credentials(payload: dict,
+                                _csrf: None = Depends(csrf_protected),
+                                principal=Depends(principal_from_request)):
+        """批量运维：对多条凭证执行同一动作，返回逐条结果。
+
+        与「前端循环调单条端点」的区别不只是省往返：单条端点任一条失败就
+        中断整轮，批量端点**逐条隔离**——一条凭证失效（不存在 / 渠道不支持 /
+        上游报错）不影响其余条，前端能一次性看到「成功 N / 失败 M」与失败原因。
+
+        `toggle` 的 `enabled` 由请求体显式给出，不做「各自取反」：混选「已启用
+        + 已暂停」时取反会让一半号走向相反方向，而操作员的意图只有一个。
+        """
+        require_operator(principal)
+        action = str(payload.get("action") or "")
+        if action not in BATCH_ACTIONS:
+            raise InvalidRequest(f"unknown batch action {action!r}")
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise InvalidRequest("ids must be a non-empty list")
+        # 去重保序：前端「先单选再全选」会带重复项，重复探测同一凭证纯属浪费
+        ids: list[str] = []
+        seen: set[str] = set()
+        for item in raw_ids:
+            credential_id = str(item).strip()
+            if credential_id and credential_id not in seen:
+                seen.add(credential_id)
+                ids.append(credential_id)
+        if not ids:
+            raise InvalidRequest("ids must be a non-empty list")
+        if len(ids) > BATCH_MAX_IDS:
+            raise InvalidRequest(f"too many credentials (max {BATCH_MAX_IDS})")
+        enabled = bool(payload.get("enabled", True))
+        semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
+
+        async def run_one(credential_id: str) -> dict:
+            try:
+                if action == "toggle":
+                    if not credentials.set_enabled(credential_id, enabled):
+                        return {"id": credential_id, "ok": False, "error": "credential not found"}
+                    return {"id": credential_id, "ok": True}
+                if action == "revive":
+                    if not credentials.revive(credential_id):
+                        return {"id": credential_id, "ok": False, "error": "credential not found"}
+                    return {"id": credential_id, "ok": True}
+                # probe / checkin 会真的出网：在途上限只约束这两类动作。
+                # toggle / revive 是本地 DB 写，无上游压力，不受信号量限制。
+                async with semaphore:
+                    if action == "probe":
+                        provider, data = provider_for(credential_id)
+                        detail = await probe_credential_once(
+                            credentials, provider, data, credential_id)
+                        return {"id": credential_id, "ok": bool(detail["probed"]),
+                                "detail": detail}
+                    provider, data = provider_for(credential_id, "checkin")
+                    detail = await checkin_credential_once(
+                        credentials, provider, data, credential_id, schedule_probe)
+                    return {"id": credential_id, "ok": bool(detail["ok"]), "detail": detail}
+            except InvalidRequest as error:
+                # 凭证不存在 / 渠道不支持该能力：可预期的逐条失败，原因直接可读
+                return {"id": credential_id, "ok": False, "error": str(error)}
+            except Exception as error:  # noqa: BLE001 - 单条失败不拖垮整批
+                # 上游异常文本可能含凭证片段，只记服务端日志，对外回受控原因
+                logger.info("批量 %s 失败 %s: %s", action, credential_id, str(error)[:200])
+                return {"id": credential_id, "ok": False, "error": "action_failed"}
+
+        results = await asyncio.gather(*(run_one(credential_id) for credential_id in ids))
+        succeeded = sum(1 for result in results if result["ok"])
+        # 审计只记一条汇总，不逐条落库：批量暂停 50 个号是一次操作、一个意图，
+        # 50 行审计会把流水刷成噪声，反而更难定位「谁在什么时候批量做了什么」。
+        audit_action = BATCH_AUDIT_ACTIONS.get(action)
+        if audit_action is not None:
+            services.audit.record(
+                actor=principal.username, action=audit_action, target=None,
+                detail=f"批量 {action}：{succeeded}/{len(results)} 成功")
+        logger.info("管理员 %s 批量 %s %d 个凭证（成功 %d）", principal.username, action,
+                    len(results), succeeded)
+        return {"action": action, "total": len(results), "succeeded": succeeded,
+                "failed": len(results) - succeeded, "results": results}
 
     @router.get("/api/credentials/{credential_id}/checkin")
     async def checkin_status(credential_id: str,

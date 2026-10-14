@@ -105,9 +105,9 @@ describe("CredentialsPage 成长中心", () => {
     await settle();
     await expandCredentialGroups();
     expect(screen.queryByTestId("growth-cred_1")).not.toBeInTheDocument();
-    // 成长中心是第 5 列（0-based 4）；token 剩余列同为「—」，不能按文本全局查
+    // 成长中心是第 6 列（0-based 5，选择列占了 0）；token 剩余列同为「—」，不能按文本全局查
     const row = screen.getByTestId("row-cred_1");
-    expect(row.children[4]).toHaveTextContent("—");
+    expect(row.children[5]).toHaveTextContent("—");
   });
 
   it("长汇报单行截断展示，鼠标悬浮显示完整内容", async () => {
@@ -223,8 +223,8 @@ describe("CredentialsPage 成长中心", () => {
     const row = screen.getByTestId("row-unknown");
     expect(within(row).queryByTestId("token-expiry-unknown")).not.toBeInTheDocument();
     expect(within(row).queryByText("已过期")).not.toBeInTheDocument();
-    // 与其他空白列一致：显示占位符而不是留空
-    const tokenCell = row.children[3];
+    // 与其他空白列一致：显示占位符而不是留空（token 剩余是第 4 列，选择列占了 0）
+    const tokenCell = row.children[4];
     expect(tokenCell).toHaveTextContent("—");
   });
 
@@ -317,7 +317,7 @@ describe("CredentialsPage 成长中心", () => {
     expect(within(drawerRow).getByTestId("credit-drawer-cred_1")).toBeInTheDocument();
     // :scope > td：抽屉内部还有一张表格，直接按 role 查会匹配到里面那些单元格。
     // 抽屉的 colSpan 与组头一致，是「表格总列数」而非本组的单元格个数
-    expect(drawerRow.querySelector(":scope > td")).toHaveAttribute("colspan", "6");
+    expect(drawerRow.querySelector(":scope > td")).toHaveAttribute("colspan", "7");
     expect(within(drawer).getByTestId("credit-event-cre_2")).toHaveTextContent(
       "+15（100 → 115）",
     );

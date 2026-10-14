@@ -5,6 +5,8 @@ import type {
   ActivationIssued,
   AlertsResponse,
   AuditResponse,
+  BatchAction,
+  BatchResult,
   CheckinResult,
   CheckinStatus,
   CredentialsResponse,
@@ -139,6 +141,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/credentials/${id}`, { method: "DELETE" }),
   probeCredential: (id: string) =>
     request<ProbeResult>(`/api/credentials/${id}/probe`, { method: "POST" }),
+  /** 批量运维：一次对多条凭证执行同一动作，后端逐条隔离返回结果。 */
+  batchCredentials: (action: BatchAction, ids: string[], enabled?: boolean) =>
+    request<BatchResult>("/api/credentials/batch", {
+      method: "POST",
+      ...json(enabled === undefined ? { action, ids } : { action, ids, enabled }),
+    }),
   checkinCredential: (id: string) =>
     request<CheckinResult>(`/api/credentials/${id}/checkin`, { method: "POST" }),
   checkinStatus: (id: string) =>

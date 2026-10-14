@@ -589,3 +589,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users
 - **统计一律以 `usage_hourly` 为准**：`overview` / `by_provider` / `timeline` / `model-timeline` 均读小时汇总，只有 `events` 读明细。代价：最近 ≤5 分钟未进汇总的请求不计入，刷新一次即可。
 - **成本是下限**：匹配不到刊例价或未上报输入 token 的不计入（聚合值 `null` 显示 `—`，不拿 0 冒充免费），历史行不随价表 / 汇率重算。
 - **应用日志只写 stderr，轮转交给平台**：应用自己写文件会与平台轮转争抢同一文件，容器里还会写进镜像层。
+- **批量运维端点收「已有单条端点」的动作，不做通用批量通道**：`POST /api/credentials/batch` 只支持 `probe` / `toggle` / `checkin` / `revive`。`refresh`（token 预刷新）没有单条入口、且由后台按到期窗口驱动，批量强刷会白耗一次性票据；`delete` 破坏性太强，需要单独的二次确认流。批量动作与单条端点共用同一份实现（`probe_credential_once` / `checkin_credential_once`），避免「批量版」与「单条版」各写一套后探测失败的 reason 翻译只在一处修好。
+- **批量 `toggle` 传显式 `enabled` 而非「各自取反」**：混选「已启用 + 已暂停」时取反会让一半号走向相反方向，而操作员点「暂停」的意图只有一个。
+- **批量审计只记一条汇总**（`toggle` / `revive`）：50 个号的批量暂停是一次操作、一个意图，逐条落库会把审计流水刷成噪声。`probe` / `checkin` 与单条端点同为只读语义、不写审计。
+- **批量 `probe` / `checkin` 用信号量限制在途数，不复用后台 Pacer**：Pacer 是跨后台任务的严格串行化节流，批量端点由操作员手动触发，完全串行会让 50 个号等上几分钟才返回。折中是 `BATCH_CONCURRENCY=4` 的在途上限——既不打爆上游，也不长时间挂住请求。`toggle` / `revive` 是本地 DB 写，无上游压力，不受该上限约束。

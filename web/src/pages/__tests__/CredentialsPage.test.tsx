@@ -905,19 +905,19 @@ describe("CredentialsPage", () => {
     expect(screen.queryByTestId("growth-tr1")).not.toBeInTheDocument();
 
     // 但列数恒定（空占位格顶住），否则 auto 布局会重算列宽、下面展开的组整列错位：
-    // 两组的列头 / 数据行都是 6 格，且「操作」落在同一格位置
-    expect(screen.getByTestId("column-header-codebuddy").children).toHaveLength(6);
-    expect(screen.getByTestId("column-header-trae").children).toHaveLength(6);
-    expect(screen.getByTestId("row-cb1").children).toHaveLength(6);
-    expect(screen.getByTestId("row-tr1").children).toHaveLength(6);
+    // 两组的列头 / 数据行都是 7 格（选择 + 5 列 + 操作），且「操作」落在同一格位置
+    expect(screen.getByTestId("column-header-codebuddy").children).toHaveLength(7);
+    expect(screen.getByTestId("column-header-trae").children).toHaveLength(7);
+    expect(screen.getByTestId("row-cb1").children).toHaveLength(7);
+    expect(screen.getByTestId("row-tr1").children).toHaveLength(7);
     // 空占位格不承载内容（无排序按钮、无文本）
     const traeHeaderCells = [...screen.getByTestId("column-header-trae").children];
-    expect(traeHeaderCells[4]).toBeEmptyDOMElement();
-    expect(traeHeaderCells[5]).toHaveTextContent("操作");
+    expect(traeHeaderCells[5]).toBeEmptyDOMElement();
+    expect(traeHeaderCells[6]).toHaveTextContent("操作");
     expect(screen.getByTestId("group-codebuddy").querySelector("td")).toHaveAttribute(
-      "colspan", "6");
+      "colspan", "7");
     expect(screen.getByTestId("group-trae").querySelector("td")).toHaveAttribute(
-      "colspan", "6");
+      "colspan", "7");
   });
 
   it("只读用户：没有操作列，成长中心占位格仍保持列数恒定", async () => {
@@ -943,7 +943,7 @@ describe("CredentialsPage", () => {
     }
     expect(screen.getByTestId("row-cb1").children).toHaveLength(5);
     expect(screen.getByTestId("row-tr1").children).toHaveLength(5);
-    // 最后一格是成长中心占位格（只读下没有操作列）
+    // 最后一格是成长中心占位格（只读下没有操作列，也没有选择列）
     const traeCells = [...screen.getByTestId("row-tr1").children];
     expect(traeCells[4]).toBeEmptyDOMElement();
     expect(screen.getByTestId("row-cb1").children[4]).toHaveTextContent("领取 30 积分");

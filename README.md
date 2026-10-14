@@ -264,6 +264,16 @@ claude
 
 > OpenCode Zen / Kilo Gateway 是无凭证渠道，池里是一条虚拟占位行。**暂停它是永久停用的唯一方式**——删除后下次重启会被种子重新补上。暂停也会把该渠道从模型列表摘掉。
 
+## 凭证批量运维
+
+池子一大，「逐个点签到 / 探测」就不现实。凭证页提供多选 + 批量操作条：每行一个 checkbox、组头一个「全选本渠道」，勾选后顶部出现操作条（探测额度 / 每日签到 / 暂停 / 恢复 / 取消选择）。
+
+- **后端批量端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive", ids: [...], enabled?}`（`enabled` 仅 `toggle` 用）。一次请求最多 200 条，重复 id 自动去重。
+- **逐条隔离**：单条失败不影响其余条——凭证不存在、渠道不支持该能力、上游报错都只体现在该条结果里，其余条照常执行。响应为 `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`：`ok` 表示该条动作是否成功；`error` 表示这条根本没执行到上游（`credential not found` / `credential does not support ...` / `action_failed`），`detail` 是动作自身的返回体（probe 的剩余额度、checkin 的积分与状态）。
+- **暂停是显式状态而非取反**：批量「暂停」对所有选中项传 `enabled=false`，不会让「已启用 + 已暂停」的混选走向相反方向。
+- **只收已有单条端点的动作**：`refresh`（token 预刷新）没有单条入口且由后台按到期窗口驱动，批量强刷会白耗一次性票据；`delete` 破坏性太强，需要单独的二次确认流，都不走这个通道。
+- **审计只记一条汇总**（`toggle` / `revive`）：批量暂停 50 个号是一次操作、一个意图，逐条落库会把审计流水刷成噪声。`probe` / `checkin` 与单条端点同为只读语义，不写审计。
+
 ## 凭证池的筛选与分组
 
 凭证多了以后，列表页把「找到某个号」这件事拆成三层，默认首屏只铺渠道级总览：
