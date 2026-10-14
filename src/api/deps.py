@@ -29,6 +29,7 @@ from ..auth.session import SESSION_COOKIE, verify_session_token
 from ..auth.throttle import LoginThrottle
 from ..compat.openai.request import InvalidRequest
 from ..config import Settings
+from ..db.limits import LimitsRepository
 from ..db.repo import (
     AlertRepository,
     ApiKeyRepository,
@@ -39,6 +40,7 @@ from ..db.repo import (
     UserRepository,
 )
 from ..engine.executor import Executor
+from ..engine.limits import LimitGuard
 from ..runtime_settings import RuntimeSettings
 from ..stats.query import StatsQuery
 
@@ -82,6 +84,11 @@ class Services:
     audit: AuditRepository
     # 运维告警事件：后台评估命中后落库，/api/alerts 回看。
     alerts: AlertRepository
+    # 凭证级限额护栏配置（/api/credentials/{id}/limits）。
+    limits: LimitsRepository
+    # 同一个限流护栏实例（executor 也持它）：管理台改完限额后 invalidate()
+    # 让新值立即生效，不必等选号侧的快照 TTL。
+    limit_guard: LimitGuard
     # 模型列表缓存：provider_id → {小写模型名: Model}（含元数据）。
     # list_models 成功时更新，某上游拉取失败时用缓存兜底（v1/models 稳定返回）。
     # **存未过滤的原始表**：MODEL_BLOCKLIST 是可热更项，过滤在每个出口现做，

@@ -25,7 +25,7 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | 仓库根 | `Dockerfile`、`docker-compose.yml` | compose build context 依赖根目录 |
 | `src/` | `main.py` `config.py` `runtime_settings.py` `version.py` | FastAPI 组装·lifespan·路由挂载（只做接线）／pydantic-settings 全部 env + `live()` 归一化标量·取值器／运行时配置覆盖层（DB 覆盖 > env + 白名单校验 + snapshot）／版本号（`pyproject.toml` 唯一真源，读不到回落常量） |
 | `src/webapp/` | `limits.py` `security.py` `request_id.py` `handlers.py` `logging.py` `static.py` | 请求体上限 ASGI 中间件（登录 8KB / 其余 16MB）／Host 白名单 + 安全响应头（CSP·nosniff）／请求 ID ASGI 中间件（最外层，任意响应含 413/400 都带 `X-Request-ID`）／异常 → HTTP 响应（稳定机器可读错误码）／root logger 配置／前端产物定位 + SPA catch-all（排除 `/api`、`/v1`） |
-| `src/db/` | `schema.sql` `conn.py` `migrate.py` `repo.py` `crypto.py` `backup.py` | DDL 定稿（只加不改）／线程本地连接 + WAL + busy_timeout + `transaction()`／启动执行 `schema.sql` + `_MIGRATION_COLUMNS`·`_MIGRATION_DROPS`／凭证·API Key·用户·审计·告警·积分流水持久化（手写 SQL）／Fernet 加解密／备份·恢复核心（`VACUUM INTO` 一致性快照 + `integrity_check` + 0600 + 保留 N 份，任务与 `scripts/` 共用） |
+| `src/db/` | `schema.sql` `conn.py` `migrate.py` `repo.py` `limits.py` `crypto.py` `backup.py` | DDL 定稿（只加不改）／线程本地连接 + WAL + busy_timeout + `transaction()`／启动执行 `schema.sql` + `_MIGRATION_COLUMNS`·`_MIGRATION_DROPS`／凭证·API Key·用户·审计·告警·积分流水持久化（手写 SQL）／凭证限额护栏配置 CRUD + 当日用量聚合／Fernet 加解密／备份·恢复核心（`VACUUM INTO` 一致性快照 + `integrity_check` + 0600 + 保留 N 份，任务与 `scripts/` 共用） |
 | `src/auth/` | `users.py` `bootstrap.py` `session.py` `api_key.py` `csrf.py` `throttle.py` `rbac.py` `access.py` | DbUserStore + UsersFileStore（users.txt 导入）／启动引导（导入 → `ADMIN_USERNAMES` 提权 → 无活跃 admin 报错）／会话 Cookie 签发校验（手写 HMAC，payload 带 `session_epoch`）／`sk-` 生成 + SHA-256 摘要 + 常量时间校验／写操作 CSRF／登录限流（三级窗口 + PBKDF2 并发上限）／三角色 `admin`·`operator`·`viewer`／来源 IP 与模型白名单（纯函数） |
 | `src/provider/` | `base.py` `proxy.py` `naming.py` `token_expiry.py` `openai_chunk.py` `fixtures/` | Provider 协议·Event·ErrKind·Quota·HealthScore·异常族／按渠道出站代理（解析 `PROVIDER_PROXIES` + `build_client`）／模型名归一（七渠道三字段）／到期提取（`expires_at` → JWT `exp`）／标准 OpenAI chunk 共享原语（choices 校验 + 空 tool_call 判定）／真实样本（`codebuddy/*.sse`、`trae/*.sse`） |
 | `src/provider/codebuddy/` | `client.py` `intl.py` `events.py` `credential.py` `headers.py` `oauth.py` `checkin.py` `activity.py` `growth.py` `growth_runner.py` `refresh.py` | 上游 HTTP + SSE 流 + 额度探测 + 内容风控指纹清洗／国际版子类（仅覆渠道 id 与能力 None）／OpenAI 风格 SSE → Event + 状态与业务码分类／凭证类型与解析／上游技术常量与请求头／设备码轮询／签到 + 连续天数／活跃上报协议层／成长中心协议层（15 端点）／成长中心编排（7 类领取的顺序与失败判定）／token 刷新 + 多账号切换 |
@@ -34,7 +34,7 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | `src/provider/kilo/` | `client.py` `events.py` | 上游（标准 OpenAI，无门禁）+ `isFree` 过滤（不探活）／标准 OpenAI SSE → Event（`delta.reasoning` 思考通道） |
 | `src/provider/qoder/` | `cosy.py` `client.py` `events.py` `credential.py` `auth.py` | COSY（自定义 Base64、AES/RSA、签名与会话头缓存）／上游 + 信封 SSE 解包 + 额度·签到／信封 SSE → 内层 chunk → Event + 状态与业务码分类／凭证解析（realm·组织·到期）／设备码 PKCE 登录（start/poll） |
 | `src/provider/codearts/` | `signer.py` `dpop.py` `client.py` `events.py` `credential.py` `units.py` `backfill.py` `auth.py` `oauth.py` | 华为云 SDK-HMAC-SHA256（纯函数，便于固定向量测试）／ES256 P-256 DPoP JWS（低 S 归一化）／上游 + 私有 SSE 还原 + 福利·余额／SSE → 增量 Event（OpenAI chunk 与累计全文双形状）／凭证解析（AK/SK/STS/DPoP/refresh）／「套餐·剩余量」单位与到期解析／历史 usage 回填／OAuth2 PKCE 登录／回调链接粘贴换 token 适配 |
-| `src/engine/` | `scheduler.py` `executor.py` `affinity.py` `continuation.py` `compress.py` `model_resolver.py` `sse.py` | 选号 + 冷却状态机 + pin（纯逻辑，操作 Candidate）／执行 + 模型目录收窄 + 轮换重试 + fallback 链 + 统计埋点／会话粘性／截断续写／上下文压缩裁剪（纯函数）／`"glm-5.2"`·`"glm-5.2@trae"`·`auto` → 候选集 + fallback 组解析／SSE 帧解析 + 行长上限 |
+| `src/engine/` | `scheduler.py` `executor.py` `limits.py` `affinity.py` `continuation.py` `compress.py` `model_resolver.py` `sse.py` | 选号 + 冷却状态机 + pin（纯逻辑，操作 Candidate）／执行 + 模型目录收窄 + 轮换重试 + fallback 链 + 统计埋点／凭证限额护栏判定 + 选号前快照缓存／会话粘性／截断续写／上下文压缩裁剪（纯函数）／`"glm-5.2"`·`"glm-5.2@trae"`·`auto` → 候选集 + fallback 组解析／SSE 帧解析 + 行长上限 |
 | `src/compat/` | `openai/{request,response,errors}.py` `responses/{request,response}.py` `anthropic/{request,response}.py` | ChatRequest 校验·chunk 聚合·OpenAI error shape／Responses 出口（Codex CLI 子集）／Anthropic Messages 出口（Claude Code 子集） |
 | `src/tasks/` | `pacer.py` `quota_probe.py` `checkin.py` `growth.py` `activity.py` `refresh.py` `retention.py` `backup.py` `alerting.py` `status.py` `runner.py` | 全局节流器（随机区间 + 按桶并发上限 + 滑动窗口）／启动立即一轮 + 每 `QUOTA_PROBE_MINUTES`／全天每 10 分钟签到、成功即封账（支持渠道回填 `seal_until`）／成长中心（仅 CB）落 `growth_events`／活跃上报（CB 与 CB 国际版，默认关闭）／每 `REFRESH_INTERVAL_MINUTES` 预刷新／每 5 分钟小时汇总重算 + 90 天前明细清理／每 `BACKUP_INTERVAL_MINUTES` 备份主库（`VACUUM INTO`，落线程池）/运维告警（四类规则 + webhook + 落库）／任务清单 `TASK_SPECS` + 进程内运行态／后台任务调度，接入应用生命周期 |
 | `src/stats/` | `backfill.py` `collector.py` `query.py` | 历史成本一次性回填与重算（`scripts/backfill_cost.py` 复用）／`usage_events` 写入（脱敏）+ 小时汇总双写·重算／`overview`·`by-*`·`timeline`·`model-timeline`·`events` |
@@ -347,6 +347,16 @@ class Scheduler:
 - **非流式** `complete` 逐链项走完整的选号 / 冷却 / 轮换 / 会话粘性 / 统计，捕获 `NoHealthyCredential` / `InvalidRequest` 继续下一项，整条链耗尽才以最后一项的错误抛出。
 - **流式** `stream` 逐链项跑 `_stream_loop`，**只有在本链项尚未产出任何响应帧之前**才允许切换——已出帧后换模型会让客户端看到两个模型的混合输出。用私有信号 `_ModelExhausted` 在链内传递「本项未出帧即用尽」；整条链都用尽时用**最后链项**的 `translator` 产出终帧。
 - `preflight` 按**整条链**判断是否有注册上游。
+
+### 6.5 凭证限额护栏
+`credential_limits(credential_id PK, keep_credits, daily_tokens, daily_credits, per_model_tokens JSON, updated_at, updated_by)`——**缺行 = 不受限**（老库升级后行为不变）。
+
+- **判定**（`src/engine/limits.py::evaluate`，纯函数）：`keep_credits` 用 `quota_remaining ≤ keep_credits` 停用整号（与当日用量无关，余额未知不猜）；`daily_tokens` / `daily_credits` 用当日累计 `≥ 上限` 停用整号；`per_model_tokens` 命中的模型只停该模型（`blocked_models`）。`None` / `≤0` = 该护栏关闭。
+- **当日口径**：北京自然日 0 点（`day_start`，`ZoneInfo("Asia/Shanghai")`），与签到 / 活跃上报同一时区。
+- **用量聚合**（`src/db/limits.py::day_usage`）：按 `credential_id` 聚合 `usage_events`（`input+output` token、`credit`、按模型 token）。**不用 `usage_hourly`**：小时汇总主键没有 `credential_id`，无法还原到凭证维度。失败请求也计入。
+- **挂钩点**：`Executor._selectable` 在 `is_selectable` 之后按 `deps.limits.blocked(candidate, target.model)` 二次过滤。**刻意不写进 `Candidate.is_selectable`**：判定依赖每请求都变的「当日聚合用量」，而 `is_selectable` 是纯函数（只吃凭证自身状态）；塞进去会让 `pool_counts` / 池健康计数也去查一遍用量。按模型上限比对的是**归一名**（`usage_events.model` 就是归一名），不是上游原始名。
+- **快照缓存**：`LimitGuard` 对「限额表 + 当日用量」做进程内快照（TTL 15s）；无任何限额配置时**不查**用量聚合。管理台写入后调用 `invalidate()` 立即生效，不等 TTL。
+- **错误语义**：全部候选都因限额被跳过时走「无可用凭证」`no_healthy_credential`（账号级原因）——`_all_model_cooled` 判据不含限额，故不会被误判成 `model_unavailable`。
 
 ## 7. 请求时序（chat completions 主链路）
 > 可视化版本：[`diagrams/coding2api-request-sequence.html`](diagrams/coding2api-request-sequence.html)。`POST /v1/responses` 与主链路同：先把请求体映射成等价的 `ChatRequest`，其后选号 / 轮换 / 记账 / 粘性完全一致，出口形状由注入的 translator 决定。

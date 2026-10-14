@@ -11,6 +11,7 @@ import {
   Coins,
   Database,
   Flame,
+  Gauge,
   HeartPulse,
   Hourglass,
   MoreHorizontal,
@@ -44,6 +45,7 @@ import { useSessionContext } from "../Layout";
 import { useCredentials, useQueryClient } from "../api/hooks";
 import { PoolOverview } from "../components/PoolOverview";
 import { AddCredentialDialog } from "../components/AddCredentialDialog";
+import { CredentialLimitsDialog } from "../components/CredentialLimitsDialog";
 import { ToastViewport, useToasts } from "../components/Toast";
 import { ColumnHint, LongTextTip } from "../components/Tip";
 import { PageHeader } from "../components/PageHeader";
@@ -294,6 +296,7 @@ interface Actions {
   growth: (credential: Credential) => void;
   activity: (credential: Credential) => void;
   credits: (credential: Credential) => void;
+  limits: (credential: Credential) => void;
 }
 
 export function CredentialsPage() {
@@ -310,6 +313,8 @@ export function CredentialsPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // 添加凭证对话框（登录渠道 / JSON 导入 / 免费层补回都收在里面）
   const [addOpen, setAddOpen] = useState(false);
+  // 限额护栏对话框：一次只编辑一条（存凭证 id，轮询替换列表后仍能取到最新值）
+  const [limitsFor, setLimitsFor] = useState<string | null>(null);
   // 列表筛选：池子一大就没有「找到某个号」的路径，这里收搜索 + 渠道 + 状态三件套。
   // 筛选是纯展示层收敛，不改后端排序（后端仍按 sort/order 给全量）。
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
@@ -379,6 +384,11 @@ export function CredentialsPage() {
   const credentialNames = useMemo(
     () => new Map(credentials.map((item) => [item.id, item.nickname || item.id.slice(0, 12)])),
     [credentials],
+  );
+  // 限额对话框当前编辑的凭证：按 id 从最新列表取，轮询替换后仍是最新快照
+  const limitsCredential = useMemo(
+    () => credentials.find((item) => item.id === limitsFor) ?? null,
+    [credentials, limitsFor],
   );
   // 是否有任何筛选生效：决定「N / 总数」计数与「清空」入口是否出现
   const filtering =
@@ -621,6 +631,8 @@ export function CredentialsPage() {
           setBusy(false);
         }
       })(),
+    // 只开对话框；保存与刷新由对话框自己回调（见 CredentialLimitsDialog）
+    limits: (credential) => setLimitsFor(credential.id),
   };
 
   if (isLoading) return <PageSkeleton variant="cards" />;
@@ -1073,6 +1085,19 @@ export function CredentialsPage() {
         )}
       </Panel>
 
+      {canWrite && limitsCredential && (
+        <CredentialLimitsDialog
+          credential={limitsCredential}
+          onClose={() => setLimitsFor(null)}
+          onSaved={(message) => {
+            setLimitsFor(null);
+            showNotice(message);
+            void refresh();
+          }}
+          onError={(message) => showError(message)}
+        />
+      )}
+
       {canWrite && (
         <AddCredentialDialog
           open={addOpen}
@@ -1411,6 +1436,11 @@ function Row({
             {credential.nickname || credential.id.slice(0, 12)}
           </span>
           {credential.pinned === 1 && <Badge tone="accent">已指定</Badge>}
+          {credential.limits && (
+            <span data-testid={`limits-badge-${credential.id}`}>
+              <Badge tone="muted">限额</Badge>
+            </span>
+          )}
         </div>
       </TableCell>
       <TableCell>
@@ -1595,6 +1625,10 @@ function Row({
                     </DropdownMenuItem>
                     <DropdownMenuItem onSelect={() => actions.pin(credential)}>
                       <Pin className="size-4" /> {credential.pinned === 1 ? "取消指定" : "指定"}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => actions.limits(credential)}>
+                      <Gauge className="size-4" />
+                      {credential.limits ? "编辑限额" : "设置限额"}
                     </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem

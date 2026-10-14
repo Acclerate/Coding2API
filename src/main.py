@@ -61,6 +61,7 @@ from .config import (
 )
 from .db.conn import Database
 from .db.crypto import CredentialCipher
+from .db.limits import LimitsRepository, day_usage
 from .db.migrate import apply_schema
 from .db.repo import (
     AlertRepository,
@@ -74,6 +75,7 @@ from .db.repo import (
 )
 from .engine.affinity import ConversationAffinity
 from .engine.executor import Executor, ExecutorDeps
+from .engine.limits import LimitGuard
 from .engine.model_resolver import KNOWN_PROVIDERS, parse_fallback_groups
 from .engine.scheduler import Scheduler
 from .provider.codearts import CodeArtsProvider
@@ -426,6 +428,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         logger.warning("恢复落盘模型目录失败: %s", error)
     stats_collector = StatsCollector(
         db, prices=lambda: price_table, usd_cny_rate=lambda: runtime.usd_cny_rate)
+    # 凭证级限额护栏：配置表 + 当日用量聚合注入 LimitGuard（快照缓存），
+    # executor 选号前用它过滤触顶候选；管理台改完 invalidate() 立即生效。
+    limits_repo = LimitsRepository(db)
+    limit_guard = LimitGuard(limits_repo,
+                             lambda since: day_usage(db, since=since))
     executor = Executor(ExecutorDeps(providers=registry, credentials=credentials,
                                      scheduler=Scheduler(
                                          expiry_window=lambda: runtime.quota_expiry_window_seconds,
@@ -454,7 +461,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      # 渠道的窗口裁剪；settings 传运行态覆盖层，
                                      # 开关与四个参数每请求现读（热更）
                                      context_compress=build_context_compressor(
-                                         model_cache, model_aliases, runtime)))
+                                         model_cache, model_aliases, runtime),
+                                     limits=limit_guard))
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
@@ -642,6 +650,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         user_repo=user_repo,
         audit=audit,
         alerts=alerts,
+        limits=limits_repo,
+        limit_guard=limit_guard,
         stats_query=app.state.stats_query,
         login_throttle=app.state.login_throttle,
         upstream_auth=app.state.upstream_auth,

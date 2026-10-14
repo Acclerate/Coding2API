@@ -121,6 +121,9 @@ class ExecutorDeps:
     # 必须返回新对象或原样返回，不得原地改入参——同一请求可能在轮换/回退里
     # 对不同渠道各压一次，且 affinity 指纹读的是未压缩原文
     context_compress: Any | None = None
+    # 凭证级限额护栏（src/engine/limits.py 的 LimitGuard）：选号前过滤掉
+    # 「当日用量/余额触顶」的候选；None 表示不启用（向后兼容）。
+    limits: Any | None = None
 
     def record(self, **fields: Any) -> None:
         """统计写入失败绝不能影响聊天响应。"""
@@ -948,11 +951,17 @@ class Executor:
         顺手把**当前模型**的消耗倍率按渠道注进候选快照（free-tier 优先档的
         数据源，见 Scheduler.select）。候选集（就是 `_select` 按模型目录
         收窄后的那些渠道）在此一次注入。
+
+        另按限额护栏二次过滤（`deps.limits`，未装配则跳过）：被限额停用的
+        凭证**只剩它时**会走到「无可用凭证」503——与「全部因模型级冷却」区分，
+        后者仍报 model_unavailable（限额是账号级原因，换个模型也未必能用）。
         """
         rates = self._model_rates(target)
+        guard = self._deps.limits
         selected = [
             c for c in candidates
             if c.is_selectable(now, self._model_scope(c.provider, target.model))
+            and (guard is None or not guard.blocked(c, target.model))
         ]
         if not rates:
             return selected

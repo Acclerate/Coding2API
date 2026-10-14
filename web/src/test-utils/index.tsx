@@ -113,6 +113,7 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     growth_last_result: null,
     created_at: 1_700_000_000,
     added_by: "root",
+    limits: null,
     ...overrides,
   };
 }

@@ -133,12 +133,13 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ## 4. 数据模型
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCHEMA_VERSION = 19`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 20`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
 
 | 表 | 用途 |
 |---|---|
 | `api_keys` | API Key（SHA-256 摘要 + 预览 + 渠道绑定 `provider_binding` + 来源 IP 白名单 `allowed_ips` + 模型白名单 `allowed_models` + 到期 `expires_at`） |
 | `credentials` | 加密凭证（`data_enc` 走 Fernet）+ 调度状态（`enabled`/`disabled`/`pinned`/`health`/`cooling_until`/`err_count`）+ 额度与到期阶梯 + token 到期列 + 成长中心最近结果 |
+| `credential_limits` | 凭证级限额护栏（保留积分 / 每日 token / 每日 credit / 按模型 token）；**缺行 = 不受限** |
 | `usage_events` | 请求明细（token / credit / 缓存命中 / 成本 / 耗时 / 首字延迟 / 请求 ID），保留 90 天 |
 | `usage_hourly` | 小时汇总（永久保留），渠道 / 模型 / 用户维度统计读此表 |
 | `growth_events` | 成长中心每轮一行汇报（仅 CodeBuddy）；活跃上报复用同表 |
@@ -160,7 +161,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **11 张表**，`SCH
 **管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、任务与配置（admin-only）。
 
 - 账号：`GET|POST /api/users`、`PATCH /api/users/{username}`、`POST /api/users/{username}/{disable|enable|reset-password}`（**不提供 DELETE**）；自助改密 `POST /api/auth/password`；无鉴权的一次性激活流 `GET|POST /api/auth/activate`；审计查询 `GET /api/audit`。
-- 凭证运维：`POST /api/credentials/{id}/checkin|toggle|revive|probe|accounts/select`、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|accounts`。
+- 凭证运维：`POST /api/credentials/{id}/checkin|toggle|revive|probe|accounts/select`、`PUT /api/credentials/{id}/limits`（限额护栏整体替换，全关时删行）、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|accounts`。
 - 凭证批量运维：`POST /api/credentials/batch`（`{action: probe|toggle|checkin|revive, ids: [...]}`，可选 `enabled` 用于 `toggle`）。逐条隔离执行——单条失败不影响其余条，响应含 `{total, succeeded, failed, results[]}`；`toggle`/`revive` 落一条汇总审计，`probe`/`checkin` 与单条端点同为只读语义、不写审计。
 - 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks`。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
 

@@ -55,6 +55,46 @@ def build_executor(repo_tuple, script, **kwargs):
 def add_credential(credentials, **kw):
     return credentials.add(provider="trae", credential_data={"accessToken": "a"}, **kw)
 
+async def test_executor_limits_guard_filters_candidates(repo_trae):
+    """限额护栏装配后：被停用的凭证不参与选号，只剩它时 503。"""
+    credentials, _keys, _db = repo_trae
+    blocked_id = add_credential(credentials, nickname="limited")
+    ok_id = add_credential(credentials, nickname="healthy")
+
+    class Guard:
+        def __init__(self):
+            self.calls = []
+
+        def blocked(self, candidate, model):
+            self.calls.append((candidate.credential_id, model))
+            return candidate.credential_id == blocked_id
+
+    guard = Guard()
+    provider = FakeProvider([GOOD_trae])
+    executor = Executor(ExecutorDeps(
+        providers={"trae": provider}, credentials=credentials,
+        scheduler=Scheduler(), default_model="glm-5.2", limits=guard))
+    result = await executor.complete(parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}]}))
+    assert result["choices"][0]["message"]["content"] == "hi"
+    # 护栏对每个候选都被问到（含被停用的那条），且被停用者未被选中
+    assert {cid for cid, _model in guard.calls} == {blocked_id, ok_id}
+
+    # 只剩被限额的凭证 → 无可用凭证
+    credentials.set_enabled(ok_id, False)
+
+    class AllBlocked:
+        def blocked(self, candidate, model):
+            return True
+
+    executor = Executor(ExecutorDeps(
+        providers={"trae": FakeProvider([GOOD_trae])}, credentials=credentials,
+        scheduler=Scheduler(), default_model="glm-5.2", limits=AllBlocked()))
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}))
+
+
 async def test_executor_complete_success(repo_trae, tmp_path):
     add_credential(repo_trae[0])
     executor, _provider, _credentials = build_executor(repo_trae, [GOOD_trae])

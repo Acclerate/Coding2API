@@ -61,6 +61,27 @@ CREATE TABLE IF NOT EXISTS credentials (
 
 CREATE INDEX IF NOT EXISTS idx_credentials_provider ON credentials(provider);
 
+-- 凭证级限额护栏（每凭证可选，缺行 = 不受限）。
+--
+-- 四个护栏与 src/engine/limits.py 的 evaluate 一一对应，全部以「当日」
+-- （北京时间自然日）为口径，0 / NULL 表示该护栏关闭：
+--   keep_credits      账户剩余积分 ≤ 该值时停用（给号留底，不跑空）
+--   daily_tokens      当日 token（输入+输出）达到上限时停用
+--   daily_credits     当日 credit 达到上限时停用
+--   per_model_tokens  JSON {模型: 当日 token 上限}，某模型达到上限时只停该模型
+--
+-- 为什么单独建表：限额是「凭证的可选附加策略」，大多数凭证没有；塞进
+-- credentials 会加一批恒 NULL 的列，且限额变更频率与凭证主体不同。
+CREATE TABLE IF NOT EXISTS credential_limits (
+    credential_id    TEXT PRIMARY KEY,
+    keep_credits     REAL,
+    daily_tokens     INTEGER,
+    daily_credits    REAL,
+    per_model_tokens TEXT NOT NULL DEFAULT '{}',   -- JSON：{模型名: token 上限}
+    updated_at       INTEGER NOT NULL,
+    updated_by       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS usage_events (
     id               TEXT PRIMARY KEY,
     ts               INTEGER NOT NULL,

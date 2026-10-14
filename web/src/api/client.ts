@@ -9,6 +9,8 @@ import type {
   BatchResult,
   CheckinResult,
   CheckinStatus,
+  CredentialLimits,
+  CredentialLimitsInput,
   CredentialsResponse,
   CreditEvent,
   GrowthEvent,
@@ -141,6 +143,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/credentials/${id}`, { method: "DELETE" }),
   probeCredential: (id: string) =>
     request<ProbeResult>(`/api/credentials/${id}/probe`, { method: "POST" }),
+  /** 设置 / 清除凭证限额护栏（整体替换；全关时后端删行）。 */
+  setCredentialLimits: (id: string, limits: CredentialLimitsInput) =>
+    request<{ limits: CredentialLimits | null }>(`/api/credentials/${id}/limits`, {
+      method: "PUT",
+      ...json(limits),
+    }),
   /** 批量运维：一次对多条凭证执行同一动作，后端逐条隔离返回结果。 */
   batchCredentials: (action: BatchAction, ids: string[], enabled?: boolean) =>
     request<BatchResult>("/api/credentials/batch", {

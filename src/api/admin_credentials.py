@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -18,6 +19,7 @@ from fastapi import APIRouter, Depends
 from ..audit.actions import (
     ACTION_CREDENTIAL_DELETE,
     ACTION_CREDENTIAL_IMPORT,
+    ACTION_CREDENTIAL_LIMITS,
     ACTION_CREDENTIAL_PIN,
     ACTION_CREDENTIAL_REVIVE,
     ACTION_CREDENTIAL_SWITCH_ACCOUNT,
@@ -60,6 +62,55 @@ BATCH_AUDIT_ACTIONS = {
     "toggle": ACTION_CREDENTIAL_TOGGLE,
     "revive": ACTION_CREDENTIAL_REVIVE,
 }
+
+
+def _optional_limit(payload: dict, key: str, *, integer: bool = False):
+    """限额字段解析：缺省 / null / ≤0 一律当「关闭」，非数值报 400。"""
+    if payload.get(key) is None:
+        return None
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidRequest(f"{key} must be a number")
+    if not math.isfinite(value):
+        raise InvalidRequest(f"{key} must be finite")
+    number = int(value) if integer else float(value)
+    return number if number > 0 else None
+
+
+def _per_model_limits(payload: dict) -> dict[str, int]:
+    """按模型 token 上限：{模型名: 上限}；空值 / ≤0 的项直接丢弃。"""
+    raw = payload.get("per_model_tokens")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise InvalidRequest("per_model_tokens must be an object")
+    out: dict[str, int] = {}
+    for model, cap in raw.items():
+        name = str(model).strip()
+        if not name:
+            continue
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) \
+                or not math.isfinite(cap):
+            raise InvalidRequest(f"per_model_tokens[{name}] must be a number")
+        cap_int = int(cap)
+        if cap_int > 0:
+            out[name] = cap_int
+    return out
+
+
+def _limits_detail(limits: dict) -> str:
+    """限额审计明细：一行可读短句（空配置=清除）。"""
+    parts: list[str] = []
+    if limits["keep_credits"]:
+        parts.append(f"保留积分 {limits['keep_credits']:g}")
+    if limits["daily_tokens"]:
+        parts.append(f"每日 token {limits['daily_tokens']}")
+    if limits["daily_credits"]:
+        parts.append(f"每日积分 {limits['daily_credits']:g}")
+    if limits["per_model_tokens"]:
+        models = ", ".join(f"{m}:{c}" for m, c in sorted(limits["per_model_tokens"].items()))
+        parts.append(f"按模型 {models}")
+    return "；".join(parts) or "清除限额"
 
 
 def describe_probe_failure(error: Exception) -> str:
@@ -171,11 +222,18 @@ def create_router(services: Services) -> APIRouter:
                                principal=Depends(principal_from_request)):
         window = services.settings.quota_expiry_window_seconds
         secondary = services.settings.quota_expiry_secondary_window_seconds
-        return {"credentials": credentials.list_all(
+        rows = credentials.list_all(
                     expiring_window=window, expiring_secondary_window=secondary,
                     sort=sort, order=order,
                     # 昵称来自共享池（常含邮箱/手机）：仅 admin/operator 可见
-                    include_nickname=principal.is_operator),
+                    include_nickname=principal.is_operator)
+        # 限额配置按凭证附带（缺行 = null = 不受限）：管理台据此显示护栏与
+        # 编辑入口；吊销/未配置的渠道不额外占字段。
+        limits_map = services.limits.map()
+        for row in rows:
+            record = limits_map.get(row["id"])
+            row["limits"] = record.as_dict() if record is not None else None
+        return {"credentials": rows,
                 "expiry_window_seconds": window,
                 "expiry_secondary_window_seconds": secondary,
                 # 到期预警阈值：前端进度条与 <1h 红字同源，避免两处各写一个数
@@ -234,6 +292,33 @@ def create_router(services: Services) -> APIRouter:
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_REVIVE,
                               target=credential_id)
         return {"ok": True}
+
+    @router.put("/api/credentials/{credential_id}/limits")
+    async def set_credential_limits(credential_id: str, payload: dict,
+                                    _csrf: None = Depends(csrf_protected),
+                                    principal=Depends(principal_from_request)):
+        """设置/清除一条凭证的限额护栏（整体替换：缺省字段=关闭该护栏）。
+
+        四个护栏全关时（提交空配置 / 全 0）删除配置行，凭证回到「不受限」。
+        写入后 `limit_guard.invalidate()` 让新值立即参与选号，不等快照 TTL。
+        """
+        require_operator(principal)
+        if credentials.provider_of(credential_id) is None:
+            raise InvalidRequest("credential not found")
+        limits = {
+            "keep_credits": _optional_limit(payload, "keep_credits"),
+            "daily_tokens": _optional_limit(payload, "daily_tokens", integer=True),
+            "daily_credits": _optional_limit(payload, "daily_credits"),
+            "per_model_tokens": _per_model_limits(payload),
+        }
+        services.limits.set(credential_id, updated_by=principal.username, **limits)
+        services.limit_guard.invalidate()
+        logger.info("管理员 %s 设置凭证 %s 限额: %s", principal.username, credential_id,
+                    _limits_detail(limits))
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_LIMITS,
+                              target=credential_id, detail=_limits_detail(limits))
+        record = services.limits.get(credential_id)
+        return {"limits": record.as_dict() if record is not None else None}
 
     @router.post("/api/credentials/pin")
     async def pin_credential(payload: dict,

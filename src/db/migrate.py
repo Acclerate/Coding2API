@@ -37,7 +37,10 @@ SCHEMA_NAME = "schema.sql"
 # 老库补列后历史行成本为 NULL（显示 —），不随汇率/价表变化重算。
 # 19：usage_events 新增 request_id（请求 ID：响应头 X-Request-ID 同值，用于把
 # 用户报的请求与明细/上游日志对齐）。老库补列后历史行为 NULL。
-SCHEMA_VERSION = 19
+# 20：新增 credential_limits 表（凭证级限额护栏：保留积分 / 每日 token /
+# 每日 credit / 按模型 token）。新增表只需进 schema.sql（CREATE TABLE IF NOT
+# EXISTS 对老库同样生效），无需迁移动作；缺行 = 不受限，老库行为不变。
+SCHEMA_VERSION = 20
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (

@@ -79,7 +79,26 @@ export interface Credential {
   growth_last_result: string | null;
   created_at: number;
   added_by: string | null;
+  /** 凭证级限额护栏；null = 未配置（不受限） */
+  limits: CredentialLimits | null;
 }
+
+/** 凭证级限额护栏（全部按北京自然日；0/null = 该护栏关闭）。 */
+export interface CredentialLimits {
+  /** 账户剩余积分 ≤ 该值时停用（给号留底） */
+  keep_credits: number | null;
+  /** 当日 token（输入+输出）上限 */
+  daily_tokens: number | null;
+  /** 当日 credit 上限 */
+  daily_credits: number | null;
+  /** 按模型当日 token 上限：{模型名: 上限} */
+  per_model_tokens: Record<string, number>;
+  updated_at: number;
+  updated_by: string | null;
+}
+
+/** 写入用的限额形态（updated_at / updated_by 由后端填）。 */
+export type CredentialLimitsInput = Omit<CredentialLimits, "updated_at" | "updated_by">;
 
 export interface ApiKey {
   id: string;
