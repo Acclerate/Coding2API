@@ -241,6 +241,15 @@ The per-row *Pause* action removes a credential from **chat traffic only**: quot
 
 > Zen / Kilo are credential-less: *pause* is the only way to disable them permanently (deletion re-seeds on restart). Pausing also hides the channel's models.
 
+## Per-credential in-flight cap
+
+`MAX_INFLIGHT_PER_CREDENTIAL` (default `0` = unlimited) stops a credential from being selected once its concurrent request count reaches the cap, keeping a single account from being hammered into upstream rate limits or bans; it is global across channels (orthogonal to the per-channel `CODEARTS_MAX_CONCURRENCY`).
+
+- The counter is **in-process** (single-instance semantics, like the `/api/tasks` state).
+- Leases release when the request ends (success, rotation, error, client disconnect), with a **600s TTL** reclaiming any that leak—better to occasionally admit one extra request than to silently retire a credential.
+- When every candidate is at its cap, the response is the same "no healthy credential" 503 as the limits guard.
+- Hot-updatable on the *Tasks & settings* page; the next request picks it up (no snapshot cache).
+
 ## Credential pool: filtering and grouping
 
 Once the pool grows, the page splits "find that one account" into three layers, while the first screen shows only the channel-level overview:
@@ -399,10 +408,11 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `CONTEXT_COMPRESS_MIN_KEEP_MESSAGES` | `4` | Recent messages always kept |
 | `CONTEXT_COMPRESS_SAFETY_RATIO` | `0.95` | Budget as a fraction of the model limit |
 | `UPSTREAM_COMPLETE_TIMEOUT_SECONDS` | `600` | Non-streaming aggregate timeout (retried as transient); `≤0` disables |
+| `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | Per-credential in-flight cap (global across channels): a credential at its cap stops being selected; `0` = unlimited. Leases release when the request ends, with a 600s TTL guarding leaked ones |
 
 ### Runtime settings (*Tasks & settings* page)
 
-**39 settings** apply immediately without editing `.env` or restarting: default model, blocklist, context-compression knobs, fallback groups, both expiry windows, sticky TTL, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour and all alerting rules.
+**44 settings** apply immediately without editing `.env` or restarting: default model, blocklist, context-compression knobs, fallback groups, both expiry windows, sticky TTL, the per-credential in-flight cap, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour and all alerting rules.
 
 **DB overrides beat `.env`**: once changed, `.env` no longer applies to that key; the row is marked "DB override" and *Reset* removes the override. Values live in the `runtime_settings` table (plain key/value), so adding a hot-updatable key needs no migration; unknown keys and invalid/out-of-range values are rejected on write. Startup-only knobs (`APP_SECRET`, `PORT`, `DATA_DIR`, `USERS_FILE`, `OPENROUTER_MODELS_URL`, endpoint allowlists) are **excluded**. API: `GET /api/settings`, `PUT /api/settings` (admin + CSRF; `null` resets). The page also shows the 9 tasks' state (`GET /api/tasks`, admin, 30s refresh), in-process only.
 

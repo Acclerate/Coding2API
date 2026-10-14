@@ -34,7 +34,7 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | `src/provider/kilo/` | `client.py` `events.py` | 上游（标准 OpenAI，无门禁）+ `isFree` 过滤（不探活）／标准 OpenAI SSE → Event（`delta.reasoning` 思考通道） |
 | `src/provider/qoder/` | `cosy.py` `client.py` `events.py` `credential.py` `auth.py` | COSY（自定义 Base64、AES/RSA、签名与会话头缓存）／上游 + 信封 SSE 解包 + 额度·签到／信封 SSE → 内层 chunk → Event + 状态与业务码分类／凭证解析（realm·组织·到期）／设备码 PKCE 登录（start/poll） |
 | `src/provider/codearts/` | `signer.py` `dpop.py` `client.py` `events.py` `credential.py` `units.py` `backfill.py` `auth.py` `oauth.py` | 华为云 SDK-HMAC-SHA256（纯函数，便于固定向量测试）／ES256 P-256 DPoP JWS（低 S 归一化）／上游 + 私有 SSE 还原 + 福利·余额／SSE → 增量 Event（OpenAI chunk 与累计全文双形状）／凭证解析（AK/SK/STS/DPoP/refresh）／「套餐·剩余量」单位与到期解析／历史 usage 回填／OAuth2 PKCE 登录／回调链接粘贴换 token 适配 |
-| `src/engine/` | `scheduler.py` `executor.py` `limits.py` `affinity.py` `continuation.py` `compress.py` `model_resolver.py` `sse.py` | 选号 + 冷却状态机 + pin（纯逻辑，操作 Candidate）／执行 + 模型目录收窄 + 轮换重试 + fallback 链 + 统计埋点／凭证限额护栏判定 + 选号前快照缓存／会话粘性／截断续写／上下文压缩裁剪（纯函数）／`"glm-5.2"`·`"glm-5.2@trae"`·`auto` → 候选集 + fallback 组解析／SSE 帧解析 + 行长上限 |
+| `src/engine/` | `scheduler.py` `executor.py` `limits.py` `inflight.py` `affinity.py` `continuation.py` `compress.py` `model_resolver.py` `sse.py` | 选号 + 冷却状态机 + pin（纯逻辑，操作 Candidate）／执行 + 模型目录收窄 + 轮换重试 + fallback 链 + 统计埋点／凭证限额护栏判定 + 选号前快照缓存／凭证在途租约（进程内计数 + TTL 兜底 + 选号前过滤）／会话粘性／截断续写／上下文压缩裁剪（纯函数）／`"glm-5.2"`·`"glm-5.2@trae"`·`auto` → 候选集 + fallback 组解析／SSE 帧解析 + 行长上限 |
 | `src/compat/` | `openai/{request,response,errors}.py` `responses/{request,response}.py` `anthropic/{request,response}.py` | ChatRequest 校验·chunk 聚合·OpenAI error shape／Responses 出口（Codex CLI 子集）／Anthropic Messages 出口（Claude Code 子集） |
 | `src/tasks/` | `pacer.py` `quota_probe.py` `checkin.py` `growth.py` `activity.py` `refresh.py` `retention.py` `backup.py` `alerting.py` `status.py` `runner.py` | 全局节流器（随机区间 + 按桶并发上限 + 滑动窗口）／启动立即一轮 + 每 `QUOTA_PROBE_MINUTES`／全天每 10 分钟签到、成功即封账（支持渠道回填 `seal_until`）／成长中心（仅 CB）落 `growth_events`／活跃上报（CB 与 CB 国际版，默认关闭）／每 `REFRESH_INTERVAL_MINUTES` 预刷新／每 5 分钟小时汇总重算 + 90 天前明细清理／每 `BACKUP_INTERVAL_MINUTES` 备份主库（`VACUUM INTO`，落线程池）/运维告警（四类规则 + webhook + 落库）／任务清单 `TASK_SPECS` + 进程内运行态／后台任务调度，接入应用生命周期 |
 | `src/stats/` | `backfill.py` `collector.py` `query.py` `csv.py` | 历史成本一次性回填与重算（`scripts/backfill_cost.py` 复用）／`usage_events` 写入（脱敏）+ 小时汇总双写·重算／`overview`·`by-*`·`timeline`·`model-timeline`·`events`（含钻取过滤与导出取数）／CSV 导出纯函数（列定义 + 公式注入防护 + 行编码） |
@@ -357,6 +357,15 @@ class Scheduler:
 - **挂钩点**：`Executor._selectable` 在 `is_selectable` 之后按 `deps.limits.blocked(candidate, target.model)` 二次过滤。**刻意不写进 `Candidate.is_selectable`**：判定依赖每请求都变的「当日聚合用量」，而 `is_selectable` 是纯函数（只吃凭证自身状态）；塞进去会让 `pool_counts` / 池健康计数也去查一遍用量。按模型上限比对的是**归一名**（`usage_events.model` 就是归一名），不是上游原始名。
 - **快照缓存**：`LimitGuard` 对「限额表 + 当日用量」做进程内快照（TTL 15s）；无任何限额配置时**不查**用量聚合。管理台写入后调用 `invalidate()` 立即生效，不等 TTL。
 - **错误语义**：全部候选都因限额被跳过时走「无可用凭证」`no_healthy_credential`（账号级原因）——`_all_model_cooled` 判据不含限额，故不会被误判成 `model_unavailable`。
+
+### 6.6 凭证在途租约
+`MAX_INFLIGHT_PER_CREDENTIAL`（全局热更，默认 `0` = 不限）：同一凭证的并发请求达到上限后不再参与选号，避免把单账号打进上游限流 / 封号（同类项目的 `pool.max_in_flight` / `QODER_MAX_CONCURRENCY`）。
+
+- **实现**（`src/engine/inflight.py`）：`InflightTracker` 是 `credential_id → 活跃租约开始时刻列表` 的**进程内**计数；`InflightGuard` 包一层热更上限。租约只记开始时刻、不绑请求标识——同一凭证的多个租约彼此等价，释放任意一个即可（先入先出），调用方在请求两侧各调一次，不必在轮换 / fallback 的多层 `finally` 里传递句柄。
+- **为什么同步（不用 `asyncio.Lock`）**：`acquire` / `release` / `count` 只在 executor 的事件循环里调用，且「选号 → 登记」之间没有任何 `await`（选号、压缩、创建上游迭代器都是同步的），单线程下不会交错。加异步锁反而会要求 `_selectable` 变成 async，把一个纯过滤函数染上异步。
+- **TTL 兜底**（`LEASE_TTL_SECONDS = 600`）：正常路径由 `finally` 释放；生成器被 GC、异常路径漏走释放时租约会滞留并慢慢占满号。超过 TTL 的租约在计数 / 登记时视为过期并回收——宁可偶尔多放一个请求，也不能让号被永久占住。
+- **挂钩点**：`Executor._selectable` 在 `is_selectable` / 限额之后按 `deps.inflight.blocked(credential_id)` 过滤；`_stream_loop` 与 `_complete_model` 在创建上游迭代器后 `_lease`、统一在 `finally` 里 `_release`（覆盖成功、轮换、异常、客户端断开）。全部候选都占满时与限额同口径报 `no_healthy_credential`。
+- **与 `tasks/pacer.py` 的 `max_concurrency` 的区别**：pacer 的桶按渠道分、只覆盖走 pacer 的渠道；这里是**跨渠道的凭证级**上限，语义是「同一个账号别被我方并发压垮」，与渠道节流正交。
 
 ## 7. 请求时序（chat completions 主链路）
 > 可视化版本：[`diagrams/coding2api-request-sequence.html`](diagrams/coding2api-request-sequence.html)。`POST /v1/responses` 与主链路同：先把请求体映射成等价的 `ChatRequest`，其后选号 / 轮换 / 记账 / 粘性完全一致，出口形状由注入的 translator 决定。

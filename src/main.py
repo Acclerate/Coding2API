@@ -75,6 +75,7 @@ from .db.repo import (
 )
 from .engine.affinity import ConversationAffinity
 from .engine.executor import Executor, ExecutorDeps
+from .engine.inflight import InflightGuard
 from .engine.limits import LimitGuard
 from .engine.model_resolver import KNOWN_PROVIDERS, parse_fallback_groups
 from .engine.scheduler import Scheduler
@@ -433,6 +434,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     limits_repo = LimitsRepository(db)
     limit_guard = LimitGuard(limits_repo,
                              lambda since: day_usage(db, since=since))
+    # 凭证在途租约：跨渠道的「单账号并发上限」，选号前过滤 + 请求结束释放。
+    # 上限现读运行态覆盖层，管理台改完下一请求即生效（无快照，无需 invalidate）。
+    inflight_guard = InflightGuard(lambda: runtime.max_inflight_per_credential)
     executor = Executor(ExecutorDeps(providers=registry, credentials=credentials,
                                      scheduler=Scheduler(
                                          expiry_window=lambda: runtime.quota_expiry_window_seconds,
@@ -462,7 +466,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      # 开关与四个参数每请求现读（热更）
                                      context_compress=build_context_compressor(
                                          model_cache, model_aliases, runtime),
-                                     limits=limit_guard))
+                                     limits=limit_guard,
+                                     inflight=inflight_guard))
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):

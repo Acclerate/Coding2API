@@ -240,6 +240,10 @@ class Settings(BaseSettings):
     # 非流式聚合整体超时（秒）：上游只支持流式，非流式由引擎聚合；上游连接
     # 半开停滞会让请求无限悬挂并占住凭证。超时按瞬态错误换号重试；≤0 关闭
     upstream_complete_timeout_seconds: int = 600
+    # 单账号在途请求上限（全局，跨渠道）：同一凭证并发达到该值后不再参与选号，
+    # 避免把单账号打进上游限流/封号；0 = 不限。租约在请求结束后释放，另有
+    # 600s TTL 兜底（见 src/engine/inflight.py）。
+    max_inflight_per_credential: int = 0
     # 上下文压缩：按模型目录里的输入上限裁剪过长对话，避免撞上游硬
     # 限制（CodeBuddy 11115 prompt is too long）。enabled=false 完全关闭；
     # 目录里查不到上限的模型不受影响（宁可不裁剪也不猜一个数字去砍上下文）。

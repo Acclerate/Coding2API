@@ -124,6 +124,10 @@ class ExecutorDeps:
     # 凭证级限额护栏（src/engine/limits.py 的 LimitGuard）：选号前过滤掉
     # 「当日用量/余额触顶」的候选；None 表示不启用（向后兼容）。
     limits: Any | None = None
+    # 凭证在途租约（src/engine/inflight.py 的 InflightGuard）：选号前过滤掉
+    # 「并发已占满」的候选，选中后登记、请求结束（含断开/异常）释放；
+    # None 表示不启用（向后兼容）。
+    inflight: Any | None = None
 
     def record(self, **fields: Any) -> None:
         """统计写入失败绝不能影响聊天响应。"""
@@ -495,6 +499,9 @@ class Executor:
             # 新请求永久阻塞——「用了三次就限制」。见 aclose_stream 注释。
             iterator = self._stream_source(
                 provider_id, credential_data, payload, target.model).__aiter__()
+            # 在途登记放在创建迭代器之后、`try` 之前：选号到此全同步，不会与
+            # 并发请求交错超额；释放统一走下面的 finally，覆盖成功/轮换/断开。
+            self._lease(credential_id)
             try:
                 async for event in iterator:
                     if event.kind is EventKind.ERROR:
@@ -553,6 +560,7 @@ class Executor:
             finally:
                 # break / 异常 / 客户端断开都走到这里：同步归还节流名额
                 await aclose_stream(iterator)
+                self._release(credential_id)
             if not self._deps.scheduler.should_rotate(attempts) or emitted:
                 if last_kind is ErrKind.INVALID:
                     # 流已开始（200 已发出），以 invalid_request 错误帧结束
@@ -700,6 +708,8 @@ class Executor:
             # 结束时同步归还，不依赖 GC 的 asyncgen finalize
             iterator = self._stream_source(
                 provider_id, credential_data, payload, target.model).__aiter__()
+            # 与 _stream_loop 同理：在途登记 + finally 释放（含超时/断开）
+            self._lease(credential_id)
             try:
                 # 聚合整体超时兜底（见 ExecutorDeps.complete_timeout_seconds）
                 async with (asyncio.timeout(self._deps.complete_timeout_seconds)
@@ -803,6 +813,7 @@ class Executor:
                     return result
             finally:
                 await aclose_stream(iterator)
+                self._release(credential_id)
             if not self._deps.scheduler.should_rotate(attempts):
                 if last_kind is ErrKind.INVALID:
                     raise InvalidRequest(_reject_message(
@@ -955,13 +966,18 @@ class Executor:
         另按限额护栏二次过滤（`deps.limits`，未装配则跳过）：被限额停用的
         凭证**只剩它时**会走到「无可用凭证」503——与「全部因模型级冷却」区分，
         后者仍报 model_unavailable（限额是账号级原因，换个模型也未必能用）。
+
+        再按在途租约过滤（`deps.inflight`，未装配则跳过）：并发已达上限的
+        凭证本轮不参与选号，避免把单账号打进上游限流/封号。
         """
         rates = self._model_rates(target)
         guard = self._deps.limits
+        inflight = self._deps.inflight
         selected = [
             c for c in candidates
             if c.is_selectable(now, self._model_scope(c.provider, target.model))
             and (guard is None or not guard.blocked(c, target.model))
+            and (inflight is None or not inflight.blocked(c.credential_id))
         ]
         if not rates:
             return selected
@@ -969,6 +985,16 @@ class Executor:
             replace(c, credit_rate=rates[c.provider]) if c.provider in rates else c
             for c in selected
         ]
+
+    def _lease(self, credential_id: str) -> None:
+        """请求开始：登记一个在途租约（未装配护栏则跳过）。"""
+        if self._deps.inflight is not None:
+            self._deps.inflight.acquire(credential_id)
+
+    def _release(self, credential_id: str) -> None:
+        """请求结束（成功/轮换/异常/断开）：释放一个在途租约（幂等）。"""
+        if self._deps.inflight is not None:
+            self._deps.inflight.release(credential_id)
 
     def _note_upstream_error(self, credential_id: str, kind: ErrKind,
                              provider_id: str, model: str) -> None:

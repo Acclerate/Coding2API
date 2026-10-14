@@ -109,6 +109,10 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("conversation_sticky_seconds", int, "会话粘性 TTL（秒）",
                "同一对话的多轮请求固定用同一凭证；≤0 关闭粘性。",
                group="affinity"),
+    HotSetting("max_inflight_per_credential", int, "单账号在途上限",
+               "同一凭证的并发请求达到该值后不再参与选号，避免把单账号打进上游"
+               "限流/封号（跨渠道全局生效）。0 = 不限。租约在请求结束后释放，"
+               "另有 600s TTL 兜底漏释放。", minimum=0, group="affinity"),
     HotSetting("growth_irreversible_actions", bool, "成长中心不可逆动作",
                "是否允许抽奖 / 连登兑换 / 开盲盒 / 消耗补登卡。关闭后仍会领取"
                "旅行礼物与任务奖励。", task="growth"),
@@ -581,6 +585,10 @@ class RuntimeSettings:
     @property
     def conversation_sticky_seconds(self) -> int:
         return int(self.get("conversation_sticky_seconds"))
+
+    @property
+    def max_inflight_per_credential(self) -> int:
+        return int(self.get("max_inflight_per_credential"))
 
     @property
     def growth_irreversible_actions(self) -> bool:
