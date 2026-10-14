@@ -44,7 +44,9 @@ def create_router(services: Services) -> APIRouter:
                        principal: ApiKeyPrincipal = Depends(api_key_user_anthropic)):
         return await dispatch_compat(
             executor, settings, request, principal,
-            parse=parse_messages_request,
+            # thinking→档位映射现读热更项（留空 = 完全不映射，见 parse_messages_request）
+            parse=lambda body: parse_messages_request(
+                body, thinking_efforts=settings.anthropic_thinking_efforts),
             translator_for=AnthropicStreamTranslator,
             convert=completion_to_message)
 

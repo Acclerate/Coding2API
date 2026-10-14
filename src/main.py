@@ -458,6 +458,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                          name, model_aliases),
                                      fallback_groups=lambda: parse_fallback_groups(
                                          runtime.model_fallback_groups),
+                                     # reasoning 控制（默认全关）：剥离出站思考内容
+                                     # + 按渠道改写客户端显式给的档位。两者都现读
+                                     # 运行态覆盖层，管理台改完下一请求即生效
+                                     force_disable_thinking=lambda: runtime.force_disable_thinking,
+                                     reasoning_effort_map=lambda: runtime.reasoning_effort_map,
                                      model_aliases=model_aliases,
                                      # 同一份 dict 的引用：模型目录恢复 / 拉取后
                                      # executor 立即可见（倍率查询走它）

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ...engine.reasoning import thinking_effort
 from ..openai.request import (
     MAX_OUTPUT_TOKENS,
     MAX_TEMPERATURE,
@@ -244,7 +245,13 @@ def _map_tool_choice(value: Any) -> Any:
     raise InvalidRequest(f"tool_choice type {kind!r} is not supported")
 
 
-def parse_messages_request(body: Any) -> ChatRequest:
+def parse_messages_request(body: Any, *, thinking_efforts: str = "") -> ChatRequest:
+    """Anthropic 请求体 → `ChatRequest`。
+
+    `thinking_efforts` 是「`thinking.budget_tokens` → `reasoning_effort`」的
+    热更映射文本（见 `engine/reasoning.py`）；**留空 = 完全不映射**，
+    `thinking` 照旧被忽略（现状），不写任何上游字段。
+    """
     if not isinstance(body, dict):
         raise InvalidRequest("request body must be a JSON object")
     model = body.get("model")
@@ -299,5 +306,11 @@ def parse_messages_request(body: Any) -> ChatRequest:
     choice = _map_tool_choice(body.get("tool_choice"))
     if choice is not None:
         upstream["tool_choice"] = choice
+    # thinking → reasoning_effort（默认不映射）：Anthropic 只规定 budget_tokens
+    # ≥1024、没给「预算 ↔ 档位」对应表，阈值只能由使用者显式配置；留空时这里
+    # 一个字段都不写，`thinking` 与现状一样被忽略
+    effort = thinking_effort(thinking_efforts, body.get("thinking"))
+    if effort is not None:
+        upstream["reasoning_effort"] = effort
     return ChatRequest(model=model or "", messages=messages, stream=stream,
                        raw=upstream)

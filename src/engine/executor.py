@@ -26,6 +26,7 @@ from .model_resolver import (
     ordered_fallback_chain,
     resolve,
 )
+from .reasoning import map_effort, parse_effort_map
 from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,16 @@ class ExecutorDeps:
     # 「并发已占满」的候选，选中后登记、请求结束（含断开/异常）释放；
     # None 表示不启用（向后兼容）。
     inflight: Any | None = None
+    # 出站剥离思考内容：真值 → 丢掉 `EventKind.REASONING` 事件（三个出口
+    # 一致生效，流式/非流式都覆盖）。**只过滤响应、不改请求体**：上游仍照常
+    # 思考（reasoning_effort 原样透传），只是不交给客户端。零参 callable 时
+    # 每次请求现读（热更）；默认关。
+    force_disable_thinking: Any = False
+    # 出站 `reasoning_effort` 档位映射：配置文本 → `{渠道: {源: 目标}}`。
+    # 只改写客户端**显式**给的档位（渠道自身的 setdefault 补值不动）；目标
+    # `none` 表示删除该键。None / 空文本 = 原样透传。零参 callable 时每次
+    # 请求现读（热更）。解析见 src/engine/reasoning.py。
+    reasoning_effort_map: Any | None = None
 
     def record(self, **fields: Any) -> None:
         """统计写入失败绝不能影响聊天响应。"""
@@ -456,6 +467,11 @@ class Executor:
         # 本链项是否已向客户端出过响应帧：出了就绝不再换模型**或换号**
         # （半截输出不可回滚，换号会让两个凭证的内容拼进同一条回复）
         emitted = False
+        # 出站剥离思考内容：每次请求现读（热更）。放在这里（executor 消费
+        # 上游事件的循环）而不是 `_stream_source` 里，是因为续写包装器在
+        # `_stream_source` 内层、需要 reasoning 原文来拼续写上下文；剥在
+        # 外层既保住续写质量，又对三个出口（chat/Anthropic/Responses）一致。
+        hide_reasoning = self._thinking_disabled()
 
         def terminal(message: str, code: str) -> bytes:
             """终帧：本项未出帧时抛信号让外层试下一链项；已出帧则写错误帧收尾。"""
@@ -492,6 +508,9 @@ class Executor:
             # 按实际服务渠道压缩（未启用/未知窗口/未超限时原样返回）：窗口
             # 取该渠道自己的上限，不再被更小窗口的兄弟渠道拖累误裁
             payload = self._compress_payload(request, provider_id, target.model)
+            # 档位映射放在选号之后：目标档位依赖**实际服务渠道**（同名模型
+            # 跨渠道接受的档位不同）。返回值可能是新 dict，不改 `request.raw`
+            payload = self._map_effort(provider_id, payload)
             # 显式持有迭代器并在 finally 里关闭：下面两处 `break`（流内错误）
             # 只跳出 `async for`，不会关闭上游 async generator，provider 的
             # 节流名额归还（pacer.release 在其 finally 里）会推迟到 GC。
@@ -504,6 +523,9 @@ class Executor:
             self._lease(credential_id)
             try:
                 async for event in iterator:
+                    if hide_reasoning and event.kind is EventKind.REASONING:
+                        # 出站剥离思考：上游仍照常生成，只是不交给客户端
+                        continue
                     if event.kind is EventKind.ERROR:
                         kind = _event_kind(event)
                         if kind is ErrKind.INVALID:
@@ -598,6 +620,37 @@ class Executor:
             return request.raw
         return self._deps.context_compress(provider_id or "-", model, request.raw)
 
+    def _thinking_disabled(self) -> bool:
+        """出站是否剥离思考内容（热更）。未装配 / 标量 False 时即关闭。"""
+        return bool(live(self._deps.force_disable_thinking)())
+
+    def _map_effort(self, provider_id: str | None,
+                    payload: dict[str, Any]) -> dict[str, Any]:
+        """按实际服务渠道改写客户端显式给的 `reasoning_effort`。
+
+        只动客户端**显式**给的值：渠道各自的 `setdefault` 补默认档发生在
+        provider 侧、晚于这里，故不受影响（见 ExecutorDeps.reasoning_effort_map）。
+        需要改写时返回**新 dict**——`payload` 可能正是 `request.raw`，原地改会
+        污染会话粘性指纹、也会把改写泄漏到下一轮轮换。
+        """
+        if self._deps.reasoning_effort_map is None:
+            return payload
+        raw = live(self._deps.reasoning_effort_map)()
+        if not raw:
+            return payload
+        effort = payload.get("reasoning_effort")
+        if not isinstance(effort, str) or not effort:
+            return payload
+        mapped = map_effort(parse_effort_map(str(raw)), provider_id, effort)
+        if mapped == effort:
+            return payload
+        updated = dict(payload)
+        if mapped is None:
+            updated.pop("reasoning_effort", None)
+        else:
+            updated["reasoning_effort"] = mapped
+        return updated
+
     def _stream_source(self, provider_id: str, credential_data: dict[str, Any],
                        payload: dict[str, Any], model: str) -> AsyncIterator[Event]:
         """上游事件流入口；开启截断续写时包一层。
@@ -680,6 +733,10 @@ class Executor:
         # 会话粘性：对话上一轮用过哪个凭证，本轮优先复用
         affinity_id = (self._deps.affinity.pin_for(request.raw, username)
                        if self._deps.affinity is not None else None)
+        # 出站剥离思考内容：与 _stream_loop 同口径，每次请求现读（热更）。
+        # 在**聚合前**丢弃 reasoning 事件，`aggregate()` 便不会写出
+        # `reasoning_content`；三个出口共用 complete 路径，故一致生效。
+        hide_reasoning = self._thinking_disabled()
 
         while True:
             pick = self._pick(target, tried, affinity_id)
@@ -701,8 +758,9 @@ class Executor:
             provider_id = self._deps.credentials.provider_of(credential_id)
             last_provider, last_credential = provider_id or "-", credential_id
             # 与 _stream_loop 同理：按实际服务渠道压缩（对同一请求可能压多次，
-            # 但实现必须无副作用——每轮都从原文出发）
+            # 但实现必须无副作用——每轮都从原文出发），再按实际服务渠道映射档位
             payload = self._compress_payload(request, provider_id, target.model)
+            payload = self._map_effort(provider_id, payload)
             events: list[Event] = []
             # 与 _stream_loop 同理：显式关闭上游流，让节流名额在每次尝试
             # 结束时同步归还，不依赖 GC 的 asyncgen finalize
@@ -718,6 +776,9 @@ class Executor:
                     async for event in iterator:
                         if first_event_at is None:
                             first_event_at = time.monotonic()
+                        if hide_reasoning and event.kind is EventKind.REASONING:
+                            # 出站剥离思考：上游仍照常生成，只是不交给客户端
+                            continue
                         events.append(event)
                         # 事件条数上限：超长/死循环输出下 events 会无界
                         # 增长直到 OOM，超时兜不住「快而无穷」。按瞬态错误换号。

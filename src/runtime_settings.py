@@ -240,6 +240,26 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
                "（不含凭证 ID / 用户名）。关闭后端点返回 404。",
                group="observability"),
+    # reasoning 控制：只给机制、不给策略（不内置默认矩阵——未核实就是编造）
+    HotSetting("force_disable_thinking", bool, "剥离思考内容",
+               "开启后出站响应不再包含模型的思考内容（chat 的 reasoning_content / "
+               "Anthropic 的 thinking 块 / Responses 的 reasoning item 一并过滤）。"
+               "**只过滤响应、不改写请求体**：上游仍照常思考，只是不交给客户端。",
+               group="routing"),
+    HotSetting("reasoning_effort_map", str, "档位映射（出站）",
+               "把客户端显式给的 `reasoning_effort` 改写成渠道期望的档位。格式 "
+               "`渠道=from:to,from:to;*=from:to`（渠道取 KNOWN_PROVIDERS，`*` 兜底）；"
+               "目标写 `none` 表示删除该键、走渠道默认。留空 = 原样透传。只改写"
+               "客户端显式值，渠道自身补的默认档不受影响。",
+               group="routing"),
+    HotSetting("anthropic_thinking_efforts", str, "Anthropic thinking→档位",
+               "把 Anthropic 入站的 `thinking.budget_tokens` 翻成上游 "
+               "`reasoning_effort`。格式 `预算:档位,预算:档位,disabled:档位`："
+               "`disabled` 匹配 `thinking.type==\"disabled\"`，其余取「阈值 ≤ "
+               "budget_tokens 中最大的那一档」，低于最小阈值则不映射。留空 = "
+               "完全不映射（`thinking` 照旧忽略）。Anthropic 未给档位对应表，"
+               "阈值由使用者自行决定。",
+               group="routing"),
 )
 
 HOT_BY_KEY: dict[str, HotSetting] = {item.key: item for item in HOT_SETTINGS}
@@ -735,6 +755,20 @@ class RuntimeSettings:
     @property
     def metrics_enabled(self) -> bool:
         return bool(self.get("metrics_enabled"))
+
+    # ------------------------------------------------------ reasoning 控制
+
+    @property
+    def force_disable_thinking(self) -> bool:
+        return bool(self.get("force_disable_thinking"))
+
+    @property
+    def reasoning_effort_map(self) -> str:
+        return str(self.get("reasoning_effort_map"))
+
+    @property
+    def anthropic_thinking_efforts(self) -> str:
+        return str(self.get("anthropic_thinking_efforts"))
 
     # ---------------------------------------------------------- 透明委托
 

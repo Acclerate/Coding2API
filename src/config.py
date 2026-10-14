@@ -260,6 +260,26 @@ class Settings(BaseSettings):
     # Prometheus 指标出口（GET /metrics）：默认开启。与 /healthz 同口径**不鉴权**，
     # 指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。可热更。
     metrics_enabled: bool = True
+    # 全局剥离响应里的思考内容（`EventKind.REASONING`）：默认关闭。开启后
+    # **只过滤出站响应**、不改写请求体——上游仍照常思考（`reasoning_effort`
+    # 原样透传），只是不再把思考交给客户端。刻意不做请求侧改写：实测 CB
+    # `enable_thinking:false` 被上游忽略（仍产 reasoning 且计入 max_tokens），
+    # 而缺 `reasoning_effort` 反而退化成「可见推演」（思考混进 delta.content）；
+    # 其余渠道的请求侧接受性未核实，写请求体就是凭猜测改客户端意图。可热更。
+    force_disable_thinking: bool = False
+    # 出站 `reasoning_effort` 档位映射（默认空 = 原样透传）。格式
+    # `渠道=from:to,from:to;*=from:to`，渠道取 KNOWN_PROVIDERS，`*` 为兜底。
+    # 只改写客户端**显式**给的档位（渠道各自的 setdefault 补值不动）；
+    # 目标 `none` = 删除该键（走渠道默认）。只给机制不给策略：内置默认矩阵
+    # 未经上游核实，写了就是编造。可热更。
+    reasoning_effort_map: str = ""
+    # Anthropic 入站 `thinking.budget_tokens` → `reasoning_effort` 的映射
+    # （默认空 = 完全不映射，`thinking` 照旧被忽略）。格式
+    # `预算:档位,预算:档位,disabled:档位`：`disabled` 匹配 `thinking.type==
+    # "disabled"`，其余按「阈值 ≤ budget_tokens 中最大的一档」取值，低于最小
+    # 阈值则不映射。Anthropic 只规定 budget ≥1024、未给档位对应表，故阈值表
+    # 必须由使用者显式给出，不内置默认。可热更。
+    anthropic_thinking_efforts: str = ""
 
     @cached_property
     def admin_set(self) -> frozenset[str]:
