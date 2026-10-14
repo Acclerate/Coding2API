@@ -1,6 +1,7 @@
 import { Check, ChevronDown, Copy, KeyRound, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "../api/client";
+import { Button as RawButton } from "../components/ui/button";
 import { useApiKeys, useQueryClient } from "../api/hooks";
 import { formatTime } from "../api/display";
 import { cn } from "../lib/utils";
@@ -10,6 +11,7 @@ import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { SortableHead } from "../components/SortableHead";
 import { PROVIDER_LABEL, PROVIDER_ORDER } from "../api/providers";
+import { buildCcSwitchLink, CCSWITCH_TARGETS } from "../lib/ccSwitch";
 import type { ApiKeyCreated } from "../api/types";
 import {
   Badge,
@@ -370,6 +372,59 @@ function AnthropicEntry({ apiKey }: { apiKey: string }) {
   );
 }
 
+/** CC Switch 一键导入：生成 `ccswitch://` 深链，由用户点击交给桌面端导入。 */
+function CcSwitchEntry({ apiKey }: { apiKey: string }) {
+  const [model, setModel] = useState("");
+  const origin = window.location.origin;
+  const ready = apiKey !== "";
+
+  return (
+    <ClientEntryPanel title="CC Switch 一键导入" testid="ccswitch-entry">
+      <p className="text-xs text-muted-foreground">
+        用 CC Switch 一键把本服务的地址、Key 与模型写进本地客户端。点击下方按钮会
+        唤起 CC Switch 并弹出导入确认框；需 CC Switch v4.0.10 及以上，且深链只能
+        由点击触发（浏览器会拦截自动跳转）。
+      </p>
+      <Field label="默认模型（可选）" hint="留空则不写入。Claude Code 无模型名时回落内置列表；非原生模型建议在此填本服务的模型名（如 glm-5.2）。">
+        <Input
+          value={model}
+          data-testid="ccswitch-model"
+          placeholder="例如 glm-5.2"
+          onChange={(event) => setModel(event.target.value)}
+        />
+      </Field>
+      <div className="flex flex-wrap gap-2">
+        {CCSWITCH_TARGETS.map((target) => (
+          ready ? (
+            <RawButton key={target.app} size="sm" variant="default" asChild>
+              <a
+                href={buildCcSwitchLink(target, { origin, apiKey, model })}
+                data-testid={`ccswitch-${target.app}`}
+              >
+                导入到 {target.label}
+              </a>
+            </RawButton>
+          ) : (
+            <Button
+              key={target.app}
+              size="sm"
+              variant="primary"
+              disabled
+              data-testid={`ccswitch-${target.app}`}
+            >
+              导入到 {target.label}
+            </Button>
+          )
+        ))}
+      </div>
+      <Notice tone="warn">
+        深链含当前 API Key 明文，请勿分享或在不可信环境使用。Key 只在创建后的
+        展示期内可生成导入链接，关闭创建对话框后不再保留。
+      </Notice>
+    </ClientEntryPanel>
+  );
+}
+
 export function ApiKeysPage() {
   const { sort, order, toggle } = useSort("created_at", "asc", { last_used_at: "desc" });
   const { data, isLoading } = useApiKeys(undefined, sort, order);
@@ -450,6 +505,7 @@ export function ApiKeysPage() {
       />
       <OpenAIEntry apiKey={created?.api_key ?? ""} />
       <AnthropicEntry apiKey={created?.api_key ?? ""} />
+      <CcSwitchEntry apiKey={created?.api_key ?? ""} />
 
       <Panel
         title="我的 API Key"

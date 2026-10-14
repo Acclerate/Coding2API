@@ -224,6 +224,10 @@ claude
 
 **鉴权**：`x-api-key` 与 `Authorization: Bearer` 都接受。**流式**：`message_start` → `content_block_start/delta/stop` → `message_delta`（含 `stop_reason` 与 usage）→ `message_stop`；无 `[DONE]` 哨兵，thinking 块在 `content_block_stop` 前补 `signature_delta`。**缓存命中**：出口 usage 按 Anthropic 语义拆两笔——`input_tokens` 只计未命中，命中另记 `cache_read_input_tokens`（内部 `input_tokens` 是 OpenAI 口径的 `prompt_tokens`，含命中），Claude Code 据此显示缓存读 token。**`count_tokens`**：`POST /v1/messages/count_tokens` 本地估算输入 token（不转发上游）。**不支持**：图片 / 文档块、Anthropic 服务端工具一律显式 400。
 
+### CC Switch 一键导入
+
+「API Key 管理」页在创建 Key 后可生成 [CC Switch](https://github.com/farion1231/cc-switch) 的 `ccswitch://` 导入深链（Claude Code / Codex CLI / OpenCode 三个目标各一个按钮），点一下即由桌面端弹确认框写入地址、Key 与模型。深链**只能由点击触发**（浏览器拦截自动跳转），且**含 Key 明文**，仅在创建 Key 的展示期内可用。协议与 `app` / `apiFormat` 取值见 CC Switch 用户手册「Deep Link Protocol」，需 CC Switch v4.0.10+。注意 **endpoint 形态随 `apiFormat` 而变**：Anthropic 格式（Claude Code）填到根、**不带 `/v1`**；两个 OpenAI 格式填到 `/v1`。本服务没有 Gemini 出口，故不提供 `app=gemini` 入口。
+
 ### 余额查询
 
 `GET /v1/user/balance` 兼容 DeepSeek 余额接口形状，Bearer `sk-...` 鉴权，供 Cherry Studio / cc-switch 等客户端显示余额。余额来自凭证池的额度探测缓存（`QUOTA_PROBE_MINUTES` 周期刷新），按可用凭证汇总，单位为上游 credits：

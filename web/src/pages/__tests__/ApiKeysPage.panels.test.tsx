@@ -108,6 +108,77 @@ describe("Anthropic 客户端接入面板", () => {
 });
 
 
+describe("CC Switch 一键导入面板", () => {
+  it("未创建 Key 时按钮禁用，不生成深链", async () => {
+    mockFetch({ "/api/api-keys": { api_keys: [] } });
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await userEvent.click(screen.getByTestId("ccswitch-entry-toggle"));
+
+    const claude = screen.getByTestId("ccswitch-claude");
+    expect(claude.tagName).toBe("BUTTON");
+    expect(claude).toBeDisabled();
+  });
+
+  it("创建 Key 后三个目标各自生成 ccswitch:// 深链", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/api-keys" && init?.method === "POST") {
+        return jsonResponse({ ...KEY, api_key: "sk-real-key" });
+      }
+      if (url === "/api/api-keys") return jsonResponse({ api_keys: [] });
+      throw new Error(`未 mock: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await userEvent.click(screen.getByTestId("ccswitch-entry-toggle"));
+    await openCreateDialog();
+    await userEvent.type(screen.getByTestId("key-name"), "test");
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(screen.getByTestId("ccswitch-claude")).toHaveAttribute("href"));
+
+    const href = (testid: string) => screen.getByTestId(testid).getAttribute("href") ?? "";
+    const claude = new URLSearchParams(href("ccswitch-claude").split("?")[1]);
+    expect(href("ccswitch-claude").startsWith("ccswitch://v1/import?")).toBe(true);
+    expect(claude.get("app")).toBe("claude");
+    expect(claude.get("apiFormat")).toBe("anthropic");
+    expect(claude.get("endpoint")).toBe(window.location.origin);   // Anthropic 不带 /v1
+    expect(claude.get("apiKey")).toBe("sk-real-key");
+
+    const codex = new URLSearchParams(href("ccswitch-codex").split("?")[1]);
+    expect(codex.get("apiFormat")).toBe("openai_responses");
+    expect(codex.get("endpoint")).toBe(`${window.location.origin}/v1`);
+
+    const opencode = new URLSearchParams(href("ccswitch-opencode").split("?")[1]);
+    expect(opencode.get("apiFormat")).toBe("openai_chat");
+  });
+
+  it("填入默认模型后写进深链", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/api-keys" && init?.method === "POST") {
+        return jsonResponse({ ...KEY, api_key: "sk-real-key" });
+      }
+      if (url === "/api/api-keys") return jsonResponse({ api_keys: [] });
+      throw new Error(`未 mock: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await userEvent.click(screen.getByTestId("ccswitch-entry-toggle"));
+    await openCreateDialog();
+    await userEvent.type(screen.getByTestId("key-name"), "test");
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(screen.getByTestId("ccswitch-claude")).toHaveAttribute("href"));
+
+    await userEvent.type(screen.getByTestId("ccswitch-model"), "glm-5.2");
+    const link = screen.getByTestId("ccswitch-claude").getAttribute("href") ?? "";
+    expect(new URLSearchParams(link.split("?")[1]).get("model")).toBe("glm-5.2");
+  });
+});
+
+
 it("调用示例默认折叠，点击端点行展开", async () => {
   mockFetch({ "/api/api-keys": { api_keys: [] } });
   renderPage(<ApiKeysPage />);

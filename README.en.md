@@ -222,6 +222,10 @@ claude
 
 **Auth**: both `x-api-key` and `Authorization: Bearer` are accepted. **Streaming**: `message_start` → `content_block_start/delta/stop` → `message_delta` (with `stop_reason` and usage) → `message_stop`; no `[DONE]` sentinel, and thinking blocks get a `signature_delta` before `content_block_stop`. **Cache hit**: usage is split Anthropic-style — `input_tokens` counts only misses, hits are reported separately as `cache_read_input_tokens` (the internal `input_tokens` is OpenAI's `prompt_tokens`, which includes hits), so Claude Code shows cached tokens instead of always 0. **`count_tokens`**: `POST /v1/messages/count_tokens` estimates input tokens locally. **Not supported**: image/document blocks and Anthropic-only server tools — explicit 400.
 
+### CC Switch one-click import
+
+After creating a key, the API Keys page can generate [CC Switch](https://github.com/farion1231/cc-switch) `ccswitch://` import deep links (one button each for Claude Code / Codex CLI / OpenCode) that write the endpoint, key and model into the desktop client after a confirmation dialog. A deep link **only fires on a user click** (browsers block automatic redirects) and **carries the key in cleartext**, so it is only usable while the created key is still displayed. Protocol and `app` / `apiFormat` values: see CC Switch's "Deep Link Protocol" manual; requires CC Switch v4.0.10+. Note the **endpoint form depends on `apiFormat`**: the Anthropic format (Claude Code) takes the bare origin **without `/v1`**, the two OpenAI formats take `/v1`. This gateway has no Gemini egress, so no `app=gemini` entry is offered.
+
 ### Balance query
 
 `GET /v1/user/balance` is DeepSeek-shaped, Bearer `sk-...`, for clients like Cherry Studio / cc-switch. Balances come from the credential pool's quota-probe cache (`QUOTA_PROBE_MINUTES`), aggregated over usable credentials, in upstream credits. `balance_known` is `false` when no credential has ever probed successfully (unknown, not 0).
