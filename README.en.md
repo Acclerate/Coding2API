@@ -344,9 +344,11 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `ACTIVITY_REPORT_ENABLED` | `false` | Post one chat event per account per day. **Off by default** — terms forbid tampering |
 | `ACTIVITY_REPORT_HOUR` | `10` | Activity hour (local Beijing time) |
 | `ALERT_ENABLED` | `true` | Operations-alert evaluation (pool exhausted / repeated task failures / token near expiry / error-rate spike), persisted to `alert_events` |
-| `ALERT_WEBHOOK_URL` | empty | Webhook POST (JSON), comma-separated (≤16, `http(s)` only, private/loopback/link-local blocked against SSRF, re-checked against DNS resolution right before delivery and skipped if it fails to resolve), concurrent delivery, all must succeed (15s budget); empty = in-app records only |
+| `ALERT_WEBHOOK_URL` | empty | Webhook POST (JSON, body carries `status`: `firing` / `resolved`), comma-separated (≤16, `http(s)` only, private/loopback/link-local blocked against SSRF, re-checked against DNS resolution right before delivery and skipped if it fails to resolve), concurrent delivery, all must succeed (15s budget); requests always carry `X-Coding2API-Signature: sha256=<HMAC-SHA256(APP_SECRET, body)>`; empty = in-app records only |
 | `ALERT_INTERVAL_MINUTES` | `5` | Alert evaluation cycle (floor 1) |
 | `ALERT_SILENCE_MINUTES` | `30` | Silence window per `(rule, target)`; `0` disables |
+| `ALERT_FOR_TICKS` | `1` | Enter-hysteresis: consecutive hits before actually alerting; `1` = fire immediately |
+| `ALERT_CLEAR_TICKS` | `2` | Clear-hysteresis: consecutive misses before confirming recovery (writes `resolved_at`, pushes a `status="resolved"` notice) |
 | `ALERT_POOL_READY_MIN` | `1` | Usable-credential threshold; `0` disables the rule |
 | `ALERT_TASK_FAILURES` | `3` | Consecutive task failures before alerting; `0` disables |
 | `ALERT_TOKEN_EXPIRY_HOURS` | `24` | Alert when a token's remaining lifetime is below this; `0` disables |

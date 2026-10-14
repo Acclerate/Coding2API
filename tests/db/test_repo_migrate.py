@@ -73,6 +73,16 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     # 老库遗留的废弃表（schema.sql 已删定义，但老库里还在）
     conn.execute("CREATE TABLE checkins (provider TEXT, account_key TEXT)")
     conn.execute("CREATE TABLE model_cache (provider TEXT, model_id TEXT)")
+    # 旧版 alert_events：无 resolved_at 列（告警迟滞/恢复升级前的结构）
+    conn.execute("""
+        CREATE TABLE alert_events (
+            id TEXT PRIMARY KEY, ts INTEGER NOT NULL, rule TEXT NOT NULL,
+            severity TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', message TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '', delivered INTEGER NOT NULL DEFAULT 0,
+            delivery_error TEXT)
+    """)
+    conn.execute("INSERT INTO alert_events (id, ts, rule, severity, scope, message) "
+                 "VALUES ('alert_old', 5, 'pool_empty', 'critical', 'pool', '旧记录')")
     conn.commit()
     conn.close()
 
@@ -85,6 +95,12 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     assert {"cost_usd", "cost_cny"} <= events_columns
     # 请求 ID（响应头 X-Request-ID 同值）：老库补列后历史行为 NULL
     assert "request_id" in events_columns
+    alert_columns = {row[1] for row in db.connect().execute("PRAGMA table_info(alert_events)")}
+    # 告警恢复时刻：老库补列后历史行 NULL（视为未恢复，不影响既有记录展示）
+    assert "resolved_at" in alert_columns
+    legacy_alert = db.connect().execute(
+        "SELECT message, resolved_at FROM alert_events WHERE id = 'alert_old'").fetchone()
+    assert tuple(legacy_alert) == ("旧记录", None)   # 历史记录保留，新列取默认
     hourly_columns = {row[1] for row in db.connect().execute("PRAGMA table_info(usage_hourly)")}
     assert "ttfb_sum" in hourly_columns
     assert "credit_estimated_known" in hourly_columns

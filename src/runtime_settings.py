@@ -197,6 +197,13 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("alert_silence_minutes", int, "告警静默窗（分钟）",
                "同一条告警（规则 + 对象）在该窗口内只落库/推送一次，避免持续"
                "状态每轮刷屏；0 关闭静默（每轮都报）。", minimum=0, task="alert"),
+    HotSetting("alert_for_ticks", int, "告警进入迟滞（连续命中轮数）",
+               "同一条告警连续命中这么多轮才真正告警（滤掉单轮毛刺）；"
+               "1 = 不迟滞、首轮即报。", minimum=1, task="alert", floor=1),
+    HotSetting("alert_clear_ticks", int, "告警恢复迟滞（连续未命中轮数）",
+               "告警中的条目连续这么多轮不再命中才确认恢复（写 resolved_at "
+               "并外推恢复通知），避免单轮抖动误撤。", minimum=1,
+               task="alert", floor=1),
     HotSetting("alert_pool_ready_min", int, "池耗尽阈值（可用数）",
                "凭证池可用数少于该值时告警（服务活着但用不了）；0 关闭该规则。",
                minimum=0, task="alert"),
@@ -668,6 +675,14 @@ class RuntimeSettings:
     @property
     def alert_silence_minutes(self) -> int:
         return int(self.get("alert_silence_minutes"))
+
+    @property
+    def alert_for_ticks(self) -> int:
+        return int(self.get("alert_for_ticks"))
+
+    @property
+    def alert_clear_ticks(self) -> int:
+        return int(self.get("alert_clear_ticks"))
 
     @property
     def alert_pool_ready_min(self) -> int:

@@ -815,6 +815,22 @@ class AlertRepository:
             (rule, scope)).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
+    def resolve(self, rule: str, scope: str, now: int | None = None) -> int:
+        """给该 (规则, 对象) 最近一条**尚未恢复**的告警写 `resolved_at`。
+
+        只更新最近一行：同一 (rule, scope) 可能历史上有多次告警/恢复循环，
+        恢复只属于「当前这一轮」那条记录。返回受影响行数（0 = 没有待恢复
+        的行，例如告警已被清理）。
+        """
+        resolved_at = int(now if now is not None else time.time())
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE alert_events SET resolved_at = ? WHERE id = ("
+                "  SELECT id FROM alert_events WHERE rule = ? AND scope = ?"
+                "  AND resolved_at IS NULL ORDER BY ts DESC, id DESC LIMIT 1)",
+                (resolved_at, rule, scope))
+        return cursor.rowcount
+
     def prune(self, *, keep_days: int, now: int | None = None) -> int:
         """删除超过保留期的告警（与 usage_events / 审计同一保留策略入口）。"""
         cutoff = int(now if now is not None else time.time()) - keep_days * 86400

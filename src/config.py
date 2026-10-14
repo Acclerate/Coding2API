@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     alert_webhook_url: str = ""
     alert_interval_minutes: int = 5         # 评估周期（分钟），下限 1
     alert_silence_minutes: int = 30         # 同一 (规则, 对象) 的静默窗（分钟）
+    # 告警迟滞：连续命中 N 轮才告警、连续 M 轮未命中才确认恢复。
+    # for_ticks=1 等价于不做进入迟滞（保持向后兼容的默认）；clear_ticks=2
+    # 避免单轮抖动就把告警撤掉。恢复通知会写 alert_events.resolved_at 并外推。
+    alert_for_ticks: int = 1
+    alert_clear_ticks: int = 2
     # 池耗尽：ready 少于该值即告警（0 关闭该规则）
     alert_pool_ready_min: int = 1
     # 任务连续失败：连续失败达到该次数即告警（0 关闭该规则）

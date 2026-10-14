@@ -39,7 +39,7 @@ export function AlertsPage() {
       <PageHeader
         eyebrow="运维"
         title="运维告警"
-        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可选推送 webhook；同一条告警在静默窗内只记一次。"
+        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可选推送 webhook；同一条告警在静默窗内只记一次，连续未命中确认恢复后标「已恢复」并外推恢复通知。"
         icon={<BellRing className="size-5" />}
       />
 
@@ -80,9 +80,15 @@ export function AlertsPage() {
                     {formatTime(alert.ts)}
                   </TableCell>
                   <TableCell>
-                    <Badge tone={severityTone(alert.severity)} dot>
-                      {alert.severity === "critical" ? "严重" : "警告"}
-                    </Badge>
+                    {alert.resolved_at !== null ? (
+                      <Badge tone="ok" dot>
+                        已恢复
+                      </Badge>
+                    ) : (
+                      <Badge tone={severityTone(alert.severity)} dot>
+                        {alert.severity === "critical" ? "严重" : "警告"}
+                      </Badge>
+                    )}
                   </TableCell>
                   <TableCell className="text-xs">
                     {ALERT_RULE_LABEL[alert.rule] ?? alert.rule}

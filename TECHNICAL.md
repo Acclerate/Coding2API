@@ -393,7 +393,7 @@ class Scheduler:
 客户端断连：生成器被关闭/取消时统计 `error_type=client_disconnect`，关闭上游流；例外：`[DONE]` 已产出后的收尾断开（客户端拿到回调即关连接，框架在结束帧 `more_body=False` 前有一拍竞态会把它判为断开）按成功记账。
 
 ## 8. 数据库
-DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 19`，共 11 张表：`api_keys` / `credentials` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
+DDL 以 `src/db/schema.sql` 为准。当前 `SCHEMA_VERSION = 21`，共 12 张表：`api_keys` / `credentials` / `credential_limits` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `credit_events` / `credential_model_cooldowns` / `runtime_settings` / `alert_events`。
 
 ```sql
 -- conn.py 打开时执行
@@ -499,6 +499,10 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 - `error_rate` 读 `usage_events` **明细**而非小时汇总（告警窗是分钟级，小时粒度要么整点才更新、要么跨小时口径错乱）。
 
 **投递**：站内每条命中落 `alert_events`（管理台倒序回看；落库而非只留内存，因为告警的价值恰在「错过的那段时间发生了什么」，保留期由 `RetentionTask` 按 90 天清理）；webhook 配置 `ALERT_WEBHOOK_URL` 时逐地址 POST JSON（多个逗号分隔，全部成功才算 delivered），留空只留站内记录，**投递失败只记 `delivery_error`、绝不抛错**。**静默去重**：同一 `(rule, scope)` 在 `ALERT_SILENCE_MINUTES` 窗内只落库 / 推送一次。`AlertTask` **与运行态共享同一个 `TaskStatusStore`**——若自建 store，「任务连续失败」规则会永远读到 0 而静默失效。
+
+**迟滞与恢复**（`ALERT_FOR_TICKS` / `ALERT_CLEAR_TICKS`）：单轮采样可能只是毛刺，故「连续 `for_ticks` 轮命中」才进入告警（默认 1 = 不迟滞，保持向后兼容），「连续 `clear_ticks` 轮不再命中」才确认恢复（默认 2）。恢复时给该 `(rule, scope)` 最近一条**尚未恢复**的行写 `resolved_at`（同一行，不新落一行——告警与恢复是一个事件的两端），并外推一条 `status="resolved"` 的 webhook；管理台把 `resolved_at` 非空的行显示为「已恢复」而非严重度。迟滞状态（连击/恢复计数、当前告警中的 key 集合）**进程内**维护，重启归零重新累积，与签到去重、静默窗同范式。
+
+**签名**：webhook 请求恒带 `X-Coding2API-Signature: sha256=<HMAC-SHA256(APP_SECRET, body)>`，签名算在**实际发送的字节**上（故发送预序列化 `content` 而非 `json=`，否则 httpx 二次序列化后无法对账），收端用同一 `APP_SECRET` 复算即可验真。不设开关——多一个开关只会多一种「以为开了其实没开」的静默状态。
 
 ## 11. 出口辅助端点与错误语义
 ### 11.1 余额与健康检查

@@ -18,6 +18,20 @@
 没有静默窗就会每轮落一行、每轮推一次，把记录和群聊都刷屏。同一条
 `(rule, scope)` 在静默窗内只落库一次；窗口过后若仍命中，再报一次（提醒还在）。
 
+为什么要迟滞（`for_ticks` / `clear_ticks`）：单轮采样可能只是毛刺（一次探测
+超时、一轮统计窗口内的偶发 5xx）。**连续 N 轮命中**才认为真的出事、才告警；
+**连续 M 轮不再命中**才认为恢复、才解除并推一条恢复通知。迟滞状态是**进程内**
+的（与签到去重、静默窗同范式）：重启后需要重新累积命中轮数，不编造重启前的
+连续计数。
+
+恢复通知：确认恢复时给该 `(rule, scope)` 最近一条告警写上 `resolved_at`（同一
+行，不新落一行——「告警 + 恢复」是一个事件的两端），并外推一条 webhook
+（body 带 `status: "resolved"`）。未配置 webhook 时只写库。
+
+签名：webhook 请求带 `X-Coding2API-Signature: sha256=<HMAC-SHA256(APP_SECRET, body)>`，
+**恒开**（不设开关——收端要么校验要么忽略，服务端多一个开关只会多一种「以为
+开了其实没开」的静默状态）。签名算在**实际发送的字节**上，收端可原样复算。
+
 纯函数 `evaluate_alerts` 与任务 `AlertTask` 分离：规则判定不碰 IO，测试可直接
 喂快照；任务的 IO（读池/统计/落库/webhook）全部可注入，便于用假实现覆盖分支。
 """
@@ -25,6 +39,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
@@ -56,6 +72,26 @@ _PII_MASK = "***"
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_WARNING = "warning"
+
+# 迟滞默认值：连续 1 轮命中即告警（等价于不做进入迟滞，保持向后兼容的默认），
+# 连续 2 轮不命中才确认恢复（避免单轮抖动就把告警撤掉）。
+DEFAULT_FOR_TICKS = 1
+DEFAULT_CLEAR_TICKS = 2
+
+# webhook 签名头：`sha256=<hex(HMAC-SHA256(APP_SECRET, body))>`。
+SIGNATURE_HEADER = "X-Coding2API-Signature"
+
+
+def sign_webhook_body(secret: str, body: bytes) -> str:
+    """对**实际发送的字节**做 HMAC-SHA256，返回 `sha256=<hex>`。
+
+    收端用同一 secret 复算即可验真。secret 为空（未配置 APP_SECRET，仅测试
+    可能出现）时返回空串，调用方据此不加签名头。
+    """
+    if not secret:
+        return ""
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
 
 
 def _redact_webhook_url(url: str) -> str:
@@ -196,10 +232,13 @@ def evaluate_alerts(
 
 
 class AlertTask:
-    """运维告警一轮：收集信号 → 判规则 → 静默去重 → 落库 + 推送。
+    """运维告警一轮：收集信号 → 判规则 → 迟滞确认 → 静默去重 → 落库 + 推送。
 
     全部依赖可注入（取值器用零参 callable，热更配置每轮现读）。`now` 与
     `client` 供测试注入固定时钟与 httpx.MockTransport。
+
+    迟滞状态（连续命中/连续未命中）**进程内**维护：重启归零、重新累积，
+    与签到去重同范式（不落库、不编造重启前的计数）。
     """
 
     def __init__(
@@ -218,6 +257,9 @@ class AlertTask:
         error_rate_min_requests: Callable[[], int] = lambda: 20,
         error_rate_window_minutes: Callable[[], int] = lambda: 15,
         silence_minutes: Callable[[], int] = lambda: 30,
+        for_ticks: Callable[[], int] = lambda: DEFAULT_FOR_TICKS,
+        clear_ticks: Callable[[], int] = lambda: DEFAULT_CLEAR_TICKS,
+        app_secret: Callable[[], str] = lambda: "",
         client: httpx.AsyncClient | None = None,
         now: Callable[[], int] | None = None,
     ) -> None:
@@ -234,8 +276,18 @@ class AlertTask:
         self._error_rate_min_requests = error_rate_min_requests
         self._error_rate_window_minutes = error_rate_window_minutes
         self._silence_minutes = silence_minutes
+        self._for_ticks = for_ticks
+        self._clear_ticks = clear_ticks
+        self._app_secret = app_secret
         self._client = client
         self._now = now or (lambda: int(time.time()))
+        # 迟滞状态机（进程内）：dedup_key → 连续命中轮数；
+        # dedup_key → 连续未命中轮数（仅对「告警中」的 key 累积）；
+        # dedup_key → (rule, scope, severity)，即当前处于告警中的告警。
+        self._streak: dict[str, int] = {}
+        self._clear_streak: dict[str, int] = {}
+        self._active: dict[str, tuple[str, str, str]] = {}
+
 
     async def run_once(self) -> dict[str, Any] | None:
         """评估一轮；返回运行态摘要，关闭时返回 None（no-op，不覆盖上次结果）。"""
@@ -269,30 +321,74 @@ class AlertTask:
         return [{**row, "remaining": int(row["token_expires_at"]) - now} for row in rows]
 
     async def _dispatch(self, alerts: list[Alert], now: int) -> dict[str, Any]:
-        """静默去重后逐条落库 + 推送；返回本轮摘要。"""
+        """迟滞确认 → 静默去重 → 逐条落库 + 推送；返回本轮摘要。
+
+        - **进入迟滞**：同一 `(rule, scope)` 连续命中 `for_ticks` 轮才真正告警，
+          之前的轮次只累加计数（记 `pending`，不落库不推送）。
+        - **静默窗**：已在告警中的条目在静默窗内不重复落库/推送。
+        - **恢复迟滞**：告警中的条目连续 `clear_ticks` 轮未再命中才确认恢复，
+          写 `resolved_at` 并外推一条 `status="resolved"` 通知。
+        """
         silence = max(0, self._silence_minutes()) * 60
-        fired = suppressed = 0
-        delivered = 0
+        for_ticks = max(1, self._for_ticks())
+        clear_ticks = max(1, self._clear_ticks())
+        fired = suppressed = pending = resolved = delivered = 0
+
+        seen: set[str] = set()
         for alert in alerts:
-            last = self._alerts.last_ts(alert.rule, alert.scope)
-            if last is not None and silence > 0 and now - last < silence:
-                suppressed += 1
+            key = alert.dedup_key
+            seen.add(key)
+            self._clear_streak.pop(key, None)
+            self._streak[key] = self._streak.get(key, 0) + 1
+            if self._streak[key] < for_ticks:
+                pending += 1
                 continue
-            ok, error = await self._deliver(alert, now)
+            if key in self._active:
+                last = self._alerts.last_ts(alert.rule, alert.scope)
+                if last is not None and silence > 0 and now - last < silence:
+                    suppressed += 1
+                    continue
+            ok, error = await self._deliver(alert, now, status="firing")
             self._alerts.record(
                 rule=alert.rule, severity=alert.severity, scope=alert.scope,
                 message=alert.message,
                 detail=json.dumps(alert.detail, ensure_ascii=False),
                 delivered=ok, delivery_error=error, now=now,
             )
+            self._active[key] = alert
             fired += 1
             if ok:
                 delivered += 1
-        return {"evaluated": len(alerts), "fired": fired,
-                "suppressed": suppressed, "delivered": delivered}
 
-    async def _deliver(self, alert: Alert, now: int) -> tuple[bool, str | None]:
+        # 告警中但本轮未命中 → 累积恢复轮数，确认后解除并外推恢复通知
+        for key in list(self._active):
+            if key in seen:
+                continue
+            self._streak.pop(key, None)
+            self._clear_streak[key] = self._clear_streak.get(key, 0) + 1
+            if self._clear_streak[key] < clear_ticks:
+                continue
+            alert = self._active.pop(key)
+            self._clear_streak.pop(key, None)
+            self._alerts.resolve(alert.rule, alert.scope, now)
+            ok, _error = await self._deliver(alert, now, status="resolved")
+            resolved += 1
+            if ok:
+                delivered += 1
+
+        # 尚未确认告警、本轮又不再命中的 key：连击清零（下次重新累积）
+        for key in list(self._streak):
+            if key not in seen:
+                self._streak.pop(key, None)
+
+        return {"evaluated": len(alerts), "fired": fired, "suppressed": suppressed,
+                "pending": pending, "resolved": resolved, "delivered": delivered}
+
+    async def _deliver(self, alert: Alert, now: int, *,
+                       status: str = "firing") -> tuple[bool, str | None]:
         """推送 webhook；未配置地址时视为「仅站内」，返回 (False, None)。
+
+        `status` 为 `firing`（命中）或 `resolved`（恢复）：收端据此区分。
 
         投递失败只告警不抛错：一条 webhook 不能把后台任务判失败，否则
         「webhook 挂了」会被误报成「告警任务连续失败」，制造假信号。
@@ -305,14 +401,19 @@ class AlertTask:
         urls = [u.strip() for u in self._webhook_url().split(",") if u.strip()]
         if not urls:
             return False, None
+        resolved = status == "resolved"
         payload = {
             "service": "coding2api", "rule": alert.rule, "severity": alert.severity,
-            "scope": alert.scope, "message": alert.public_message(),
+            "scope": alert.scope, "status": status,
+            "message": (f"已恢复：{alert.public_message()}" if resolved
+                        else alert.public_message()),
             "detail": _public_detail(alert.detail), "ts": now,
         }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        signature = sign_webhook_body(self._app_secret(), body)
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*(self._deliver_one(url, payload) for url in urls)),
+                asyncio.gather(*(self._deliver_one(url, body, signature) for url in urls)),
                 timeout=_WEBHOOK_TOTAL_BUDGET,
             )
         except TimeoutError:
@@ -322,7 +423,7 @@ class AlertTask:
         errors = [error for error in results if error is not None]
         return (not errors), (errors[0] if errors else None)
 
-    async def _deliver_one(self, url: str, payload: dict[str, Any]) -> str | None:
+    async def _deliver_one(self, url: str, body: bytes, signature: str) -> str | None:
         """投递单个地址；失败只记日志并返回脱敏后的错误串，不抛出。
 
         webhook path/query 常即密钥（Slack/飞书），日志与落库都只留 host，
@@ -336,7 +437,7 @@ class AlertTask:
                            _redact_webhook_url(url))
             return "BlockedWebhookHost: resolves to a private address"
         try:
-            await self._post(url, payload)
+            await self._post(url, body, signature)
         except Exception as exc:  # noqa: BLE001 - 单点失败不影响其余地址
             error = _redact_webhook_error(exc)
             logger.warning("告警 webhook 投递失败 %s: %s",
@@ -344,13 +445,18 @@ class AlertTask:
             return error
         return None
 
-    async def _post(self, url: str, payload: dict[str, Any]) -> None:
+    async def _post(self, url: str, body: bytes, signature: str) -> None:
+        # 发送**预序列化字节**而不是 `json=`：签名必须覆盖实际发送的字节，
+        # 收端才能原样复算验真（`json=` 会让 httpx 二次序列化，无法对账）。
+        headers = {"Content-Type": "application/json"}
+        if signature:
+            headers[SIGNATURE_HEADER] = signature
         if self._client is not None:
-            response = await self._client.post(url, json=payload)
+            response = await self._client.post(url, content=body, headers=headers)
         else:
             # trust_env=False 与 provider/proxy.build_client 同口径：告警 JSON
             # 带池子健康详情，不能被宿主环境代理静默转手。
             async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT,
                                          trust_env=False) as client:
-                response = await client.post(url, json=payload)
+                response = await client.post(url, content=body, headers=headers)
         response.raise_for_status()

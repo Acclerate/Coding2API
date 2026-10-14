@@ -671,6 +671,8 @@ export interface AlertEvent {
   /** webhook 是否投递成功（0=未配置或失败） */
   delivered: 0 | 1;
   delivery_error: string | null;
+  /** 恢复时刻（epoch 秒）；null = 仍在告警中。迟滞确认恢复后由后台写入 */
+  resolved_at: number | null;
 }
 
 export interface AlertsResponse {

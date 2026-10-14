@@ -438,7 +438,10 @@ def build_runner(credentials, providers: dict, stats_collector, config,
                           error_rate_threshold=lambda: config.alert_error_rate_threshold,
                           error_rate_min_requests=lambda: config.alert_error_rate_min_requests,
                           error_rate_window_minutes=lambda: config.alert_error_rate_window_minutes,
-                          silence_minutes=lambda: config.alert_silence_minutes)
+                          silence_minutes=lambda: config.alert_silence_minutes,
+                          for_ticks=lambda: config.alert_for_ticks,
+                          clear_ticks=lambda: config.alert_clear_ticks,
+                          app_secret=lambda: config.app_secret)
     return TaskRunner(
         quota_probe=QuotaProbeTask(credentials, providers, pacer),
         checkin=CheckinTask(credentials, providers, pacer=pacer),

@@ -133,7 +133,7 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ## 4. 数据模型
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 20`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 21`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
 
 | 表 | 用途 |
 |---|---|
@@ -148,7 +148,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 | `runtime_settings` | 运行时配置覆盖（纯 key/value，只存管理台改过的 key），白名单校验在 `runtime_settings.HOT_SETTINGS` |
 | `users` | 账号（PBKDF2 密码哈希 + `role` + `enabled` + `must_change_password` + `session_epoch` + 一次性激活令牌摘要） |
 | `audit_events` | 审计流水（登录 / 账号变动 / 凭证写操作） |
-| `alert_events` | 运维告警事件（四类规则命中落一行） |
+| `alert_events` | 运维告警事件（四类规则命中落一行；`resolved_at` 非空 = 迟滞确认恢复） |
 
 - 调度状态与到期阶梯**落库**，重启不丢冷却状态与到期阶梯。签到去重、模型列表缓存、后台任务运行态均**进程内实现、不建表**（运行态重启归零，不编造重启前记录）。
 - 模型目录落盘到 `DATA_DIR/model_catalog.json`（未过滤原始表），启动同步读回；OpenRouter 目录落盘 `data/openrouter_catalog.json`。

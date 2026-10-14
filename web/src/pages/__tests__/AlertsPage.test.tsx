@@ -17,7 +17,7 @@ function stubFetch(body: unknown, status = 200) {
 const ALERT = {
   id: "alert_1", ts: 1_700_000_000, rule: "pool_empty", severity: "critical",
   scope: "pool", message: "凭证池可用数为 0", detail: "{}", delivered: 1,
-  delivery_error: null,
+  delivery_error: null, resolved_at: null,
 };
 
 describe("AlertsPage", () => {
@@ -43,6 +43,17 @@ describe("AlertsPage", () => {
     expect(screen.getByTestId("alert-row-alert_2")).toHaveTextContent("后台任务连续失败");
     expect(screen.getByTestId("alert-row-alert_2")).toHaveTextContent("站内");
     expect(screen.getByTestId("alert-row-alert_3")).toHaveTextContent("推送失败");
+  });
+
+  it("已恢复的告警显示「已恢复」而非严重度", async () => {
+    stubFetch({ alerts: [
+      { ...ALERT, id: "alert_r", resolved_at: 1_700_000_500 },
+    ] });
+    renderPage(<AlertsPage />, { username: "root", is_admin: true });
+    await settle();
+    const row = screen.getByTestId("alert-row-alert_r");
+    expect(row).toHaveTextContent("已恢复");
+    expect(row).not.toHaveTextContent("严重");
   });
 
   it("未知规则回落到原始 key，不崩", async () => {

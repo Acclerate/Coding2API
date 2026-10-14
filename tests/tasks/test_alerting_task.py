@@ -25,7 +25,8 @@ async def test_alert_task_fires_and_records_without_webhook(tmp_path):
         tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
         now=lambda: 1000)
     report = await task.run_once()
-    assert report == {"evaluated": 1, "fired": 1, "suppressed": 0, "delivered": 0}
+    assert report == {"evaluated": 1, "fired": 1, "suppressed": 0, "pending": 0,
+                      "resolved": 0, "delivered": 0}
     row = alerts.recent()[0]
     assert row["rule"] == "pool_empty" and row["delivered"] == 0
     assert row["delivery_error"] is None
@@ -39,7 +40,8 @@ async def test_alert_task_silences_repeats_then_refires(tmp_path):
     assert (await task.run_once())["fired"] == 1
     # 静默窗内：命中但被抑制，不再落库
     second = await task.run_once()
-    assert second == {"evaluated": 1, "fired": 0, "suppressed": 1, "delivered": 0}
+    assert second == {"evaluated": 1, "fired": 0, "suppressed": 1, "pending": 0,
+                      "resolved": 0, "delivered": 0}
     assert len(alerts.recent()) == 1
     # 窗口过后仍命中 → 再报一次
     task._now = lambda: 1000 + 30 * 60
@@ -195,8 +197,9 @@ async def test_alert_task_default_client_path(tmp_path, monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def post(self, url, json=None):
-            captured.append({"url": url, "json": json})
+        async def post(self, url, content=None, headers=None):
+            captured.append({"url": url, "json": json.loads(content),
+                             "headers": headers})
             return _FakeResponse()
 
     monkeypatch.setattr("src.tasks.alerting.httpx.AsyncClient", _FakeClient)
@@ -281,7 +284,7 @@ async def test_alert_task_webhook_total_budget_exceeded(tmp_path, monkeypatch):
     monkeypatch.setattr("src.tasks.alerting._WEBHOOK_TOTAL_BUDGET", 0.01)
 
     class _SlowClient:
-        async def post(self, url, json=None):
+        async def post(self, url, content=None, headers=None):
             await asyncio.sleep(1)
             return httpx.Response(200)
 
@@ -329,6 +332,138 @@ def test_alert_humanize_boundaries():
 def test_alert_dataclass_dedup_key():
     alert = Alert(rule="pool_empty", severity="critical", scope="pool", message="x")
     assert alert.dedup_key == "pool_empty:pool"
+
+# ------------------------------------------------------------------ 迟滞 / 恢复
+
+
+async def test_alert_task_for_ticks_defers_until_streak(tmp_path):
+    """连续命中 for_ticks 轮才真正告警；之前只累计（pending，不落库）。"""
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        for_ticks=lambda: 2, silence_minutes=lambda: 0, now=lambda: 1000)
+    first = await task.run_once()
+    assert first["pending"] == 1 and first["fired"] == 0
+    assert alerts.recent() == []
+    second = await task.run_once()
+    assert second["pending"] == 0 and second["fired"] == 1
+    assert len(alerts.recent()) == 1
+    db.close()
+
+
+async def test_alert_task_streak_resets_when_signal_clears(tmp_path):
+    """未达阈值前信号消失 → 连击清零，下次重新从 1 开始累积。"""
+    creds = _StubCredentials(counts={"total": 1, "ready": 0})
+    task, alerts, db = _task(
+        tmp_path, credentials=creds, for_ticks=lambda: 2,
+        silence_minutes=lambda: 0, now=lambda: 1000)
+    assert (await task.run_once())["pending"] == 1
+    creds._counts = {"total": 1, "ready": 1}          # 恢复
+    assert (await task.run_once())["evaluated"] == 0
+    creds._counts = {"total": 1, "ready": 0}          # 再次命中
+    assert (await task.run_once())["pending"] == 1    # 重新累积，而非立即报
+    assert alerts.recent() == []
+    db.close()
+
+
+async def test_alert_task_clear_ticks_resolves_and_notifies(tmp_path):
+    """告警中连续 clear_ticks 轮未命中 → 写 resolved_at 并外推恢复通知。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    creds = _StubCredentials(counts={"total": 1, "ready": 0})
+    task, alerts, db = _task(
+        tmp_path, credentials=creds, clear_ticks=lambda: 2,
+        webhook_url=lambda: "https://hook.example/a", client=client,
+        silence_minutes=lambda: 0, now=lambda: 1000)
+    assert (await task.run_once())["fired"] == 1
+    creds._counts = {"total": 1, "ready": 1}          # 恢复
+    # 第 1 轮未命中：还没到 clear_ticks，不算恢复
+    first = await task.run_once()
+    assert first["resolved"] == 0
+    assert alerts.recent()[0]["resolved_at"] is None
+    # 第 2 轮未命中：确认恢复
+    second = await task.run_once()
+    assert second["resolved"] == 1 and second["delivered"] == 1
+    assert alerts.recent()[0]["resolved_at"] == 1000
+    # 外推的恢复通知带 status=resolved
+    assert seen[-1]["status"] == "resolved"
+    assert seen[-1]["rule"] == "pool_empty"
+    assert "已恢复" in seen[-1]["message"]
+    await client.aclose()
+    db.close()
+
+
+async def test_alert_task_clear_streak_resets_on_rehit(tmp_path):
+    """恢复迟滞中又重新命中 → 恢复连击清零，告警保持有效、不误撤。"""
+    creds = _StubCredentials(counts={"total": 1, "ready": 0})
+    task, alerts, db = _task(
+        tmp_path, credentials=creds, clear_ticks=lambda: 3,
+        silence_minutes=lambda: 0, now=lambda: 1000)
+    assert (await task.run_once())["fired"] == 1
+    creds._counts = {"total": 1, "ready": 1}
+    assert (await task.run_once())["resolved"] == 0
+    creds._counts = {"total": 1, "ready": 0}          # 又命中
+    assert (await task.run_once())["fired"] == 1      # 静默窗 0 → 再报一次
+    creds._counts = {"total": 1, "ready": 1}
+    # 之前的 1 轮恢复连击已清零，需重新攒满 3 轮
+    assert (await task.run_once())["resolved"] == 0
+    assert (await task.run_once())["resolved"] == 0
+    assert (await task.run_once())["resolved"] == 1
+    db.close()
+
+
+async def test_alert_task_resolve_without_webhook_writes_only(tmp_path):
+    """未配置 webhook：恢复只写库，delivered 保持 0。"""
+    creds = _StubCredentials(counts={"total": 1, "ready": 0})
+    task, alerts, db = _task(
+        tmp_path, credentials=creds, clear_ticks=lambda: 1,
+        silence_minutes=lambda: 0, now=lambda: 1000)
+    await task.run_once()
+    creds._counts = {"total": 1, "ready": 1}
+    report = await task.run_once()
+    assert report["resolved"] == 1 and report["delivered"] == 0
+    assert alerts.recent()[0]["resolved_at"] == 1000
+    db.close()
+
+
+def test_sign_webhook_body_is_stable_hmac():
+    from src.tasks.alerting import sign_webhook_body
+
+    body = b'{"a":1}'
+    first = sign_webhook_body("secret", body)
+    assert first == sign_webhook_body("secret", body)      # 确定性
+    assert first.startswith("sha256=")
+    assert first != sign_webhook_body("other", body)       # 换密钥即变
+    assert sign_webhook_body("", body) == ""               # 无密钥不加签名头
+
+
+async def test_alert_task_signs_webhook_body(tmp_path):
+    """webhook 带 HMAC 签名，且签名覆盖实际发送的字节。"""
+    import hashlib
+    import hmac
+
+    seen: list[tuple[bytes, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.content, request.headers.get("X-Coding2API-Signature", "")))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task, _alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        webhook_url=lambda: "https://hook.example/a", client=client,
+        app_secret=lambda: "top-secret", now=lambda: 5)
+    report = await task.run_once()
+    assert report["delivered"] == 1
+    body, signature = seen[0]
+    expected = "sha256=" + hmac.new(b"top-secret", body, hashlib.sha256).hexdigest()
+    assert signature == expected
+    await client.aclose()
+    db.close()
 
 def test_alert_severity_warning_constant():
     assert SEVERITY_WARNING == "warning"

@@ -273,7 +273,11 @@ CREATE TABLE IF NOT EXISTS alert_events (
     message        TEXT NOT NULL,
     detail         TEXT NOT NULL DEFAULT '', -- JSON 补充数据（计数 / 到期时间等）
     delivered      INTEGER NOT NULL DEFAULT 0, -- webhook 是否投递成功（0=未配置或失败）
-    delivery_error TEXT
+    delivery_error TEXT,
+    -- 恢复通知：该 (规则, 对象) 的告警在此时刻被观测到恢复（NULL=仍在告警中）。
+    -- 迟滞状态机在内存里维护「连续命中/连续恢复」计数，只有确认恢复才写这里，
+    -- 并外推一条 resolved 通知（见 src/tasks/alerting.py）。
+    resolved_at    INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_ts ON alert_events(ts);

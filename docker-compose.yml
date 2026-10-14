@@ -42,6 +42,10 @@ services:
       ALERT_INTERVAL_MINUTES: ${ALERT_INTERVAL_MINUTES:-5}
       # 同一 (规则, 对象) 的静默窗（分钟）；0 关闭静默（每轮都报）
       ALERT_SILENCE_MINUTES: ${ALERT_SILENCE_MINUTES:-30}
+      # 告警迟滞：连续命中 N 轮才告警、连续 M 轮未命中才确认恢复（写 resolved_at
+      # 并外推恢复通知）。1 = 不迟滞。
+      ALERT_FOR_TICKS: ${ALERT_FOR_TICKS:-1}
+      ALERT_CLEAR_TICKS: ${ALERT_CLEAR_TICKS:-2}
       # 池耗尽：ready 少于该值即告警；0 关闭该规则
       ALERT_POOL_READY_MIN: ${ALERT_POOL_READY_MIN:-1}
       # 任务连续失败达到该次数即告警；0 关闭该规则

@@ -131,6 +131,25 @@ def test_alert_repository_records_delivery_failure(tmp_path):
     assert row["delivered"] == 0 and row["delivery_error"] == "boom"
     db.close()
 
+
+def test_alert_repository_resolve_marks_latest_unresolved(tmp_path):
+    """恢复只写最近一条未恢复的记录（历史多轮循环各归各的）。"""
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    repo = AlertRepository(db)
+    repo.record(rule="pool_empty", severity="critical", scope="pool",
+                message="第一次", now=100)
+    repo.record(rule="pool_empty", severity="critical", scope="pool",
+                message="第二次", now=200)
+    assert repo.resolve("pool_empty", "pool", now=250) == 1
+    rows = repo.recent()             # 倒序：第二条先
+    assert rows[0]["resolved_at"] == 250 and rows[0]["message"] == "第二次"
+    assert rows[1]["resolved_at"] is None
+    # 已全部恢复：再 resolve 无事发生
+    assert repo.resolve("pool_empty", "pool", now=260) == 1
+    assert repo.resolve("pool_empty", "pool", now=270) == 0
+    db.close()
+
 def test_alerts_requires_admin(admin_client):
     _app, client = admin_client
     client.cookies.set("coding2api_session", create_session_token("guest", SECRET))

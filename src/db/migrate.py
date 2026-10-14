@@ -40,7 +40,9 @@ SCHEMA_NAME = "schema.sql"
 # 20：新增 credential_limits 表（凭证级限额护栏：保留积分 / 每日 token /
 # 每日 credit / 按模型 token）。新增表只需进 schema.sql（CREATE TABLE IF NOT
 # EXISTS 对老库同样生效），无需迁移动作；缺行 = 不受限，老库行为不变。
-SCHEMA_VERSION = 20
+# 21：alert_events 新增 resolved_at（告警迟滞状态机确认恢复后写入；老库补列
+# 后历史行为 NULL，不影响既有记录展示与静默去重）。
+SCHEMA_VERSION = 21
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -84,6 +86,9 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("usage_hourly", "cost_known INTEGER NOT NULL DEFAULT 0"),
     # 请求 ID（响应头 X-Request-ID 同值）：老库补列后历史行为 NULL。
     ("usage_events", "request_id TEXT"),
+    # 告警恢复时刻（迟滞状态机确认恢复后写入）：老库补列后历史行为 NULL
+    # （全部视为「仍在告警中」/未恢复，不影响既有记录展示）。
+    ("alert_events", "resolved_at INTEGER"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。
