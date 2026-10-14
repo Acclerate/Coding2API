@@ -257,6 +257,9 @@ class Settings(BaseSettings):
     # 依次回退到组内其他模型（组内成员自行带上 @渠道 或依赖目录收窄）。
     # 格式 `组名=成员1,成员2;组名2=成员3`；留空 = 不启用（保持原行为）。
     model_fallback_groups: str = ""
+    # Prometheus 指标出口（GET /metrics）：默认开启。与 /healthz 同口径**不鉴权**，
+    # 指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。可热更。
+    metrics_enabled: bool = True
 
     @cached_property
     def admin_set(self) -> frozenset[str]:

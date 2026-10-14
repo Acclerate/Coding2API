@@ -67,6 +67,7 @@ GATEWAY_GROUPS: tuple[tuple[str, str], ...] = (
     ("affinity", "选号与会话"),
     ("channels", "渠道节流"),
     ("pacer", "后台任务节流"),
+    ("observability", "可观测性"),
 )
 
 
@@ -234,6 +235,11 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("backup_keep", int, "备份保留份数",
                "只保留最近这么多份备份，更旧的按时间删除；0 表示不清理（只备份）。",
                minimum=0, task="backup"),
+    HotSetting("metrics_enabled", bool, "Prometheus 指标出口",
+               "是否暴露 `GET /metrics`（Prometheus text 格式：请求/token/凭证池/"
+               "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
+               "（不含凭证 ID / 用户名）。关闭后端点返回 404。",
+               group="observability"),
 )
 
 HOT_BY_KEY: dict[str, HotSetting] = {item.key: item for item in HOT_SETTINGS}
@@ -725,6 +731,10 @@ class RuntimeSettings:
     @property
     def backup_keep(self) -> int:
         return int(self.get("backup_keep"))
+
+    @property
+    def metrics_enabled(self) -> bool:
+        return bool(self.get("metrics_enabled"))
 
     # ---------------------------------------------------------- 透明委托
 

@@ -226,6 +226,22 @@ claude
 
 `GET /health` is a pure liveness probe. `GET /healthz` adds credential-pool counts (`total` / `ready` / `cooling` / `paused` / `disabled`), so monitors can alert when the pool is exhausted (`ready=0`: alive but unusable). Both are unauthenticated; buckets are mutually exclusive and sum to `total`.
 
+### Prometheus metrics (`GET /metrics`)
+
+`GET /metrics` serves the Prometheus text format (`text/plain; version=0.0.4`) for direct scraping. On by default, **unauthenticated** (same stance as `/healthz`); `METRICS_ENABLED=false` (hot-updatable) makes the endpoint return 404.
+
+Five metric families:
+
+| Metric | Type | Labels | Source |
+| --- | --- | --- | --- |
+| `coding2api_requests_total` | counter | `provider` / `model` / `status`(ok\|error) | `usage_hourly` (permanent, monotonic across restarts) |
+| `coding2api_tokens_total` | counter | `provider` / `type`(input\|output\|reasoning\|cached) | `usage_hourly` |
+| `coding2api_credentials` | gauge | `state`(ready\|cooling\|paused\|disabled) | credential pool (same stance as `/healthz`) |
+| `coding2api_upstream_errors_total` | counter | `provider` / `kind` | in-process counter (resets on restart) |
+| `coding2api_task_failures_total` | counter | `task` | in-process task state (resets on restart) |
+
+**No high-cardinality labels**: no `credential_id` / `api_key_id` / `username`. `requests_total` / `tokens_total` read the **permanent** hourly rollup (not the 90-day detail table), so scraping never scans details and counts stay monotonic; the in-process counters reset on restart, which Prometheus handles as a counter reset.
+
 ## API key policy
 
 A key can be restricted by channel, model, source IP and expiry:
@@ -409,10 +425,11 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `CONTEXT_COMPRESS_SAFETY_RATIO` | `0.95` | Budget as a fraction of the model limit |
 | `UPSTREAM_COMPLETE_TIMEOUT_SECONDS` | `600` | Non-streaming aggregate timeout (retried as transient); `≤0` disables |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | Per-credential in-flight cap (global across channels): a credential at its cap stops being selected; `0` = unlimited. Leases release when the request ends, with a 600s TTL guarding leaked ones |
+| `METRICS_ENABLED` | `true` | Expose `GET /metrics` (Prometheus text format, **unauthenticated**, same stance as `/healthz`); `false` disables it (404). Hot-updatable |
 
 ### Runtime settings (*Tasks & settings* page)
 
-**44 settings** apply immediately without editing `.env` or restarting: default model, blocklist, context-compression knobs, fallback groups, both expiry windows, sticky TTL, the per-credential in-flight cap, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour and all alerting rules.
+**45 settings** apply immediately without editing `.env` or restarting: default model, blocklist, context-compression knobs, fallback groups, both expiry windows, sticky TTL, the per-credential in-flight cap, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour, all alerting rules and `METRICS_ENABLED`.
 
 **DB overrides beat `.env`**: once changed, `.env` no longer applies to that key; the row is marked "DB override" and *Reset* removes the override. Values live in the `runtime_settings` table (plain key/value), so adding a hot-updatable key needs no migration; unknown keys and invalid/out-of-range values are rejected on write. Startup-only knobs (`APP_SECRET`, `PORT`, `DATA_DIR`, `USERS_FILE`, `OPENROUTER_MODELS_URL`, endpoint allowlists) are **excluded**. API: `GET /api/settings`, `PUT /api/settings` (admin + CSRF; `null` resets). The page also shows the 9 tasks' state (`GET /api/tasks`, admin, 30s refresh), in-process only.
 

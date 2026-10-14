@@ -77,6 +77,20 @@ def test_store_records_only_last_run_and_counts():
     assert store.get("never") is None and store.runs("never") == 0
 
 
+def test_store_tracks_cumulative_failures():
+    """累计失败数（/metrics 的 task_failures_total）：单调递增，成功不清零。"""
+    store = TaskStatusStore(now=lambda: 1.0)
+    store.record("quota_probe", started_at=0.0, ok=True, report=None, error=None)
+    assert store.failures("quota_probe") == 0
+    store.record("quota_probe", started_at=0.0, ok=False, report=None, error="x")
+    store.record("quota_probe", started_at=0.0, ok=False, report=None, error="x")
+    store.record("quota_probe", started_at=0.0, ok=True, report=None, error=None)
+    # 连续失败被成功清零，但累计失败不受影响
+    assert store.consecutive_failures("quota_probe") == 0
+    assert store.failures("quota_probe") == 2
+    assert store.failures("never") == 0
+
+
 def test_store_defaults_to_wall_clock():
     """未注入时钟时用真实时间（否则页面的「距今多久」会退化成常量）。"""
     store = TaskStatusStore()

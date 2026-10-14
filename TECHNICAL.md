@@ -39,7 +39,7 @@ PROPOSAL.md 定方向，本文档定实现。描述**当前代码的现状**，�
 | `src/tasks/` | `pacer.py` `quota_probe.py` `checkin.py` `growth.py` `activity.py` `refresh.py` `retention.py` `backup.py` `alerting.py` `status.py` `runner.py` | 全局节流器（随机区间 + 按桶并发上限 + 滑动窗口）／启动立即一轮 + 每 `QUOTA_PROBE_MINUTES`／全天每 10 分钟签到、成功即封账（支持渠道回填 `seal_until`）／成长中心（仅 CB）落 `growth_events`／活跃上报（CB 与 CB 国际版，默认关闭）／每 `REFRESH_INTERVAL_MINUTES` 预刷新／每 5 分钟小时汇总重算 + 90 天前明细清理／每 `BACKUP_INTERVAL_MINUTES` 备份主库（`VACUUM INTO`，落线程池）/运维告警（四类规则 + webhook + 落库）／任务清单 `TASK_SPECS` + 进程内运行态／后台任务调度，接入应用生命周期 |
 | `src/stats/` | `backfill.py` `collector.py` `query.py` `csv.py` | 历史成本一次性回填与重算（`scripts/backfill_cost.py` 复用）／`usage_events` 写入（脱敏）+ 小时汇总双写·重算／`overview`·`by-*`·`timeline`·`model-timeline`·`events`（含钻取过滤与导出取数）／CSV 导出纯函数（列定义 + 公式注入防护 + 行编码） |
 | `src/` 顶层 | `sorting.py` `benchmarks.py` `pricing.py` `model_match.py` `request_context.py` | 列表排序 `sort`/`order` 白名单解析（db 与 api 共用）／OpenRouter 单一源：刊例价 + 明细元数据 + 能力指数 + 落盘快照／单请求成本估算（USD→CNY）／本地模型名 ↔ OpenRouter 条目匹配（仅 benchmarks·pricing 用）／请求 ID 的 contextvar + 白名单校验 + 自生成（中间件设置、统计写入现读） |
-| `src/api/` | `deps.py` `endpoints.py` `chat.py` `responses.py` `messages.py` `context.py` `models.py` `model_merge.py` `model_catalog.py` `balance.py` `authorize.py` `admin_credentials.py` `admin_keys.py` `admin_settings.py` `admin_users.py` `admin_audit.py` `admin_alerts.py` `admin_model_catalog.py` `activate.py` `admin_stats.py` `admin_auth.py` `playground.py` `streaming.py` | Services 容器 + 鉴权·会话·CSRF 依赖／三个 /v1 出口共用的 `dispatch_compat` 骨架／`POST /v1/chat/completions`·`/v1/responses`·`/v1/messages`／请求入口的上下文压缩接线／`GET /v1/models`（按凭证加载 + SWR + 缓存·TTL + 落盘 + 黑名单 + 白名单）／模型归一·合并·命名·对外 id 消歧·别名表（纯函数）／模型目录落盘快照 + 别名预热／`GET /v1/user/balance`／`GET /authorize`（TRAE 回调落点）／凭证 CRUD·toggle·pin·probe·checkin·成长·账号切换／API Key CRUD（渠道绑定 + 双白名单 + 到期）／`GET`/`PUT /api/settings` + `GET /api/tasks`／用户管理／审计查询／告警回看／模型目录只读查看／一次性令牌激活流／统计查询／登录·登出·会话·自助改密 + 上游登录 start·poll·complete·cancel／会话调试端点（无需 API Key）／SSE 流包装（长空隙插心跳帧） |
+| `src/api/` | `deps.py` `endpoints.py` `chat.py` `responses.py` `messages.py` `context.py` `models.py` `model_merge.py` `model_catalog.py` `balance.py` `authorize.py` `admin_credentials.py` `admin_keys.py` `admin_settings.py` `admin_users.py` `admin_audit.py` `admin_alerts.py` `admin_model_catalog.py` `activate.py` `admin_stats.py` `admin_auth.py` `playground.py` `streaming.py` `metrics.py` | Services 容器 + 鉴权·会话·CSRF 依赖／三个 /v1 出口共用的 `dispatch_compat` 骨架／`POST /v1/chat/completions`·`/v1/responses`·`/v1/messages`／请求入口的上下文压缩接线／`GET /v1/models`（按凭证加载 + SWR + 缓存·TTL + 落盘 + 黑名单 + 白名单）／模型归一·合并·命名·对外 id 消歧·别名表（纯函数）／模型目录落盘快照 + 别名预热／`GET /v1/user/balance`／`GET /authorize`（TRAE 回调落点）／凭证 CRUD·toggle·pin·probe·checkin·成长·账号切换／API Key CRUD（渠道绑定 + 双白名单 + 到期）／`GET`/`PUT /api/settings` + `GET /api/tasks`／用户管理／审计查询／告警回看／模型目录只读查看／一次性令牌激活流／统计查询／登录·登出·会话·自助改密 + 上游登录 start·poll·complete·cancel／会话调试端点（无需 API Key）／SSE 流包装（长空隙插心跳帧）／`GET /metrics`（Prometheus text 格式） |
 | `src/audit/actions.py` | — | 审计动作常量 + 中文标签 |
 | `web/` | — | React 前端 |
 | `deploy/` | — | 各部署形态模板（launchd / newsyslog / logrotate / systemd） |
@@ -528,7 +528,21 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 ```
 
 五类计数互斥且合计 = `total`，判定优先级 `disabled → paused → cooling → ready`（系统禁用 / 用户暂停优先于冷却）。口径**复用调度器的 `Candidate.is_selectable`**（`CredentialRepository.pool_counts`），不另写 SQL——两套口径一旦分叉，健康检查会报出与实际选号不符的「可用数」。`ready=0` 时对话请求直接返回 503。
-### 11.2 面向用户的错误语义
+
+### 11.2 Prometheus 指标（`GET /metrics`）
+`src/api/metrics.py` 零依赖手写 Prometheus text 格式（不引 `prometheus_client`：本服务只暴露一组固定小指标，官方客户端会带进整套注册表与默认采集器）。默认开启、**不鉴权**（与 `/healthz` 同口径），`METRICS_ENABLED=false`（可热更）时返回 404。路由注册在 SPA catch-all 之前，否则会被通配路由吞掉。
+
+| 指标 | 类型 | 标签 | 数据源 |
+|---|---|---|---|
+| `coding2api_requests_total` | counter | `provider` / `model` / `status`(ok\|error) | `usage_hourly` 永久小时汇总（`StatsQuery.metrics_provider_model`），`error = requests − ok_count` |
+| `coding2api_tokens_total` | counter | `provider` / `type`(input\|output\|reasoning\|cached) | `usage_hourly`（`StatsQuery.metrics_provider_tokens`） |
+| `coding2api_credentials` | gauge | `state`(ready\|cooling\|paused\|disabled) | `CredentialRepository.pool_counts()`（与 `/healthz` 同口径） |
+| `coding2api_upstream_errors_total` | counter | `provider` / `kind`（受控 `error_type`） | `StatsCollector.error_totals()`（进程内计数，重启归零） |
+| `coding2api_task_failures_total` | counter | `task` | `TaskStatusStore.failures()`（进程内累计失败数，重启归零） |
+
+三个口径要点：① **禁高基数标签**——不打 `credential_id` / `api_key_id` / `username` / `request_id`，一个账号一条时间序列会让 Prometheus 内存与查询失控；② `requests_total` / `tokens_total` 读**永久**小时汇总而非 90 天明细，故 scrape 不做明细全表扫描、且计数跨重启单调；③ 进程内计数器（失败原因、任务失败）随重启归零，Prometheus 原生按 counter reset 处理。文本转义只处理 `\` / `"` / 换行（模型名可能含引号，不转义会拼坏整份响应）。**已知偏离扫描报告**：报告写 `upstream_errors_total` 数据源为 `usage_hourly`，但小时汇总没有 `error_type` 维度，用明细当 `_total` 会随裁剪下降，故 `kind` 改用进程内计数。
+
+### 11.3 面向用户的错误语义
 管理端点返回的失败原因必须是**稳定的机器可读枚举**，不能是 Python 异常类名（类名是实现细节，重构时会漂移）。`POST /api/credentials/{id}/probe` 的失败响应：
 
 ```json

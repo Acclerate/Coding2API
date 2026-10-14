@@ -33,6 +33,7 @@ from .api import (
     balance,
     chat,
     messages,
+    metrics,
     models,
     playground,
     responses,
@@ -719,6 +720,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(balance.create_router(services))
     app.include_router(playground.create_router(services))
     app.include_router(authorize.create_router(services))
+    # Prometheus 指标出口（无鉴权，与 /healthz 同口径）：必须注册在 SPA
+    # catch-all 之前，否则会被通配路由吞掉返回 index.html。
+    app.include_router(metrics.create_router(services))
 
     # ------------------------------------------------------- 前端静态资源
     _static.register_spa_routes(app)

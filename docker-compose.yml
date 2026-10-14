@@ -134,6 +134,8 @@ services:
       UPSTREAM_COMPLETE_TIMEOUT_SECONDS: ${UPSTREAM_COMPLETE_TIMEOUT_SECONDS:-600}
       # 单账号在途请求上限（跨渠道全局）；0 = 不限
       MAX_INFLIGHT_PER_CREDENTIAL: ${MAX_INFLIGHT_PER_CREDENTIAL:-0}
+      # Prometheus 指标出口（GET /metrics，无鉴权，与 /healthz 同口径）；false 关闭
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
       # 上下文压缩：按模型目录里的输入上限裁剪过长对话，避免撞上游硬限制
       CONTEXT_COMPRESS_ENABLED: ${CONTEXT_COMPRESS_ENABLED:-true}
       CONTEXT_COMPRESS_RESERVE_TOKENS: ${CONTEXT_COMPRESS_RESERVE_TOKENS:-4096}

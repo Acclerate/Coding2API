@@ -165,3 +165,32 @@ def test_stats_record_defaults_username_when_blank(stats):
     collector, query = stats
     collector.record(username="", provider="trae", model="m", ok=True)
     assert query.by_provider()[0]["requests"] == 1
+
+
+def test_metrics_provider_model_and_tokens_aggregate_hourly(stats):
+    """`/metrics` 的两个小时汇总查询：按 (渠道, 模型) / 渠道聚合、稳定排序。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     input_tokens=10, output_tokens=20, reasoning_tokens=1, cached_tokens=3)
+    collector.record(username="u", provider="trae", model="m", ok=False)
+    collector.record(username="v", provider="codebuddy", model="m", ok=True,
+                     input_tokens=7)
+    assert query.metrics_provider_model() == [
+        ("codebuddy", "m", 1, 1), ("trae", "m", 2, 1)]
+    assert query.metrics_provider_tokens() == [
+        ("codebuddy", 7, 0, 0, 0), ("trae", 10, 20, 1, 3)]
+
+
+def test_error_totals_counts_only_controlled_types(stats):
+    """未知 error_type 归一为 None → 不计入 /metrics 的失败计数。"""
+    collector, _query = stats
+    collector.record(username="u", provider="trae", model="m", ok=False,
+                     error_type="rate_limit")
+    collector.record(username="u", provider="trae", model="m", ok=False,
+                     error_type="not-controlled")
+    collector.record(username="u", provider="codebuddy", model="m", ok=True)
+    collector.record(username="u", provider="codebuddy", model="m", ok=False,
+                     error_type="upstream_error")
+    # 稳定排序：按 (provider, kind)
+    assert collector.error_totals() == [("codebuddy", "upstream_error", 1),
+                                        ("trae", "rate_limit", 1)]

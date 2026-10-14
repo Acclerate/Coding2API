@@ -86,6 +86,13 @@ class StatsCollector:
         self._db = db
         self._prices = prices
         self._usd_cny_rate = usd_cny_rate
+        # 进程内「失败请求 × 原因」计数（供 /metrics 的 errors_total）。
+        # 为什么不落库、不读明细表：① usage_hourly 没有 error_type 维度；
+        # ② usage_events 只留 90 天，用它算 `_total` 会让计数器随裁剪**下降**
+        #   （Prometheus 视作 reset）；③ scrape 时对明细全表 GROUP BY 正是
+        #   /metrics 要避免的开销。进程内计数器随重启归零，Prometheus 原生
+        #   把 counter 下降当作 reset 处理，语义自洽。
+        self._error_totals: dict[tuple[str, str], int] = {}
 
     def _cost(self, model: str, *, input_tokens: int | None,
               output_tokens: int | None,
@@ -158,6 +165,9 @@ class StatsCollector:
             # → None（该列可空）。
             request_id=get_request_id(),
         )
+        if not event.ok and event.error_type is not None:
+            key = (event.provider, event.error_type)
+            self._error_totals[key] = self._error_totals.get(key, 0) + 1
         with self._db.transaction() as conn:
             conn.execute(
                 "INSERT INTO usage_events (id, ts, username, provider, credential_id, model, "
@@ -235,6 +245,16 @@ class StatsCollector:
             "COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed "
             "FROM usage_events WHERE ts >= ?", (since,)).fetchone()
         return int(row["requests"] or 0), int(row["failed"] or 0)
+
+    def error_totals(self) -> list[tuple[str, str, int]]:
+        """进程内「渠道 × 失败原因」累计计数（稳定排序）。
+
+        只统计**受控**错误类型（`CONTROLLED_ERROR_TYPES`，`error_type` 为
+        None 的失败不计入）。返回 (provider, kind, count)，供 `/metrics`
+        渲染 `coding2api_upstream_errors_total{provider,kind}`。
+        """
+        return sorted((provider, kind, count)
+                      for (provider, kind), count in self._error_totals.items())
 
     def purge_expired(self, retention_days: int = 90, now: int | None = None) -> int:
         """明细保留 90 天；小时汇总永久（PROPOSAL §6）。

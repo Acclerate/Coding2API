@@ -178,6 +178,38 @@ class StatsQuery:
             "avg_ttfb_ms": round(row["ttfb_sum"] / ok_count) if ok_count else None,
         }
 
+    def metrics_provider_model(self) -> list[tuple[str, str, int, int]]:
+        """按 (渠道, 模型) 汇总请求数 / 成功数（/metrics 的 requests_total）。
+
+        读**永久保留**的 `usage_hourly`（与总览同源）：明细只留 90 天，
+        用它算累计计数器会随裁剪下降。返回 (provider, model, requests, ok_count)，
+        由调用方拆成 status=ok / error 两条样本。排序稳定（provider, model）。
+        """
+        rows = self._db.connect().execute(
+            "SELECT provider, model, COALESCE(SUM(requests), 0) AS requests, "
+            "COALESCE(SUM(ok_count), 0) AS ok_count "
+            "FROM usage_hourly GROUP BY provider, model "
+            "ORDER BY provider, model").fetchall()
+        return [(row["provider"], row["model"], int(row["requests"]),
+                 int(row["ok_count"])) for row in rows]
+
+    def metrics_provider_tokens(self) -> list[tuple[str, int, int, int, int]]:
+        """按渠道汇总各 token 类别（/metrics 的 tokens_total）。
+
+        返回 (provider, input, output, reasoning, cached)，排序稳定（provider）。
+        与 requests 同为 `usage_hourly`（永久）上的累计值。
+        """
+        rows = self._db.connect().execute(
+            "SELECT provider, "
+            "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+            "COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, "
+            "COALESCE(SUM(cached_tokens), 0) AS cached_tokens "
+            "FROM usage_hourly GROUP BY provider ORDER BY provider").fetchall()
+        return [(row["provider"], int(row["input_tokens"]), int(row["output_tokens"]),
+                 int(row["reasoning_tokens"]), int(row["cached_tokens"]))
+                for row in rows]
+
     @staticmethod
     def _group_row(row: Any, key: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:
         """把一行聚合结果转成 {分组键: ...} + 公共指标的 dict（各分组维度共用）。
