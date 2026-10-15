@@ -76,7 +76,13 @@ class CheckinTask:
             # 身份未知（provider 返回空 scope）时绝不共享：共享会让第二个账号被
             # 永久跳过（空 scope 相同 → seen 去重命中），代价是漏签一个号且无任何
             # 报错。回落到 credential_id 最坏只是多签一次，上游签到幂等（返回 ALREADY）。
-            scope = checkin_scope(data) or f"credential|{candidate.credential_id}"
+            # `None` 是另一回事——凭证级「本通道无签到活动」（如 Qoder lingma
+            # 区域）：整类跳过，不出网、不重试、不计失败。
+            scope = checkin_scope(data)
+            if scope is None:
+                report.skipped += 1
+                continue
+            scope = scope or f"credential|{candidate.credential_id}"
             done_key = self._done_key(day, scope)
             if self._sealed(done_key, current):
                 report.skipped += 1                      # 封账未到期，不再调上游

@@ -58,13 +58,36 @@ def test_parse_string_content_by_role():
         {"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}]))
     assert [m["role"] for m in parsed.messages] == ["user", "assistant"]
 
-def test_parse_rejects_unknown_role_and_bad_message():
-    with pytest.raises(InvalidRequest, match="role 'system' is not supported"):
-        parse_messages_request(_body(messages=[{"role": "system", "content": "x"}]))
-    # 数组 content 下的非法 role 走另一分支
-    with pytest.raises(InvalidRequest, match="role 'system' is not supported"):
+def test_parse_system_role_messages_merge_into_system():
+    # 字符串 content
+    parsed = parse_messages_request(_body(messages=[
+        {"role": "user", "content": "u"},
+        {"role": "system", "content": "hook-output"}]))
+    assert parsed.messages[0] == {"role": "system", "content": "hook-output"}
+    assert [m["role"] for m in parsed.messages[1:]] == ["user"]
+    # 数组 content 与顶层 system 合并，按出现顺序拼接
+    parsed = parse_messages_request(_body(system="top", messages=[
+        {"role": "system", "content": [{"type": "text", "text": "a"},
+                                        {"type": "text", "text": "b"}]},
+        {"role": "user", "content": "u"},
+        {"role": "system", "content": "c"}]))
+    assert parsed.messages[0] == {"role": "system", "content": "topabc"}
+    assert [m["role"] for m in parsed.messages[1:]] == ["user"]
+    # 仅 system 角色消息时也构成合法请求
+    parsed = parse_messages_request(_body(
+        messages=[{"role": "system", "content": "only"}]))
+    assert parsed.messages == [{"role": "system", "content": "only"}]
+
+def test_parse_system_role_message_rejects_bad_blocks():
+    with pytest.raises(InvalidRequest, match="not supported"):
         parse_messages_request(_body(messages=[{"role": "system", "content": [
-            {"type": "text", "text": "x"}]}]))
+            {"type": "image"}]}]))
+    with pytest.raises(InvalidRequest, match="string or an array"):
+        parse_messages_request(_body(messages=[{"role": "system", "content": 5}]))
+
+def test_parse_rejects_unknown_role_and_bad_message():
+    with pytest.raises(InvalidRequest, match="role 'tool' is not supported"):
+        parse_messages_request(_body(messages=[{"role": "tool", "content": "x"}]))
     with pytest.raises(InvalidRequest, match=r"messages\[0\] must be an object"):
         parse_messages_request(_body(messages=["x"]))
     with pytest.raises(InvalidRequest, match="string or an array"):

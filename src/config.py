@@ -131,6 +131,9 @@ class Settings(BaseSettings):
     # 需要保守部署时可关闭：关闭后仍会领取旅行礼物与任务奖励。
     growth_interval_minutes: int = 60
     growth_irreversible_actions: bool = True
+    # 每日签到（Qoder 账号领积分；lingma 区域无此活动自动跳过）。不需要该
+    # 活动的部署（如纯 Lingma 企业凭证）可整体关闭，后台不再定时出网。
+    checkin_enabled: bool = True
     # 活跃上报（CodeBuddy 与 CodeBuddy 国际版）：默认关闭。给账号补发一条
     # 对话事件，续上成长中心连登天数/活跃地图，与积分、调度无关。官方条款禁止脚本
     # 篡改活动数据（处罚为取消资格并追回礼品），开启前请评估账号风险；上游改版即失效。

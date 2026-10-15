@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -98,7 +99,14 @@ class QoderProvider:
         return qoder_events.classify_status(status, body)
 
     async def probe_quota(self, credential_data: dict) -> Quota:
-        return await self.client.probe_quota(QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if credential.realm == "lingma":
+            # lingma-api 域名下没有 openapi 额度端点（/api/v2/quota/usage 打过去
+            # 只会被拒，管理台误报「凭证被渠道拒绝」）。改用同网关、同 COSY 签名
+            # 的模型发现做存活探测；额度数值未知，返回三态的 None。
+            await self.client.fetch_models(credential)
+            return Quota(probed_at=int(time.time()))
+        return await self.client.probe_quota(credential)
 
     async def list_models(self, credential_data: dict) -> list[Model]:
         return await self.client.fetch_models(
@@ -121,21 +129,35 @@ class QoderProvider:
     # ---------------------------------------------------------------- 签到
 
     async def checkin(self, credential_data: dict) -> CheckinResult:
-        return await self.client.checkin(QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            # lingma-api 域名下没有签到活动（/me/campaigns 与旧 daily-check-in
+            # 都是 Qoder openapi 专属端点），pt-token 打过去只会 401
+            # TOKEN_EXPIRE——曾致后台任务每 10 分钟误报签到失败。与
+            # `probe_quota` 的 lingma 特判同源。
+            return CheckinResult(ok=False, message="Lingma 通道无每日签到活动")
+        return await self.client.checkin(credential)
 
     async def checkin_status(self, credential_data: dict) -> dict:
         """只读签到状态（管理台展示连续天数）；本区域无接口时返回非活动状态。"""
-        status, _ = await self.client.fetch_checkin_status(
-            QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            return status_to_dict(CheckinStatus())
+        status, _ = await self.client.fetch_checkin_status(credential)
         return status_to_dict(status or CheckinStatus(activity_name="Qoder 每日签到"))
 
-    def checkin_scope(self, credential_data: dict) -> str:
+    def checkin_scope(self, credential_data: dict) -> str | None:
         """签到隔离键：区域 + uid；身份未知时返回空串（调用方回落凭证 ID）。
 
         返回空串而不是「区域|」是安全取向：后者会让同区域所有未知身份的
         凭证算出同一个 scope，CheckinTask 的 seen 集合只跑第一个账号。
+
+        lingma 区域返回 `None`：该通道没有签到活动，任务层按「凭证级无此
+        能力」整类跳过（不重试、不告警），区别于空串的「身份未知仍要签」。
         """
         credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            return None
         if not credential.uid:
             return ""
         return f"{realm_for(credential)}|{credential.uid}"

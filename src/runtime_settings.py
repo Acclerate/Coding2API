@@ -120,6 +120,10 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("growth_interval_minutes", int, "成长中心周期（分钟）",
                "成长中心后台任务的一轮间隔；下限 5 分钟（更密只会撞上游风控）。",
                minimum=5, task="growth", floor=5),
+    HotSetting("checkin_enabled", bool, "每日签到开关",
+               "Qoder 账号的每日签到（领积分）。lingma 区域无此活动、自动跳过；"
+               "不需要该活动的部署可整体关闭，后台不再定时出网。管理台手动"
+               "「签到」按钮不受影响。", task="checkin"),
     HotSetting("refresh_interval_minutes", int, "token 预刷新周期（分钟）",
                "后台 token 预刷新任务的一轮间隔；下限 5 分钟。短寿命渠道"
                "（CodeArts STS 2h）会把预刷新窗口封顶，此时该周期必须窄于窗口，"
@@ -667,6 +671,10 @@ class RuntimeSettings:
     @property
     def activity_report_enabled(self) -> bool:
         return bool(self.get("activity_report_enabled"))
+
+    @property
+    def checkin_enabled(self) -> bool:
+        return bool(self.get("checkin_enabled"))
 
     @property
     def activity_report_hour(self) -> int:

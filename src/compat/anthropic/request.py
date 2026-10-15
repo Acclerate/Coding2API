@@ -13,6 +13,10 @@ Claude Code / Anthropic SDK 会用的子集，其余显式 400（`InvalidRequest
   - `assistant` 的 text 块 → assistant 消息正文；`tool_use` 块 → chat
     `tool_calls`（`input` 对象序列化成 `arguments` JSON 串）；`thinking`
     块 → assistant 的 `reasoning_content`
+  - `system` 的消息（Claude Code 在 SDK/`-p` 模式下会把 SessionStart hook
+    输出以 `role:"system"` 消息携带）→ 文本按出现顺序并入开头的 system
+    消息，而不是 400——官方 API 接受该形状，拒绝会导致 Claude Code 静默
+    丢弃整次回复
   - `image` / `document` 块本网关暂不支持 → 400
 - `tools` 的 `{name, description, input_schema}` → chat
   `{type:"function", function:{name, description, parameters}}`
@@ -56,6 +60,30 @@ def _text_from_system(system: Any) -> str:
     if system is None:
         return ""
     raise InvalidRequest("system must be a string or an array")
+
+
+def _text_from_system_message(content: Any, where: str) -> str:
+    """`role:"system"` 消息的 content（字符串或 text 块数组）→ 纯文本。
+
+    与顶层 `system` 同构校验；图片等不支持的块依旧 400。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise InvalidRequest(f"{where}.content[{index}] must be an object")
+            kind = block.get("type")
+            if kind == "text":
+                parts.append(_block_text(block, f"{where}.content[{index}]"))
+            elif kind in ("image", "document"):
+                raise InvalidRequest(
+                    f"content block type {kind!r} is not supported by this gateway")
+            else:
+                raise InvalidRequest(f"unknown content block type {kind!r}")
+        return "".join(parts)
+    raise InvalidRequest(f"{where}.content must be a string or an array")
 
 
 def _block_text(block: dict[str, Any], where: str) -> str:
@@ -179,17 +207,26 @@ def _assistant_message(blocks: list[Any]) -> dict[str, Any] | None:
     return message
 
 
-def _map_messages(raw_messages: list[Any]) -> list[dict[str, Any]]:
+def _map_messages(raw_messages: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """→ (chat 消息序列, `role:"system"` 消息按出现顺序收集的文本)。
+
+    system 角色的文本不保留原位（chat 上游没有 mid-conversation system），
+    由调用方并入开头 system 消息。
+    """
     messages: list[dict[str, Any]] = []
+    system_texts: list[str] = []
     for index, item in enumerate(raw_messages):
         if not isinstance(item, dict):
             raise InvalidRequest(f"messages[{index}] must be an object")
         role = item.get("role")
         content = item.get("content")
         if isinstance(content, str):
-            if role not in ("user", "assistant"):
+            if role == "system":
+                system_texts.append(content)
+            elif role in ("user", "assistant"):
+                messages.append({"role": role, "content": content})
+            else:
                 raise InvalidRequest(f"message role {role!r} is not supported")
-            messages.append({"role": role, "content": content})
             continue
         if not isinstance(content, list):
             raise InvalidRequest(
@@ -200,9 +237,13 @@ def _map_messages(raw_messages: list[Any]) -> list[dict[str, Any]]:
             mapped = _assistant_message(content)
             if mapped is not None:
                 messages.append(mapped)
+        elif role == "system":
+            text = _text_from_system_message(content, f"messages[{index}]")
+            if text:
+                system_texts.append(text)
         else:
             raise InvalidRequest(f"message role {role!r} is not supported")
-    return messages
+    return messages, system_texts
 
 
 def _map_tools(tools: Any) -> list[dict[str, Any]]:
@@ -255,10 +296,13 @@ def parse_messages_request(body: Any) -> ChatRequest:
         raise InvalidRequest("messages must be a non-empty array")
 
     messages: list[dict[str, Any]] = []
+    mapped_messages, system_texts = _map_messages(raw_messages)
     system = _text_from_system(body.get("system"))
+    if system_texts:
+        system = "".join([system, *system_texts]) if system else "".join(system_texts)
     if system:
         messages.append({"role": "system", "content": system})
-    messages.extend(_map_messages(raw_messages))
+    messages.extend(mapped_messages)
     if not messages:
         raise InvalidRequest("messages must contain at least one message")
 

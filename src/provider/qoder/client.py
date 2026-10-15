@@ -254,8 +254,15 @@ class QoderClient:
             return list(self._gateway_fallbacks)
         realm = realm_for(credential)
         configured = gateway_candidates(realm)
-        # client 的 gateway 覆盖了区域主选时，用它替换列表首项（测试与灰度）
-        if configured and configured[0] != self.gateway:
+        # client 的 gateway 覆盖了区域主选时，用它替换列表首项（测试与灰度）。
+        # 但默认装配的 gateway 就是默认区域（cn）主选——对 lingma/intl 等其他
+        # 区域的凭证这不是「覆盖」而是「错域」：替换会把请求全部路由到 cn 网关、
+        # 被 403 code 105 拒绝。故仅当凭证属于默认区域，或 gateway 是显式自定义
+        # 值（不在默认区域主机清单内）时才替换。
+        default_hosts = gateway_candidates(qoder_events.DEFAULT_REALM)
+        if (configured and configured[0] != self.gateway
+                and (realm == qoder_events.DEFAULT_REALM
+                     or self.gateway not in default_hosts)):
             configured = [self.gateway, *configured[1:]]
         return configured or [self.gateway]
 

@@ -84,6 +84,28 @@ async def test_provider_models_quota_refresh_and_scopes():
     assert await provider.refresh({"access_token": "t"}) == {"access_token": "t"}
     assert provider.checkin_scope({"uid": "u", "realm": "intl"}) == "intl|u"
     assert provider.checkin_scope({"realm": "intl"}) == ""
+    # lingma 区域无签到活动：凭证级 None（任务层据此跳过），不出网
+    assert provider.checkin_scope({"uid": "u", "realm": "lingma"}) is None
+    await provider.aclose()
+
+async def test_provider_lingma_checkin_short_circuits_without_upstream():
+    """lingma 凭证的签到/签到状态直接返回「无活动」，不触碰上游。
+
+    回归用例：pt-token 打 Qoder openapi 签到端点只会 401 TOKEN_EXPIRE，
+    后台任务曾每 10 分钟误报一次签到失败。handler 一旦被调用即失败
+    （AssertionError），证明分支确实短路。
+    """
+    from src.provider.qoder import QoderProvider
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("lingma 签到不应出网")
+
+    provider = QoderProvider(client=handler_for(handler))
+    result = await provider.checkin({"realm": "lingma", "access_token": "pt-x"})
+    assert result.ok is False and "无每日签到活动" in (result.message or "")
+    status = await provider.checkin_status({"realm": "lingma",
+                                            "access_token": "pt-x"})
+    assert status["active"] is False and status["today_checked_in"] is False
     await provider.aclose()
 
 async def test_provider_refresh_delegates_for_oauth():

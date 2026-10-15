@@ -239,6 +239,9 @@ def health_score(quota: Quota | None) -> int | None:
     """三态健康度：known(0-100) / unknown(None) / exhausted(-1)。"""
     if quota is None or quota.probe_failed:
         return UNKNOWN
+    # 探测成功但额度字段全为空（如 lingma 无 openapi 额度端点）→ 未知，非耗尽
+    if quota.remaining is None and quota.total is None:
+        return UNKNOWN
     if quota.total is None or quota.total <= 0:
         return EXHAUSTED
     remaining = quota.remaining or 0.0

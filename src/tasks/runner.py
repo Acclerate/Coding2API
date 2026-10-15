@@ -64,6 +64,7 @@ class TaskRunner:
     backup_interval_minutes: int | Callable[[], int] = 1440,
     activity_enabled: Callable[[], bool] | None = None,
     alert_enabled: Callable[[], bool] | None = None,
+    checkin_enabled: Callable[[], bool] | None = None,
     status: TaskStatusStore | None = None,
 ) -> None:
         self._quota_probe = quota_probe
@@ -91,6 +92,9 @@ class TaskRunner:
         self._activity_enabled = activity_enabled or (lambda: activity is not None)
         # 运维告警同理由 AlertTask 自己问（关着时 run_once 返回 None）
         self._alert_enabled = alert_enabled or (lambda: alert is not None)
+        # 每日签到同理（不需要该活动的部署整体关掉；lingma 区域由 provider
+        # 的 checkin_scope 逐凭证跳过，与本开关正交）
+        self._checkin_enabled = checkin_enabled or (lambda: True)
         # 活跃上报：每 10 分钟醒一次看时点（due() 只在配置小时窗口内放行），
         # 而不是整点只醒一次——服务恰在整点重启会整天漏报
         self._activity_interval = 600
@@ -205,7 +209,12 @@ class TaskRunner:
         return await self._activity.run_once()
 
     async def _sync_checkin(self) -> object:
-        """全天每 10 分钟一轮；成功凭证当日封账（run_once 内跳过），失败凭证持续重试。"""
+        """全天每 10 分钟一轮；成功凭证当日封账（run_once 内跳过），失败凭证持续重试。
+
+        关闭时每轮现读开关（no-op），管理台「任务与配置」页显示为停用。
+        """
+        if not self._checkin_enabled():
+            return None
         if not self._checkin.due():
             return None
         return await self._checkin.run_once()
@@ -347,6 +356,8 @@ class TaskRunner:
             return bool(self._activity_enabled())
         if key == "alert":
             return bool(self._alert_enabled())
+        if key == "checkin":
+            return bool(self._checkin_enabled())
         return True
 
     async def stop(self) -> None:
@@ -465,5 +476,6 @@ def build_runner(credentials, providers: dict, stats_collector, config,
         backup_interval_minutes=lambda: config.backup_interval_minutes,
         activity_enabled=lambda: config.activity_report_enabled,
         alert_enabled=lambda: config.alert_enabled,
+        checkin_enabled=lambda: config.checkin_enabled,
         status=status_store,
     )
