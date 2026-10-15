@@ -5,6 +5,20 @@
 > [!WARNING]
 > 逆向接口，仅供学习研究，未做安全审计；公网部署需反向代理 + 鉴权 + IP 白名单。
 
+## 最近更新
+
+### 主要功能增强
+
+- **Claude Code 兼容性提升**：现在能够正确处理来自 Claude Code 的 `role:"system"` 消息，解决了之前可能导致整次回复被静默丢弃的问题
+- **新增 Qoder Provider**：完整实现了 Qoder 作为新的服务提供者，包括客户端、事件处理和完整的单元测试
+- **任务系统强化**：Check-in 任务有显著增强，相关测试用例大幅增加，表明对关键路径的质量要求提高
+
+### 基础设施更新
+
+- 配置和运行时设置模块有所增强
+- 依赖项有重大变更，可能引入了新功能或安全修复
+- 提升了多个模块的测试覆盖，特别是核心任务系统的测试
+
 ## 特性
 
 - **OpenAI 兼容出口**：`/v1/chat/completions`（流式 + 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Anthropic / Claude Code）、`/v1/models`、`/v1/user/balance`（DeepSeek 兼容余额）。
