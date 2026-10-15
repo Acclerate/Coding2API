@@ -102,8 +102,9 @@ export const api = {
     }),
 
   // ------------------------------------------------------------ 用户管理
-  users: (sort?: string, order?: string) =>
-    request<{ users: UserRow[] }>(`/api/users${query({ sort, order })}`),
+  users: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<{ users: UserRow[]; total: number }>(
+      `/api/users${query({ sort, order, limit, offset })}`),
   createUser: (username: string, role: Role) =>
     request<ActivationIssued>("/api/users", { method: "POST", ...json({ username, role }) }),
   updateUserRole: (username: string, role: Role) =>
@@ -129,7 +130,6 @@ export const api = {
   audit: (filters: { actor?: string; action?: string; limit?: number; offset?: number;
                      sort?: string; order?: string } = {}) =>
     request<AuditResponse>(`/api/audit${query(filters)}`),
-
   // ---------------------------------------------------------------- 凭证
   credentials: (sort?: string, order?: string) =>
     request<CredentialsResponse>(`/api/credentials${query({ sort, order })}`),
@@ -200,8 +200,9 @@ export const api = {
     }),
 
   // ------------------------------------------------------------- API Key
-  apiKeys: (sort?: string, order?: string) =>
-    request<{ api_keys: ApiKey[] }>(`/api/api-keys${query({ sort, order })}`),
+  apiKeys: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<{ api_keys: ApiKey[]; total: number }>(
+      `/api/api-keys${query({ sort, order, limit, offset })}`),
   createApiKey: (payload: {
     name: string;
     provider_binding?: string;
@@ -227,14 +228,17 @@ export const api = {
   /** 手动运行一个后台任务一轮（管理台「立即运行」）；同步等结果返回。 */
   runTask: (key: string) =>
     request<TaskRunResult>(`/api/tasks/${encodeURIComponent(key)}/run`, { method: "POST" }),
-  /** 运维告警记录：后台评估命中后落库，倒序回看。 */
-  alerts: (sort?: string, order?: string) =>
-    request<AlertsResponse>(`/api/alerts${query({ sort, order })}`),
+  /** 运维告警记录：后台评估命中后落库，倒序回看（分页）。 */
+  alerts: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<AlertsResponse>(`/api/alerts${query({ sort, order, limit, offset })}`),
   /** 上游官方状态页聚合快照（进程内、重启归零）：只读展示，不参与选号 / 熔断。 */
   upstreamStatus: () => request<UpstreamStatusResponse>("/api/upstream-status"),
-  /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示。 */
-  modelCatalog: (sort?: string, order?: string) =>
-    request<ModelCatalogResponse>(`/api/model-catalog${query({ sort, order })}`),
+  /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示（服务端分页 + 筛选）。 */
+  modelCatalog: (sort?: string, order?: string, q?: string, onlyAvailable?: boolean,
+                 limit?: number, offset?: number) =>
+    request<ModelCatalogResponse>(
+      `/api/model-catalog${query({ sort, order, q, only_available: onlyAvailable,
+                                   limit, offset })}`),
 
   // ---------------------------------------------------------------- 统计
   // `since` / `until`：自定义时间窗两端（半开 `[since, until)`，epoch 秒）。
@@ -299,7 +303,7 @@ export const api = {
   },
 };
 
-function query(params: Record<string, string | number | undefined>): string {
+function query(params: Record<string, string | number | boolean | undefined>): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== "") search.set(key, String(value));

@@ -237,6 +237,61 @@ def test_model_catalog_availability_ignores_channel_without_credentials(tmp_path
         rows = {row["id"]: row for row in client.get("/api/model-catalog").json()["models"]}
     assert rows["z-ai/glm-5.3"]["available"] is False
 
+def test_model_catalog_filters_and_paginates_server_side(tmp_path, monkeypatch):
+    """`q` / `only_available` / `limit` / `offset` 都在服务端生效，`total` 是筛选后条数。
+
+    `count` 仍是目录全量（页头「命中 N / 共 M」），只有 `total` 随筛选变化。
+    """
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+        "moonshotai/kimi-k3": {"id": "moonshotai/kimi-k3", "name": "Kimi K3",
+                               "provider": "moonshotai", "input": 0.5, "output": 1.0,
+                               "cache_read": 0.05},
+        "xai/grok": {"id": "xai/grok", "name": "Grok", "provider": "xai",
+                     "input": 2.0, "output": 4.0, "cache_read": 0.2},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    # 只有 glm-5.3 接了渠道 → only_available 只剩它
+    _seed_models(app.state.services, models={"glm-5.3": "GLM 5.3"})
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+
+        # 空 q（None / 纯空白）不筛；count 恒为目录全量
+        all_payload = client.get("/api/model-catalog", params={"q": "  "}).json()
+        assert all_payload["count"] == 3
+        assert all_payload["total"] == 3
+
+        # q 命中 id：大小写不敏感
+        by_id = client.get("/api/model-catalog", params={"q": "KIMI"}).json()
+        assert [row["id"] for row in by_id["models"]] == ["moonshotai/kimi-k3"]
+        assert by_id["total"] == 1
+
+        # q 命中名称（id 里没有 needle）
+        by_name = client.get("/api/model-catalog", params={"q": "grok"}).json()
+        assert [row["id"] for row in by_name["models"]] == ["xai/grok"]
+
+        # 既不命中 id 也不命中名称 → 空表 + total=0
+        none_hit = client.get("/api/model-catalog", params={"q": "zzz"}).json()
+        assert none_hit["models"] == [] and none_hit["total"] == 0
+
+        # only_available 只留接入渠道的行
+        available = client.get("/api/model-catalog", params={"only_available": True}).json()
+        assert [row["id"] for row in available["models"]] == ["z-ai/glm-5.3"]
+        assert available["total"] == 1
+
+        # limit / offset 切片：id 升序下取第 2 条（kimi-k3 < xai/grok < z-ai/glm-5.3）
+        page = client.get("/api/model-catalog", params={"limit": 1, "offset": 1}).json()
+        assert [row["id"] for row in page["models"]] == ["xai/grok"]
+        assert page["total"] == 3
+
+
 def test_model_catalog_endpoint_empty_table(tmp_path, monkeypatch):
     """无快照时回空表 + saved_at=None（页面显示空态，不是错误）。"""
     async def no_models(_url):

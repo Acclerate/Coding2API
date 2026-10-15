@@ -5,8 +5,8 @@ import { jsonResponse, renderPage, settle, userEvent } from "@/test-utils";
 
 const LABELS = { login_success: "登录成功", user_disable: "禁用用户" };
 
-function auditPayload(events: unknown[]) {
-  return { events, actions: ["login_success", "user_disable"], labels: LABELS };
+function auditPayload(events: unknown[], total = events.length) {
+  return { events, total, actions: ["login_success", "user_disable"], labels: LABELS };
 }
 
 function stubFetch(body: unknown, status = 200) {
@@ -106,7 +106,8 @@ describe("AuditPage", () => {
     const full = Array.from({ length: 50 }, (_, index) => ({
       ...EVENT, id: `audit_${index}`,
     }));
-    const spy = stubFetch(auditPayload(full));
+    // total > 本页条数 → 还有下一页（页数由后端 total 算出）
+    const spy = stubFetch(auditPayload(full, 120));
     renderPage(<AuditPage />, { username: "root", is_admin: true });
     await settle();
 
@@ -116,10 +117,11 @@ describe("AuditPage", () => {
       const urls = spy.mock.calls.map(([url]) => String(url));
       expect(urls.some((url) => url.includes("offset=50"))).toBe(true);
     });
-    expect(screen.getByText(/第 2 页/)).toBeInTheDocument();
+    expect(screen.getByTestId("audit-page-info")).toHaveTextContent("第 2 / 3 页");
 
     await userEvent.click(screen.getByTestId("audit-prev"));
-    await waitFor(() => expect(screen.getByText(/第 1 页/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("audit-page-info")).toHaveTextContent("第 1 / 3 页"));
   });
 
   it("不满一页时下一页禁用", async () => {

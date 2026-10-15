@@ -32,10 +32,12 @@ export function useCredentials(username?: string, refetchIntervalMs?: number,
   });
 }
 
-export function useApiKeys(username?: string, sort?: string, order?: string) {
+export function useApiKeys(username?: string, sort?: string, order?: string,
+                           limit?: number, offset?: number) {
   return useQuery({
-    queryKey: adminKey(username, "api-keys", sort, order),
-    queryFn: () => api.apiKeys(sort, order),
+    queryKey: adminKey(username, "api-keys", sort, order, limit, offset),
+    queryFn: () => api.apiKeys(sort, order, limit, offset),
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -57,19 +59,25 @@ export function usePlaygroundModels() {
   });
 }
 
-/** OpenRouter 模型目录（模型列表页）不缓存太久的引用数据；与凭证/设置同区分。 */
-export function useModelCatalog(username?: string, sort?: string, order?: string) {
+/** OpenRouter 模型目录（模型列表页）：服务端分页 + 筛选，翻页保留上一页避免闪烁。 */
+export function useModelCatalog(username?: string, sort?: string, order?: string,
+                                q?: string, onlyAvailable?: boolean,
+                                limit?: number, offset?: number) {
   return useQuery({
-    queryKey: adminKey(username, "model-catalog", sort, order),
-    queryFn: () => api.modelCatalog(sort, order),
+    queryKey: adminKey(username, "model-catalog", sort, order, q, onlyAvailable,
+                       limit, offset),
+    queryFn: () => api.modelCatalog(sort, order, q, onlyAvailable, limit, offset),
+    placeholderData: keepPreviousData,
   });
 }
 
 /** 用户列表（admin only）。改动后由 useUserMutation 统一失效。 */
-export function useUsers(username?: string, sort?: string, order?: string) {
+export function useUsers(username?: string, sort?: string, order?: string,
+                         limit?: number, offset?: number) {
   return useQuery({
-    queryKey: adminKey(username, "users", sort, order),
-    queryFn: () => api.users(sort, order),
+    queryKey: adminKey(username, "users", sort, order, limit, offset),
+    queryFn: () => api.users(sort, order, limit, offset),
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -84,16 +92,19 @@ export function useAudit(
                        filters.limit ?? 100, filters.offset ?? 0,
                        filters.sort ?? "", filters.order ?? ""),
     queryFn: () => api.audit(filters),
+    placeholderData: keepPreviousData,
   });
 }
 
 /** 运维告警记录（admin only）。轮询：告警是「刚刚发生了什么」，需要自己刷新。 */
 export function useAlerts(username?: string, refetchIntervalMs = 30_000,
-                          sort?: string, order?: string) {
+                          sort?: string, order?: string,
+                          limit?: number, offset?: number) {
   return useQuery({
-    queryKey: adminKey(username, "alerts", sort, order),
-    queryFn: () => api.alerts(sort, order),
+    queryKey: adminKey(username, "alerts", sort, order, limit, offset),
+    queryFn: () => api.alerts(sort, order, limit, offset),
     refetchInterval: refetchIntervalMs,
+    placeholderData: keepPreviousData,
   });
 }
 

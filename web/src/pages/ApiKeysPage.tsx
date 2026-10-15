@@ -9,10 +9,12 @@ import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
 import { buildSections, displayName, modelValue } from "../components/ModelPicker";
 import { PROVIDER_LABEL, PROVIDER_ORDER } from "../api/providers";
 import { buildCcSwitchLink, CCSWITCH_TARGETS } from "../lib/ccSwitch";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import type { ApiKey, ApiKeyCreated } from "../api/types";
 import {
   Badge,
@@ -470,8 +472,20 @@ export function CcSwitchImportButtons({
 
 export function ApiKeysPage() {
   const { sort, order, toggle } = useSort("created_at", "asc", { last_used_at: "desc" });
-  const { data, isLoading } = useApiKeys(undefined, sort, order);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const { data, isLoading, isFetching } = useApiKeys(undefined, sort, order,
+                                                     pageSize, page * pageSize);
   const client = useQueryClient();
+  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
+  const toggleSort = (columnKey: string) => {
+    toggle(columnKey);
+    setPage(0);
+  };
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+  };
   const [name, setName] = useState("");
   const [binding, setBinding] = useState("");
   const [allowedIps, setAllowedIps] = useState("");
@@ -582,24 +596,25 @@ export function ApiKeysPage() {
             data-testid="no-keys"
           />
         ) : (
+          <>
           <Table data-testid="keys-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="名称" columnKey="name" active={sort === "name"}
-                              direction={order} onToggle={toggle} testId="sort-name" />
+                              direction={order} onToggle={toggleSort} testId="sort-name" />
                 <TableHead>Key</TableHead>
                 <SortableHead label="渠道" columnKey="provider_binding"
                               active={sort === "provider_binding"} direction={order}
-                              onToggle={toggle} testId="sort-provider_binding" />
+                              onToggle={toggleSort} testId="sort-provider_binding" />
                 <TableHead>来源 IP</TableHead>
                 <TableHead>模型白名单</TableHead>
                 <SortableHead label="到期" columnKey="expires_at" active={sort === "expires_at"}
-                              direction={order} onToggle={toggle} testId="sort-expires_at" />
+                              direction={order} onToggle={toggleSort} testId="sort-expires_at" />
                 <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
-                              direction={order} onToggle={toggle} testId="sort-created_at" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <SortableHead label="最后使用" columnKey="last_used_at"
                               active={sort === "last_used_at"} direction={order}
-                              onToggle={toggle} testId="sort-last_used_at" />
+                              onToggle={toggleSort} testId="sort-last_used_at" />
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -658,6 +673,16 @@ export function ApiKeysPage() {
               ))}
             </TableBody>
           </Table>
+          <Pagination
+            testId="keys"
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            busy={isFetching}
+            onPageChange={setPage}
+            onPageSizeChange={changePageSize}
+          />
+          </>
         )}
       </Panel>
 

@@ -421,6 +421,14 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 适用端点：`/api/credentials`、`/api/users`、`/api/api-keys`、`/api/audit`、`/api/alerts`、`/api/model-catalog`、`/api/credentials/{id}/credit-events`、`/api/credentials/{id}/accounts`、`/api/stats/by-*`、`/api/stats/events`（逐请求明细：默认按 rowid 游标分页返回 `next_before`；按其它列排序或时间升序时改用 `LIMIT/OFFSET` 并返回 `total`）。各端点的白名单键与默认排序见 `src/api/`。
 
+### 列表分页
+
+管理台各列表**统一分页**：共享同一套页码文案（`第 N / M 页`）、每页选项（`20 / 50 / 100`，默认 `50`）与上一页 / 下一页按钮。扁平列表一律由**后端**分页——`GET` 列表端点接受 `limit`（每页条数）+ `offset`（偏移）并返回 `total`（**筛选后**的总条数，供前端算页数）；原列表键名不变，只新增 `total`，向后兼容。`/api/users`、`/api/api-keys`、`/api/alerts`、`/api/audit` 在 SQL 层 `LIMIT/OFFSET`；`/api/model-catalog` 因排序键含派生字段（能力分 / 可用性）先内存排序再切片。
+
+`/api/model-catalog` 另接受两个筛选参数（服务端生效，前端搜索框去抖 250ms 后回第一页）：`q`（大小写不敏感地匹配模型 `id` 与名称）与 `only_available`（`true` 时只留 `available=true` 的行）。`total` 是筛选后的条数，顶层 `count` 仍是目录全量（页头展示「命中 N / 共 M」）。
+
+**分组类表**（凭证页按渠道分组、用量统计分组表）不分页，保持一次性全量展示——它们的行数由渠道 / 分组维度决定，本就不受明细规模影响。
+
 ## 后台任务
 
 额度探测、token 预刷新、每日签到、成长中心、活跃上报、明细清理、数据库备份、渠道模型列表刷新、模型目录刷新（OpenRouter）、运维告警、上游状态页聚合共 11 类，由 `TaskRunner` 自动调度，失败互不影响。每类任务的上次执行时间、最近结果与错误在管理台**「任务与配置」页**查看（30 秒自动刷新），运行态只存在于**本次进程**内，重启归零。每个任务卡片带「立即运行」按钮（`POST /api/tasks/{key}/run`，admin + CSRF）：**绕过时点窗口但绕过不了开关**——`due()` 未到点也照跑，而任务被开关关掉时如实回 `ran=false`（不把「关了」谎报成「跑过了」）；同一任务已在跑时立刻回 `busy=true`、不排队、不并发打上游；同步等这一轮跑完再返回结果。

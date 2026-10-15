@@ -6,7 +6,9 @@ import { useSessionContext } from "../Layout";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
   Badge,
   Button,
@@ -24,22 +26,21 @@ import {
   TableRow,
 } from "../ui";
 
-const PAGE_SIZE = 50;
-
 export function AuditPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("ts", "desc", { ts: "desc" });
   const [actor, setActor] = useState("");
   const [action, setAction] = useState("");
-  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
 
   // actor 用输入框，提交时才进查询（避免每敲一个字都打一次接口）
   const [actorDraft, setActorDraft] = useState("");
-  const { data, isLoading } = useAudit(session.username, {
+  const { data, isLoading, isFetching } = useAudit(session.username, {
     actor: actor || undefined,
     action: action || undefined,
-    limit: PAGE_SIZE,
-    offset,
+    limit: pageSize,
+    offset: page * pageSize,
     sort,
     order,
   });
@@ -47,16 +48,22 @@ export function AuditPage() {
   const events = data?.events ?? [];
   const labels = data?.labels ?? {};
   const actions = data?.actions ?? [];
+  const total = data?.total ?? 0;
 
+  /** 换筛选 / 排序 = 换数据集：回到第一页，避免停在越界页码上（空白）。 */
   const reset = (next: () => void) => {
-    setOffset(0);
+    setPage(0);
     next();
   };
 
-  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
   const toggleSort = (columnKey: string) => {
     toggle(columnKey);
-    setOffset(0);
+    setPage(0);
+  };
+
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
   };
 
   return (
@@ -177,31 +184,15 @@ export function AuditPage() {
                 ))}
               </TableBody>
             </Table>
-            <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground">
-              <span>
-                第 {Math.floor(offset / PAGE_SIZE) + 1} 页
-              </span>
-              <span className="inline-flex gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={offset === 0}
-                  data-testid="audit-prev"
-                  onClick={() => setOffset((value) => Math.max(0, value - PAGE_SIZE))}
-                >
-                  上一页
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={events.length < PAGE_SIZE}
-                  data-testid="audit-next"
-                  onClick={() => setOffset((value) => value + PAGE_SIZE)}
-                >
-                  下一页
-                </Button>
-              </span>
-            </div>
+            <Pagination
+              testId="audit"
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              busy={isFetching}
+              onPageChange={setPage}
+              onPageSizeChange={changePageSize}
+            />
           </>
         )}
       </Panel>

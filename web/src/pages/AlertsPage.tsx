@@ -1,11 +1,14 @@
 import { BellRing } from "lucide-react";
+import { useState } from "react";
 import { ALERT_RULE_LABEL, formatTime } from "../api/display";
 import { useAlerts } from "../api/hooks";
 import { useSessionContext } from "../Layout";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
   Badge,
   EmptyState,
@@ -29,10 +32,24 @@ function severityTone(severity: string): "danger" | "warn" | "muted" {
 export function AlertsPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("ts", "desc", { ts: "desc" });
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   // 30 秒轮询：告警是「刚刚发生了什么」，用户停留时自动刷新。
-  const { data, isLoading } = useAlerts(session.username, 30_000, sort, order);
+  const { data, isLoading, isFetching } = useAlerts(
+    session.username, 30_000, sort, order, pageSize, page * pageSize);
 
   const alerts = data?.alerts ?? [];
+  const total = data?.total ?? 0;
+
+  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
+  const toggleSort = (columnKey: string) => {
+    toggle(columnKey);
+    setPage(0);
+  };
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+  };
 
   return (
     <div className="space-y-6" data-testid="alerts-page">
@@ -44,7 +61,7 @@ export function AlertsPage() {
       />
 
       <Panel
-        title={`最近告警${data ? `（${alerts.length} 条）` : ""}`}
+        title={`最近告警${data ? `（共 ${total} 条）` : ""}`}
         aria-label="告警记录"
       >
         {isLoading ? (
@@ -57,61 +74,72 @@ export function AlertsPage() {
             data-testid="no-alerts"
           />
         ) : (
-          <Table data-testid="alerts-table" cards>
-            <TableHeader>
-              <TableRow>
-                <SortableHead label="时间" columnKey="ts" active={sort === "ts"}
-                              direction={order} onToggle={toggle} testId="sort-ts" />
-                <SortableHead label="级别" columnKey="severity" active={sort === "severity"}
-                              direction={order} onToggle={toggle} testId="sort-severity" />
-                <SortableHead label="规则" columnKey="rule" active={sort === "rule"}
-                              direction={order} onToggle={toggle} testId="sort-rule" />
-                <SortableHead label="对象" columnKey="scope" active={sort === "scope"}
-                              direction={order} onToggle={toggle} testId="sort-scope" />
-                <TableHead>说明</TableHead>
-                <SortableHead label="推送" columnKey="delivered" active={sort === "delivered"}
-                              direction={order} onToggle={toggle} testId="sort-delivered" />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {alerts.map((alert) => (
-                <TableRow key={alert.id} data-testid={`alert-row-${alert.id}`}>
-                  <TableCell label="时间" className="whitespace-nowrap text-xs tabular-nums">
-                    {formatTime(alert.ts)}
-                  </TableCell>
-                  <TableCell label="级别">
-                    {alert.resolved_at !== null ? (
-                      <Badge tone="ok" dot>
-                        已恢复
-                      </Badge>
-                    ) : (
-                      <Badge tone={severityTone(alert.severity)} dot>
-                        {alert.severity === "critical" ? "严重" : "警告"}
-                      </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell label="规则" className="text-xs">
-                    {ALERT_RULE_LABEL[alert.rule] ?? alert.rule}
-                  </TableCell>
-                  <TableCell label="对象" className="font-mono text-xs">
-                    {alert.scope || "—"}
-                  </TableCell>
-                  <TableCell label="说明" className="text-xs">{alert.message}</TableCell>
-                  <TableCell label="推送">
-                    {alert.delivered === 1 ? (
-                      <Badge tone="ok" dot>
-                        已推送
-                      </Badge>
-                    ) : (
-                      <Badge tone="muted">
-                        {alert.delivery_error ? "推送失败" : "站内"}
-                      </Badge>
-                    )}
-                  </TableCell>
+          <>
+            <Table data-testid="alerts-table" cards>
+              <TableHeader>
+                <TableRow>
+                  <SortableHead label="时间" columnKey="ts" active={sort === "ts"}
+                                direction={order} onToggle={toggleSort} testId="sort-ts" />
+                  <SortableHead label="级别" columnKey="severity" active={sort === "severity"}
+                                direction={order} onToggle={toggleSort} testId="sort-severity" />
+                  <SortableHead label="规则" columnKey="rule" active={sort === "rule"}
+                                direction={order} onToggle={toggleSort} testId="sort-rule" />
+                  <SortableHead label="对象" columnKey="scope" active={sort === "scope"}
+                                direction={order} onToggle={toggleSort} testId="sort-scope" />
+                  <TableHead>说明</TableHead>
+                  <SortableHead label="推送" columnKey="delivered" active={sort === "delivered"}
+                                direction={order} onToggle={toggleSort} testId="sort-delivered" />
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {alerts.map((alert) => (
+                  <TableRow key={alert.id} data-testid={`alert-row-${alert.id}`}>
+                    <TableCell label="时间" className="whitespace-nowrap text-xs tabular-nums">
+                      {formatTime(alert.ts)}
+                    </TableCell>
+                    <TableCell label="级别">
+                      {alert.resolved_at !== null ? (
+                        <Badge tone="ok" dot>
+                          已恢复
+                        </Badge>
+                      ) : (
+                        <Badge tone={severityTone(alert.severity)} dot>
+                          {alert.severity === "critical" ? "严重" : "警告"}
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell label="规则" className="text-xs">
+                      {ALERT_RULE_LABEL[alert.rule] ?? alert.rule}
+                    </TableCell>
+                    <TableCell label="对象" className="font-mono text-xs">
+                      {alert.scope || "—"}
+                    </TableCell>
+                    <TableCell label="说明" className="text-xs">{alert.message}</TableCell>
+                    <TableCell label="推送">
+                      {alert.delivered === 1 ? (
+                        <Badge tone="ok" dot>
+                          已推送
+                        </Badge>
+                      ) : (
+                        <Badge tone="muted">
+                          {alert.delivery_error ? "推送失败" : "站内"}
+                        </Badge>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <Pagination
+              testId="alerts"
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              busy={isFetching}
+              onPageChange={setPage}
+              onPageSizeChange={changePageSize}
+            />
+          </>
         )}
       </Panel>
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Boxes, CircleDollarSign, RefreshCw, Search, Trophy } from "lucide-react";
 import { useSessionContext } from "../Layout";
 import { useModelCatalog } from "../api/hooks";
@@ -10,11 +10,12 @@ import {
 } from "../api/display";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
 import { ColumnHint } from "../components/Tip";
 import { useSort } from "../hooks/useSort";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
-  Button,
   Checkbox,
   Empty,
   Input,
@@ -22,7 +23,6 @@ import {
   Metric,
   Notice,
   Panel,
-  Select,
   Table,
   TableBody,
   TableCell,
@@ -40,9 +40,6 @@ const CURRENCIES = [
   { value: "USD", label: "美元" },
   { value: "CNY", label: "人民币" },
 ];
-
-/** 分页步长：与「用量统计」明细表一致，默认 50（目录数百条，全渲染会拖慢搜索）。 */
-const PAGE_SIZES = [20, 50, 100];
 
 /** 单价格式化：刊例价量级跨度大（0.02 ~ 数十），保留最多 4 位小数。 */
 function formatUnitPrice(
@@ -120,40 +117,33 @@ export function ModelCatalogPage() {
   const { sort, order, toggle } = useSort("id", "asc",
     { context: "desc", max_output: "desc", input: "desc", output: "desc",
       cache_read: "desc", cache_write: "desc", intelligence: "desc" });
-  const { data, isLoading, isError } = useModelCatalog(session.username, sort, order);
   const [query, setQuery] = useState("");
+  // 搜索词去抖：服务端分页后每次击键都会打接口，逐字符发请求既费流量又让结果闪烁。
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [currency, setCurrency] = useState<Currency>("USD");
-  const [pageIndex, setPageIndex] = useState(0);
-  const [pageSize, setPageSize] = useState(50);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   // 只看「当前渠道获取到的模型」：默认关闭（OpenRouter 收录全量，用户按需收窄）。
   const [onlyAvailable, setOnlyAvailable] = useState(false);
 
-  const rate = data?.usd_cny_rate ?? 1;
-  const models = useMemo(() => data?.models ?? [], [data]);
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return models.filter((row) => {
-      if (onlyAvailable && !row.available) return false;
-      if (!needle) return true;
-      // provider 不参与匹配：它恒为 id 的厂商前缀（id 的子串），匹配它等于匹配 id
-      return (
-        row.id.toLowerCase().includes(needle) ||
-        (row.name ?? "").toLowerCase().includes(needle)
-      );
-    });
-  }, [models, query, onlyAvailable]);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 250);
+    return () => clearTimeout(timer);
+  }, [query]);
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
-  const safePage = Math.min(pageIndex, pageCount - 1);
-  const pageRows = useMemo(
-    () => filtered.slice(safePage * pageSize, safePage * pageSize + pageSize),
-    [filtered, safePage, pageSize],
-  );
+  const { data, isLoading, isError, isFetching } = useModelCatalog(
+    session.username, sort, order, debouncedQuery || undefined, onlyAvailable,
+    pageSize, page * pageSize);
+
+  const rate = data?.usd_cny_rate ?? 1;
+  const models = data?.models ?? [];
+  const catalogCount = data?.count ?? 0;
+  const total = data?.total ?? 0;
 
   // 搜索 / 改每页条数 / 换排序 / 切渠道过滤后回到第一页：否则会停在一个已不存在的页码上（空白）
   useEffect(() => {
-    setPageIndex(0);
-  }, [query, pageSize, sort, order, onlyAvailable]);
+    setPage(0);
+  }, [debouncedQuery, pageSize, sort, order, onlyAvailable]);
 
   if (isLoading) {
     return (
@@ -232,33 +222,20 @@ export function ModelCatalogPage() {
             模型列表加载失败，请刷新重试；若刚升级服务，请确认后端已重启。
           </Notice>
         </div>
-      ) : models.length === 0 ? (
+      ) : catalogCount === 0 ? (
         <Panel title="模型列表">
           <Empty data-testid="no-model-catalog">
             尚无模型目录快照（后台拉取 OpenRouter 后自动出现），统计里的成本与能力分会显示 —
           </Empty>
         </Panel>
       ) : (
-        <Panel title={`模型列表（${filtered.length} / ${models.length}）`}>
+        <Panel title={`模型列表（${total} / ${catalogCount}）`}>
           {/* 搜索与币种切换独立成行：放进 Panel 标题行会在窄视口挤压标题成竖排 */}
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             {toolbar}
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              每页
-              <Select
-                value={String(pageSize)}
-                data-testid="model-page-size"
-                className="h-8 w-20 text-xs"
-                onChange={(event) => setPageSize(Number(event.target.value))}
-              >
-                {PAGE_SIZES.map((size) => (
-                  <option key={size} value={size}>{size} 条</option>
-                ))}
-              </Select>
-            </label>
           </div>
 
-          {filtered.length === 0 ? (
+          {total === 0 ? (
             <Empty data-testid="no-model-match">
               {query.trim()
                 ? `没有匹配「${query}」的模型`
@@ -295,7 +272,7 @@ export function ModelCatalogPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {pageRows.map((row) => {
+                  {models.map((row) => {
                     const caps = capabilities(row);
                     return (
                       <TableRow key={row.id} data-testid={`model-row-${row.id}`}>
@@ -343,33 +320,15 @@ export function ModelCatalogPage() {
                   })}
                 </TableBody>
               </Table>
-              {pageCount > 1 && (
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground" data-testid="model-page-info">
-                    第 {safePage + 1} / {pageCount} 页
-                  </span>
-                  <div className="flex gap-2">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      data-testid="model-prev"
-                      disabled={safePage === 0}
-                      onClick={() => setPageIndex((p) => Math.max(0, p - 1))}
-                    >
-                      上一页
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      data-testid="model-next"
-                      disabled={safePage >= pageCount - 1}
-                      onClick={() => setPageIndex((p) => Math.min(pageCount - 1, p + 1))}
-                    >
-                      下一页
-                    </Button>
-                  </div>
-                </div>
-              )}
+              <Pagination
+                testId="model"
+                page={page}
+                pageSize={pageSize}
+                total={total}
+                busy={isFetching}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+              />
             </div>
           )}
         </Panel>

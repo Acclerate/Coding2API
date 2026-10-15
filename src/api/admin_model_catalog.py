@@ -99,27 +99,62 @@ def _with_availability(rows: list[dict[str, Any]],
             for row in rows]
 
 
+def _filter_catalog(rows: list[dict[str, Any]], q: str | None,
+                    only_available: bool) -> list[dict[str, Any]]:
+    """目录的服务端筛选：`q` 匹配 id / 名称，`only_available` 只留可用行。
+
+    provider 不参与匹配：它恒为 id 的厂商前缀（id 的子串），匹配它等于匹配 id。
+    与前端旧实现同口径，避免搜索行为在迁移后悄悄变化。
+    """
+    needle = (q or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if only_available and not row.get("available"):
+            continue
+        if needle and not (
+            str(row.get("id") or "").lower().find(needle) >= 0
+            or str(row.get("name") or "").lower().find(needle) >= 0
+        ):
+            continue
+        out.append(row)
+    return out
+
+
 def create_router(services: Services) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/model-catalog")
     async def get_model_catalog(request: Request, sort: str | None = None,
                                 order: str | None = None,
+                                q: str | None = None,
+                                only_available: bool = False,
+                                limit: int = 50, offset: int = 0,
                                 _principal=Depends(principal_from_request)):
-        """当前生效模型目录 + 元信息；仅要求登录（OpenRouter 是公开数据，各角色可看）。"""
+        """当前生效模型目录 + 元信息；仅要求登录（OpenRouter 是公开数据，各角色可看）。
+
+        分页与筛选都在服务端：目录数百条，全量下发会拖慢首屏，而「搜索 id/名称」
+        与「只看当前渠道」是两个常用收窄手段。`q` 大小写不敏感地匹配 id 与名称；
+        `only_available` 只留 `available=true` 的行。返回的 `total` 是**筛选后**
+        的总条数（供前端算页数），`count` 仍是目录全量（页头展示「N / 总数」）。
+        """
         state = request.app.state
         catalog: dict[str, dict] = state.models_dev_catalog
         # 先补能力分再排序：能力分排序键读 `row["benchmarks"]`，若在 enrich 之前
         # 排，所有行都拿不到分数、按能力分排会退化成不动。
         rows = _with_benchmarks([catalog[model] for model in sorted(catalog)],
                                 getattr(state, "model_benchmarks", None))
+        rows = _with_availability(rows, _available_keys(services))
+        rows = _filter_catalog(rows, q, only_available)
+        total = len(rows)
         # 默认按模型 id 升序：结果确定（前端无需再排），与历史行为一致。
         models = sort_rows(rows, sort, order,
                            MODEL_CATALOG_SORT_KEYS, default_key="id", default_desc=False)
-        models = _with_availability(models, _available_keys(services))
+        # 排序后切片：排序键含派生字段，SQL 排不了，故先排再分页。
+        models = models[max(0, offset):max(0, offset) + max(1, min(500, limit))]
         return {
             "models": models,
             "count": len(catalog),
+            "total": total,
             "currency": "USD",
             "usd_cny_rate": float(services.settings.usd_cny_rate),
             # 快照时刻：价格、明细与能力分同一次抓取，故只有一个时刻。缺失即

@@ -53,8 +53,12 @@ def create_router(services: Services) -> APIRouter:
 
     @router.get("/api/api-keys")
     async def list_keys(sort: str | None = None, order: str | None = None,
+                        limit: int = 50, offset: int = 0,
                         principal=Depends(principal_from_request)):
-        return {"api_keys": api_keys.list_for(principal.username, sort=sort, order=order)}
+        # 分页：total 供前端算页数
+        return {"api_keys": api_keys.list_for(principal.username, sort=sort, order=order,
+                                              limit=limit, offset=offset),
+                "total": api_keys.count_for(principal.username)}
 
     @router.post("/api/api-keys")
     async def create_key(payload: dict,

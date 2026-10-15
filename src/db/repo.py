@@ -685,14 +685,32 @@ class ApiKeyRepository:
         return row["username"] if row else None
 
     def list_for(self, username: str, sort: str | None = None,
-                 order: str | None = None) -> list[dict[str, Any]]:
+                 order: str | None = None, limit: int | None = None,
+                 offset: int = 0) -> list[dict[str, Any]]:
+        """该用户名下的 Key；默认创建时间升序。
+
+        `limit` / `offset`：分页。`limit=None`（默认）= 全量，与旧行为一致。
+        """
         clause = sql_order(sort, order, API_KEY_SORT_COLUMNS,
                            default_key="created_at", default_desc=False, tiebreak="id")
-        rows = self._db.connect().execute(
-            "SELECT id, username, name, preview, created_at, last_used_at, "
-            "provider_binding, allowed_ips, allowed_models, expires_at FROM api_keys "
-            f"WHERE username = ? ORDER BY {clause}", (username,)).fetchall()
+        if limit is None:
+            rows = self._db.connect().execute(
+                "SELECT id, username, name, preview, created_at, last_used_at, "
+                "provider_binding, allowed_ips, allowed_models, expires_at FROM api_keys "
+                f"WHERE username = ? ORDER BY {clause}", (username,)).fetchall()
+        else:
+            rows = self._db.connect().execute(
+                "SELECT id, username, name, preview, created_at, last_used_at, "
+                "provider_binding, allowed_ips, allowed_models, expires_at FROM api_keys "
+                f"WHERE username = ? ORDER BY {clause} LIMIT ? OFFSET ?",
+                (username, max(1, min(500, limit)), max(0, offset))).fetchall()
         return [dict(row) for row in rows]
+
+    def count_for(self, username: str) -> int:
+        """该用户名下的 Key 总数（分页端点算页数用）。"""
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM api_keys WHERE username = ?", (username,)).fetchone()
+        return int(row["n"])
 
     def delete(self, key_id: str, username: str) -> bool:
         with self._db.transaction() as conn:
@@ -809,17 +827,24 @@ class AlertRepository:
         return alert_id
 
     def recent(self, limit: int = 50, sort: str | None = None,
-               order: str | None = None) -> list[dict[str, Any]]:
+               order: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
         """默认倒序返回最近告警；limit 收敛到 [1, 200] 防止一次拉爆前端。
 
         `sort` / `order`：列头排序白名单见 `ALERT_SORT_COLUMNS`。
+        `offset`：分页偏移（非负）。
         """
         clause = sql_order(sort, order, ALERT_SORT_COLUMNS,
                            default_key="ts", default_desc=True, tiebreak="id")
         rows = self._db.connect().execute(
-            f"SELECT * FROM alert_events ORDER BY {clause} LIMIT ?",
-            (max(1, min(200, limit)),)).fetchall()
+            f"SELECT * FROM alert_events ORDER BY {clause} LIMIT ? OFFSET ?",
+            (max(1, min(200, limit)), max(0, offset))).fetchall()
         return [dict(row) for row in rows]
+
+    def count_all(self) -> int:
+        """告警总数（分页端点算页数用）。"""
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM alert_events").fetchone()
+        return int(row["n"])
 
     def last_ts(self, rule: str, scope: str) -> int | None:
         """该 (规则, 对象) 最近一次落库时刻（静默去重用）；无记录返回 None。"""
@@ -908,16 +933,31 @@ class UserRepository:
         return dict(row) if row else None
 
     def list_all(self, sort: str | None = None,
-                 order: str | None = None) -> list[dict[str, Any]]:
+                 order: str | None = None,
+                 limit: int | None = None,
+                 offset: int = 0) -> list[dict[str, Any]]:
         """按用户名排序的完整行；展示层负责剔除敏感列。
 
         `sort` / `order`：排序白名单见 `USER_SORT_COLUMNS`；默认用户名升序。
+
+        `limit` / `offset`：分页。`limit=None`（默认）= 不分页返回全量，与旧行为
+        一致（多处内部调用点依赖全量）。传入时收敛到 [1, 500]，`offset` 非负。
         """
         clause = sql_order(sort, order, USER_SORT_COLUMNS,
                            default_key="username", default_desc=False, tiebreak="username")
-        rows = self._db.connect().execute(
-            f"SELECT * FROM users ORDER BY {clause}").fetchall()
+        if limit is None:
+            rows = self._db.connect().execute(
+                f"SELECT * FROM users ORDER BY {clause}").fetchall()
+        else:
+            rows = self._db.connect().execute(
+                f"SELECT * FROM users ORDER BY {clause} LIMIT ? OFFSET ?",
+                (max(1, min(500, limit)), max(0, offset))).fetchall()
         return [dict(row) for row in rows]
+
+    def count_all(self) -> int:
+        """用户总数（分页端点算页数用）。"""
+        row = self._db.connect().execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"])
 
     def list_usernames(self) -> tuple[str, ...]:
         rows = self._db.connect().execute(
@@ -1050,6 +1090,29 @@ class AuditRepository:
 
         `sort` / `order`：列头排序白名单见 `AUDIT_SORT_COLUMNS`。
         """
+        where, params = self._filters(actor=actor, action=action, since=since, before=before)
+        clause = sql_order(sort, order, AUDIT_SORT_COLUMNS,
+                           default_key="ts", default_desc=True, tiebreak="id")
+        rows = self._db.connect().execute(
+            f"SELECT * FROM audit_events {where} ORDER BY {clause} LIMIT ? OFFSET ?",
+            (*params, max(1, min(500, limit)), max(0, offset))).fetchall()
+        return [dict(row) for row in rows]
+
+    def count(self, *, actor: str | None = None, action: str | None = None,
+              since: int | None = None, before: int | None = None) -> int:
+        """与 `query` 同一套过滤条件下的总条数（分页端点算页数用）。
+
+        过滤条件必须与 `query` 完全一致，否则页数会与实际结果对不上。
+        """
+        where, params = self._filters(actor=actor, action=action, since=since, before=before)
+        row = self._db.connect().execute(
+            f"SELECT COUNT(*) AS n FROM audit_events {where}", params).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _filters(*, actor: str | None, action: str | None,
+                 since: int | None, before: int | None) -> tuple[str, list[Any]]:
+        """`query` / `count` 共用的 WHERE 片段与参数（两处口径必须同源）。"""
         clauses: list[str] = []
         params: list[Any] = []
         if actor:
@@ -1065,13 +1128,7 @@ class AuditRepository:
             clauses.append("ts < ?")
             params.append(int(before))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.extend((max(1, min(500, limit)), max(0, offset)))
-        clause = sql_order(sort, order, AUDIT_SORT_COLUMNS,
-                           default_key="ts", default_desc=True, tiebreak="id")
-        rows = self._db.connect().execute(
-            f"SELECT * FROM audit_events {where} ORDER BY {clause} LIMIT ? OFFSET ?",
-            tuple(params)).fetchall()
-        return [dict(row) for row in rows]
+        return where, params
 
     def prune(self, *, keep_days: int, now: int | None = None) -> int:
         cutoff = int(now if now is not None else time.time()) - keep_days * 86400

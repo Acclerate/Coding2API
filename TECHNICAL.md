@@ -493,6 +493,11 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 ### 9.8 列表排序
 所有 `GET` 列表端点接受统一的 `sort`（白名单键）+ `order`（`asc`/`desc`）。**未知 `sort` 键或非法 `order` 值回落到默认排序，不报错**；`sort` 是白名单键而非 SQL 列名，SQL 片段只由受控常量拼出，用户输入永不进 SQL，注入面为零。契约在 `src/sorting.py`（db 与 api 共用，避免 db → api 反向依赖）：`parse_sort_order`（唯一解析入口）、`sql_order`（`tiebreak` 兜底稳定次序）、`sort_rows`（组装后再排，`None` 值无论升降序都排**最后**）。逐请求明细默认（`time` 降序）走 rowid 游标分页返回 `next_before`；按其它列排序 / 时间升序 / 显式 `offset` 时改用 `LIMIT/OFFSET` 并返回 `total`。适用端点：`/api/credentials`、`/api/users`、`/api/api-keys`、`/api/audit`、`/api/alerts`、`/api/model-catalog`、`/api/credentials/{id}/credit-events`、`/api/credentials/{id}/accounts`、`/api/stats/by-*`、`/api/stats/events`。
 
+### 9.9 列表分页
+扁平列表**统一后端分页**，前端共享 `Pagination` 组件（`web/src/components/Pagination.tsx`）——同一套页码文案（`第 N / M 页`）、每页选项（`PAGE_SIZE_OPTIONS = [20, 50, 100]`，默认 `DEFAULT_PAGE_SIZE = 50`）与上下页按钮，`data-testid` 前缀按表区分（`${prefix}-page-info` / `-page-size` / `-prev` / `-next`）。
+
+契约：`GET` 列表端点接受 `limit` + `offset`，响应在**原列表键旁**新增 `total`（**筛选后**条数，前端据此算页数；键名不变、向后兼容）。仓储层 `limit=None` 表示不分页返回全量，保持内部调用点旧行为。实现分流：`users` / `api-keys` / `alerts` / `audit` 在 SQL 层 `LIMIT/OFFSET` + 独立 `count`；`model-catalog` 排序键含派生字段（能力分 / `available`），先 `sort_rows` 再内存切片。`/api/model-catalog` 的服务端筛选收敛在 `_filter_catalog`（`q` 大小写不敏感匹配 `id` / 名称，`only_available` 只留 `available=true`），`total` 是筛选后条数、顶层 `count` 仍是目录全量。游标分页的明细端点（`/api/stats/events` 默认 `time` 降序）无总页数，页码文案退化为 `第 N 页`（未知总数）。分组类表（凭证按渠道分组、用量统计分组表）不分页。
+
 ## 10. 后台任务
 `TaskRunner`（`runner.py`）每类任务一个独立 asyncio 循环，失败只记日志不拖垮服务；间隔有安全下限，避免打爆上游。`Pacer` 有两种模式：后台任务用**严格模式**（默认，单锁串行化跨任务/跨凭证的相邻请求）；聊天用**并发模式**（`allow_concurrent=True`），按「渠道 + 凭证身份」分桶并在桶内放行并发——同渠道同模型的并发请求不再被逐级串行化，只有同凭证「上一请求已结束、紧接着又来一个」的顺序连发才补足最小间隔。请求结束由 provider `stream_chat` 的 `finally` 调 `release(key)` 归还名额。**间隔抖动（`JITTER_RATIO = 0.25`）**：定值间隔（`min == max`，聊天节流器的形态，如 `Pacer(5, 5)`）逐个账号精确同拍，多实例 / 多账号会同时刻撞上游，故 `next_interval()` 对定值**只向上**抖 `[low, low × 1.25]`——`low` 是频率风控下限，不可击穿；`min < max` 的区间本就均匀随机（文档承诺的 `[min, max]`），不再叠加。抖动源是构造期的 `random.Random(0)`（测试可复现），非热更项。
 

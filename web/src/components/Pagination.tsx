@@ -16,7 +16,8 @@ import { DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from "../lib/constants";
  *   「第 X 页」（不知道总数，不猜）。
  *
  * 受控组件：翻页 / 改每页条数都由调用方持有状态（后端分页要据此重新取数）。
- * 页数 ≤ 1 且无下一页时整体不渲染——单页列表配一条「第 1 / 1 页」只是噪声。
+ * 始终渲染（含单页列表）：翻页按钮按 `page` / 总页数自动禁用，每页选择器在单页
+ * 时仍可用——空表由调用方的空态分支兜住，不在这里隐藏。
  */
 export function Pagination({
   testId = "pagination",

@@ -17,11 +17,13 @@ def create_router(services: Services) -> APIRouter:
     alerts = services.alerts
 
     @router.get("/api/alerts")
-    async def list_alerts(limit: int = 50, sort: str | None = None,
+    async def list_alerts(limit: int = 50, offset: int = 0,
+                          sort: str | None = None,
                           order: str | None = None,
                           principal=Depends(principal_from_request)):
-        """最近告警（默认倒序）。limit 由仓储收敛到 [1, 200]。"""
+        """最近告警（默认倒序）。limit 由仓储收敛到 [1, 200]；total 供前端算页数。"""
         require_admin(principal)
-        return {"alerts": alerts.recent(limit, sort=sort, order=order)}
+        return {"alerts": alerts.recent(limit, sort=sort, order=order, offset=offset),
+                "total": alerts.count_all()}
 
     return router

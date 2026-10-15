@@ -1,4 +1,4 @@
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ModelCatalogPage } from "../ModelCatalogPage";
 import { renderPage, settle, userEvent } from "@/test-utils";
@@ -14,58 +14,97 @@ function stubFetch(body: unknown, status = 200) {
   return spy;
 }
 
-const CATALOG = {
-  count: 2,
-  currency: "USD",
-  usd_cny_rate: 7,
-  saved_at: 1_700_000_000,
-  models: [
-    {
-      id: "a-model",
-      name: "A Model",
-      provider: "alpha",
-      family: null,
-      knowledge: "2024-01-01",
-      release_date: "2024-02-01",
-      context: 128000,
-      max_output: 16000,
-      input_modalities: ["text", "image"],
-      output_modalities: ["text"],
-      attachment: true,
-      reasoning: false,
-      tool_call: true,
-      structured_output: false,
-      open_weights: false,
-      input: 0.5,
-      output: 1.5,
-      cache_read: 0.05,
-      cache_write: null,
-      available: true,
-    },
-    {
-      id: "glm-5.2",
-      name: null,
-      provider: "zhipuai",
-      family: "glm",
-      knowledge: null,
-      release_date: null,
-      context: 200000,
-      max_output: 64000,
-      input_modalities: ["text"],
-      output_modalities: ["text"],
-      attachment: false,
-      reasoning: true,
-      tool_call: true,
-      structured_output: true,
-      open_weights: true,
-      input: 1.0,
-      output: 2.0,
-      cache_read: 0.1,
-      cache_write: 1.25,
-      available: false,
-    },
-  ],
-};
+/**
+ * 模拟服务端的目录端点：筛选（q / only_available）+ 排序 + 分页都在「服务端」，
+ * 与 `src/api/admin_model_catalog.py` 同口径。前端已改为服务端分页，静态响应不再
+ * 能验证翻页与筛选——必须让 mock 读懂 URL 上的参数。
+ */
+function stubCatalog(models: Array<Record<string, unknown>>, status = 200) {
+  const spy = vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input), "http://localhost");
+    const q = (url.searchParams.get("q") ?? "").toLowerCase();
+    const onlyAvailable = url.searchParams.get("only_available") === "true";
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+    const sort = url.searchParams.get("sort") ?? "id";
+    const order = url.searchParams.get("order") ?? "asc";
+    let rows = models.filter((row) => {
+      if (onlyAvailable && !row.available) return false;
+      if (!q) return true;
+      return String(row.id).toLowerCase().includes(q)
+        || String(row.name ?? "").toLowerCase().includes(q);
+    });
+    rows = [...rows].sort((left, right) => {
+      const a = left[sort] as string | number | null;
+      const b = right[sort] as string | number | null;
+      if (a === b) return 0;
+      if (a === null || a === undefined) return 1;
+      if (b === null || b === undefined) return -1;
+      const cmp = a < b ? -1 : 1;
+      return order === "desc" ? -cmp : cmp;
+    });
+    const total = rows.length;
+    return new Response(JSON.stringify({
+      models: rows.slice(offset, offset + limit),
+      count: models.length,
+      total,
+      currency: "USD",
+      usd_cny_rate: 7,
+      saved_at: 1_700_000_000,
+    }), { status, headers: { "Content-Type": "application/json" } });
+  });
+  vi.stubGlobal("fetch", spy);
+  return spy;
+}
+
+const MODELS = [
+  {
+    id: "a-model",
+    name: "A Model",
+    provider: "alpha",
+    family: null,
+    knowledge: "2024-01-01",
+    release_date: "2024-02-01",
+    context: 128000,
+    max_output: 16000,
+    input_modalities: ["text", "image"],
+    output_modalities: ["text"],
+    attachment: true,
+    reasoning: false,
+    tool_call: true,
+    structured_output: false,
+    open_weights: false,
+    input: 0.5,
+    output: 1.5,
+    cache_read: 0.05,
+    cache_write: null,
+    available: true,
+  },
+  {
+    id: "glm-5.2",
+    name: null,
+    provider: "zhipuai",
+    family: "glm",
+    knowledge: null,
+    release_date: null,
+    context: 200000,
+    max_output: 64000,
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    attachment: false,
+    reasoning: true,
+    tool_call: true,
+    structured_output: true,
+    open_weights: true,
+    input: 1.0,
+    output: 2.0,
+    cache_read: 0.1,
+    cache_write: 1.25,
+    available: false,
+  },
+];
+
+const CATALOG = { count: 2, models: MODELS };
 
 describe("ModelCatalogPage（模型列表）", () => {
   beforeEach(() => {
@@ -73,7 +112,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("渲染模型明细：名称 / id / 模态 / 能力 / 知识与刊例价", async () => {
-    stubFetch(CATALOG);
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -100,7 +139,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("名称缺失时回退显示 id，缓存写价照常展示", async () => {
-    stubFetch(CATALOG);
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -114,42 +153,43 @@ describe("ModelCatalogPage（模型列表）", () => {
     expect(row).toHaveTextContent("缓存读 $0.1 · 缓存写 $1.25");
   });
 
-  it("搜索按 id / 名称过滤，无匹配显示空态", async () => {
-    stubFetch(CATALOG);
+  it("搜索按 id / 名称过滤（服务端），无匹配显示空态", async () => {
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
+    // 搜索词去抖 + 服务端取数：等旧行消失，避免在 keepPreviousData 的旧页上判定
     fireEvent.change(screen.getByTestId("model-search"), { target: { value: "glm" } });
+    await waitFor(() =>
+      expect(screen.queryByTestId("model-row-a-model")).not.toBeInTheDocument());
     expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
-    expect(screen.queryByTestId("model-row-a-model")).not.toBeInTheDocument();
 
     // 按展示名搜（大写差异走小写归一）
     fireEvent.change(screen.getByTestId("model-search"), { target: { value: "a model" } });
+    await waitFor(() =>
+      expect(screen.queryByTestId("model-row-glm-5.2")).not.toBeInTheDocument());
     expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
-    expect(screen.queryByTestId("model-row-glm-5.2")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByTestId("model-search"), { target: { value: "zzz" } });
-    expect(screen.getByTestId("no-model-match")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("no-model-match")).toBeInTheDocument());
   });
 
   it("按 id 的厂商前缀搜（provider 列已移除，前缀仍在 id 里）", async () => {
-    stubFetch({
-      ...CATALOG,
-      models: [
-        { ...CATALOG.models[0], id: "zhipuai/glm-5.3", name: "GLM 5.3" },
-        { ...CATALOG.models[0], id: "moonshotai/kimi-k3", name: "Kimi K3" },
-      ],
-    });
+    stubCatalog([
+      { ...MODELS[0], id: "zhipuai/glm-5.3", name: "GLM 5.3" },
+      { ...MODELS[0], id: "moonshotai/kimi-k3", name: "Kimi K3" },
+    ]);
     renderPage(<ModelCatalogPage />);
     await settle();
 
     fireEvent.change(screen.getByTestId("model-search"), { target: { value: "zhipuai/" } });
+    await waitFor(() =>
+      expect(screen.queryByTestId("model-row-moonshotai/kimi-k3")).not.toBeInTheDocument());
     expect(screen.getByTestId("model-row-zhipuai/glm-5.3")).toBeInTheDocument();
-    expect(screen.queryByTestId("model-row-moonshotai/kimi-k3")).not.toBeInTheDocument();
   });
 
   it("切到人民币按汇率折算", async () => {
-    stubFetch(CATALOG);
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -161,11 +201,11 @@ describe("ModelCatalogPage（模型列表）", () => {
 
   it("超过一页时分页，翻页只渲染当前页", async () => {
     const many = Array.from({ length: 60 }, (_, i) => ({
-      ...CATALOG.models[0],
+      ...MODELS[0],
       id: `m-${String(i).padStart(2, "0")}`,
       name: `Model ${i}`,
     }));
-    stubFetch({ ...CATALOG, count: many.length, models: many });
+    stubCatalog(many);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -175,40 +215,44 @@ describe("ModelCatalogPage（模型列表）", () => {
     expect(screen.getByTestId("model-prev")).toBeDisabled();
 
     fireEvent.click(screen.getByTestId("model-next"));
+    // keepPreviousData：翻页期间仍显示上一页，必须等到新页行数到位
+    await waitFor(() =>
+      expect(screen.getAllByTestId(/^model-row-/)).toHaveLength(10));
     expect(screen.getByTestId("model-page-info")).toHaveTextContent("第 2 / 2 页");
-    expect(screen.getAllByTestId(/^model-row-/)).toHaveLength(10);
     expect(screen.getByTestId("model-next")).toBeDisabled();
   });
 
   it("搜索后回到第一页并只渲染命中项", async () => {
     const many = Array.from({ length: 60 }, (_, i) => ({
-      ...CATALOG.models[0],
+      ...MODELS[0],
       id: `m-${String(i).padStart(2, "0")}`,
       name: `Model ${i}`,
     }));
-    stubFetch({ ...CATALOG, count: many.length, models: many });
+    stubCatalog(many);
     renderPage(<ModelCatalogPage />);
     await settle();
 
     fireEvent.click(screen.getByTestId("model-next"));
-    expect(screen.getByTestId("model-page-info")).toHaveTextContent("第 2 / 2 页");
+    await waitFor(() =>
+      expect(screen.getAllByTestId(/^model-row-/)).toHaveLength(10));
 
     // 改搜索词后应回到第一页（否则会停在一个已不存在的页码上）
     fireEvent.change(screen.getByTestId("model-search"), { target: { value: "Model 5" } });
-    expect(screen.queryByTestId("model-page-info")).not.toBeInTheDocument();
+    // 「Model 5」命中 Model 5 / 50-59 共 11 条 → 单页。两个条件一起等：
+    // 只看页信息会在 keepPreviousData 的空页上误判，只看 m-59 又会撞上第二页残留。
+    await waitFor(() => {
+      expect(screen.getByTestId("model-page-info")).toHaveTextContent("第 1 / 1 页");
+      expect(screen.getByTestId("model-row-m-59")).toBeInTheDocument();
+    });
     expect(screen.getAllByTestId(/^model-row-/).length).toBeLessThanOrEqual(50);
-    expect(screen.getByTestId("model-row-m-59")).toBeInTheDocument();
   });
 
   it("能力分列展示三项指数，缺失显示 —", async () => {
-    stubFetch({
-      ...CATALOG,
-      models: [
-        { ...CATALOG.models[1], benchmarks: {
-          intelligence_index: 44.8, coding_index: 74.8, agentic_index: 53.1 } },
-        CATALOG.models[0],
-      ],
-    });
+    stubCatalog([
+      { ...MODELS[1], benchmarks: {
+        intelligence_index: 44.8, coding_index: 74.8, agentic_index: 53.1 } },
+      MODELS[0],
+    ]);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -225,7 +269,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("无能力分快照时指标卡显示 —", async () => {
-    stubFetch({ ...CATALOG, saved_at: null });
+    stubFetch({ ...CATALOG, total: 2, saved_at: null });
     renderPage(<ModelCatalogPage />);
     await settle();
     expect(screen.getByTestId("model-catalog-page")).toHaveTextContent(
@@ -233,7 +277,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("无目录快照时显示空态", async () => {
-    stubFetch({ ...CATALOG, count: 0, models: [], saved_at: null });
+    stubFetch({ ...CATALOG, count: 0, total: 0, models: [], saved_at: null });
     renderPage(<ModelCatalogPage />);
     await settle();
     expect(screen.getByTestId("no-model-catalog")).toBeInTheDocument();
@@ -247,7 +291,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("「只看当前渠道」默认关闭，开启后只留 available 的模型", async () => {
-    stubFetch(CATALOG);
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -257,33 +301,32 @@ describe("ModelCatalogPage（模型列表）", () => {
     expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
     expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
 
-    // 开启：只留 available=true 的 a-model，标题计数同步收窄
+    // 开启：只留 available=true 的 a-model，标题计数同步收窄（命中 1 / 目录 2）
     fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(screen.queryByTestId("model-row-glm-5.2")).not.toBeInTheDocument());
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
-    expect(screen.queryByTestId("model-row-glm-5.2")).not.toBeInTheDocument();
     expect(screen.getByText("模型列表（1 / 2）")).toBeInTheDocument();
 
     // 关闭：恢复两条
     fireEvent.click(toggle);
-    expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument());
   });
 
   it("开启过滤但无任何 available 模型时显示渠道空态（非搜索空态）", async () => {
-    stubFetch({
-      ...CATALOG,
-      models: CATALOG.models.map((row) => ({ ...row, available: false })),
-    });
+    stubCatalog(MODELS.map((row) => ({ ...row, available: false })));
     renderPage(<ModelCatalogPage />);
     await settle();
 
     fireEvent.click(screen.getByTestId("model-available-toggle"));
-    expect(screen.getByTestId("no-model-match")).toHaveTextContent(
-      "当前渠道没有可用模型");
+    await waitFor(() => expect(screen.getByTestId("no-model-match")).toHaveTextContent(
+      "当前渠道没有可用模型"));
   });
 
   it("吸顶表头不透明：滚动时行内容不从表头底下透出", async () => {
-    stubFetch(CATALOG);
+    stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 
@@ -295,7 +338,7 @@ describe("ModelCatalogPage（模型列表）", () => {
   });
 
   it("能力分列可排序：点列头下发 sort=intelligence（首点降序）", async () => {
-    const spy = stubFetch(CATALOG);
+    const spy = stubCatalog(MODELS);
     renderPage(<ModelCatalogPage />);
     await settle();
 

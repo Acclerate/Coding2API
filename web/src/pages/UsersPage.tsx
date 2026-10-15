@@ -10,7 +10,9 @@ import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
   Badge,
   Button,
@@ -71,7 +73,10 @@ export function UsersPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("username", "asc",
     { created_at: "desc", enabled: "desc" });
-  const { data, isLoading } = useUsers(session.username, sort, order);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const { data, isLoading, isFetching } = useUsers(session.username, sort, order,
+                                                   pageSize, page * pageSize);
   const [username, setUsername] = useState("");
   const [role, setRole] = useState<Role>("viewer");
   const [issued, setIssued] = useState<ActivationIssued | null>(null);
@@ -104,6 +109,15 @@ export function UsersPage() {
 
   const users = data?.users ?? [];
 
+  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
+  const toggleSort = (columnKey: string) => {
+    toggle(columnKey);
+    setPage(0);
+  };
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+  };
   const report = (caught: unknown, fallback: string) => {
     const message = caught instanceof ApiError ? caught.message : "";
     if (message.includes("last active admin")) {
@@ -215,19 +229,20 @@ export function UsersPage() {
             data-testid="no-users"
           />
         ) : (
+          <>
           <Table data-testid="users-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="用户名" columnKey="username" active={sort === "username"}
-                              direction={order} onToggle={toggle} testId="sort-username" />
+                              direction={order} onToggle={toggleSort} testId="sort-username" />
                 <SortableHead label="角色" columnKey="role" active={sort === "role"}
-                              direction={order} onToggle={toggle} testId="sort-role" />
+                              direction={order} onToggle={toggleSort} testId="sort-role" />
                 <SortableHead label="状态" columnKey="enabled" active={sort === "enabled"}
-                              direction={order} onToggle={toggle} testId="sort-enabled" />
+                              direction={order} onToggle={toggleSort} testId="sort-enabled" />
                 <SortableHead label="创建者" columnKey="created_by" active={sort === "created_by"}
-                              direction={order} onToggle={toggle} testId="sort-created_by" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_by" />
                 <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
-                              direction={order} onToggle={toggle} testId="sort-created_at" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -315,6 +330,16 @@ export function UsersPage() {
               ))}
             </TableBody>
           </Table>
+          <Pagination
+            testId="users"
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            busy={isFetching}
+            onPageChange={setPage}
+            onPageSizeChange={changePageSize}
+          />
+          </>
         )}
       </Panel>
 
