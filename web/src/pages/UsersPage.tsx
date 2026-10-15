@@ -353,8 +353,9 @@ export function UsersPage() {
               </Button>
             </div>
             <form onSubmit={submitCreate} className="space-y-3">
-              <Field label="用户名">
+              <Field label="用户名" htmlFor="new-user-name-input">
                 <Input
+                  id="new-user-name-input"
                   value={username}
                   data-testid="new-user-name"
                   placeholder="例如 alice"
@@ -362,8 +363,9 @@ export function UsersPage() {
                   onChange={(event) => setUsername(event.target.value)}
                 />
               </Field>
-              <Field label="角色">
+              <Field label="角色" htmlFor="new-user-role-select">
                 <Select
+                  id="new-user-role-select"
                   value={role}
                   data-testid="new-user-role"
                   onChange={(event) => setRole(event.target.value as Role)}

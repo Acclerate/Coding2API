@@ -45,6 +45,16 @@ describe("AuditPage", () => {
     expect(screen.getByTestId("audit-row-audit_2")).toHaveTextContent("禁用用户");
   });
 
+  it("筛选字段的 label 与控件关联（读屏能拿到字段名）", async () => {
+    stubFetch(auditPayload([EVENT]));
+    renderPage(<AuditPage />, { username: "root", is_admin: true });
+    await settle();
+
+    // label 与控件必须真的绑上：getByLabelText 找不到就说明只是视觉上摆在一起
+    expect(screen.getByLabelText("操作者")).toBe(screen.getByTestId("audit-actor"));
+    expect(screen.getByLabelText("动作")).toBe(screen.getByTestId("audit-action"));
+  });
+
   it("无记录时显示占位", async () => {
     stubFetch(auditPayload([]));
     renderPage(<AuditPage />, { username: "root", is_admin: true });

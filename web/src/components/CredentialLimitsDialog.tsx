@@ -113,9 +113,11 @@ export function CredentialLimitsDialog({
         <div className="mt-4 space-y-4">
           <Field
             label="保留积分（账户剩余积分 ≤ 该值时停用）"
+            htmlFor="limits-keep-credits-input"
             hint="给号留底：余额跌到该值就换号，避免跑空。留空关闭。"
           >
             <Input
+              id="limits-keep-credits-input"
               type="number"
               min="0"
               inputMode="decimal"
@@ -126,8 +128,9 @@ export function CredentialLimitsDialog({
             />
           </Field>
 
-          <Field label="每日 token 上限（输入 + 输出）" hint="当日累计达到该值即停用。留空关闭。">
+          <Field label="每日 token 上限（输入 + 输出）" htmlFor="limits-daily-tokens-input" hint="当日累计达到该值即停用。留空关闭。">
             <Input
+              id="limits-daily-tokens-input"
               type="number"
               min="0"
               inputMode="numeric"
@@ -138,8 +141,9 @@ export function CredentialLimitsDialog({
             />
           </Field>
 
-          <Field label="每日积分上限" hint="当日累计 credit 到该值即停用。留空关闭。">
+          <Field label="每日积分上限" htmlFor="limits-daily-credits-input" hint="当日累计 credit 到该值即停用。留空关闭。">
             <Input
+              id="limits-daily-credits-input"
               type="number"
               min="0"
               inputMode="decimal"
@@ -152,9 +156,11 @@ export function CredentialLimitsDialog({
 
           <Field
             label="按模型 token 上限"
+            htmlFor="limits-per-model-input"
             hint="每行一条 `模型=上限`，如 glm-5=500000。到上限只停该模型。"
           >
             <textarea
+              id="limits-per-model-input"
               rows={3}
               value={perModel}
               data-testid="limits-per-model"

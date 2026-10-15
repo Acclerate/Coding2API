@@ -377,8 +377,9 @@ export function StatsPage() {
             起点晚于终点时提示并暂停取数（见 buildCustomRange）。 */}
         {range === "custom" && (
           <div className="mt-3 flex flex-wrap items-end gap-3" data-testid="custom-range">
-            <Field label="开始时间">
+            <Field label="开始时间" htmlFor="custom-from-input">
               <Input
+                id="custom-from-input"
                 type="datetime-local"
                 value={customFrom}
                 data-testid="custom-from"
@@ -390,8 +391,9 @@ export function StatsPage() {
                 }}
               />
             </Field>
-            <Field label="结束时间">
+            <Field label="结束时间" htmlFor="custom-to-input">
               <Input
+                id="custom-to-input"
                 type="datetime-local"
                 value={customTo}
                 data-testid="custom-to"

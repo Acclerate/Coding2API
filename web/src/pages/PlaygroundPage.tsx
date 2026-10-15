@@ -234,8 +234,9 @@ export function PlaygroundPage() {
       <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
         <Panel title="请求">
           <form onSubmit={send} className="space-y-3">
-            <Field label="提示词">
+            <Field label="提示词" htmlFor="playground-prompt-input">
               <Textarea
+                id="playground-prompt-input"
                 rows={6}
                 value={prompt}
                 data-testid="playground-prompt"
@@ -261,8 +262,9 @@ export function PlaygroundPage() {
 
             {/* 高级参数：留空即不发送该键，由渠道走各自的默认值 */}
             <div className="grid gap-3 sm:grid-cols-3" data-testid="playground-advanced">
-              <Field label="temperature" hint="留空不发送；0–2 是 OpenAI 惯例，本服务只做有限值透传">
+              <Field label="temperature" htmlFor="param-temperature-input" hint="留空不发送；0–2 是 OpenAI 惯例，本服务只做有限值透传">
                 <Input
+                  id="param-temperature-input"
                   type="number"
                   step="0.1"
                   min="0"
@@ -274,6 +276,7 @@ export function PlaygroundPage() {
               </Field>
               <Field
                 label="max_tokens"
+                htmlFor="param-max-tokens-input"
                 hint={
                   selectedInfo?.max_output_tokens !== undefined
                     ? `留空不发送；该模型上限 ${selectedInfo.max_output_tokens.toLocaleString()}`
@@ -281,6 +284,7 @@ export function PlaygroundPage() {
                 }
               >
                 <Input
+                  id="param-max-tokens-input"
                   type="number"
                   step="1"
                   min="1"
@@ -293,6 +297,7 @@ export function PlaygroundPage() {
               {efforts && (
                 <Field
                   label="reasoning_effort"
+                  htmlFor="param-effort-select"
                   hint={
                     selectedInfo?.default_effort
                       ? `该模型默认档位 ${selectedInfo.default_effort}；留空不发送，渠道可能自补默认`
@@ -300,6 +305,7 @@ export function PlaygroundPage() {
                   }
                 >
                   <Select
+                    id="param-effort-select"
                     value={effort}
                     data-testid="param-effort"
                     onChange={(event) => setEffort(event.target.value)}

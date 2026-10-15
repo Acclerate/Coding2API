@@ -161,16 +161,29 @@ export function Field({
   label,
   hint,
   children,
+  htmlFor,
 }: {
   label: string;
   hint?: string;
   children: ReactNode;
+  /**
+   * 关联控件的 id。传了才把 label 与控件绑上（读屏报字段名、点 label 聚焦控件）。
+   *
+   * 不默认用 useId 自动生成：控件如果是 page 传进来的（多数场景），
+   * 生成的 id 到不了它身上，绑了反而给一个错的 aria 关系。
+   */
+  htmlFor?: string;
 }) {
   return (
     <div className="space-y-1.5">
-      <Label className="text-xs font-medium text-muted-foreground">{label}</Label>
+      <Label className="text-xs font-medium text-muted-foreground" htmlFor={htmlFor}>
+        {label}
+      </Label>
       {children}
-      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+      {hint && (
+        // hint 与 label 的关联靠调用方给控件 aria-describedby（hint 没有 id 可指）
+        <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>
+      )}
     </div>
   );
 }

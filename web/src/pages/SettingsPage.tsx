@@ -89,9 +89,10 @@ function SettingRow({
         <div className="flex items-end gap-2">
           <div className="w-44">
             {/* 输入控件的可读名称：Field 的 label 未与控件 id 关联，读屏拿不到「生效值」属于哪一项 */}
-            <Field label={`${setting.label} 生效值`}>
+            <Field label={`${setting.label} 生效值`} htmlFor={`input-${setting.key}`}>
               {setting.kind === "bool" ? (
                 <Select
+                  id={`input-${setting.key}`}
                   value={draft}
                   disabled={disabled}
                   data-testid={`input-${setting.key}`}
@@ -102,6 +103,7 @@ function SettingRow({
                 </Select>
               ) : (
                 <Input
+                  id={`input-${setting.key}`}
                   value={draft}
                   disabled={disabled}
                   data-testid={`input-${setting.key}`}

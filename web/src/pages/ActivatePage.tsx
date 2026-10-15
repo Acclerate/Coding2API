@@ -104,8 +104,9 @@ export function ActivatePage() {
               <div className="text-sm text-muted-foreground">
                 正在为 <span className="font-medium text-foreground">{username ?? "…"}</span> 设置密码
               </div>
-              <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`}>
+              <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`} htmlFor="activate-password-input">
                 <Input
+                  id="activate-password-input"
                   type="password"
                   value={password}
                   autoComplete="new-password"
@@ -114,8 +115,9 @@ export function ActivatePage() {
                   onChange={(event) => setPassword(event.target.value)}
                 />
               </Field>
-              <Field label="确认密码">
+              <Field label="确认密码" htmlFor="activate-confirm-input">
                 <Input
+                  id="activate-confirm-input"
                   type="password"
                   value={confirm}
                   autoComplete="new-password"

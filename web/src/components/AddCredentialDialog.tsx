@@ -336,8 +336,9 @@ export function AddCredentialDialog({
             </p>
             {pasteProvider && (
               <div className="space-y-2" data-testid="paste-callback">
-                <Field label={`${PROVIDER_LABEL[pasteProvider]} 授权回调链接`}>
+                <Field label={`${PROVIDER_LABEL[pasteProvider]} 授权回调链接`} htmlFor="paste-callback-input-el">
                   <Input
+                    id="paste-callback-input-el"
                     data-testid="paste-callback-input"
                     value={pasteUrl}
                     onChange={(event) => setPasteUrl(event.target.value)}
@@ -416,8 +417,9 @@ export function AddCredentialDialog({
           <form onSubmit={submitImport} className="mt-4 space-y-3" data-testid="add-credential-import">
             <div className="flex flex-wrap gap-3">
               <div className="w-40">
-                <Field label="渠道">
+                <Field label="渠道" htmlFor="import-provider-select">
                   <Select
+                    id="import-provider-select"
                     value={importProvider}
                     data-testid="import-provider"
                     onChange={(event) => setImportProvider(event.target.value as Provider)}
@@ -431,8 +433,9 @@ export function AddCredentialDialog({
                 </Field>
               </div>
               <div className="w-48">
-                <Field label="昵称（可选）">
+                <Field label="昵称（可选）" htmlFor="import-nickname-input">
                   <Input
+                    id="import-nickname-input"
                     value={nickname}
                     data-testid="import-nickname"
                     onChange={(event) => setNickname(event.target.value)}

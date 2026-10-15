@@ -77,8 +77,9 @@ export function AuditPage() {
           }}
         >
           <div className="w-56">
-            <Field label="操作者">
+            <Field label="操作者" htmlFor="audit-actor-input">
               <Input
+                id="audit-actor-input"
                 value={actorDraft}
                 data-testid="audit-actor"
                 placeholder="例如 root"
@@ -87,8 +88,9 @@ export function AuditPage() {
             </Field>
           </div>
           <div className="w-56">
-            <Field label="动作">
+            <Field label="动作" htmlFor="audit-action-select">
               <Select
+                id="audit-action-select"
                 value={action}
                 data-testid="audit-action"
                 onChange={(event) => reset(() => setAction(event.target.value))}

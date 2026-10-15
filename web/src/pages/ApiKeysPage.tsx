@@ -717,16 +717,18 @@ export function ApiKeysPage() {
               </div>
             ) : (
               <form onSubmit={create} className="space-y-3">
-                <Field label="名称（可选）">
+                <Field label="名称（可选）" htmlFor="key-name-input">
                   <Input
+                    id="key-name-input"
                     value={name}
                     data-testid="key-name"
                     placeholder="例如 laptop"
                     onChange={(event) => setName(event.target.value)}
                   />
                 </Field>
-                <Field label="渠道绑定">
+                <Field label="渠道绑定" htmlFor="key-binding-select">
                   <Select
+                    id="key-binding-select"
                     value={binding}
                     data-testid="key-binding"
                     onChange={(event) => setBinding(event.target.value)}
@@ -738,24 +740,27 @@ export function ApiKeysPage() {
                     ))}
                   </Select>
                 </Field>
-                <Field label="来源 IP 白名单（逗号分隔 IP/CIDR，留空不限制）">
+                <Field label="来源 IP 白名单（逗号分隔 IP/CIDR，留空不限制）" htmlFor="key-allowed-ips-input">
                   <Input
+                    id="key-allowed-ips-input"
                     value={allowedIps}
                     data-testid="key-allowed-ips"
                     placeholder="例如 203.0.113.9,10.0.0.0/8"
                     onChange={(event) => setAllowedIps(event.target.value)}
                   />
                 </Field>
-                <Field label="模型白名单（逗号分隔模型名或 glob，留空不限制）">
+                <Field label="模型白名单（逗号分隔模型名或 glob，留空不限制）" htmlFor="key-allowed-models-input">
                   <Input
+                    id="key-allowed-models-input"
                     value={allowedModels}
                     data-testid="key-allowed-models"
                     placeholder="例如 glm-*,kimi-k3"
                     onChange={(event) => setAllowedModels(event.target.value)}
                   />
                 </Field>
-                <Field label="到期时间（留空永不过期）">
+                <Field label="到期时间（留空永不过期）" htmlFor="key-expires-at-input">
                   <Input
+                    id="key-expires-at-input"
                     type="datetime-local"
                     value={expiresAt}
                     data-testid="key-expires-at"
@@ -820,8 +825,9 @@ export function ApiKeysPage() {
                 本列表只保留脱敏预览（{importing.preview}），服务端不再存明文，故需
                 粘贴创建时保存的完整 Key 才能生成导入深链（CC Switch v4.0.10+）。
               </p>
-              <Field label="API Key" hint="仅本次导入的内存中使用，关闭即清除，不落库、不上传。">
+              <Field label="API Key" htmlFor="ccswitch-row-key-input" hint="仅本次导入的内存中使用，关闭即清除，不落库、不上传。">
                 <Input
+                  id="ccswitch-row-key-input"
                   value={importKey}
                   data-testid="ccswitch-row-key"
                   placeholder="sk-..."
