@@ -281,7 +281,7 @@ it("Responses 端点示例默认折叠，展开后可复制 Codex CLI 配置", a
 });
 
 
-/** 展开「OpenAI 客户端接入」面板（默认收起，与 HelpBlock 一致）。 */
+/** 展开「OpenAI 客户端接入」面板（默认收起）。 */
 async function openOpenAIEntry() {
   await userEvent.click(screen.getByTestId("openai-entry-toggle"));
 }

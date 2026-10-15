@@ -200,8 +200,8 @@ function EndpointRow({
   );
 }
 
-/** 客户端接入面板的公共骨架：折叠交互与「模型与渠道调度说明」(HelpBlock) 一致，
- *  卡片 header 的「说明 / 收起」按钮切换内容，不引入动画。 */
+/** 客户端接入面板的公共骨架：卡片 header 的「说明 / 收起」按钮切换内容，
+ *  默认收起，不引入动画。 */
 function ClientEntryPanel({
   title,
   testid,

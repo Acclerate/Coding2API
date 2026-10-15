@@ -9,7 +9,6 @@ import {
 import { useSessionContext } from "../Layout";
 import { usePlaygroundModels } from "../api/hooks";
 import { errorText } from "../lib/errors";
-import { HelpBlock } from "../components/HelpBlock";
 import { PageHeader } from "../components/PageHeader";
 import { ModelPicker, modelValue, pickDefaultModel } from "../components/ModelPicker";
 import { buildSamplingParams, effortOptions } from "../lib/playgroundParams";
@@ -52,6 +51,9 @@ export function PlaygroundPage() {
 
   const send = async (event: React.FormEvent) => {
     event.preventDefault();
+    // 快捷键（⌘/Ctrl+Enter）走 requestSubmit()，不受发送按钮 disabled 约束；
+    // 请求进行中直接忽略，避免重复 POST 重复计费。
+    if (busy) return;
     // 推理档位随模型能力变化：当前模型不适用（控件不渲染）时，即使 state 里
     // 还留着上一个模型选的档位也不发送，避免把无关参数塞给不支持的模型。
     const built = buildSamplingParams({
@@ -125,24 +127,26 @@ export function PlaygroundPage() {
         icon={<TerminalSquare className="size-5" />}
       />
 
-      <HelpBlock
-        title="模型与渠道调度说明"
-        entries={[
-          { term: "模型名 model@provider", where: "模型 · 强制指定渠道", meaning: "默认 glm-5.2 由调度器在可用渠道间自动选健康的；写 glm-5.2@trae 则只走 TRAE，写 模型@zen 只走 OpenCode Zen。" },
-        ]}
-      />
+      {(error || modelsQuery.error) && (
+        <div data-testid="playground-error">
+          <Notice tone="danger">
+            {error ?? "模型列表加载失败，请刷新重试"}
+          </Notice>
+        </div>
+      )}
 
-      <Panel title="请求">
-        <form onSubmit={send} className="space-y-3">
-          <Field label="模型" hint="多渠道模型默认自动路由；可在「当前选择」条里强制指定渠道">
-            <ModelPicker
-              models={models}
-              value={selectedModel}
-              onChange={pickModel}
-              onPin={pickModel}
-              loading={modelsQuery.isFetching && fetched.length === 0}
-            />
-          </Field>
+      <Panel title="模型">
+        <div className="space-y-3">
+          <ModelPicker
+            models={models}
+            value={selectedModel}
+            onChange={pickModel}
+            onPin={pickModel}
+            loading={modelsQuery.isFetching && fetched.length === 0}
+          />
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            默认由调度器在可用渠道间自动选健康号；在「当前选择」条点渠道可强制走单一渠道（如 glm-5.2@trae）。
+          </p>
 
           {selectedInfo && (selectedInfo.max_input_tokens !== undefined ||
             selectedInfo.max_output_tokens !== undefined ||
@@ -223,142 +227,148 @@ export function PlaygroundPage() {
               </span>
             </Card>
           )}
-
-          <Field label="提示词">
-            <Textarea
-              rows={4}
-              value={prompt}
-              data-testid="playground-prompt"
-              className="font-mono text-xs"
-              onChange={(event) => setPrompt(event.target.value)}
-            />
-          </Field>
-          <Label className="w-fit cursor-pointer gap-2 text-sm font-normal">
-            <Checkbox
-              checked={stream}
-              data-testid="stream-toggle"
-              onCheckedChange={(value) => setStream(value === true)}
-            />
-            流式输出
-          </Label>
-
-          {/* 高级参数：留空即不发送该键，由渠道走各自的默认值 */}
-          <div className="grid gap-3 sm:grid-cols-3" data-testid="playground-advanced">
-            <Field label="temperature" hint="留空不发送；0–2 是 OpenAI 惯例，本服务只做有限值透传">
-              <Input
-                type="number"
-                step="0.1"
-                min="0"
-                value={temperature}
-                placeholder="渠道默认"
-                data-testid="param-temperature"
-                onChange={(event) => setTemperature(event.target.value)}
-              />
-            </Field>
-            <Field
-              label="max_tokens"
-              hint={
-                selectedInfo?.max_output_tokens !== undefined
-                  ? `留空不发送；该模型上限 ${selectedInfo.max_output_tokens.toLocaleString()}`
-                  : "留空不发送"
-              }
-            >
-              <Input
-                type="number"
-                step="1"
-                min="1"
-                value={maxTokens}
-                placeholder="渠道默认"
-                data-testid="param-max-tokens"
-                onChange={(event) => setMaxTokens(event.target.value)}
-              />
-            </Field>
-            {efforts && (
-              <Field
-                label="reasoning_effort"
-                hint={
-                  selectedInfo?.default_effort
-                    ? `该模型默认档位 ${selectedInfo.default_effort}；留空不发送，渠道可能自补默认`
-                    : "留空不发送；档位由上游裁决，不支持的值会返回上游错误"
-                }
-              >
-                <Select
-                  value={effort}
-                  data-testid="param-effort"
-                  onChange={(event) => setEffort(event.target.value)}
-                >
-                  <option value="">不发送</option>
-                  {efforts.map((level) => (
-                    <option key={level} value={level}>{level}</option>
-                  ))}
-                </Select>
-              </Field>
-            )}
-          </div>
-
-          <Button type="submit" variant="primary" disabled={busy} data-testid="send-request" className="gap-1.5">
-            {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-            {busy ? "请求中…" : "发送"}
-          </Button>
-        </form>
+        </div>
       </Panel>
 
-      {(error || modelsQuery.error) && (
-        <div data-testid="playground-error" role="alert">
-          <Notice tone="danger">
-            {error ?? "模型列表加载失败，请刷新重试"}
-          </Notice>
-        </div>
-      )}
+      {/* 宽屏把「请求」与「响应」并排：发送按钮与回答同屏，不必先滚过整个模型列表 */}
+      <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
+        <Panel title="请求">
+          <form onSubmit={send} className="space-y-3">
+            <Field label="提示词">
+              <Textarea
+                rows={6}
+                value={prompt}
+                data-testid="playground-prompt"
+                placeholder="输入提示词，Ctrl/⌘ + Enter 发送"
+                className="font-mono text-xs"
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+                onChange={(event) => setPrompt(event.target.value)}
+              />
+            </Field>
+            <Label className="w-fit cursor-pointer gap-2 text-sm font-normal">
+              <Checkbox
+                checked={stream}
+                data-testid="stream-toggle"
+                onCheckedChange={(value) => setStream(value === true)}
+              />
+              流式输出
+            </Label>
 
-      {/* 请求/流式响应无焦点变化：aria-live 让读屏可感知回答到达 */}
-      <div aria-live="polite">
-      {(answer || reasoning) && (
-        <Panel title="响应">
-          {reasoning && (
-            <div className="mb-3" data-testid="playground-reasoning">
-              <div className="mb-1 inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                <span className="rounded px-1 py-0.5 font-mono bg-muted">reasoning</span>
-                思考链
-              </div>
-              <pre className="rounded-lg border border-border bg-foreground/[0.03] p-3 text-xs whitespace-pre-wrap">
-                {reasoning}
-              </pre>
+            {/* 高级参数：留空即不发送该键，由渠道走各自的默认值 */}
+            <div className="grid gap-3 sm:grid-cols-3" data-testid="playground-advanced">
+              <Field label="temperature" hint="留空不发送；0–2 是 OpenAI 惯例，本服务只做有限值透传">
+                <Input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={temperature}
+                  placeholder="渠道默认"
+                  data-testid="param-temperature"
+                  onChange={(event) => setTemperature(event.target.value)}
+                />
+              </Field>
+              <Field
+                label="max_tokens"
+                hint={
+                  selectedInfo?.max_output_tokens !== undefined
+                    ? `留空不发送；该模型上限 ${selectedInfo.max_output_tokens.toLocaleString()}`
+                    : "留空不发送"
+                }
+              >
+                <Input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={maxTokens}
+                  placeholder="渠道默认"
+                  data-testid="param-max-tokens"
+                  onChange={(event) => setMaxTokens(event.target.value)}
+                />
+              </Field>
+              {efforts && (
+                <Field
+                  label="reasoning_effort"
+                  hint={
+                    selectedInfo?.default_effort
+                      ? `该模型默认档位 ${selectedInfo.default_effort}；留空不发送，渠道可能自补默认`
+                      : "留空不发送；档位由上游裁决，不支持的值会返回上游错误"
+                  }
+                >
+                  <Select
+                    value={effort}
+                    data-testid="param-effort"
+                    onChange={(event) => setEffort(event.target.value)}
+                  >
+                    <option value="">不发送</option>
+                    {efforts.map((level) => (
+                      <option key={level} value={level}>{level}</option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
             </div>
-          )}
-          <div data-testid="playground-answer">
-            <div className="mb-1 text-xs text-muted-foreground">回答</div>
-            <pre className="rounded-lg border border-border bg-foreground/[0.03] p-3 text-xs whitespace-pre-wrap">
-              {answer}
-            </pre>
-          </div>
-          {usage && (
-            <Card
-              size="sm"
-              className="mt-3 gap-0 bg-muted/40 px-3 py-2 font-mono text-xs text-muted-foreground ring-border"
-              data-testid="playground-usage"
-            >
-              <pre className="whitespace-pre-wrap">{JSON.stringify(usage, null, 2)}</pre>
-              <div className="mt-1 font-sans">
-                credit 为渠道可选字段，经常不返回；健康度只依赖额度探测接口。
-              </div>
-            </Card>
-          )}
-        </Panel>
-      )}
-      </div>
 
-      {!answer && !reasoning && !error && (
-        <Empty>
-          <div className="space-y-1">
-            <p>选择模型并填写提示词后发送，结果会显示在下方。</p>
-            <p className="text-xs">
-              用量计入 {session.username}，与外部 API 同一条调度与统计链路。
-              API Key 仅供外部客户端接入使用。
-            </p>
-          </div>
-        </Empty>
-      )}
+            <Button type="submit" variant="primary" disabled={busy} data-testid="send-request" className="gap-1.5">
+              {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+              {busy ? "请求中…" : "发送"}
+            </Button>
+          </form>
+        </Panel>
+
+        {/* 请求/流式响应无焦点变化：aria-live 让读屏可感知回答到达 */}
+        <div aria-live="polite">
+          <Panel title="响应">
+            {answer || reasoning ? (
+              <>
+                {reasoning && (
+                  <div className="mb-3" data-testid="playground-reasoning">
+                    <div className="mb-1 inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                      <span className="rounded px-1 py-0.5 font-mono bg-muted">reasoning</span>
+                      思考链
+                    </div>
+                    <pre className="rounded-lg border border-border bg-foreground/[0.03] p-3 text-xs whitespace-pre-wrap">
+                      {reasoning}
+                    </pre>
+                  </div>
+                )}
+                <div data-testid="playground-answer">
+                  <div className="mb-1 text-xs text-muted-foreground">回答</div>
+                  <pre className="rounded-lg border border-border bg-foreground/[0.03] p-3 text-xs whitespace-pre-wrap">
+                    {answer}
+                  </pre>
+                </div>
+                {usage && (
+                  <Card
+                    size="sm"
+                    className="mt-3 gap-0 bg-muted/40 px-3 py-2 font-mono text-xs text-muted-foreground ring-border"
+                    data-testid="playground-usage"
+                  >
+                    <pre className="whitespace-pre-wrap">{JSON.stringify(usage, null, 2)}</pre>
+                    <div className="mt-1 font-sans">
+                      credit 为渠道可选字段，经常不返回；健康度只依赖额度探测接口。
+                    </div>
+                  </Card>
+                )}
+              </>
+            ) : (
+              <Empty>
+                <div className="space-y-1">
+                  <p>选择模型并填写提示词后发送，结果会显示在这里。</p>
+                  <p className="text-xs">
+                    用量计入 {session.username}，与外部 API 同一条调度与统计链路。
+                    API Key 仅供外部客户端接入使用。
+                  </p>
+                </div>
+              </Empty>
+            )}
+          </Panel>
+        </div>
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PlaygroundPage } from "../PlaygroundPage";
 import { jsonResponse, mockFetch, renderPage, userEvent } from "@/test-utils";
@@ -671,6 +671,73 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     await userEvent.click(screen.getByTestId("model-option-plain@codebuddy"));
     await userEvent.click(screen.getByTestId("model-option-thinker@codebuddy"));
     expect(screen.getByTestId("param-effort")).toHaveValue("");
+  });
+
+  it("提示词框内 Ctrl/⌘ + Enter 直接发送", async () => {
+    const calls = spyChat(MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
+
+    await waitFor(() =>
+      expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(true),
+    );
+  });
+
+  it("多渠道时当前选择条只渲染一份渠道徽章（徽章即渠道按钮）", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const current = screen.getByTestId("model-current");
+    // 徽章不再静态列一遍、渠道按钮再列一遍：每个渠道在「当前选择」条里只出现一次
+    for (const provider of ["codebuddy", "trae"]) {
+      expect(within(current).getAllByTestId(`channel-pill-${provider}`)).toHaveLength(1);
+      // 徽章就挂在渠道按钮内部，点它即强制该渠道
+      expect(
+        within(within(current).getByTestId(`provider-pin-${provider}`))
+          .getByTestId(`channel-pill-${provider}`),
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("请求进行中再次提交被忽略，不重复发请求", async () => {
+    let release: () => void = () => {};
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: { url: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push({ url });
+        if (url.includes("/api/playground/models")) return jsonResponse(MODELS);
+        await pending;
+        return jsonResponse({ choices: [{ message: { content: "ok" } }] });
+      }),
+    );
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+    await userEvent.click(screen.getByTestId("stream-toggle"));
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.click(screen.getByTestId("send-request"));
+
+    // 请求在途：⌘/Ctrl+Enter 走 requestSubmit()，真实浏览器里不受发送按钮
+    // disabled 约束（jsdom 会拦，所以这里直接派发 submit 事件来覆盖该路径）。
+    // 没有 busy 守卫时这里会发出第二个 POST，重复计费。
+    const form = screen.getByTestId("playground-prompt").closest("form")!;
+    fireEvent.submit(form);
+
+    release();
+    await waitFor(() =>
+      expect(screen.getByTestId("playground-answer")).toHaveTextContent("ok"),
+    );
+    expect(calls.filter((item) => item.url.includes("/api/playground/chat/completions")))
+      .toHaveLength(1);
   });
 
   it("非法数值拦住发送并给出提示，不发请求", async () => {
