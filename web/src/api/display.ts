@@ -7,7 +7,7 @@
  * 是两回事——前者不该提示用户去点「探测」。
  */
 
-import type { Credential, Health, ModelCooldown, ProbeFailureReason } from "../api/types";
+import type { Credential, Health, ModelCooldown, ProbeFailureReason, UpstreamLevel } from "../api/types";
 
 export type HealthKind = "known" | "unknown" | "noprobe" | "exhausted";
 
@@ -458,4 +458,49 @@ export const PROBE_FAILURE_LABEL: Record<ProbeFailureReason, string> = {
 
 export function probeFailureLabel(reason: ProbeFailureReason | undefined): string {
   return reason ? (PROBE_FAILURE_LABEL[reason] ?? "未知错误") : "未知错误";
+}
+
+// ---------------------------------------------------------- 上游状态页
+
+/**
+ * 上游档位的中文名（与后端六档一一对应）。
+ *
+ * 措辞区分「故障」与「维护」：维护是计划内、不一定是问题，但也不能显示成
+ * 一切正常——用户看到 429 时最需要知道的是「现在到底是不是上游在动」。
+ */
+export const UPSTREAM_LEVEL_LABEL: Record<UpstreamLevel, string> = {
+  operational: "正常",
+  degraded: "性能下降",
+  partial: "部分中断",
+  major: "重大故障",
+  maintenance: "维护中",
+  unknown: "未知",
+};
+
+/**
+ * 上游档位 → 徽标色调。
+ *
+ * `partial` 与 `major` 都归 danger：两者都意味着「有模型用不了」，只是范围不同，
+ * 分两种红只会让配色更碎；范围差异由文字承担。`unknown` 用 muted——抓取失败
+ * 不是「上游挂了」，不该和真实故障抢同一个红色。
+ */
+export function upstreamLevelTone(level: UpstreamLevel): "ok" | "warn" | "danger" | "muted" {
+  switch (level) {
+    case "operational":
+      return "ok";
+    case "degraded":
+      return "warn";
+    case "partial":
+    case "major":
+      return "danger";
+    case "maintenance":
+      return "warn";
+    default:
+      return "muted";
+  }
+}
+
+/** 上游档位展示名；未知取值不原样透传（与 usageErrorLabel 同一口径）。 */
+export function upstreamLevelLabel(level: string): string {
+  return UPSTREAM_LEVEL_LABEL[level as UpstreamLevel] ?? "未知";
 }

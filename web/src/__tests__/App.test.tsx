@@ -52,6 +52,7 @@ describe("Layout", () => {
     expect(screen.queryByText("用户管理")).not.toBeInTheDocument();
     expect(screen.queryByText("审计日志")).not.toBeInTheDocument();
     expect(screen.queryByText("运维告警")).not.toBeInTheDocument();
+    expect(screen.queryByText("上游状态")).not.toBeInTheDocument();
     expect(screen.queryByText("任务与配置")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
     expect(await screen.findByRole("menu")).toHaveTextContent("op · 操作员");
@@ -66,6 +67,7 @@ describe("Layout", () => {
     expect(within(nav).getByText("用户管理")).toBeInTheDocument();
     expect(within(nav).getByText("审计日志")).toBeInTheDocument();
     expect(within(nav).getByText("运维告警")).toBeInTheDocument();
+    expect(within(nav).getByText("上游状态")).toBeInTheDocument();
     expect(within(nav).getByText("任务与配置")).toBeInTheDocument();
     // 仓库入口已移出侧栏，改到顶栏图标按钮
     expect(within(nav).queryByText("项目仓库")).not.toBeInTheDocument();

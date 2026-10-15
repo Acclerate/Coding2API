@@ -18,6 +18,8 @@ import {
   formatDuration,
   formatNumber,
   formatTime,
+  upstreamLevelLabel,
+  upstreamLevelTone,
   hasQuotaProbe,
   healthView,
   modelCooldownLabel,
@@ -428,5 +430,26 @@ describe("display helpers", () => {
       { model: "m", cooling_until: 1, hits: 1, reason: "model" })).toContain("其它模型不受影响");
     expect(modelCooldownLabel(
       { model: "m", cooling_until: 1, hits: 1, reason: "blocked" })).toContain("无此模型");
+  });
+
+  it("上游档位：六档各有中文名，未知取值不原样透传", () => {
+    expect(upstreamLevelLabel("operational")).toBe("正常");
+    expect(upstreamLevelLabel("degraded")).toBe("性能下降");
+    expect(upstreamLevelLabel("partial")).toBe("部分中断");
+    expect(upstreamLevelLabel("major")).toBe("重大故障");
+    expect(upstreamLevelLabel("maintenance")).toBe("维护中");
+    expect(upstreamLevelLabel("unknown")).toBe("未知");
+    // 后端新增档位时前端不显示空白
+    expect(upstreamLevelLabel("brand_new_level")).toBe("未知");
+  });
+
+  it("上游档位色调：partial / major 同为 danger，unknown 用 muted", () => {
+    expect(upstreamLevelTone("operational")).toBe("ok");
+    expect(upstreamLevelTone("degraded")).toBe("warn");
+    expect(upstreamLevelTone("maintenance")).toBe("warn");
+    expect(upstreamLevelTone("partial")).toBe("danger");
+    expect(upstreamLevelTone("major")).toBe("danger");
+    // 抓取失败不是「上游挂了」，不该抢真实故障的红色
+    expect(upstreamLevelTone("unknown")).toBe("muted");
   });
 });

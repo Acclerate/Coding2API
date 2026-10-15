@@ -28,6 +28,7 @@ from .api import (
     admin_model_catalog,
     admin_settings,
     admin_stats,
+    admin_upstream,
     admin_users,
     authorize,
     balance,
@@ -100,6 +101,8 @@ from .stats.query import StatsQuery
 from .tasks.backup import BackupTask
 from .tasks.pacer import Pacer
 from .tasks.runner import build_runner
+from .tasks.upstream_status import UpstreamStatusTask
+from .upstream_status import UpstreamStatusStore
 from .version import app_version
 from .webapp import limits as _limits
 from .webapp import static as _static
@@ -295,6 +298,20 @@ async def _warm_model_catalog(refresh, table: dict) -> None:
         logger.warning("启动预热模型目录失败: %s", error)
 
 
+async def _warm_upstream_status(task: UpstreamStatusTask) -> None:
+    """启动时后台补抓一轮上游状态页。
+
+    与 `_warm_model_catalog` 同一口径：循环体是先睡后跑，不预热的话页面在
+    重启后要空等一个周期（默认 5 分钟）才第一次有数据——运维页刚部署完就是
+    空白最容易被当成坏了。放后台跑不阻塞启动；失败仅记日志（下一轮循环会
+    重试，且单源失败本来就被 `fetch_source` 兜成 unknown 条目）。
+    """
+    try:
+        await task.run_once()
+    except Exception as error:  # noqa: BLE001 - 预热失败不阻断服务
+        logger.warning("启动预热上游状态页失败: %s", error)
+
+
 def _restore_model_list(services) -> None:
     """启动时同步回灌落盘模型目录：失败仅记日志（缓存是加速手段，不是必需项）。"""
     try:
@@ -323,6 +340,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     user_repo = UserRepository(db)
     audit = AuditRepository(db)
     alerts = AlertRepository(db)
+    # 上游状态页快照：纯内存、不落盘（状态分钟级易变，旧快照比没有更危险）。
+    # 装配在这里、路由层每请求现读 app.state，任务就地替换整批。
+    upstream_status_store = UpstreamStatusStore()
     store = users if users is not None else _load_users(
         settings=config, user_repo=user_repo)
     # 聊天节流器存「取值器」而不是快照：管理台改最小间隔后立即生效。
@@ -527,6 +547,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             return {"models": len(price_table)}
 
         # 传 runtime（而非 env 快照）：后台循环的热更值每轮现读覆盖层。
+        upstream_status_task = UpstreamStatusTask(
+            upstream_status_store,
+            timeout=config.upstream_status_timeout_seconds,
+            enabled=lambda: runtime.upstream_status_enabled)
         runner = build_runner(credentials, registry, app_.state.stats_collector, runtime,
                               growth_events=app_.state.growth_events,
                               credit_events=credit_events,
@@ -534,6 +558,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               alerts=alerts,
                               backup=BackupTask(config.db_path,
                                                 keep=lambda: runtime.backup_keep),
+                              upstream_status=upstream_status_task,
                               model_catalog=_refresh_channel_models,
                               openrouter_catalog=_refresh_model_catalog,
                               openrouter_catalog_minutes=(
@@ -548,6 +573,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         # 部署的成本与分数空窗到下一轮（默认 24 小时后）。
         app_.state.catalog_warmup_task = asyncio.create_task(
             _warm_model_catalog(_refresh_model_catalog, price_table))
+        # 上游状态页同理：不预热的话运维页在重启后要空等一个周期（默认 5 分钟）
+        # 才第一次有数据。放在后台跑（8 个外部端点，不抢启动时间）。
+        app_.state.upstream_warmup_task = asyncio.create_task(
+            _warm_upstream_status(upstream_status_task))
         # 让预热任务先跑一步：失败时日志立即落盘（成功与否都不阻塞下面 yield）。
         await asyncio.sleep(0)
         try:
@@ -564,6 +593,13 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                 catalog_warmup.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await catalog_warmup
+            # 上游状态页预热同理：它在等 8 个外部端点，不取消会把 in-flight
+            # 的 httpx 请求带出事件循环。
+            upstream_warmup = getattr(app_.state, "upstream_warmup_task", None)
+            if upstream_warmup is not None and not upstream_warmup.done():
+                upstream_warmup.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await upstream_warmup
             # stale-while-revalidate 的后台刷新任务：不取消会把 in-flight 的
             # 上游请求（zen 探活可占十几秒）带出事件循环，关闭变慢且报错。
             for task in list(services_.model_refresh_tasks):
@@ -621,6 +657,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 把 A 的凭证记到 B 名下。回调不带 state，故用会话 Cookie 认发起人。
     app.state.pending_callbacks = {}
     app.state.login_throttle = LoginThrottle()
+    # 上游状态页快照（纯内存）：任务就地替换，路由每请求现读。
+    app.state.upstream_status = upstream_status_store
 
     # 路由层共享依赖容器（TECHNICAL §2 deps.py）
     def schedule_probe(credential_id: str) -> None:
@@ -714,6 +752,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(admin_settings.create_router(services))
     app.include_router(admin_model_catalog.create_router(services))
     app.include_router(admin_alerts.create_router(services))
+    app.include_router(admin_upstream.create_router(services))
     app.include_router(admin_stats.create_router(services))
     app.include_router(admin_users.create_router(services))
     app.include_router(admin_audit.create_router(services))

@@ -212,6 +212,25 @@ def price_catalog_offline(monkeypatch, request):
     monkeypatch.setattr(main, "fetch_openrouter_models", fake_fetch)
 
 
+@pytest.fixture(autouse=True)
+def upstream_status_offline(monkeypatch):
+    """一律不真连状态源：把任务用的 `fetch_all` 换成「什么都抓不到」。
+
+    `build_app()` 启动时会后台预热一次上游状态页（`_warm_upstream_status`），
+    每个用真实装配的用例都会打 8 个外部端点。这里掐的是**任务侧**的抓取入口
+    （`src.tasks.upstream_status.fetch_all`），返回空快照——不打外网、也不凭空
+    编造状态。真实抓取 / 解析由 `tests/test_upstream_status.py`（直接调
+    `src.upstream_status.fetch_all`，走 MockTransport）与
+    `tests/tasks/test_upstream_status.py`（自己的 autouse 夹具换回真实现）覆盖。
+    """
+    from src.tasks import upstream_status as task_module
+
+    async def fake_fetch_all(specs, *, timeout, client=None):
+        return ()
+
+    monkeypatch.setattr(task_module, "fetch_all", fake_fetch_all)
+
+
 def _real_upstream(request) -> set[str]:
     """本测试所属文件声明的 `real_upstream` 豁免项集合（如 {"zen"}）。"""
     marker = request.node.get_closest_marker("real_upstream")

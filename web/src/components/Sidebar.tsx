@@ -5,6 +5,7 @@ import {
   Boxes,
   Database,
   KeyRound,
+  RadioTower,
   ScrollText,
   SlidersHorizontal,
   TerminalSquare,
@@ -34,6 +35,7 @@ export const ADMIN_NAV: NavItem[] = [
   { to: "/users", label: "用户管理", icon: UsersRound },
   { to: "/audit", label: "审计日志", icon: ScrollText },
   { to: "/alerts", label: "运维告警", icon: BellRing },
+  { to: "/upstream", label: "上游状态", icon: RadioTower },
   { to: "/settings", label: "任务与配置", icon: SlidersHorizontal },
 ];
 

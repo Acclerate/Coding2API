@@ -162,6 +162,14 @@ class Settings(BaseSettings):
     # 备份周期取整日是因为库本身不大（几十 MB 量级），更密只是白占磁盘。
     backup_interval_minutes: int = 1440
     backup_keep: int = 7
+    # 上游状态页聚合后台任务：并发抓各模型 / 网关提供方的公开状态接口，归一化
+    # 后存内存快照，管理台「上游状态」页只读展示。**只做解释不做决策**（状态页
+    # 滞后于我们自己的模型级冷却）。不落盘：状态分钟级易变，重启后拿旧快照
+    # 比显示「尚未抓取」更危险。
+    upstream_status_enabled: bool = True
+    upstream_status_minutes: int = 5            # 抓取周期（分钟），下限 1
+    # 单源 HTTP 超时（秒）：8 个源并发抓，慢的那个不该拖住整轮。
+    upstream_status_timeout_seconds: float = 10.0
     pacer_min_seconds: float = 5
     pacer_max_seconds: float = 20
     # CodeBuddy 聊天最小间隔：同渠道同凭证的「顺序连发」之间的最小请求间隔，

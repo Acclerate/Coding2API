@@ -80,8 +80,8 @@
 一个 FastAPI 进程内按**三个平面**组织，三面共享同一份 SQLite（WAL + `busy_timeout=5000`：账号 / 加密凭证 / 统计 / 审计）与 Provider 客户端：
 
 - **请求面**（鉴权 = API Key）：`/v1/chat/completions` · `/v1/responses` · `/v1/messages` · `/v1/models` · `/v1/user/balance` → 协议层（OpenAI / Responses / Anthropic 规范化与适配、模型名解析 `name` ｜ `name@provider`）→ 执行引擎（调度器 · 冷却状态机 · 会话粘性 · 截断续写 · 统计采集）→ 中立事件流 → 七个 Provider。
-- **管理面**（鉴权 = 会话 Cookie + RBAC）：React 管理台 → `/api/*`，含用户管理、审计、凭证运维、API Key、统计、任务与配置。
-- **后台面**（无 HTTP 入口，`TaskRunner` 起 10 类循环）：额度探测 · token 预刷新 · 每日签到 · 成长中心 · 活跃上报 · 明细清理 · 数据库备份 · 渠道模型列表刷新 · 模型目录刷新（OpenRouter）· 运维告警 → Provider 客户端 → 上游。
+- **管理面**（鉴权 = 会话 Cookie + RBAC）：React 管理台 → `/api/*`，含用户管理、审计、凭证运维、API Key、统计、任务与配置、上游状态。
+- **后台面**（无 HTTP 入口，`TaskRunner` 起 11 类循环）：额度探测 · token 预刷新 · 每日签到 · 成长中心 · 活跃上报 · 明细清理 · 数据库备份 · 渠道模型列表刷新 · 模型目录刷新（OpenRouter）· 运维告警 · 上游状态页聚合 → Provider 客户端 → 上游。
 
 **为什么按平面切**：请求面全程无状态、可并发，且不知道「人」是谁（只认 Key 的归属用户）；管理面与请求面**共用同一个执行引擎与仓储**，不做独立服务——自托管小实例里进程隔离只换来部署复杂度。两个鉴权面互不替代：API Key 进不了管理台，会话 Cookie 也进不了 `/v1`。后台面与请求面**共用 Provider 客户端与节流器**：各渠道风控按最小间隔生效，不能因为「后台签到」与「前台对话」是两条代码路径就各发各的。三面共享一份 SQLite，故升级只需重启**一个**进程。
 
@@ -126,7 +126,7 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ### 3.7 账号与权限面
 
-管理面身份来自 SQLite `users` 表。三角色：`admin`（用户管理、运行时配置、凭证写操作、全量统计、审计、运维告警，`require_admin`）、`operator`（凭证写操作：导入 / 删除 / 启停 / pin / 切换账号 / 签到 / 成长，全量统计，`require_operator`）、`viewer`（只读：仪表盘、凭证列表、Playground、统计；审计为 admin-only，登录即可）。
+管理面身份来自 SQLite `users` 表。三角色：`admin`（用户管理、运行时配置、凭证写操作、全量统计、审计、运维告警、上游状态，`require_admin`）、`operator`（凭证写操作：导入 / 删除 / 启停 / pin / 切换账号 / 签到 / 成长，全量统计，`require_operator`）、`viewer`（只读：仪表盘、凭证列表、Playground、统计；审计为 admin-only，登录即可）。
 
 - **鉴权链**：签名 Cookie（HMAC，payload 带用户名与 `session_epoch`）→ 用户仍存在且启用 → epoch 与 DB 一致 → 角色现读 DB。四者缺一即 401；**角色不进 Cookie**，降级立即生效。
 - **吊销不建会话表**：`users.session_epoch` 在改密 / 改角色 / 启停 / 硬删时 `+1`，旧 Cookie 立即失效。
@@ -161,12 +161,13 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 
 **外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate}` + 可选 `benchmarks`）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
 
-**管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、任务与配置（admin-only）。
+**管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、上游状态（admin-only）、任务与配置（admin-only）。
 
 - 账号：`GET|POST /api/users`、`PATCH /api/users/{username}`、`POST /api/users/{username}/{disable|enable|reset-password}`（**不提供 DELETE**）；自助改密 `POST /api/auth/password`；无鉴权的一次性激活流 `GET|POST /api/auth/activate`；审计查询 `GET /api/audit`。
 - 凭证运维：`POST /api/credentials/{id}/checkin|toggle|revive|probe|accounts/select`、`PUT /api/credentials/{id}/limits`（限额护栏整体替换，全关时删行）、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|accounts`。
 - 凭证批量运维：`POST /api/credentials/batch`（`{action: probe|toggle|checkin|revive, ids: [...]}`，可选 `enabled` 用于 `toggle`）。逐条隔离执行——单条失败不影响其余条，响应含 `{total, succeeded, failed, results[]}`；`toggle`/`revive` 落一条汇总审计，`probe`/`checkin` 与单条端点同为只读语义、不写审计。
 - 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`（手动跑一轮）。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
+- 上游状态聚合：`GET /api/upstream-status`（admin-only）返回后台任务抓取的内存快照（`summary` + `sources`）与任务的当前 `enabled` / `interval_seconds` / `server_time`；**不落盘**，重启后为「尚未抓取」。四种解析器（Statuspage v2 / OpenCode / Better Stack / Atom）归一化到六档，加源只需在 `SOURCE_SPECS` 加一行。
 
 实现以代码为准，使用说明见 [README.md](README.md)。
 

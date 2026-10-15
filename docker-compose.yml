@@ -59,6 +59,11 @@ services:
       # SQLite 备份后台任务：周期（分钟）与保留份数；0 份表示不清理
       BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-1440}
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      # 上游状态页聚合（只读展示，不参与选号/熔断）：周期（分钟）与开关。
+      # 数据只在内存、不落盘；单源 HTTP 超时（秒）供 8 个源并发抓取
+      UPSTREAM_STATUS_ENABLED: ${UPSTREAM_STATUS_ENABLED:-true}
+      UPSTREAM_STATUS_MINUTES: ${UPSTREAM_STATUS_MINUTES:-5}
+      UPSTREAM_STATUS_TIMEOUT_SECONDS: ${UPSTREAM_STATUS_TIMEOUT_SECONDS:-10.0}
       # 到期排序窗口（秒）：把距到期 ≤ 该值的积分加总，多的账号先用；≤0 关闭
       QUOTA_EXPIRY_WINDOW_SECONDS: ${QUOTA_EXPIRY_WINDOW_SECONDS:-129600}
       # 次到期排序窗口（秒）：主窗口打平（含都为 0）时才比较；≤0 关闭该级

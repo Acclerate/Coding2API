@@ -235,6 +235,14 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("backup_keep", int, "备份保留份数",
                "只保留最近这么多份备份，更旧的按时间删除；0 表示不清理（只备份）。",
                minimum=0, task="backup"),
+    # 上游状态页聚合：改周期时人就在看这个任务最近抓到了什么。
+    HotSetting("upstream_status_enabled", bool, "上游状态页抓取",
+               "是否抓取各模型 / 网关提供方的官方状态接口并在「上游状态」页展示。"
+               "关闭后页面保留上一次快照并标注已关闭。", task="upstream_status"),
+    HotSetting("upstream_status_minutes", int, "上游状态页周期（分钟）",
+               "并发抓取全部状态源的一轮间隔；官方状态页本身是分钟级更新，抓得"
+               "更密只是白打别人的接口。下限 1 分钟。", minimum=1,
+               task="upstream_status", floor=1),
     HotSetting("metrics_enabled", bool, "Prometheus 指标出口",
                "是否暴露 `GET /metrics`（Prometheus text 格式：请求/token/凭证池/"
                "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
@@ -751,6 +759,16 @@ class RuntimeSettings:
     @property
     def backup_keep(self) -> int:
         return int(self.get("backup_keep"))
+
+    # ------------------------------------------------------ 上游状态页聚合
+
+    @property
+    def upstream_status_enabled(self) -> bool:
+        return bool(self.get("upstream_status_enabled"))
+
+    @property
+    def upstream_status_minutes(self) -> int:
+        return int(self.get("upstream_status_minutes"))
 
     @property
     def metrics_enabled(self) -> bool:

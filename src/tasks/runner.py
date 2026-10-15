@@ -26,6 +26,7 @@ from .quota_probe import QuotaProbeTask
 from .refresh import RefreshTask
 from .retention import RetentionTask
 from .status import TASK_BY_KEY, TASK_SPECS, TaskStatusStore
+from .upstream_status import UpstreamStatusTask
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class TaskRunner:
     alert: AlertTask | None = None,
     # SQLite 备份：None 表示不装配该循环（老调用方/测试保持原行为）。
     backup: BackupTask | None = None,
+    # 上游状态页聚合：None 表示不装配该循环（老调用方/测试保持原行为）。
+    upstream_status: UpstreamStatusTask | None = None,
     quota_probe_minutes: int | Callable[[], int] = 60,
     growth_interval_minutes: int | Callable[[], int] = 60,
     refresh_interval_minutes: int | Callable[[], int] = 60,
@@ -82,8 +85,10 @@ class TaskRunner:
     openrouter_catalog_minutes: int | Callable[[], int] = 1440,
     alert_interval_minutes: int | Callable[[], int] = 5,
     backup_interval_minutes: int | Callable[[], int] = 1440,
+    upstream_status_minutes: int | Callable[[], int] = 5,
     activity_enabled: Callable[[], bool] | None = None,
     alert_enabled: Callable[[], bool] | None = None,
+    upstream_status_enabled: Callable[[], bool] | None = None,
     status: TaskStatusStore | None = None,
 ) -> None:
         self._quota_probe = quota_probe
@@ -96,6 +101,7 @@ class TaskRunner:
         self._openrouter_catalog = openrouter_catalog
         self._alert = alert
         self._backup = backup
+        self._upstream_status = upstream_status
         # 周期可热更：存取值器，每轮 sleep 前读当前值（否则改配置
         # 要等到下一次重启才生效）。下限与业务语义同前，不变。
         self._quota_probe_minutes = live(quota_probe_minutes)
@@ -106,11 +112,15 @@ class TaskRunner:
         self._openrouter_catalog_minutes = live(openrouter_catalog_minutes)
         self._alert_minutes = live(alert_interval_minutes)
         self._backup_minutes = live(backup_interval_minutes)
+        self._upstream_status_minutes = live(upstream_status_minutes)
         # 活跃上报是否启用也可热更：装配时恒建对象（构造成本为零），
         # 每轮由 _sync_activity 问一次，关着时是 no-op。
         self._activity_enabled = activity_enabled or (lambda: activity is not None)
         # 运维告警同理由 AlertTask 自己问（关着时 run_once 返回 None）
         self._alert_enabled = alert_enabled or (lambda: alert is not None)
+        # 上游状态页抓取同理（关着时 run_once 返回 None）
+        self._upstream_status_enabled = (upstream_status_enabled
+                                         or (lambda: upstream_status is not None))
         # 活跃上报：每 10 分钟醒一次看时点（due() 只在配置小时窗口内放行），
         # 而不是整点只醒一次——服务恰在整点重启会整天漏报
         self._activity_interval = 600
@@ -164,6 +174,12 @@ class TaskRunner:
     def _backup_interval(self) -> float:
         # 下限 60 分钟与热更项 minimum 对齐：库不大，更密只是白占磁盘。
         return max(3600, int(self._backup_minutes()) * 60)
+
+    @property
+    def _upstream_status_interval(self) -> float:
+        # 下限 1 分钟与热更项 minimum 对齐：官方状态页本身就是分钟级更新的，
+        # 抓得比它更新只是白打别人的接口。
+        return max(60, int(self._upstream_status_minutes()) * 60)
 
     async def start(self) -> None:
         """启动所有周期任务；首轮额度探测与 token 预刷新都立即执行（不节流）。
@@ -227,6 +243,9 @@ class TaskRunner:
         if self._backup is not None:
             specs.append(_LoopSpec("backup", self._sync_backup,
                                    lambda: self._interval_seconds("backup")))
+        if self._upstream_status is not None:
+            specs.append(_LoopSpec("upstream_status", self._sync_upstream_status,
+                                   lambda: self._interval_seconds("upstream_status")))
         return specs
 
     async def run_task(self, key: str) -> dict[str, Any]:
@@ -302,6 +321,16 @@ class TaskRunner:
         if self._backup is None:
             raise RuntimeError("backup task not configured")
         return await asyncio.to_thread(self._backup.run_once)
+
+    async def _sync_upstream_status(self) -> object:
+        """上游状态页一轮：并发抓全部源并原子替换内存快照。
+
+        是否启用每轮现读：任务关着时 `run_once` 返回 None，`_guarded` 不记
+        运行态——页面显示「未运行」，而不是「刚跑过」。
+        """
+        if self._upstream_status is None:
+            raise RuntimeError("upstream status task not configured")
+        return await self._upstream_status.run_once()
 
     async def _loop(self, name: str, runner: Callable[[], Awaitable[object]],
                     interval: float | Callable[[], float],
@@ -425,6 +454,8 @@ class TaskRunner:
             return self._alert_interval
         if key == "backup":
             return self._backup_interval
+        if key == "upstream_status":
+            return self._upstream_status_interval
         return self._retention_interval
 
     def _task_enabled(self, key: str) -> bool:
@@ -432,6 +463,8 @@ class TaskRunner:
             return bool(self._activity_enabled())
         if key == "alert":
             return bool(self._alert_enabled())
+        if key == "upstream_status":
+            return bool(self._upstream_status_enabled())
         return True
 
     async def stop(self) -> None:
@@ -466,6 +499,7 @@ def build_runner(credentials, providers: dict, stats_collector, config,
                  openrouter_catalog_minutes: int | Callable[[], int] = 1440,
                  alerts=None,
                  backup: BackupTask | None = None,
+                 upstream_status: UpstreamStatusTask | None = None,
                  status: TaskStatusStore | None = None) -> TaskRunner:
     """按配置装配后台任务（Pacer 由两个 provider 共享）。
 
@@ -490,6 +524,9 @@ def build_runner(credentials, providers: dict, stats_collector, config,
 
     backup 同理：None 时不装配数据库备份循环（老调用方与测试保持原行为）；
     生产路径传入 BackupTask（需要 config.db_path，装配期在 main.py 构造）。
+
+    upstream_status 同理：None 时不装配上游状态页抓取循环（老调用方与测试保持
+    原行为）；生产路径传入 UpstreamStatusTask（快照挂在 app.state 供路由读取）。
 
     热更：`config` 既可以是启动期快照 `Settings`，也可以是
     `RuntimeSettings` 覆盖层。装配时所有「可热更项」必须传**零参 lambda**，
@@ -548,7 +585,10 @@ def build_runner(credentials, providers: dict, stats_collector, config,
         alert_interval_minutes=lambda: config.alert_interval_minutes,
         backup=backup,
         backup_interval_minutes=lambda: config.backup_interval_minutes,
+        upstream_status=upstream_status,
+        upstream_status_minutes=lambda: config.upstream_status_minutes,
         activity_enabled=lambda: config.activity_report_enabled,
         alert_enabled=lambda: config.alert_enabled,
+        upstream_status_enabled=lambda: config.upstream_status_enabled,
         status=status_store,
     )

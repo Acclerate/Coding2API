@@ -57,6 +57,11 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
     TaskSpec("backup", "数据库备份",
              "周期性把主库一致性快照（VACUUM INTO）写进 DATA_DIR/backups/，"
              "并只保留最近 N 份；周期与保留份数见「备份周期」「备份保留份数」。"),
+    TaskSpec("upstream_status", "上游状态页",
+             "并发抓各模型 / 网关提供方的官方状态接口（OpenCode Zen / Kilo / "
+             "DeepSeek / Together / Moonshot / MiniMax / OpenAI / Anthropic），"
+             "归一化后存内存供「上游状态」页展示。只做解释不做决策，不参与选号；"
+             "周期见「上游状态页周期」。"),
 )
 
 TASK_BY_KEY: dict[str, TaskSpec] = {spec.key: spec for spec in TASK_SPECS}

@@ -97,6 +97,18 @@ export function useAlerts(username?: string, refetchIntervalMs = 30_000,
   });
 }
 
+/**
+ * 上游状态页聚合快照（admin only）。轮询：状态页是「现在上游怎么样」，
+ * 用户停留时自动刷新；抓取由后端周期任务负责，前端不触发。
+ */
+export function useUpstreamStatus(username?: string, refetchIntervalMs = 60_000) {
+  return useQuery({
+    queryKey: adminKey(username, "upstream-status"),
+    queryFn: api.upstreamStatus,
+    refetchInterval: refetchIntervalMs,
+  });
+}
+
 /** 用户写操作：成功后失效用户列表（角色/启用状态改变了）。 */
 export function useUserMutation<TArgs, TResult>(
   mutationFn: (args: TArgs) => Promise<TResult>,

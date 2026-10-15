@@ -282,6 +282,108 @@ async def test_runner_starts_backup_loop_when_assembled(repo, tmp_path):
         await runner.stop()
 
 
+def test_build_runner_wires_upstream_status(repo):
+    """upstream_status 传入时接线：周期从配置读，开关与对象原样挂上。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET,
+                      UPSTREAM_STATUS_MINUTES=7, UPSTREAM_STATUS_ENABLED=False)
+    task = UpstreamStatusTask(UpstreamStatusStore(),
+                              enabled=lambda: config.upstream_status_enabled)
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          upstream_status=task)
+
+    assert runner._upstream_status is task
+    assert runner._upstream_status_interval == 7 * 60
+    assert runner._task_enabled("upstream_status") is False
+    assert "upstream_status" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("upstream_status") == 7 * 60
+
+
+def test_upstream_status_interval_has_floor(repo):
+    """周期下限 1 分钟（与热更项 minimum 对齐）。"""
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, UPSTREAM_STATUS_MINUTES=0)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._upstream_status_interval == 60
+
+
+def test_upstream_status_not_assembled_by_default(repo):
+    """老调用方不传 upstream_status 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._upstream_status is None
+    assert "upstream_status" not in {spec.key for spec in runner._loop_specs()}
+    assert "upstream_status" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_upstream_status_without_task_raises(repo):
+    """未装配时 _sync_upstream_status 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="upstream status task not configured"):
+        await runner._sync_upstream_status()
+
+
+async def test_runner_upstream_status_loop_runs_task(repo):
+    """循环体委托给任务对象；任务关闭时 no-op 不入账（页面显示「未运行」）。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore, spec_by_key
+
+    credentials, _db = repo
+    provider = StubProvider()
+    flag = {"on": False}
+    store = UpstreamStatusStore()
+    spec = spec_by_key("kilo")
+    assert spec is not None
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(store, specs=(spec,),
+                                           enabled=lambda: flag["on"]),
+    )
+
+    # 关着：返回 None，不覆盖运行态
+    assert await runner._sync_upstream_status() is None
+    assert runner.status.runs("upstream_status") == 0
+
+    flag["on"] = True
+    ok = await runner._guarded(runner._sync_upstream_status(), "上游状态页",
+                               key="upstream_status")
+    assert ok is True
+    assert runner.status.runs("upstream_status") == 1
+    assert runner.status.get("upstream_status").report == {
+        "sources": 0, "abnormal": 0, "failed": 0}
+
+
+async def test_runner_starts_upstream_status_loop_when_assembled(repo):
+    """装配后必须真的多起一条循环。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, _db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(UpstreamStatusStore(), specs=()),
+    )
+    await runner.start()
+    try:
+        assert len(runner._tasks) == 5
+        assert "upstream_status" in {item["key"] for item in runner.task_status()}
+    finally:
+        await runner.stop()
+
+
 async def test_providers_release_http_pools_on_shutdown(tmp_path):
     """lifespan 关闭时必须释放 provider 的连接池。"""
     from src.provider.codebuddy.client import CodeBuddyProvider

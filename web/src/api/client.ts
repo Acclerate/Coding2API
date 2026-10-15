@@ -36,6 +36,7 @@ import type {
   TaskRunResult,
   UpstreamAuthPoll,
   UpstreamAuthStart,
+  UpstreamStatusResponse,
   UserStats,
   UserRow,
 } from "./types";
@@ -229,6 +230,8 @@ export const api = {
   /** 运维告警记录：后台评估命中后落库，倒序回看。 */
   alerts: (sort?: string, order?: string) =>
     request<AlertsResponse>(`/api/alerts${query({ sort, order })}`),
+  /** 上游官方状态页聚合快照（进程内、重启归零）：只读展示，不参与选号 / 熔断。 */
+  upstreamStatus: () => request<UpstreamStatusResponse>("/api/upstream-status"),
   /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示。 */
   modelCatalog: (sort?: string, order?: string) =>
     request<ModelCatalogResponse>(`/api/model-catalog${query({ sort, order })}`),
