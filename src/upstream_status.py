@@ -32,13 +32,20 @@ import asyncio
 import html
 import re
 import time
-import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+#: defusedxml 复用 stdlib 的 Element 类型（只是把解析入口换成安全版）。
+from xml.etree.ElementTree import Element as XmlElement
+
 import httpx
+
+# Atom 事故史来自外部站点：用 defusedxml 而非 stdlib ElementTree——后者对
+# 「十亿笑声 / 实体展开」这类 XXE / DoS 载荷不设防（bandit B314）。
+from defusedxml.ElementTree import ParseError as XmlParseError
+from defusedxml.ElementTree import fromstring as xml_fromstring
 
 # ------------------------------------------------------------------ 健康档位
 
@@ -508,8 +515,8 @@ def parse_atom(spec: SourceSpec, text: Any, *, now: int) -> SourceStatus:
     if not isinstance(text, str):
         raise ValueError("atom payload is not text")
     try:
-        root = ElementTree.fromstring(text)
-    except ElementTree.ParseError as error:
+        root = xml_fromstring(text)
+    except XmlParseError as error:
         raise ValueError(f"atom payload is not valid XML: {error}") from error
 
     incidents: list[Incident] = []
@@ -581,7 +588,7 @@ def _deepseek_title_level(title: str) -> str:
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 
 
-def _atom_children(root: ElementTree.Element, name: str) -> list[ElementTree.Element]:
+def _atom_children(root: XmlElement, name: str) -> list[XmlElement]:
     """按 Atom 命名空间找子元素；无命名空间的裸 `<entry>` 也认（上游换库不崩）。"""
     found = root.findall(f"{{{_ATOM_NS}}}{name}")
     if found:
@@ -589,14 +596,14 @@ def _atom_children(root: ElementTree.Element, name: str) -> list[ElementTree.Ele
     return [child for child in root if child.tag.split("}")[-1] == name]
 
 
-def _atom_text(entry: ElementTree.Element, name: str) -> str | None:
+def _atom_text(entry: XmlElement, name: str) -> str | None:
     children = _atom_children(entry, name)
     if not children:
         return None
     return _text("".join(children[0].itertext())) or None
 
 
-def _atom_link(entry: ElementTree.Element) -> str | None:
+def _atom_link(entry: XmlElement) -> str | None:
     for child in _atom_children(entry, "link"):
         href = child.get("href")
         if href:

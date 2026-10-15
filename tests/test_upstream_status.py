@@ -493,6 +493,23 @@ def test_parse_atom_rejects_bad_input():
         parse_atom(_spec("deepseek"), "<feed><entry>", now=NOW)
 
 
+def test_parse_atom_rejects_xxe_and_entity_expansion():
+    """外部实体 / 十亿笑声：走 defusedxml，绝不能让外部站点读本地文件或炸内存。
+
+    stdlib `ElementTree.fromstring` 对这两类载荷不设防（bandit B314），故解析
+    入口用 defusedxml——命中即抛 `ValueError`，由 `fetch_source` 兜成 unknown。
+    """
+    xxe = ('<?xml version="1.0"?><!DOCTYPE feed [<!ENTITY xxe SYSTEM '
+           '"file:///etc/passwd">]><feed><entry><title>&xxe;</title></entry></feed>')
+    with pytest.raises(ValueError):
+        parse_atom(_spec("deepseek"), xxe, now=NOW)
+    billion_laughs = ('<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">'
+                      '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;">]>'
+                      '<feed><entry><title>&lol2;</title></entry></feed>')
+    with pytest.raises(ValueError):
+        parse_atom(_spec("deepseek"), billion_laughs, now=NOW)
+
+
 def test_parse_atom_tolerates_unrelated_entries_and_missing_link():
     """无 link 的条目 url 为 None；summary 为空文本时 detail 为 None。"""
     feed = ("<feed><entry><title>性能下降</title><summary>  </summary></entry>"
