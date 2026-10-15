@@ -193,6 +193,19 @@ def test_events_classify_error_code_branches():
     assert classify("APIG.0301 decrypt token fail") is ErrKind.DEAD
     assert classify("ChatAgent.99999999") is ErrKind.OTHER
 
+def test_events_classify_request_marker_is_not_credential_fault():
+    """`InferHub.001001020.406 not multimodal` 是请求侧错误（实测原文）。
+
+    判成 OTHER 会让正常用户带图请求 3 次后把整条渠道拉进 10min 冷却；
+    REQUEST 不冷却、不累计、不落库，仍换号重试。
+    """
+    classify = codearts_events.classify_error_code
+    assert classify("InferHub.001001020.406") is ErrKind.REQUEST
+    assert classify(
+        "InferHub.001001020.406 The request model is not multimodal"
+    ) is ErrKind.REQUEST
+    assert classify("The request model is not multimodal") is ErrKind.REQUEST
+
 def test_events_relogin_required_markers():
     """令牌端点终态判定：只有点名的一次性票据失效类错误才算不可自愈。"""
     burned = codearts_events.relogin_required(

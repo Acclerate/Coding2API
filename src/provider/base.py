@@ -45,7 +45,8 @@ class ErrKind(StrEnum):
     # 该后端无此模型（11102）：(账号, 模型) 负缓存，重试无意义
     BLOCKED = "blocked"
     # 请求级错误（请求体坏 11101 / 上下文超限 11115 / 渠道风控 11128 /
-    # 图片无效 11135）：不是账号的问题，不冷却、不累计；仍会换号重试
+    # 图片无效 11135 / CodeArts 非多模态模型收到图片 001001020）：不是账号
+    # 的问题，不冷却、不累计；仍会换号重试
     REQUEST = "request"
 
 
@@ -210,6 +211,17 @@ class Event:
     # 流内 error 事件的业务分类：provider 解析时按自己的错误码语义定好，
     # executor 不再维护第二份 code→kind 映射（两份必然漂移）
     error_kind: ErrKind | None = None
+
+
+def event_error_kind(event: Event) -> ErrKind:
+    """中立 error 事件的业务分类，未标时按 OTHER。
+
+    provider 解析时已按自己的错误码语义写好 `error_kind`；合成事件 / 测试桩
+    未标时才落到 OTHER（「其它上游失败」），绝不猜成更重的死禁。executor 的
+    流内错误处理与 `UpstreamStreamError.kind()` 共用此口径，避免两处各写一份
+    兜底而漂移。
+    """
+    return event.error_kind if event.error_kind is not None else ErrKind.OTHER
 
 
 @dataclass(slots=True)

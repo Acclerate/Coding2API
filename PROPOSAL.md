@@ -41,6 +41,7 @@
 - **每日签到**：`GET {snap}/v1/ops/delivery?channel=IDE` → `POST /v1/ops/claim`（`{campaignId:1, idempotentKey, channel:"IDE"}`）→ `POST /v1/ops/confirm`（`{campaignId:1}`）；**`/v1/ops/*` 挂在 snap 引擎根、不带 `snap-manager` 前缀**。`status` 四态必须区分：`ELIGIBLE`→claim+confirm；`CLAIMED`（已领未确认，非终态）→只补 confirm；`CONFIRMED`/`CONSUMED`→已签不写。**claim 时积分即到账**，confirm 只推进状态；业务码走 HTTP 200，不能只看状态码。
 - **单位折算**：上游余额按 token 计量（每日池 1000 万），统一折算为积分，**1 积分 = 10000 token**。该「积分」是为跨渠道排序合成的折算值，与上游签到/套餐积分同名不同物。**积分与每日 token 池是两套并行的账**：token 池给福利模型用，签到积分给系统内置模型用。**福利模型单请求扣池**：上游 usage 缺额度字段时按「输入 + 输出 token」补 `credit` 并标 `credit_estimated`（展示加 ≈）。
 - **并发上限**：上游硬限**每账号每约 60s 最多 3 个会话**，超出即 `400 TM.00001041`；配在途上限 `CODEARTS_MAX_CONCURRENCY` 与滑动窗口 `CODEARTS_REQUEST_WINDOW_SECONDS`。流式 `text` 是**累计全文（替换语义）**，解析层还原为增量事件。
+- **流内业务错误分类**：业务错误内嵌在 HTTP 200 的 SSE 里（`InferHub.<码>`），由 executor 转成冷却 + 轮换。分类统一由 `Event.error_kind` 承载，`UpstreamStreamError.kind()` 与 `executor._event_kind` 共用 `provider.base.event_error_kind` 兜底（缺失 → `OTHER`），避免两处各写一份而漂移。非多模态模型收到图片（`InferHub.001001020.406 The request model is not multimodal`）归 `REQUEST`：请求侧错误不冷却、不累计、不落库，仍换号重试。
 
 ### 2.5 OpenCode Zen（`zen`，虚拟凭证）
 

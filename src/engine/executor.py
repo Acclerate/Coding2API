@@ -18,7 +18,14 @@ from ..compat.openai.response import (
 )
 from ..config import live
 from ..db.repo import CredentialRepository
-from ..provider.base import ErrKind, Event, EventKind, Usage, aclose_stream
+from ..provider.base import (
+    ErrKind,
+    Event,
+    EventKind,
+    Usage,
+    aclose_stream,
+    event_error_kind,
+)
 from .continuation import ContinuationStream
 from .model_resolver import (
     ModelTarget,
@@ -1110,9 +1117,10 @@ def _elapsed_ms(started: float, end: float | None = None) -> int:
 def _event_kind(event: Event) -> ErrKind:
     """流内 error 事件的业务分类：provider 解析时已定（Event.error_kind）。
 
-    缺失（无码事件 / 测试桩未带分类）按 OTHER 处理。
+    缺失（无码事件 / 测试桩未带分类）按 OTHER 处理。口径与
+    `UpstreamStreamError.kind()` 共用 `event_error_kind`，避免两处兜底漂移。
     """
-    return event.error_kind if event.error_kind is not None else ErrKind.OTHER
+    return event_error_kind(event)
 
 
 def _classify(error: Exception) -> ErrKind | None:
