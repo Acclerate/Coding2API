@@ -271,14 +271,39 @@ def test_launchd_template_starts_via_wrapper_not_bare_uvicorn():
     assert "uvicorn" not in args, "uvicorn 应写在 wrapper 里，便于构建失败时不阻断"
 
 
+def _shell_code_lines(path: Path) -> str:
+    """剥掉 shell 注释行，只留可执行代码。
+
+    断言「脚本里不得出现 uvicorn / --host」时不能连解释性注释一起算：
+    注释恰恰要写清「为什么不再用 uvicorn CLI」，那是给后人看的。
+    """
+    return "\n".join(
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#"))
+
+
+def test_launchd_server_does_not_hardcode_listen_address():
+    """脚本不得硬编码 --host/--port：HOST/PORT 是文档化配置项。
+
+    CLI 参数优先级高于环境变量，写死 --host 127.0.0.1 会让 .env 里的
+    HOST 静默失效——本地表现为「局域网 IP 访问不了、只有回环能通」，
+    且 curl 本地永远成功，极难定位。走 src.main:run 才是唯一读 .env 的路径。
+    """
+    code = _shell_code_lines(LAUNCHD_SERVER)
+    assert "--host" not in code, "监听地址必须由 src.main:run 从 .env 读取"
+    assert "--port" not in code, "监听端口必须由 src.main:run 从 .env 读取"
+    assert "python -m src.main" in code, "应走 src.main:run（唯一读 .env 的启动路径）"
+    assert "uvicorn" not in code, "改走 src.main:run 后不应再出现 uvicorn CLI"
+
+
 def test_launchd_server_uses_exec_so_keepalive_tracks_the_real_process():
-    """uvicorn 必须用 exec 替换脚本进程。
+    """服务进程必须用 exec 替换脚本进程。
 
     否则 launchd 监管的是 bash，kickstart -k 的 SIGTERM 打到 bash，
-    真正的 uvicorn 会变成孤儿继续占着 8000 端口。
+    真正的服务进程会变成孤儿继续占着 8000 端口。
     """
     text = LAUNCHD_SERVER.read_text(encoding="utf-8")
-    assert re.search(r"^exec ", text, re.MULTILINE), "缺少 exec，信号无法直达 uvicorn"
+    assert re.search(r"^exec ", text, re.MULTILINE), "缺少 exec，信号无法直达服务进程"
 
 
 def test_launchd_server_does_not_abort_when_build_fails():
@@ -454,7 +479,7 @@ def test_systemd_unit_sends_logs_to_journal():
 def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     """停机排空时长必须处处一致，且容器/systemd 窗口 >= 应用侧排空窗口。
 
-    三条启动路径（Docker CMD → src.main:run、systemd/launchd → uvicorn CLI）
+    三条启动路径（Docker CMD / launchd → src.main:run、systemd → uvicorn CLI）
     各写一遍同一个数字，最容易漂移；漂移的后果是「本地排空 30s、生产无限等」
     或「应用还在排空就被 SIGKILL、长流统计丢失」。这里把它们对一遍。
     """
@@ -463,12 +488,15 @@ def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     from src.main import GRACEFUL_SHUTDOWN_SECONDS
 
     assert GRACEFUL_SHUTDOWN_SECONDS > 0
-    # launchd 与 systemd 直接跑 uvicorn CLI，必须显式带同一个 flag
-    for path in (ROOT / "scripts" / "launchd-server.sh", SYSTEMD_UNIT):
-        text = path.read_text(encoding="utf-8")
-        found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
-        assert found, f"{path.name} 缺 --timeout-graceful-shutdown"
-        assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, path.name
+    # launchd 与 Docker 都走 src.main:run，flag 由 run() 内部传入，脚本里没有
+    # 这个数字可对；systemd 仍直接跑 uvicorn CLI，必须显式带同一个 flag。
+    text = SYSTEMD_UNIT.read_text(encoding="utf-8")
+    found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
+    assert found, f"{SYSTEMD_UNIT.name} 缺 --timeout-graceful-shutdown"
+    assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, SYSTEMD_UNIT.name
+    # launchd 走 run() 的前提：脚本代码里不得再出现 uvicorn CLI（否则数字又分裂）
+    launchd = _shell_code_lines(ROOT / "scripts" / "launchd-server.sh")
+    assert "uvicorn" not in launchd, "launchd 改走 src.main:run 后不应再出现 uvicorn CLI"
     # Docker：stop_grace_period 是容器给进程的停机窗口，必须 >= 应用排空窗口
     compose = COMPOSE.read_text(encoding="utf-8")
     grace = _re.search(r"stop_grace_period: (\d+)s", compose)

@@ -27,6 +27,14 @@ def _hostname(host_header: str) -> str:
     return text.split(":", 1)[0].strip().lower()
 
 
+def _public_base_host(settings: Settings) -> str:
+    """PUBLIC_BASE_URL 的主机名（剥 scheme / path / 端口），解析不出返回空串。"""
+    base = settings.public_base_url
+    if base.startswith(("http://", "https://")):
+        base = base.split("://", 1)[1]
+    return _hostname(base.split("/", 1)[0])
+
+
 def host_allowed(host_header: str, settings: Settings) -> bool:
     """Host 白名单（防 DNS rebinding）。
 
@@ -43,13 +51,41 @@ def host_allowed(host_header: str, settings: Settings) -> bool:
     allowed = {"localhost", "127.0.0.1", "::1"}
     if settings.allow_test_host:
         allowed.add("testserver")
-    base = settings.public_base_url
-    if base.startswith(("http://", "https://")):
-        base = base.split("://", 1)[1]
-    path_host = _hostname(base.split("/", 1)[0])
+    path_host = _public_base_host(settings)
     if path_host:
         allowed.add(path_host)
     return hostname in allowed
+
+
+def session_cookie_secure(request: Request, settings: Settings) -> bool:
+    """会话 Cookie 是否加 `Secure`：按**请求的实际协议**判定。
+
+    不能只看 PUBLIC_BASE_URL：同一实例可能同时有两条入口——LAN 直连
+    （http://192.168.124.35:8000）与 Cloudflare Tunnel
+    （https://ai-api.robbs.work）。`Secure` Cookie 会被浏览器在 http 上丢弃，
+    所以「一律 Secure」会让 LAN 登录失败，「一律不 Secure」又让公网 https
+    会话失去保护。
+
+    应用自身不做 TLS 终止（uvicorn 跑明文 http），socket 层拿不到真实协议，
+    只能靠 `X-Forwarded-Proto`：
+
+    - 有该头 → 采信它的第一个条目（反代 / 隧道终止 TLS 后唯一的协议信号）。
+      **故意不依赖 TRUST_PROXY**：伪造它只会让伪造者自己的浏览器丢掉 Cookie
+      （判定 https 只会让 Cookie 更严），不构成对他人的降级；而耦合
+      TRUST_PROXY 会与本机「LAN 直连必须关 TRUST_PROXY（否则 XFF 可伪造
+      绕过 allowed_ips）」冲突，导致隧道请求永远拿不到 Secure。
+    - 无该头 → 仅当请求 Host 正是 PUBLIC_BASE_URL 的主机、且后者是 https 时
+      按 https 处理（覆盖「https 反代未转发 XFP」的部署）；直连其它地址
+      （如 LAN IP）一律视为明文。
+    """
+    proto = request.headers.get("x-forwarded-proto", "")
+    first = proto.split(",", 1)[0].strip().lower()
+    if first in ("http", "https"):
+        return first == "https"
+    if not settings.public_base_url.startswith("https://"):
+        return False
+    base_host = _public_base_host(settings)
+    return bool(base_host) and _hostname(request.headers.get("host", "")) == base_host
 
 
 def content_security_policy(settings: Settings) -> str:

@@ -477,7 +477,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `APP_SECRET` | **必填** | 凭证加密密钥，≥16 字符；丢失 = 凭证全部作废，无密钥轮换。启动时拒绝低熵值（全同字符 / 周期重复 / 字符集过小） |
 | `ADMIN_USERNAMES` | 空 | **仅引导期**：逗号分隔的用户名，首次启动时被提权为 `admin`；DB 里已有角色后不再生效 |
 | `USERS_FILE` | `secrets/users.txt` | **仅引导期**：老式用户文件路径，启动时一次性导入 SQLite（幂等）。账号唯一源是 `users` 表 |
-| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | 浏览器可达地址；TRAE 登录回调依赖它 |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | 浏览器可达地址；TRAE 登录回调（`+/authorize`）依赖它，scheme 为 https 时额外下发 HSTS。**不决定会话 Cookie 的 `Secure`**——那按请求实际协议动态判定（`X-Forwarded-Proto` 优先，无该头则看 Host），同一实例 LAN(http) 与隧道(https) 双入口才能都登录 |
 | `DATA_DIR` | `./data` | SQLite 与运行数据目录 |
 | `DEFAULT_MODEL` | `glm-5.2` | 模型为空/`auto` 时的默认 |
 | `QUOTA_PROBE_MINUTES` | `60` | 额度探测周期（下限 1 分钟） |
