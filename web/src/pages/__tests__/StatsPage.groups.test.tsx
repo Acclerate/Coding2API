@@ -108,6 +108,38 @@ describe("StatsPage 分组与明细", () => {
     });
   });
 
+  it("分组统计排序：点延迟列头按均值/P95 重新取数", async () => {
+    const spy = mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": EVENTS_EMPTY,
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    const lastProviderCall = () => spy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes("/api/stats/by-provider"))
+      .at(-1)!;
+
+    // 均值列：SQL 表达式排序（hourly 的 sum ÷ ok_count）
+    await userEvent.click(screen.getByTestId("sort-avg_latency_ms"));
+    await waitFor(() => expect(lastProviderCall()).toContain("sort=avg_latency_ms"));
+    // 再点一次同列 → 切升序
+    await userEvent.click(screen.getByTestId("sort-avg_latency_ms"));
+    await waitFor(() => expect(lastProviderCall()).toContain("order=asc"));
+
+    // 分位列：LEFT JOIN 子查询算出的列
+    await userEvent.click(screen.getByTestId("sort-p95_latency_ms"));
+    await waitFor(() => expect(lastProviderCall()).toContain("sort=p95_latency_ms"));
+    await userEvent.click(screen.getByTestId("sort-p95_ttfb_ms"));
+    await waitFor(() => expect(lastProviderCall()).toContain("sort=p95_ttfb_ms"));
+  });
+
   it("请求明细排序：换列从 rowid 游标切到 offset 分页", async () => {
     const spy = mockFetch({
       "/api/stats/overview": OVERVIEW,
@@ -228,7 +260,7 @@ describe("StatsPage 分组与明细", () => {
       .not.toBeInTheDocument();
   });
 
-  it("分组统计：各维度都给出成功率、命中缓存与成本", async () => {
+  it("分组统计：各维度都给出成功率、命中缓存、成本与延迟", async () => {
     mockFetch({
       "/api/stats/overview": OVERVIEW,
       "/api/stats/by-provider": PROVIDERS,
@@ -250,6 +282,11 @@ describe("StatsPage 分组与明细", () => {
     expect(row).toHaveTextContent("¥5.36");
     // 命中率列 = 命中 100 ÷ 输入 300 = 33.3%
     expect(within(row).getByTestId("group-cache-rate")).toHaveTextContent("33.3%");
+    // 延迟四列：均值 4200/900 ms、P95 9500/2400 ms（都 ≥1s → 显示 s）
+    expect(within(row).getByTestId("group-avg-latency")).toHaveTextContent("4.2 s");
+    expect(within(row).getByTestId("group-avg-ttfb")).toHaveTextContent("900 ms");
+    expect(within(row).getByTestId("group-p95-latency")).toHaveTextContent("9.5 s");
+    expect(within(row).getByTestId("group-p95-ttfb")).toHaveTextContent("2.4 s");
     // kimi-k3 28/30 = 93.3%，推算成本标 ≈；未上报缓存 → 命中率显示 —
     row = within(screen.getByTestId("group-table")).getByText("kimi-k3").closest("tr")!;
     expect(row).toHaveTextContent("93.3%");
@@ -262,6 +299,7 @@ describe("StatsPage 分组与明细", () => {
     row = within(screen.getByTestId("group-table")).getByText("alice").closest("tr")!;
     expect(row).toHaveTextContent("95.0%");
     expect(row).toHaveTextContent("¥8.04");
+    expect(within(row).getByTestId("group-p95-latency")).toHaveTextContent("31.9 s");
 
     // 按凭证：主账号行 68/70 = 97.1%
     await userEvent.click(screen.getByTestId("group-tabs-credential"));
@@ -269,6 +307,13 @@ describe("StatsPage 分组与明细", () => {
     row = within(screen.getByTestId("group-table")).getByText("主账号").closest("tr")!;
     expect(row).toHaveTextContent("97.1%");
     expect(row).toHaveTextContent("≈¥3.35");
+    expect(within(row).getByTestId("group-avg-latency")).toHaveTextContent("8.2 s");
+    // 无成功样本的凭证行：延迟四列都是 —（不拿 0 冒充有数据）
+    row = within(screen.getByTestId("group-table")).getByText("cred_zzz9998").closest("tr")!;
+    expect(within(row).getByTestId("group-avg-latency")).toHaveTextContent("—");
+    expect(within(row).getByTestId("group-avg-ttfb")).toHaveTextContent("—");
+    expect(within(row).getByTestId("group-p95-latency")).toHaveTextContent("—");
+    expect(within(row).getByTestId("group-p95-ttfb")).toHaveTextContent("—");
   });
 
   it("分组统计：凭证名与请求明细同口径，且带渠道 icon", async () => {

@@ -20,6 +20,13 @@ METRIC_COLUMNS: dict[str, str] = {
 # 分组统计排序白名单：API 键 → 聚合列别名（`group` 指分组键列 `group_key`）。
 # 默认按请求数降序（「哪家/哪个模型用得最多」才是分组表的用途），并列时按
 # 分组键升序——次序稳定且与旧行为一致（旧代码就是按分组键升序）。
+#
+# 延迟类键的两种来源：
+# - 均值（avg_*）：小时汇总上的 `*_sum ÷ ok_count`，SQLite 允许 ORDER BY 引用
+#   SELECT 别名并做表达式；`ok_count = 0` 时除零得 NULL，降序自然排最后（与
+#   其它可空列同语义）。
+# - 分位（p95_*）：由 `_percentile_join` 的 LEFT JOIN 子查询算出，排序直接走
+#   该列别名。
 GROUP_SORT_COLUMNS: dict[str, str] = {
     "group": "group_key",
     "requests": "requests",
@@ -29,6 +36,10 @@ GROUP_SORT_COLUMNS: dict[str, str] = {
     "cached_tokens": "cached_tokens",
     "credit": "credit_sum",
     "cost_cny": "cost_cny_sum",
+    "avg_latency_ms": "CAST(latency_sum AS REAL) / ok_count",
+    "avg_ttfb_ms": "CAST(ttfb_sum AS REAL) / ok_count",
+    "p95_latency_ms": "p95_latency_ms",
+    "p95_ttfb_ms": "p95_ttfb_ms",
 }
 
 
@@ -65,6 +76,73 @@ _GROUP_KEYS = frozenset({"provider", "model", "username", "credential_id"})
 # CSV 导出单次上限：明细只留 90 天，但全量导出（几万行）会一次性拉进内存并
 # 撑爆响应。超上限时明确告知「被截断、请收窄条件」，而不是静默给半份文件。
 EXPORT_MAX_ROWS = 10000
+
+# 分位值的 nearest-rank 名次：第 p 百分位 = 第 ⌈p·n⌉ 小的值。用整数运算写
+# `(p_num * n + p_den - 1) / p_den`（SQLite 整数除法即向下取整，加分母−1 后
+# 等价于对分子向上取整），避免浮点误差把名次算偏。
+_P95_NUMER = 95
+_P95_DENOM = 100
+
+# 分位 JOIN 子查询的别名：`_percentile_join` 与两个分组路径共用，别名固定。
+_PERCENTILE_ALIAS = "lat"
+
+
+def _percentile_rank(n_expr: str) -> str:
+    """`⌈0.95·n⌉` 的 SQL 表达式（整数运算，避免浮点误差）。"""
+    return f"({_P95_NUMER} * {n_expr} + {_P95_DENOM - 1}) / {_P95_DENOM}"
+
+
+def _percentile_join(key: str, *, where: str = "", params: list[Any] | None = None,
+                     suffix: str = "e2", outer: str = "") -> tuple[str, list[Any]]:
+    """按 `key` 分组算 P95 延迟的 LEFT JOIN 子查询（挂到主聚合查询上）。
+
+    分位值**只能从明细表算**：小时汇总只存 `latency_sum` / `ttfb_sum`（和与
+    成功计数），数学上无法还原分布。代价是只覆盖明细保留期（90 天），均值列
+    仍读小时汇总（永久）——表尾文案把这个差异写明，不假装全覆盖。
+
+    口径与均值一致：**只算成功请求**（`ok = 1`，TECHNICAL §9.7）。`ttfb_ms`
+    对非流式 / 未产出首字的成功请求为 NULL，故 latency 与 ttfb 各自独立排名
+    （`COUNT(col)` 忽略 NULL，天然只数有值样本）。`ORDER BY (col IS NULL), col`
+    把 NULL 排在有值样本之后，配合 `COUNT(col)` 的名次不会错位。
+
+    `where` / `params`：子查询**独立**应用作用域与时间窗（取值列用 `ts`，
+    与主查询的 `hour_utc` 口径区分）。参数由调用方按子查询内的占位符顺序给出，
+    返回时原样带回，主查询拼在自己的参数之后。
+
+    `suffix`：子查询内部表别名，避免与主查询的别名撞名（明细路径主查询用
+    `e`，故子查询用 `e2`）。
+    `outer`：**主查询**那侧的分组列前缀（小时路径无别名 = ""，明细路径 = "e."），
+    JOIN 的 ON 必须指向主查询的列而不是子查询里的同名列。
+    """
+    if key not in _GROUP_KEYS:
+        raise ValueError(f"非法分组键: {key!r}")
+    inner = f"{suffix}.{key}"
+    return f"""
+        LEFT JOIN (
+            SELECT ranked.group_key AS group_key,
+                   MAX(CASE WHEN ranked.lat_rn = {_percentile_rank("ranked.lat_n")}
+                            THEN ranked.latency_ms END) AS p95_latency_ms,
+                   MAX(CASE WHEN ranked.ttfb_rn = {_percentile_rank("ranked.ttfb_n")}
+                            THEN ranked.ttfb_ms END) AS p95_ttfb_ms
+            FROM (
+                SELECT {inner} AS group_key, {suffix}.latency_ms AS latency_ms,
+                       {suffix}.ttfb_ms AS ttfb_ms,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {inner}
+                           ORDER BY ({suffix}.latency_ms IS NULL), {suffix}.latency_ms
+                       ) AS lat_rn,
+                       COUNT({suffix}.latency_ms) OVER (PARTITION BY {inner}) AS lat_n,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {inner}
+                           ORDER BY ({suffix}.ttfb_ms IS NULL), {suffix}.ttfb_ms
+                       ) AS ttfb_rn,
+                       COUNT({suffix}.ttfb_ms) OVER (PARTITION BY {inner}) AS ttfb_n
+                FROM usage_events {suffix}
+                WHERE {suffix}.ok = 1 AND {inner} IS NOT NULL {where}
+            ) AS ranked
+            GROUP BY ranked.group_key
+        ) AS {_PERCENTILE_ALIAS} ON {_PERCENTILE_ALIAS}.group_key = {outer}{key}
+    """, list(params or [])
 
 
 def _group_order(sort: str | None, order: str | None) -> str:
@@ -239,11 +317,18 @@ class StatsQuery:
 
         `extra`：维度特有的展示列（如凭证维度的 provider / credential_name），
         SQL 已算好，这里原样带出。
+
+        延迟指标两种来源、两套口径（表尾文案对用户说明）：
+        - 均值读小时汇总（永久保留），与 `overview()` 逐字节同口径：
+          `round(sum / ok_count)`，无成功请求给 None（前端显示 —）；
+        - 分位读明细表（只覆盖 90 天），SQL 里已按成功请求算好，NULL =
+          该组无成功样本（全失败 / 未上报延迟）。
         """
+        ok_count = row["ok_count"] or 0
         return {
             key: row["group_key"],
             "requests": row["requests"],
-            "ok_count": row["ok_count"],
+            "ok_count": ok_count,
             "input_tokens": row["input_tokens"],
             "output_tokens": row["output_tokens"],
             # 缓存命中：任一明细上报过才可信，否则 None（前端显示 —）
@@ -252,6 +337,10 @@ class StatsQuery:
             "credit_estimated": bool(row["credit_estimated_known"]),
             "cost_usd": row["cost_usd_sum"] if row["cost_known"] else None,
             "cost_cny": row["cost_cny_sum"] if row["cost_known"] else None,
+            "avg_latency_ms": round(row["latency_sum"] / ok_count) if ok_count else None,
+            "avg_ttfb_ms": round(row["ttfb_sum"] / ok_count) if ok_count else None,
+            "p95_latency_ms": row["p95_latency_ms"],
+            "p95_ttfb_ms": row["p95_ttfb_ms"],
             **{name: row[name] for name in extra},
         }
 
@@ -264,6 +353,13 @@ class StatsQuery:
             raise ValueError(f"非法分组键: {key!r}")
         where, params = self._where(username=username, since=since, since_col="hour_utc",
                                     until=until, until_col="hour_utc")
+        # 分位值另起一条明细过滤：同一作用域与时间窗，但取值列用 `ts`（明细表），
+        # 与主查询的 `hour_utc`（小时表）区分——否则时间窗对不上，分位会算错范围
+        pct_where, pct_params = self._where(username=username, since=since, until=until,
+                                            alias="e2.")
+        # 分位子查询的 WHERE 由 _where 生成（无条件时是空串），这里补 AND 接后续条件
+        pct_clause = f"AND {pct_where[6:]}" if pct_where else ""
+        join, join_params = _percentile_join(key, where=pct_clause, params=pct_params)
         rows = self._db.connect().execute(
             f"""
             SELECT {key} AS group_key, COALESCE(SUM(requests), 0) AS requests,
@@ -277,9 +373,15 @@ class StatsQuery:
                    SUM(credit_estimated_known) AS credit_estimated_known,
                    SUM(cost_usd_sum) AS cost_usd_sum,
                    SUM(cost_cny_sum) AS cost_cny_sum,
-                   SUM(cost_known) AS cost_known
-            FROM usage_hourly {where} GROUP BY {key} ORDER BY {_group_order(sort, order)}
-            """, params).fetchall()
+                   SUM(cost_known) AS cost_known,
+                   COALESCE(SUM(latency_sum), 0) AS latency_sum,
+                   COALESCE(SUM(ttfb_sum), 0) AS ttfb_sum,
+                   {_PERCENTILE_ALIAS}.p95_latency_ms AS p95_latency_ms,
+                   {_PERCENTILE_ALIAS}.p95_ttfb_ms AS p95_ttfb_ms
+            FROM usage_hourly
+            {join}
+            {where} GROUP BY {key} ORDER BY {_group_order(sort, order)}
+            """, [*join_params, *params]).fetchall()
         return [self._group_row(row, key) for row in rows]
 
     def _group_events(self, key: str, *, username: str | None = None,
@@ -304,6 +406,13 @@ class StatsQuery:
         # 分组键为空的行（无凭证的预热失败等）没有可归属对象，不参与分组；
         # _where 无条件时返回空串，这里补 WHERE 关键词
         clause = f"{where} AND e.{key} IS NOT NULL" if where else f"WHERE e.{key} IS NOT NULL"
+        # 分位子查询：与主查询同表同过滤（明细路径两条路都读 usage_events），
+        # 内部别名用 e2 避免与主查询的 e 相撞
+        pct_where, pct_params = self._where(username=username, since=since, until=until,
+                                            alias="e2.")
+        pct_clause = f"AND {pct_where[6:]}" if pct_where else ""
+        join, join_params = _percentile_join(key, where=pct_clause, params=pct_params,
+                                             suffix="e2", outer="e.")
         # 渠道优先取凭证当前所属渠道；凭证已被硬删除则回退该组明细里的渠道。
         # 同组跨渠道（凭证改过 provider）时 MAX 取字典序最大的那个，仅用于画
         # icon，不参与统计口径。
@@ -323,13 +432,18 @@ class StatsQuery:
                    COALESCE(SUM(e.cost_usd), 0) AS cost_usd_sum,
                    COALESCE(SUM(e.cost_cny), 0) AS cost_cny_sum,
                    SUM(CASE WHEN e.cost_usd IS NULL THEN 0 ELSE 1 END) AS cost_known,
+                   COALESCE(SUM(CASE WHEN e.ok = 1 THEN e.latency_ms END), 0) AS latency_sum,
+                   COALESCE(SUM(CASE WHEN e.ok = 1 THEN e.ttfb_ms END), 0) AS ttfb_sum,
                    COALESCE(c.provider, MAX(e.provider)) AS provider,
-                   {name_expr} AS credential_name
+                   {name_expr} AS credential_name,
+                   {_PERCENTILE_ALIAS}.p95_latency_ms AS p95_latency_ms,
+                   {_PERCENTILE_ALIAS}.p95_ttfb_ms AS p95_ttfb_ms
             FROM usage_events e
             LEFT JOIN credentials c ON c.id = e.credential_id
+            {join}
             {clause}
             GROUP BY e.{key} ORDER BY {_group_order(sort, order)}
-            """, params).fetchall()
+            """, [*join_params, *params]).fetchall()
         return [self._group_row(row, key, ("provider", "credential_name")) for row in rows]
 
     def by_provider(self, *, username: str | None = None,

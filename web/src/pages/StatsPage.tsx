@@ -16,6 +16,7 @@ import { formatCacheRate, formatCompact, formatCredit, formatLatency, formatMone
 import { ModelTrendChart } from "../components/ModelTrendChart";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { ProviderIcon } from "../components/ProviderIcon";
 import { SortableHead } from "../components/SortableHead";
 import { SortMenuHead } from "../components/SortMenuHead";
@@ -33,7 +34,6 @@ import {
   Metric,
   Notice,
   Panel,
-  Select,
   Table,
   TableBody,
   TableCell,
@@ -60,9 +60,6 @@ const METRICS = [
   { value: "latency", label: "耗时", icon: <Timer className="size-3.5" /> },
   { value: "ttfb", label: "首字延迟", icon: <Gauge className="size-3.5" /> },
 ];
-
-/** 明细分页的可选每页条数。 */
-const PAGE_SIZES = [10, 20, 50, 100];
 
 /**
  * 请求明细的合并列：把同类列并成一列，默认值一眼可读，悬停展开全部子项。
@@ -529,6 +526,24 @@ export function StatsPage() {
                 <SortableHead label="成本" columnKey="cost_cny"
                               active={groupSort.sort === "cost_cny"} direction={groupSort.order}
                               onToggle={groupSort.toggle} align="right" testId="sort-cost_cny" />
+                {/* 延迟四列：均值读小时汇总（与总览同口径），P95 读明细表（仅 90 天）。
+                    两套口径在同一行并存，靠表尾说明与列头文案区分。 */}
+                <SortableHead label="平均耗时" columnKey="avg_latency_ms"
+                              active={groupSort.sort === "avg_latency_ms"}
+                              direction={groupSort.order} onToggle={groupSort.toggle}
+                              align="right" testId="sort-avg_latency_ms" />
+                <SortableHead label="平均首字" columnKey="avg_ttfb_ms"
+                              active={groupSort.sort === "avg_ttfb_ms"}
+                              direction={groupSort.order} onToggle={groupSort.toggle}
+                              align="right" testId="sort-avg_ttfb_ms" />
+                <SortableHead label="P95 耗时" columnKey="p95_latency_ms"
+                              active={groupSort.sort === "p95_latency_ms"}
+                              direction={groupSort.order} onToggle={groupSort.toggle}
+                              align="right" testId="sort-p95_latency_ms" />
+                <SortableHead label="P95 首字" columnKey="p95_ttfb_ms"
+                              active={groupSort.sort === "p95_ttfb_ms"}
+                              direction={groupSort.order} onToggle={groupSort.toggle}
+                              align="right" testId="sort-p95_ttfb_ms" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -607,6 +622,23 @@ export function StatsPage() {
                              title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
                     {formatMoney(row.cost_cny, "CNY")}
                   </TableCell>
+                  {/* 延迟四列：均值与 P95 都只算成功请求；无成功请求显示 — */}
+                  <TableCell label="平均耗时" className="text-right tabular-nums"
+                             data-testid="group-avg-latency">
+                    {formatLatency(row.avg_latency_ms)}
+                  </TableCell>
+                  <TableCell label="平均首字" className="text-right tabular-nums"
+                             data-testid="group-avg-ttfb">
+                    {formatLatency(row.avg_ttfb_ms)}
+                  </TableCell>
+                  <TableCell label="P95 耗时" className="text-right tabular-nums"
+                             data-testid="group-p95-latency">
+                    {formatLatency(row.p95_latency_ms)}
+                  </TableCell>
+                  <TableCell label="P95 首字" className="text-right tabular-nums"
+                             data-testid="group-p95-ttfb">
+                    {formatLatency(row.p95_ttfb_ms)}
+                  </TableCell>
                 </TableRow>
                 );
               })}
@@ -619,24 +651,17 @@ export function StatsPage() {
             : "各维度数据源为小时汇总（永久保留），最近 5 分钟内的请求可能尚未计入。"}
           {" "}点任意一行可钻取到下方「请求明细」。
         </p>
+        {/* 延迟列的两套口径必须写明：均值永久、分位只覆盖 90 天，
+            混在同一行里不说明会被读成「同一个范围」。 */}
+        <p className="mt-1 text-xs text-muted-foreground">
+          延迟列只统计成功请求。平均耗时 / 平均首字取自小时汇总（与总览卡片同口径）；
+          P95 为第 95 百分位（向上取整名次），取自逐请求明细，只覆盖最近 90 天。
+        </p>
       </Panel>
 
       <Panel data-testid="events-panel" title="请求明细" action={
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>共 {formatNumber(overview.data?.requests)} 条 · 保留 90 天</span>
-          <label className="flex items-center gap-1.5">
-            每页
-            <Select
-              value={String(pageSize)}
-              data-testid="events-page-size"
-              className="h-7 w-20 text-xs"
-              onChange={(event) => changePageSize(Number(event.target.value))}
-            >
-              {PAGE_SIZES.map((size) => (
-                <option key={size} value={size}>{size} 条</option>
-              ))}
-            </Select>
-          </label>
           {/* 导出限 admin/operator：整份明细落盘比翻页浏览的暴露面大 */}
           {session.is_operator && (
             <Button size="sm" variant="ghost" data-testid="events-export"
@@ -760,44 +785,28 @@ export function StatsPage() {
                 ))}
               </TableBody>
             </Table>
-            {eventRows.length > 0 && (
-              <div className="mt-3 flex items-center justify-between">
-                <span className="text-xs text-muted-foreground" data-testid="events-page-info">
-                  第 {pageIndex + 1} 页
-                </span>
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    data-testid="events-prev"
-                    disabled={pageIndex === 0 || events.isFetching}
-                    onClick={() => setPageIndex((p) => Math.max(0, p - 1))}
-                  >
-                    上一页
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    data-testid="events-next"
-                    disabled={!hasNextPage || events.isFetching}
-                    onClick={() => {
-                      if (cursorMode) {
-                        const nextBefore = events.data?.next_before;
-                        if (nextBefore === null || nextBefore === undefined) return;
-                        setCursors((prev) => {
-                          const next = prev.slice();
-                          next[pageIndex + 1] = nextBefore;
-                          return next;
-                        });
-                      }
-                      setPageIndex((p) => p + 1);
-                    }}
-                  >
-                    下一页
-                  </Button>
-                </div>
-              </div>
-            )}          </>
+            <Pagination
+              testId="events"
+              page={pageIndex}
+              pageSize={pageSize}
+              hasNext={hasNextPage}
+              busy={events.isFetching}
+              onPageSizeChange={changePageSize}
+              onPageChange={(next) => {
+                // 游标模式向下翻页：先把本页的 next_before 压栈，下一页才有游标可发
+                if (next > pageIndex && cursorMode) {
+                  const nextBefore = events.data?.next_before;
+                  if (nextBefore === null || nextBefore === undefined) return;
+                  setCursors((prev) => {
+                    const updated = prev.slice();
+                    updated[pageIndex + 1] = nextBefore;
+                    return updated;
+                  });
+                }
+                setPageIndex(next);
+              }}
+            />
+          </>
         )}
       </Panel>
 

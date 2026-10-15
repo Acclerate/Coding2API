@@ -166,6 +166,14 @@ export interface GroupStats {
   cost_usd: number | null;
   /** 成本估算（CNY） */
   cost_cny: number | null;
+  /** 平均耗时（ms）：latency_sum ÷ 成功数，读小时汇总；无成功请求为 null */
+  avg_latency_ms: number | null;
+  /** 平均首字延迟（ms）：ttfb_sum ÷ 成功数，读小时汇总；无成功请求为 null */
+  avg_ttfb_ms: number | null;
+  /** P95 耗时（ms）：按成功请求 nearest-rank 取第 ⌈0.95n⌉ 小，读明细表（仅 90 天） */
+  p95_latency_ms: number | null;
+  /** P95 首字延迟（ms）：同 p95_latency_ms，只数上报过 ttfb 的样本 */
+  p95_ttfb_ms: number | null;
 }
 
 export interface ProviderStats extends GroupStats {
@@ -334,6 +342,8 @@ export interface AuditEvent {
 
 export interface AuditResponse {
   events: AuditEvent[];
+  /** 与 events 同一套过滤条件下的总条数（分页算页数用） */
+  total: number;
   /** 可选的 action 枚举（与后端 src/audit/actions.py 同源） */
   actions: string[];
   /** action → 中文标签 */
@@ -604,7 +614,10 @@ export interface ModelCatalogEntry {
  */
 export interface ModelCatalogResponse {
   models: ModelCatalogEntry[];
+  /** 目录全量条数（不受筛选影响，页头展示「N / 总数」用） */
   count: number;
+  /** 当前筛选（q / only_available）命中的总条数（分页算页数用） */
+  total: number;
   /** 刊例价币种，当前恒为 "USD" */
   currency: string;
   /** 成本估算当前生效的 USD→CNY 汇率（热更项 USD_CNY_RATE） */
@@ -719,4 +732,89 @@ export interface AlertEvent {
 
 export interface AlertsResponse {
   alerts: AlertEvent[];
+  /** 告警总数（分页算页数用） */
+  total: number;
+}
+
+/**
+ * 上游状态档位（GET /api/upstream-status，与后端 `src/upstream_status.py` 的
+ * `LEVEL_*` 一一对应）。
+ *
+ * 六档而非三档：`maintenance` 是「计划内维护」——不是故障，但也不该显示成
+ * 一切正常；`partial` 与 `major` 分开才能表达「部分模型受影响」与「整体挂了」。
+ */
+export type UpstreamLevel =
+  | "operational"
+  | "degraded"
+  | "partial"
+  | "major"
+  | "maintenance"
+  | "unknown";
+
+/** 一个组件 / 模型的当前状态（详情文本由后端解析器拼好，前端不再二次加工）。 */
+export interface UpstreamComponent {
+  name: string;
+  level: UpstreamLevel;
+  detail: string | null;
+}
+
+/**
+ * 一条事故。`ongoing` 是**归一化后**的生命周期：各源侧写法不同（Statuspage 的
+ * investigating/identified/monitoring、OpenCode 的 resolvedAt、DeepSeek 正文里的
+ * `Status: resolved`），后端统一成这一个布尔，前端只认它。
+ */
+export interface UpstreamIncident {
+  title: string;
+  level: UpstreamLevel;
+  ongoing: boolean;
+  updated_at: number | null;
+  url: string | null;
+  detail: string | null;
+}
+
+/** 一个状态源的一次抓取结果（抓取失败也在内，带 `error`）。 */
+export interface UpstreamSource {
+  /** 源 key（与后端 `SOURCE_SPECS` 一致），仅用于 React key 与测试定位 */
+  key: string;
+  label: string;
+  /** `channel` = 与本站某个渠道一一对应；`model` = 模型 / 上游方，经渠道间接使用 */
+  scope: "channel" | "model";
+  /** 给人看的官方状态页地址（卡片外链） */
+  page_url: string;
+  /** 本站关联渠道 key（仅 channel 级非空） */
+  related_providers: string[];
+  level: UpstreamLevel;
+  /** 该源本次抓取时刻（epoch 秒） */
+  fetched_at: number;
+  /** 抓取 / 解析失败原因；成功为 null */
+  error: string | null;
+  /** 源侧自己声明「数据已过期」（目前只有 OpenCode Zen 提供） */
+  source_stale: boolean;
+  components: UpstreamComponent[];
+  incidents: UpstreamIncident[];
+}
+
+/**
+ * 上游状态聚合快照（GET /api/upstream-status，进程内、重启归零）。
+ *
+ * `summary.abnormal` 是「除 operational / unknown 之外的一切」——抓取失败
+ * 只计入 `unknown`，不该冒充上游故障（一个源连不上，不代表它挂了）。
+ */
+export interface UpstreamStatusResponse {
+  summary: {
+    level: UpstreamLevel;
+    operational: number;
+    abnormal: number;
+    unknown: number;
+    total: number;
+  };
+  /** 快照抓取时刻（epoch 秒）；从未抓取为 null */
+  fetched_at: number | null;
+  sources: UpstreamSource[];
+  /** 后台抓取任务的当前开关（热更项） */
+  enabled: boolean;
+  /** 后台抓取任务的当前周期（秒，热更项） */
+  interval_seconds: number;
+  /** 服务端当前时间（epoch 秒）：算「距今多久」用服务端时钟，避免浏览器偏移 */
+  server_time: number;
 }
