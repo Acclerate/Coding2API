@@ -506,6 +506,12 @@ export function StatsPage() {
                               active={groupSort.sort === "ok_count"} direction={groupSort.order}
                               onToggle={groupSort.toggle} align="right" testId="sort-ok_count" />
                 <TableHead className="text-right">成功率</TableHead>
+                <SortableHead label="Credit" columnKey="credit"
+                              active={groupSort.sort === "credit"} direction={groupSort.order}
+                              onToggle={groupSort.toggle} align="right" testId="sort-credit" />
+                <SortableHead label="成本" columnKey="cost_cny"
+                              active={groupSort.sort === "cost_cny"} direction={groupSort.order}
+                              onToggle={groupSort.toggle} align="right" testId="sort-cost_cny" />
                 <SortableHead label="输入 token" columnKey="input_tokens"
                               active={groupSort.sort === "input_tokens"}
                               direction={groupSort.order} onToggle={groupSort.toggle}
@@ -520,12 +526,6 @@ export function StatsPage() {
                               align="right" testId="sort-cached_tokens" />
                 {/* 命中率 = 命中 ÷ 输入，派生列不排序（与「成功率」同例） */}
                 <TableHead className="text-right">命中率</TableHead>
-                <SortableHead label="Credit" columnKey="credit"
-                              active={groupSort.sort === "credit"} direction={groupSort.order}
-                              onToggle={groupSort.toggle} align="right" testId="sort-credit" />
-                <SortableHead label="成本" columnKey="cost_cny"
-                              active={groupSort.sort === "cost_cny"} direction={groupSort.order}
-                              onToggle={groupSort.toggle} align="right" testId="sort-cost_cny" />
                 {/* 延迟四列：均值读小时汇总（与总览同口径），P95 读明细表（仅 90 天）。
                     两套口径在同一行并存，靠表尾说明与列头文案区分。 */}
                 <SortableHead label="平均耗时" columnKey="avg_latency_ms"
@@ -602,6 +602,13 @@ export function StatsPage() {
                       ? `${((row.ok_count / row.requests) * 100).toFixed(1)}%`
                       : "—"}
                   </TableCell>
+                  <TableCell label="Credit" className="text-right tabular-nums">
+                    {formatCredit(row.credit, row.credit_estimated)}
+                  </TableCell>
+                  <TableCell label="成本" className="text-right tabular-nums"
+                             title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
+                    {formatMoney(row.cost_cny, "CNY")}
+                  </TableCell>
                   <TableCell label="输入 token" className="text-right tabular-nums">
                     {formatCompact(row.input_tokens)}
                   </TableCell>
@@ -614,13 +621,6 @@ export function StatsPage() {
                   <TableCell label="命中率" className="text-right tabular-nums"
                              data-testid="group-cache-rate">
                     {formatCacheRate(row.cached_tokens, row.input_tokens)}
-                  </TableCell>
-                  <TableCell label="Credit" className="text-right tabular-nums">
-                    {formatCredit(row.credit, row.credit_estimated)}
-                  </TableCell>
-                  <TableCell label="成本" className="text-right tabular-nums"
-                             title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
-                    {formatMoney(row.cost_cny, "CNY")}
                   </TableCell>
                   {/* 延迟四列：均值与 P95 都只算成功请求；无成功请求显示 — */}
                   <TableCell label="平均耗时" className="text-right tabular-nums"

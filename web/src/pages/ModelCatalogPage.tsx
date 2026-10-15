@@ -254,21 +254,21 @@ export function ModelCatalogPage() {
                   <TableRow>
                     <SortableHead label="模型" columnKey="id" active={sort === "id"}
                                   direction={order} onToggle={toggle} testId="sort-id" />
+                    <SortableHead label={`价格（${priceUnit}）`} columnKey="input"
+                                  active={sort === "input"} direction={order}
+                                  onToggle={toggle} align="right" testId="sort-input" />
+                    <SortableHead label="能力分" columnKey="intelligence"
+                                  active={sort === "intelligence"} direction={order}
+                                  onToggle={toggle} testId="sort-intelligence"
+                                  hint={<ColumnHint text="Artificial Analysis 三项指数（智 / 编 / 体），非本服务实测。点列头按「智」排序；无分数行排末尾。" />} />
                     <SortableHead label="上下文 / 输出" columnKey="context"
                                   active={sort === "context"} direction={order}
                                   onToggle={toggle} testId="sort-context" />
                     <TableHead>输入 → 输出模态</TableHead>
                     <TableHead>能力</TableHead>
-                    <SortableHead label="能力分" columnKey="intelligence"
-                                  active={sort === "intelligence"} direction={order}
-                                  onToggle={toggle} testId="sort-intelligence"
-                                  hint={<ColumnHint text="Artificial Analysis 三项指数（智 / 编 / 体），非本服务实测。点列头按「智」排序；无分数行排末尾。" />} />
                     <SortableHead label="知识截止" columnKey="knowledge"
                                   active={sort === "knowledge"} direction={order}
                                   onToggle={toggle} testId="sort-knowledge" />
-                    <SortableHead label={`价格（${priceUnit}）`} columnKey="input"
-                                  active={sort === "input"} direction={order}
-                                  onToggle={toggle} align="right" testId="sort-input" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -281,25 +281,6 @@ export function ModelCatalogPage() {
                           <div className="font-mono text-xs break-all text-muted-foreground">
                             {row.id}
                           </div>
-                        </TableCell>
-                        <TableCell label="上下文 / 输出" className="text-xs tabular-nums">
-                          <div title="上下文窗口上限">{limitLine(row.context)}</div>
-                          <div className="text-muted-foreground" title="单次输出上限">
-                            {limitLine(row.max_output)}
-                          </div>
-                        </TableCell>
-                        <TableCell label="模态" className="max-w-[9rem] text-xs whitespace-normal break-keep">
-                          {modalityText(row.input_modalities)} →{" "}
-                          {modalityText(row.output_modalities)}
-                        </TableCell>
-                        <TableCell label="能力" className="max-w-[12rem] text-xs whitespace-normal break-keep">
-                          {caps.length === 0 ? "—" : caps.join(" · ")}
-                        </TableCell>
-                        <TableCell label="能力分" className="text-xs tabular-nums">
-                          {benchmarkLine(row)}
-                        </TableCell>
-                        <TableCell label="知识截止" className="text-xs">
-                          {row.knowledge ?? "—"}
                         </TableCell>
                         <TableCell label="价格" className="text-right tabular-nums">
                           <div title="输入 单价 · 输出 单价">
@@ -314,6 +295,25 @@ export function ModelCatalogPage() {
                             <span> · 缓存写 </span>
                             {formatUnitPrice(row.cache_write, currency, rate)}
                           </div>
+                        </TableCell>
+                        <TableCell label="能力分" className="text-xs tabular-nums">
+                          {benchmarkLine(row)}
+                        </TableCell>
+                        <TableCell label="上下文 / 输出" className="text-xs tabular-nums">
+                          <div title="上下文窗口上限">{limitLine(row.context)}</div>
+                          <div className="text-muted-foreground" title="单次输出上限">
+                            {limitLine(row.max_output)}
+                          </div>
+                        </TableCell>
+                        <TableCell label="模态" className="max-w-[9rem] text-xs whitespace-normal break-keep">
+                          {modalityText(row.input_modalities)} →{" "}
+                          {modalityText(row.output_modalities)}
+                        </TableCell>
+                        <TableCell label="能力" className="max-w-[12rem] text-xs whitespace-normal break-keep">
+                          {caps.length === 0 ? "—" : caps.join(" · ")}
+                        </TableCell>
+                        <TableCell label="知识截止" className="text-xs">
+                          {row.knowledge ?? "—"}
                         </TableCell>
                       </TableRow>
                     );

@@ -606,15 +606,15 @@ export function ApiKeysPage() {
                 <SortableHead label="渠道" columnKey="provider_binding"
                               active={sort === "provider_binding"} direction={order}
                               onToggle={toggleSort} testId="sort-provider_binding" />
-                <TableHead>来源 IP</TableHead>
-                <TableHead>模型白名单</TableHead>
                 <SortableHead label="到期" columnKey="expires_at" active={sort === "expires_at"}
                               direction={order} onToggle={toggleSort} testId="sort-expires_at" />
-                <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
-                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <SortableHead label="最后使用" columnKey="last_used_at"
                               active={sort === "last_used_at"} direction={order}
                               onToggle={toggleSort} testId="sort-last_used_at" />
+                <TableHead>来源 IP</TableHead>
+                <TableHead>模型白名单</TableHead>
+                <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
+                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -626,20 +626,20 @@ export function ApiKeysPage() {
                   <TableCell label="渠道" className="text-xs" data-testid={`key-binding-${key.id}`}>
                     {providerBindingLabel(key.provider_binding)}
                   </TableCell>
+                  <TableCell label="到期" className="text-xs" data-testid={`key-expires-${key.id}`}>
+                    {key.expires_at ? formatTime(key.expires_at) : "永不过期"}
+                  </TableCell>
+                  <TableCell label="最后使用" className="text-xs">
+                    {key.last_used_at ? formatTime(key.last_used_at) : "从未使用"}
+                  </TableCell>
                   <TableCell label="来源 IP" className="font-mono text-xs" data-testid={`key-ips-${key.id}`}>
                     {key.allowed_ips || "不限制"}
                   </TableCell>
                   <TableCell label="模型白名单" className="font-mono text-xs" data-testid={`key-models-${key.id}`}>
                     {key.allowed_models || "不限制"}
                   </TableCell>
-                  <TableCell label="到期" className="text-xs" data-testid={`key-expires-${key.id}`}>
-                    {key.expires_at ? formatTime(key.expires_at) : "永不过期"}
-                  </TableCell>
                   <TableCell label="创建时间" className="text-xs">
                     {formatTime(key.created_at)}
-                  </TableCell>
-                  <TableCell label="最后使用" className="text-xs">
-                    {key.last_used_at ? formatTime(key.last_used_at) : "从未使用"}
                   </TableCell>
                   <TableCell label="操作" className="text-right">
                     {confirming === key.id ? (
