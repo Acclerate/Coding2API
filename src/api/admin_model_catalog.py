@@ -38,7 +38,6 @@ from ..benchmarks import BenchmarkTable
 from ..model_match import lookup, match_keys
 from ..sorting import sort_rows
 from .deps import Services, principal_from_request
-from .model_merge import _finalize
 from .models import credential_providers, merged_entries
 
 # 模型目录排序白名单：API 键 → 取值函数（缺失值排最后）。
@@ -61,8 +60,9 @@ MODEL_CATALOG_SORT_KEYS = {
 }
 
 
-def _with_benchmarks(rows: list[dict[str, Any]],
-                     table: BenchmarkTable | None) -> list[dict[str, Any]]:
+def _with_benchmarks(
+    rows: list[dict[str, Any]], table: BenchmarkTable | None
+) -> list[dict[str, Any]]:
     """给目录行补能力分（匹配不到就不带该字段；表为空时全部原样返回）。"""
     if not table:
         return rows
@@ -77,45 +77,59 @@ def _available_keys(services: Services) -> set[str]:
     """当前渠道真能提供的模型 → 候选键集合（与 `/v1/models` 同口径）。
 
     只算「有可用凭证」的渠道（`credential_providers`），并过当前黑名单
-    （`merged_entries` 内部已滤）。`merged_entries` 返回的是**未定稿**的分组
-    （还没有对外 id），故先 `_finalize` 补出 id / 展示名，再展开成候选键。
+    （`merged_entries` 内部已滤）。按条目的**归一键主体**（`entry["base"]`）
+    与展示名展开候选键：对外 id 只是主体拼 `-渠道`（`kimi-k3-qoder`），外部
+    目录按裸名登记，带后缀的 id 既匹配不上也不该去匹配。
     """
     entries = merged_entries(services, credential_providers(services))
     keys: set[str] = set()
     for entry in entries:
-        _finalize(entry)
-        keys |= match_keys(entry["id"], entry["meta"].get("name"))
+        keys |= match_keys(entry["base"], entry["meta"].get("name"))
     return keys
 
 
-def _with_availability(rows: list[dict[str, Any]],
-                       keys: set[str]) -> list[dict[str, Any]]:
+def _with_availability(
+    rows: list[dict[str, Any]], keys: set[str]
+) -> list[dict[str, Any]]:
     """给目录行补 `available`：该模型是否命中当前渠道提供的模型集合。
 
     用候选键**求交集**（不是 `lookup` 的「唯一命中」）：这里只问「有没有渠道
     提供」，命中多条渠道也是提供；键集为空（未接入任何渠道）时全部 false。
     """
-    return [{**row, "available": bool(match_keys(row.get("id"), row.get("name")) & keys)}
-            for row in rows]
+    return [
+        {**row, "available": bool(match_keys(row.get("id"), row.get("name")) & keys)}
+        for row in rows
+    ]
 
 
 def create_router(services: Services) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/model-catalog")
-    async def get_model_catalog(request: Request, sort: str | None = None,
-                                order: str | None = None,
-                                _principal=Depends(principal_from_request)):
+    async def get_model_catalog(
+        request: Request,
+        sort: str | None = None,
+        order: str | None = None,
+        _principal=Depends(principal_from_request),
+    ):
         """当前生效模型目录 + 元信息；仅要求登录（OpenRouter 是公开数据，各角色可看）。"""
         state = request.app.state
         catalog: dict[str, dict] = state.models_dev_catalog
         # 先补能力分再排序：能力分排序键读 `row["benchmarks"]`，若在 enrich 之前
         # 排，所有行都拿不到分数、按能力分排会退化成不动。
-        rows = _with_benchmarks([catalog[model] for model in sorted(catalog)],
-                                getattr(state, "model_benchmarks", None))
+        rows = _with_benchmarks(
+            [catalog[model] for model in sorted(catalog)],
+            getattr(state, "model_benchmarks", None),
+        )
         # 默认按模型 id 升序：结果确定（前端无需再排），与历史行为一致。
-        models = sort_rows(rows, sort, order,
-                           MODEL_CATALOG_SORT_KEYS, default_key="id", default_desc=False)
+        models = sort_rows(
+            rows,
+            sort,
+            order,
+            MODEL_CATALOG_SORT_KEYS,
+            default_key="id",
+            default_desc=False,
+        )
         models = _with_availability(models, _available_keys(services))
         return {
             "models": models,

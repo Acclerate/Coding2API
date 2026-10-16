@@ -363,7 +363,7 @@ def test_playground_serves_stale_list_and_refreshes_in_background(settings):
 
     async def scenario():
         response = await serve_models(services)   # 立刻返回旧列表
-        assert response["data"][0]["id"] == "kilo-m"
+        assert response["data"][0]["id"] == "kilo-m-kilo"
         # 后台任务已排队（此刻可能还没跑完）
         assert services.pending_model_refreshes
         await asyncio.gather(*list(services.pending_model_refreshes))
@@ -382,7 +382,7 @@ def test_playground_blocks_once_when_channel_has_no_cache(settings):
     assert services.model_list_cache == {}
 
     response = asyncio.run(serve_models(services))
-    assert [m["id"] for m in response["data"]] == ["kilo-m"]
+    assert [m["id"] for m in response["data"]] == ["kilo-m-kilo"]
     assert provider.calls == 1
     assert not services.model_refreshing
 
@@ -430,7 +430,7 @@ def test_playground_background_refresh_survives_upstream_failure(settings):
 
     async def scenario():
         response = await serve_models(services)
-        assert response["data"][0]["id"] == "kilo-m"
+        assert response["data"][0]["id"] == "kilo-m-kilo"
         await asyncio.gather(*list(services.pending_model_refreshes),
                              return_exceptions=True)
 
@@ -475,10 +475,10 @@ def test_list_response_filters_by_api_key_model_allowlist(settings):
     asyncio.run(list_models(services))            # 先填缓存（不碰上游的出口需要它）
 
     full = _build_response(services, {"kilo"})
-    assert [m["id"] for m in full["data"]] == ["glm-m", "kilo-m"]
+    assert [m["id"] for m in full["data"]] == ["glm-m-kilo", "kilo-m-kilo"]
 
     filtered = _build_response(services, {"kilo"}, allowed_models="glm-*")
-    assert [m["id"] for m in filtered["data"]] == ["glm-m"]
+    assert [m["id"] for m in filtered["data"]] == ["glm-m-kilo"]
 
 
 def test_schedule_refresh_noop_without_stale_channels(settings):

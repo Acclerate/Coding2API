@@ -514,7 +514,7 @@ def test_callback_accepts_upper_case_keys():
 # ------------------------------------------------------------- main app
 
 def test_models_endpoint_lists_connected_providers(tmp_path):
-    """模型列表按渠道凭证加载：有凭证的渠道才合并进列表。"""
+    """模型列表按渠道凭证加载：有凭证的渠道才进列表（每模型一条，id 带渠道后缀）。"""
     from src.config import Settings
     from src.provider.base import Model
 
@@ -547,5 +547,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         data = test_client.get("/v1/models",
                                headers={"Authorization": f"Bearer {key}"}).json()["data"]
     by_id = {item["id"]: item["providers"] for item in data}
-    assert by_id["glm-5.2"] == ["codebuddy", "trae"]
-    assert by_id["only-cb"] == ["codebuddy"]
+    # 同名 `glm-5.2` 两渠道都有 → 拆成两条，各钉死自己的渠道
+    assert by_id["glm-5.2-codebuddy"] == ["codebuddy"]
+    assert by_id["glm-5.2-trae"] == ["trae"]
+    assert by_id["only-cb-codebuddy"] == ["codebuddy"]

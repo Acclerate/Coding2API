@@ -65,7 +65,7 @@
 
 | 问题 | 事实 | 对策 |
 |---|---|---|
-| 模型 ID 撞车 | 多渠道都有 `glm-5.2`、`DeepSeek-V4-Pro`、`kimi-k3` 等 | 扁平名 + 归一键合并 + 健康度路由 + `@渠道` 后缀 |
+| 模型 ID 撞车 | 多渠道都有 `glm-5.2`、`DeepSeek-V4-Pro`、`kimi-k3` 等 | 扁平名 + 按渠道拆分（对外 id `归一键-渠道`）+ 裸名扇出 + `@渠道` 后缀 |
 | 积分语义不同 | CB/Qoder/CodeArts 有周期会重置；TRAE 各权益包独立到期 | 健康分统一为百分比；展示层标注周期语义 |
 | credit 可得性 | CB 有 per-request；TRAE 只有账户总额 | 统计表 credit 可空；TRAE 按官方单价、CodeArts 福利模型按每日池 1:1 推算并标 `credit_estimated` |
 | 登录机制 | CB/Qoder/CodeArts 轮询或粘贴（后端出网）；TRAE 浏览器回调 | 三轨（poll / callback / paste），回调统一走主端口 |
@@ -107,9 +107,9 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ### 3.4 模型名三字段
 
-七条渠道每个模型统一为三个字段，同一条链派生：**原代号**（`raw_id`，渠道请求时真正发的 key，**永不改动**，转发时经别名表换回）、**归一键**（剥掉免费档标记 `-free` / 路径段 `free`、新版标记 `-new` 与命名空间前缀后 slug 化，模型列表按它判断同一模型并合并）、**展示名**（`name`，清洗后的可读文本，上游可读名优先、无则由原代号派生、品牌缩写按官方写法纠正）。
+七条渠道每个模型统一为三个字段，同一条链派生：**原代号**（`raw_id`，渠道请求时真正发的 key，**永不改动**，转发时经别名表换回）、**归一键**（剥掉免费档标记 `-free` / 路径段 `free`、新版标记 `-new` 与命名空间前缀后 slug 化，作为对外 id 的主体）、**展示名**（`name`，清洗后的可读文本，上游可读名优先、无则由原代号派生、品牌缩写按官方写法纠正）。
 
-**合并键 = 归一键**；`/v1/models` 对外 `id` 一律是归一键，原代号进 `by_provider.{渠道}.raw_id`；**原代号、展示名、归一键三种写法都能直接请求**。同模型异名由显式规范表 `MODEL_SYNONYMS` 收敛（键与展示名一起），**只登记人工核实的等价、不做模糊匹配**。哨兵名（`auto` / `default`）语义只在本渠道内成立，不跨渠道合并；同渠道内归一键重复或对外 id 撞车时退回原代号 / 加后缀。黑名单按**归一后的对外写法**匹配（原代号、其归一键、展示名、展示名归一键四种任一命中即滤）。
+**每模型一条、不跨渠道合并（2026-10-16 起）**：`/v1/models` 对外 `id` = `归一键-渠道`（`kimi-k3-qoder`），请求该 id 经别名表收窄后**钉死该渠道**；原代号进 `by_provider.{渠道}.raw_id`；**原代号、展示名、裸归一键三种旧写法仍能直接请求**（裸名按登记渠道扇出，保留旧口径的自动选号语义）。原先「合并键 = 归一键、同名并成一条、多渠道健康轮转」的口径取消；跨渠道自动选号由显式 `MODEL_FALLBACK_GROUPS` 与各厂商自动档模型（如 `org-auto`，照样带厂商后缀）承担。同模型异名由显式规范表 `MODEL_SYNONYMS` 收敛（键与展示名一起），**只登记人工核实的等价、不做模糊匹配**。哨兵名（`auto` / `default`）语义只在本渠道内成立，对外 id 退回原代号归一键；同渠道内归一键撞车时退回原代号 / 数字后缀。黑名单按**归一后的对外写法**匹配（原代号、其归一键、展示名、展示名归一键及各自拼 `-渠道` 的形态，任一命中即滤）；Key 白名单的 `-{渠道}` 后缀不参与 glob 匹配（裸名 `kimi-k3` 覆盖各渠道变体）。
 
 ### 3.5 登录三轨
 
@@ -157,7 +157,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 
 ## 5. API 契约
 
-**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate}` + 可选 `benchmarks`）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
+**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为 `归一键-渠道` + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate}` + 可选 `benchmarks`）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
 
 **管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、任务与配置（admin-only）。
 
@@ -189,7 +189,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 |---|---|---|
 | CB 协议复杂度高（私有信封 + 多业务码 + 成长中心） | 高 | 先 bearer-only 跑通再补 OAuth；成长中心不可逆动作用配置开关总控 |
 | 上游 SSE / 私有协议格式变更 | 中 | 各 provider 的 SSE 样本存 fixture 做契约测试；解析失败不静默 |
-| 模型 ID 撞车导致路由错误 | 中 | 扁平名 + 归一键合并 + `@渠道` 后门；统计行强制带 provider 字段 |
+| 模型 ID 撞车导致路由错误 | 中 | 扁平名 + 按渠道拆分（对外 id 带渠道后缀）+ `@渠道` 后门；统计行强制带 provider 字段 |
 | 上游 credit 不保证可得 | 低 | credit 仅辅助展示；健康度只依赖额度探测接口 |
 | 积分语义混淆（周期 vs 余额 vs 合成折算） | 低 | 健康分仅用于调度；展示层标注周期与折算语义 |
 | 第三方能力分被误读为本服务实测 | 中 | 三处 UI 均标注「Artificial Analysis 指数，经 OpenRouter 公开接口；非本服务实测」；不做排序 |

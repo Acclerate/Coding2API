@@ -69,9 +69,11 @@ def test_v1_models_and_playground_carry_benchmarks(tmp_path, monkeypatch):
         key = _create_api_key(client)
         data = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"}).json()
         rows = {row["id"]: row for row in data["data"]}
-        assert rows["glm-5.3"]["benchmarks"]["intelligence_index"] == 44.8
+        # 对外 id 带渠道后缀（_seed_models 塞的是 trae），能力分按对外 id /
+        # 归一主体 / 展示名三路匹配——主体 `glm-5.3` 命中
+        assert rows["glm-5.3-trae"]["benchmarks"]["intelligence_index"] == 44.8
         # 前缀不算匹配：没有分数就不带该字段，而不是带一个错的值
-        assert "benchmarks" not in rows["glm-5.3-flash"]
+        assert "benchmarks" not in rows["glm-5.3-flash-trae"]
 
 def test_models_endpoint_without_table_has_no_benchmarks(tmp_path, monkeypatch):
     """能力表为空（拉取失败 / 未装配）时，条目与加字段前完全一致。"""

@@ -288,7 +288,7 @@ def test_models_endpoint_falls_back_to_cache(settings):
         provider.fail = True
         second = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert second.status_code == 200
-    assert [m["id"] for m in second.json()["data"]] == ["glm-5.2"]
+    assert [m["id"] for m in second.json()["data"]] == ["glm-5.2-trae"]
     assert services.model_list_cache["trae"]      # 缓存保留
 
 def test_models_endpoint_logs_when_no_cache(settings):
@@ -333,7 +333,7 @@ def test_models_cache_fallback_when_ttl_expired(settings):
         provider.fail = True
         app.state.services.model_list_fetched_at.clear()      # 模拟 TTL 过期
         response = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
-    assert [m["id"] for m in response.json()["data"]] == ["glm-5.2"]
+    assert [m["id"] for m in response.json()["data"]] == ["glm-5.2-trae"]
 
 def test_models_failure_is_negatively_cached(settings):
     """拉取失败也刷 TTL 时间戳：TTL 内不再重试（有缓存用缓存，无缓存跳过）。"""
@@ -393,18 +393,18 @@ def test_models_failure_keeps_cache_for_ttl(settings):
     auth = {"Authorization": f"Bearer {key}"}
     with TestClient(app) as c:
         first = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in first.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in first.json()["data"]] == ["glm-5.2-trae"]
         assert Flaky.attempts == 1
 
         provider.fail = True
         services.model_list_fetched_at.clear()       # 模拟 TTL 过期 → 触发重试并失败
         second = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in second.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in second.json()["data"]] == ["glm-5.2-trae"]
         _drain_model_refresh(c, services)            # SWR：重试在后台，等它跑完
         assert Flaky.attempts == 2
 
         third = c.get("/v1/models", headers=auth)    # 失败后的 TTL 内：不再重试
-        assert [m["id"] for m in third.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in third.json()["data"]] == ["glm-5.2-trae"]
         assert Flaky.attempts == 2
 
 # --------------------------------------------------- #25 dump 有界保留
