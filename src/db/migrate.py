@@ -44,7 +44,17 @@ SCHEMA_NAME = "schema.sql"
 # 后历史行为 NULL，不影响既有记录展示与静默去重）。
 # 22：credentials 新增 tags（逗号分隔的运维标签，仅用于列表展示与筛选，
 # 不参与调度/鉴权）。默认 ''，老库补列后全部凭证「无标签」，行为不变。
-SCHEMA_VERSION = 22
+# 23：credentials 新增 quota_credits_remaining / quota_credits_total（CodeArts
+# 第二本账：积分＝内置模型计费单位，与每日 token 池并行）。老库补列后为 NULL
+# ＝「无积分账」，展示层隐藏该行，health / 选号行为不变。
+# 24：credit_events 新增 ledger（区分两本账：pool＝每日 token 池 / credits＝
+# 积分账）。老库补列后默认 'pool'——历史流水全部由主账（每日池）的 diff 产生，
+# 归入 pool 即为事实，不需要回填；积分账流水从补列后的下一轮探测开始记。
+# 25：credentials 新增 quota_credits_expiry_ladder（积分账到期阶梯，仅 CodeArts，
+# 供管理台按账本展示到期积分：福利组＝每日池 / 内置组＝积分账）。老库补列后为
+# NULL ＝「无积分到期信息」，展示层按「无到期积分」处理，health / 选号不受影响
+# （选号读的是两本账合并的 quota_expiry_ladder，不读这一列）。
+SCHEMA_VERSION = 25
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -94,11 +104,30 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 运维标签（仅列表展示与筛选，不参与调度）：老库补 '' 后全部凭证无标签，
     # 筛选界面默认「全部标签」下行为与补列前一致。
     ("credentials", "tags TEXT NOT NULL DEFAULT ''"),
+    # 第二本账（CodeArts 积分：内置模型计费，与每日 token 池并行）：老库补列后
+    # 为 NULL ＝「无积分账」，展示层隐藏该行，health / 选号不受影响。
+    ("credentials", "quota_credits_remaining REAL"),
+    ("credentials", "quota_credits_total REAL"),
+    # 变动流水按账本分流：老库补 'pool'——历史行全部由主账（每日池）diff 产生，
+    # 归入 pool 即为事实；无账本概念的渠道也恒为 pool，读路径行为不变。
+    ("credit_events", "ledger TEXT NOT NULL DEFAULT 'pool'"),
+    # 积分账到期阶梯（仅 CodeArts，展示用）：老库补列后为 NULL ＝「无积分到期
+    # 信息」，管理台按「无到期积分」处理；选号读合并阶梯，不受本列影响。
+    ("credentials", "quota_credits_expiry_ladder TEXT"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。
 # 签到去重改为当日内存态、模型列表改为进程内 TTL 缓存后这两张表零引用。
 _MIGRATION_DROPS: tuple[str, ...] = ("checkins", "model_cache")
+
+# (索引名, 表, 列)：**建在补列之后**的索引。
+# 为什么不能只放 schema.sql：`CREATE INDEX` 在 `executescript` 阶段执行，而老库
+# 此时还没补上新列，会直接 `no such column` 报错（见 idx_alert_unresolved 的
+# resolved_at——它本身是第 21 版迁移补的列）。放这里 = 先补列再建索引。
+_MIGRATION_INDEXES: tuple[tuple[str, str, str], ...] = (
+    # 侧栏角标只数「仍在告警中」（resolved_at IS NULL）：避免每次轮询全表扫。
+    ("idx_alert_unresolved", "alert_events", "resolved_at"),
+)
 
 
 def _read_schema() -> str:
@@ -130,6 +159,8 @@ def apply_schema(conn) -> None:
                 raise
     for table in _MIGRATION_DROPS:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for name, table, column in _MIGRATION_INDEXES:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({column})")
     # PRAGMA 不支持参数绑定，版本号来自本模块常量（非外部输入）
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

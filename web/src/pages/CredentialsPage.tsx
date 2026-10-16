@@ -41,7 +41,7 @@ import {
   stateOptions,
   tagOptions,
 } from "../lib/credentialList";
-import type { GroupSort } from "../lib/credentialList";
+import type { GroupSort, Ledger } from "../lib/credentialList";
 import { api } from "../api/client";
 import { useSessionContext } from "../Layout";
 import { useCredentials, useQueryClient } from "../api/hooks";
@@ -68,6 +68,7 @@ import {
   CREDIT_SOURCE_LABEL,
   creditEventLabel,
   credentialState,
+  CREDITS_QUOTA_SEMANTICS,
   cooldownRemaining,
   expiringQuotaLabel,
   formatDuration,
@@ -85,7 +86,6 @@ import {
 } from "../api/display";
 import type { CredentialState, TokenExpiryView } from "../api/display";
 import type { BatchAction, BatchResult, Credential, CreditEvent, GrowthRunResult } from "../api/types";
-import { providerLabel } from "../api/providers";
 import {
   Badge,
   Button,
@@ -148,18 +148,36 @@ function packageExpiry(epoch: number | null): string {
 }
 
 /**
- * 批量动作的中文名与结果措辞。
+ * 批量条按钮：后端动作 + 按钮自身文案。
  *
- * `verb` 用于操作条按钮与 toast 标题；`done` 用于结果句。放一张表而不是散在
- * 各处的 if/else：动作名要在按钮、确认文案、结果汇总三处保持一致，写歪一处
- * 就会出现「批量探测」按钮却弹出「批量签到完成」。
+ * 按钮与后端动作**不是一一对应**：`toggle` 要拆成「暂停」（enabled=false）与
+ * 「取消暂停」（enabled=true）两个按钮——只给一个按钮的话，操作员把号批量
+ * 暂停后就再也没有入口批量放回来（`revive` 清的是 `disabled` 硬禁用，不碰
+ * `enabled`，救不了暂停态）。因此按钮有独立 `key` 用于 testid 与文案查表，
+ * `action` 才是发给后端的动作名。
+ *
+ * `verb` 用于按钮；`done` 用于结果句。放一张表而不是散在各处的 if/else：
+ * 文案要在按钮与结果汇总两处保持一致，写歪一处就会出现「批量探测」按钮却
+ * 弹出「批量签到完成」。
  */
-const BATCH_ACTION_LABEL: Record<BatchAction, { verb: string; done: string }> = {
-  probe: { verb: "探测额度", done: "探测完成" },
-  checkin: { verb: "每日签到", done: "签到完成" },
-  toggle: { verb: "暂停", done: "已暂停" },
-  revive: { verb: "恢复", done: "已恢复" },
+type BatchButton = {
+  key: string;
+  action: BatchAction;
+  /** 仅 toggle 需要：显式目标状态，不做「各自取反」。 */
+  enabled?: boolean;
+  verb: string;
+  done: string;
 };
+
+const BATCH_BUTTONS: readonly BatchButton[] = [
+  { key: "probe", action: "probe", verb: "探测额度", done: "探测完成" },
+  { key: "checkin", action: "checkin", verb: "每日签到", done: "签到完成" },
+  { key: "pause", action: "toggle", enabled: false, verb: "暂停", done: "已暂停" },
+  { key: "resume", action: "toggle", enabled: true, verb: "取消暂停", done: "已取消暂停" },
+  // 「恢复」= revive（解除 session 死亡硬禁用），与「取消暂停」是两件事；
+  // 单条菜单里已按同样口径区分，批量条保持一致。
+  { key: "revive", action: "revive", verb: "恢复", done: "已恢复" },
+];
 
 /**
  * 批量结果浮层：成功数 + 失败明细。
@@ -171,16 +189,22 @@ const BATCH_ACTION_LABEL: Record<BatchAction, { verb: string; done: string }> = 
 function BatchToastContent({
   result,
   names,
+  done,
 }: {
   result: BatchResult;
   names: Map<string, string>;
+  /**
+   * 结果句的措辞，由**触发按钮**给出而非 `result.action` 反查：
+   * 「暂停」与「取消暂停」共用 action=toggle，按 action 查表会把取消暂停的
+   * 成功提示写成「已暂停」。
+   */
+  done: string;
 }) {
-  const label = BATCH_ACTION_LABEL[result.action];
   const failures = result.results.filter((row) => !row.ok);
   return (
     <div className="space-y-1">
       <div className="font-medium">
-        {label.done}：成功 {result.succeeded} / {result.total}
+        {done}：成功 {result.succeeded} / {result.total}
         {result.failed > 0 && `，失败 ${result.failed}`}
       </div>
       {failures.length > 0 && (
@@ -298,7 +322,7 @@ interface Actions {
   checkin: (credential: Credential) => void;
   growth: (credential: Credential) => void;
   activity: (credential: Credential) => void;
-  credits: (credential: Credential) => void;
+  credits: (credential: Credential, ledger: Ledger) => void;
   limits: (credential: Credential) => void;
   tags: (credential: Credential) => void;
 }
@@ -307,8 +331,8 @@ export function CredentialsPage() {
   const session = useSessionContext();
   // 默认 created_at 升序（与后端一致）；额度 / 健康度等数值列首点降序
   const { sort, order, toggle } = useSort("created_at", "asc",
-    { health: "desc", quota_remaining: "desc", token_expires_at: "asc",
-      growth_last_run_at: "desc" });
+    { health: "desc", quota_remaining: "desc", quota_credits_remaining: "desc",
+      token_expires_at: "asc", growth_last_run_at: "desc" });
   // 30s 轮询：冷却倒计时 / token 剩余都是「随时间变化」的观测量，页面停留
   // 时应自动刷新（与 useTasks 同口径）。
   const { data, isLoading } = useCredentials(session.username, 30_000, sort, order);
@@ -341,10 +365,13 @@ export function CredentialsPage() {
   const { toasts, push, dismiss } = useToasts();
   const showError = (content: ReactNode) => push({ tone: "danger", testId: "credentials-error", content });
   const showNotice = (content: ReactNode) => push({ tone: "ok", testId: "credentials-notice", content });
-  // 积分记录抽屉：一次只开一个（同一行内展开，不弹层——
-  // 表格行本身就是最好的上下文，弹层会遮掉额度列）
+  // 变动流水抽屉：一次只开一个（同一行内展开，不弹层——
+  // 表格行本身就是最好的上下文，弹层会遮掉额度列）。`ledger` 记下打开时
+  // 读的是哪本账：内置组读积分账（credits），其余组读每日池（pool），
+  // 换排序重新取数时必须带同一个账本，否则会串到另一本账的流水。
   const [creditEvents, setCreditEvents] = useState<{
     credentialId: string;
+    ledger: Ledger;
     events: CreditEvent[];
     sort: string;
     order: string;
@@ -421,24 +448,24 @@ export function CredentialsPage() {
         next.state !== ANY || next.tag !== ANY) {
       setExpanded(new Set(groupByProvider(
         credentials.filter((item) => matchesFilters(item, next, now)), now,
-      ).map((group) => group.provider)));
+      ).map((group) => group.key)));
     } else {
       setExpanded(new Set());
     }
   };
 
-  const toggleGroup = (provider: string) => {
+  const toggleGroup = (key: string) => {
     setExpanded((previous) => {
       const next = new Set(previous);
-      if (next.has(provider)) next.delete(provider);
-      else next.add(provider);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
 
   const refresh = () => client.invalidateQueries({ queryKey: ["admin"] });
 
-  // 积分记录抽屉内排序：改排序需重新取数（后端排），并保持方向直觉
+  // 流水抽屉内排序：改排序需重新取数（后端排），并保持方向直觉
   // （时间/数值列首点降序，来源首点升序）。
   const CREDIT_FIRST_ORDER: Record<string, "asc" | "desc"> = {
     ts: "desc", window_start: "desc", delta: "desc", source: "asc",
@@ -449,10 +476,11 @@ export function CredentialsPage() {
       ? (creditEvents.order === "asc" ? "desc" : "asc")
       : (CREDIT_FIRST_ORDER[columnKey] ?? "asc");
     try {
-      const result = await api.creditEvents(creditEvents.credentialId, columnKey, order);
+      const result = await api.creditEvents(
+        creditEvents.credentialId, creditEvents.ledger, columnKey, order);
       setCreditEvents({ ...creditEvents, events: result.events, sort: columnKey, order });
     } catch (caught) {
-      showError(caught instanceof Error ? caught.message : "积分记录读取失败");
+      showError(caught instanceof Error ? caught.message : "流水读取失败");
     }
   };
 
@@ -477,17 +505,17 @@ export function CredentialsPage() {
    * 同一批号再点一次「签到」没有意义；失败项也一并清空，避免用户以为要重试
    * 却把成功项又跑一遍（失败原因通常需要先修凭证）。
    */
-  const runBatch = async (action: BatchAction, enabled?: boolean) => {
+  const runBatch = async (button: BatchButton) => {
     const ids = selectedIds.map((credential) => credential.id);
     if (ids.length === 0) return;
     setBusy(true);
     try {
-      const result = await api.batchCredentials(action, ids, enabled);
+      const result = await api.batchCredentials(button.action, ids, button.enabled);
       const tone = result.failed > 0 ? "warn" : "ok";
       push({
         tone,
         testId: "credentials-batch-result",
-        content: <BatchToastContent result={result} names={credentialNames} />,
+        content: <BatchToastContent result={result} names={credentialNames} done={button.done} />,
       });
       setSelected(new Set());
       await refresh();
@@ -613,21 +641,23 @@ export function CredentialsPage() {
           setBusy(false);
         }
       })(),
-    // 只读：开关抽屉不写任何状态，因此不复用 run()（那个会刷新列表）
-    credits: (credential) =>
+    // 只读：开关抽屉不写任何状态，因此不复用 run()（那个会刷新列表）。
+    // `ledger` 由调用组给出（内置组＝积分账，其余＝每日池）：两本账必须分开读。
+    credits: (credential, ledger) =>
       void (async () => {
-        if (creditEvents?.credentialId === credential.id) {
+        if (creditEvents?.credentialId === credential.id
+            && creditEvents.ledger === ledger) {
           setCreditEvents(null);
           return;
         }
         try {
-          const result = await api.creditEvents(credential.id);
+          const result = await api.creditEvents(credential.id, ledger);
           setCreditEvents({
-            credentialId: credential.id, events: result.events,
+            credentialId: credential.id, ledger, events: result.events,
             sort: "ts", order: "desc",
           });
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "积分记录读取失败");
+          showError(caught instanceof Error ? caught.message : "流水读取失败");
         }
       })(),
     activity: (credential) =>
@@ -811,17 +841,16 @@ export function CredentialsPage() {
                 <span className="text-xs text-muted-foreground" data-testid="batch-selected-count">
                   已选 <strong className="tabular-nums text-foreground">{selectedIds.length}</strong> 个
                 </span>
-                {(["probe", "checkin", "toggle", "revive"] as BatchAction[]).map((action) => (
+                {BATCH_BUTTONS.map((button) => (
                   <Button
-                    key={action}
+                    key={button.key}
                     size="sm"
                     variant="default"
                     disabled={busy}
-                    data-testid={`batch-${action}`}
-                    onClick={() =>
-                      void runBatch(action, action === "toggle" ? false : undefined)}
+                    data-testid={`batch-${button.key}`}
+                    onClick={() => void runBatch(button)}
                   >
-                    {BATCH_ACTION_LABEL[action].verb}
+                    {button.verb}
                   </Button>
                 ))}
                 <Button
@@ -853,15 +882,17 @@ export function CredentialsPage() {
               >
                 <TableBody>
                   {groups.map((group) => {
-                    const isCollapsed = !expanded.has(group.provider);
+                    const isCollapsed = !expanded.has(group.key);
                     // 到期积分：以「窗口 + 数字」两个图块呈现，比一行长句更像仪表盘。
                     // 主/次窗口措辞区分开（主窗口 36h 是次窗口 7 天的子集）。
                     const primaryWindowLabel = `${formatDuration(expiryWindow)}内过期`;
                     const secondaryWindowLabel = `${formatDuration(expirySecondaryWindow)}内过期`;
+                    // 到期积分按**本组那本账**取：福利组（每日池）用主账字段，内置组
+                    // （积分账）用积分账字段——后端已把两段合并阶梯拆开，各自独立。
+                    // 其余渠道只有一本账，主账字段即其全部到期积分。
                     const hasExpiring = (group.expiring ?? 0) > 0;
                     // 次窗口只在**比主窗口多出东西**时才展示：次窗口是主窗口的超集，
-                    // 相等就意味着「没有超出 1.5 天窗口的部分」。CodeArts 的每日池
-                    // 当天清零，两个窗口恒等，同时列两块只是把同一个数字说两遍。
+                    // 相等就意味着「没有超出 1.5 天窗口的部分」。
                     const hasExpiringSecondary =
                       (group.expiringSecondary ?? 0) > (group.expiring ?? 0);
                     // 成长中心列只在支持的渠道出现（见 supportsGrowth）；**但表格列数
@@ -872,8 +903,12 @@ export function CredentialsPage() {
                     // 列数一变就重算列宽，展开的下一组会整列错位。选择列只在可写
                     // （canWrite）时出现，与 ColumnHeaderRow / Row 的渲染条件严格一致。
                     // canWrite：选择 + 凭证 + 状态 + 额度 + token + 成长 + 操作 = 7；
-                    // viewer：去掉选择与操作两列 = 5。
+                    // viewer：去掉选择与操作两列 = 5。**只读的福利组列数不变**：它仍
+                    // 渲染空的勾选 / 操作格（见 Row 的 readOnly 分支），否则表格 auto
+                    // 布局会把同一张表里其它组整列错位。
                     const columnCount = canWrite ? 7 : 5;
+                    // 只读组（福利）里能写吗：不能。行与列头都按它收窄渲染。
+                    const groupCanWrite = canWrite && !group.readOnly;
                     // 本组是否已全选：决定组头 checkbox 的勾选态。用 group.items
                     // （组内全部行）而不是 filtered，因为组头「全选本渠道」的语义
                     // 就是这一渠道下的所有账号。
@@ -886,25 +921,32 @@ export function CredentialsPage() {
                         ? Math.min(100, Math.max(0, (group.remaining / group.total) * 100))
                         : null;
                     return (
-                      <Fragment key={group.provider}>
+                      <Fragment key={group.key}>
                         {/* 组头：折叠时的「渠道仪表盘」——身份 + 状态分布 + 额度合计 +
                             1.5 天 / 7 天内将过期的积分。每个指标一个带图标的图块，
                             比一行纯文字更好扫读；点击展开该渠道（默认全折叠）。 */}
-                        <TableRow data-testid={`group-${group.provider}`}>
+                        <TableRow data-testid={`group-${group.key}`}>
                           <TableCell
                             colSpan={columnCount}
                             className="bg-muted/40 p-0"
                           >
                             {/* 组头「全选本渠道」的 checkbox 必须在 button **外面**：
                                 checkbox 嵌进 button 会形成嵌套交互元素，读屏与键盘
-                                焦点都会打架（点 checkbox 会连带展开/折叠该组）。 */}
+                                焦点都会打架（点 checkbox 会连带展开/折叠该组）。
+                                只在**会话可写**时渲染（viewer 整张表都没有选择列，组头
+                                也不该多出这一格）；可写会话下只读的福利组仍渲染，但置为
+                                **禁用**——它不承载任何操作，却要占住这一格，否则组头比
+                                其它组少一个前导元素、指标区整体左移，与同表其它组对不齐。 */}
                             <div className="flex items-center">
                               {canWrite && (
                                 <span className="pl-3">
                                   <Checkbox
-                                    checked={allSelected}
-                                    aria-label={`全选 ${providerLabel(group.provider)} 的账号`}
-                                    data-testid={`group-select-${group.provider}`}
+                                    checked={groupCanWrite && allSelected}
+                                    disabled={!groupCanWrite}
+                                    aria-label={groupCanWrite
+                                      ? `全选 ${group.label} 的账号`
+                                      : `${group.label} 为只读渠道，不可选择`}
+                                    data-testid={`group-select-${group.key}`}
                                     onCheckedChange={(checked) =>
                                       toggleGroupSelected(groupIds, checked === true)}
                                   />
@@ -912,9 +954,9 @@ export function CredentialsPage() {
                               )}
                               <button
                                 type="button"
-                                data-testid={`group-toggle-${group.provider}`}
+                                data-testid={`group-toggle-${group.key}`}
                                 aria-expanded={!isCollapsed}
-                                onClick={() => toggleGroup(group.provider)}
+                                onClick={() => toggleGroup(group.key)}
                                 className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
                               >
                               {/* 身份：折叠箭头 + 品牌图标 + 渠道名 + 账号数 */}
@@ -931,7 +973,7 @@ export function CredentialsPage() {
                                 </span>
                                 <span className="min-w-0">
                                   <span className="block truncate text-[13px] leading-tight font-semibold text-foreground">
-                                    {providerLabel(group.provider)}
+                                    {group.label}
                                   </span>
                                   <span className="block text-xs leading-tight text-muted-foreground tabular-nums">
                                     {group.items.length} 个账号
@@ -960,7 +1002,7 @@ export function CredentialsPage() {
                                           <span
                                             key={state}
                                             className="inline-flex items-center gap-1 text-xs leading-tight"
-                                            data-testid={`group-${group.provider}-state-${state}`}
+                                            data-testid={`group-${group.key}-state-${state}`}
                                           >
                                             <StateIcon
                                               className={cn("size-3.5", STATE_TEXT[state])}
@@ -985,7 +1027,7 @@ export function CredentialsPage() {
                                     退回一个中性图标位保持各块对齐。 */}
                                 <span className="flex w-48 shrink-0 items-center gap-2">
                                   {quotaPct !== null ? (
-                                    <span data-testid={`group-${group.provider}-quota-pct`}>
+                                    <span data-testid={`group-${group.key}-quota-pct`}>
                                       <QuotaRing pct={quotaPct} />
                                     </span>
                                   ) : (
@@ -995,10 +1037,12 @@ export function CredentialsPage() {
                                   )}
                                   <span
                                     className="min-w-0"
-                                    title="组内各号额度合计（只统计有额度接口的号；免费层 —）"
+                                    title={group.ledger === "credits"
+                                      ? "组内各号**积分账**合计（内置模型计费）；未探测到的号不计入"
+                                      : "组内各号额度合计（只统计有额度接口的号；免费层 —）"}
                                   >
                                     <span className="block text-[11px] leading-tight text-muted-foreground">
-                                      额度合计
+                                      {group.ledger === "credits" ? "积分合计" : "额度合计"}
                                       {quotaPct !== null && (
                                         <span className="ml-1 tabular-nums text-ok-ink">
                                           {Math.round(quotaPct)}%
@@ -1024,7 +1068,7 @@ export function CredentialsPage() {
                                 {hasExpiring && (
                                   <span
                                     className="flex w-36 shrink-0 items-center gap-2"
-                                    data-testid={`group-${group.provider}-expiring`}
+                                    data-testid={`group-${group.key}-expiring`}
                                     title={`组内各号主窗口（${formatDuration(expiryWindow)}）内将过期的积分合计`}
                                   >
                                     <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
@@ -1043,7 +1087,7 @@ export function CredentialsPage() {
                                 {hasExpiringSecondary && (
                                   <span
                                     className="flex w-36 shrink-0 items-center gap-2"
-                                    data-testid={`group-${group.provider}-expiring-secondary`}
+                                    data-testid={`group-${group.key}-expiring-secondary`}
                                     title={`组内各号次窗口（${formatDuration(expirySecondaryWindow)}）内将过期的积分合计，含主窗口的部分`}
                                   >
                                     <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
@@ -1067,8 +1111,10 @@ export function CredentialsPage() {
                         {!isCollapsed && (
                           <>
                             <ColumnHeaderRow
-                              provider={group.provider}
+                              groupKey={group.key}
                               canWrite={canWrite}
+                              readOnly={group.readOnly}
+                              ledger={group.ledger}
                               showGrowth={showGrowth}
                               sort={sort}
                               order={order}
@@ -1078,30 +1124,41 @@ export function CredentialsPage() {
                               <Fragment key={credential.id}>
                                 <Row
                                   credential={credential}
+                                  // 同一凭证在 CodeArts 的两个组各有一行，只读组给
+                                  // testid 加后缀，避免行内 testid 在两组之间撞 id。
+                                  idSuffix={group.readOnly ? "-benefit" : ""}
+                                  ledger={group.ledger}
                                   now={now}
                                   expiryWindow={expiryWindow}
                                   expirySecondaryWindow={expirySecondaryWindow}
                                   tokenWarning={tokenWarning}
                                   canWrite={canWrite}
+                                  readOnly={group.readOnly}
                                   showGrowth={showGrowth}
                                   busy={busy}
                                   selected={selected.has(credential.id)}
                                   onSelect={toggleSelected}
                                   confirming={confirmDelete === credential.id}
-                                  creditsOpen={creditEvents?.credentialId === credential.id}
+                                  creditsOpen={creditEvents?.credentialId === credential.id
+                                    && creditEvents.ledger === group.ledger}
                                   onConfirmDelete={setConfirmDelete}
                                   actions={actions}
                                 />
-                                {creditEvents?.credentialId === credential.id && (
+                                {/* 抽屉跟随打开它的那组渲染：同一凭证在福利组也有一行，
+                                    不判组就会在两处各展开一份。福利组本就不给入口。 */}
+                                {!group.readOnly
+                                  && creditEvents?.credentialId === credential.id
+                                  && creditEvents.ledger === group.ledger && (
                                   <TableRow data-testid={`credit-row-${credential.id}`}>
                                     <TableCell colSpan={columnCount} className="p-0">
                                       <CreditDrawer
                                         credentialId={credential.id}
+                                        ledger={creditEvents.ledger}
                                         events={creditEvents.events}
                                         sort={creditEvents.sort}
                                         order={creditEvents.order}
                                         onSort={sortCredits}
-                                        onClose={() => actions.credits(credential)}
+                                        onClose={() => actions.credits(credential, creditEvents.ledger)}
                                       />
                                     </TableCell>
                                   </TableRow>
@@ -1350,41 +1407,54 @@ function QuotaRing({ pct }: { pct: number }) {
  * 同一列会渲染多份，不带前缀会撞 id。
  */
 function ColumnHeaderRow({
-  provider,
+  groupKey,
   canWrite,
+  readOnly,
+  ledger,
   showGrowth,
   sort,
   order,
   toggle,
 }: {
-  provider: string;
+  groupKey: string;
   canWrite: boolean;
+  readOnly: boolean;
+  /** 本组讲哪本账：credits＝积分账（内置组），pool＝每日池（其余） */
+  ledger: Ledger;
   showGrowth: boolean;
   sort: string;
   order: "asc" | "desc";
   toggle: (columnKey: string) => void;
 }) {
+  // 只读组（CodeArts 福利）不承载任何操作：勾选列与操作列都渲染成**空占位格**，
+  // 而不是不渲染——列数必须与其它组严格一致，表格是 auto 布局，少一格会让
+  // 同表其它组整列错位。
+  const writable = canWrite && !readOnly;
+  // 额度列排的是**本组那本账**：内置组按积分账排（与列里显示的数字同源），
+  // 其余按每日池排。两把键都在后端白名单里，未知键会被后端回落默认键。
+  const creditsLedger = ledger === "credits";
+  const quotaColumnKey = creditsLedger ? "quota_credits_remaining" : "quota_remaining";
   return (
     <TableRow
-      data-testid={`column-header-${provider}`}
+      data-testid={`column-header-${groupKey}`}
       className="hover:bg-transparent [&>th]:sticky [&>th]:top-0 [&>th]:z-10 [&>th]:h-9 [&>th]:bg-muted"
     >
       {/* 选择列：列头留空（每行的 checkbox 由 Row 渲染，组头的全选在组标题行）。
           必须与 Row 的 checkbox 格一一对应，否则表格 auto 布局会整列错位。 */}
       {canWrite && <TableHead className="w-8" aria-hidden />}
       <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
-                    direction={order} onToggle={toggle} testId={`sort-${provider}-nickname`}
+                    direction={order} onToggle={toggle} testId={`sort-${groupKey}-nickname`}
                     hint={<ColumnHint text="昵称；「已指定」＝调度器优先用该凭证（全局唯一）。渠道名与数量在分组标题行。" />} />
       <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
-                    direction={order} onToggle={toggle} testId={`sort-${provider}-health`}
+                    direction={order} onToggle={toggle} testId={`sort-${groupKey}-health`}
                     hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。" />} />
-      <SortableHead label="额度" columnKey="quota_remaining"
-                    active={sort === "quota_remaining"} direction={order}
-                    onToggle={toggle} testId={`sort-${provider}-quota_remaining`}
-                    hint={<ColumnHint text="剩余 / 总量。周期口径按渠道（CodeBuddy 本周期剩余、TRAE 账户剩余递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口）；悬浮额度看口径。到期额度行＝窗口内即将过期、优先消耗；主窗口（36h）打平才比次窗口（7 天）。下箭头展开积分记录。" />} />
+      <SortableHead label="额度" columnKey={quotaColumnKey}
+                    active={sort === quotaColumnKey} direction={order}
+                    onToggle={toggle} testId={`sort-${groupKey}-quota_remaining`}
+                    hint={<ColumnHint text="剩余 / 总量。周期口径按渠道（CodeBuddy 本周期剩余、TRAE 账户剩余递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口）；悬浮额度看口径。CodeArts 内置组显示的是**积分账**（内置模型计费），福利组显示每日 token 池。下箭头展开本组的变动流水。" />} />
       <SortableHead label="token 剩余" columnKey="token_expires_at"
                     active={sort === "token_expires_at"} direction={order}
-                    onToggle={toggle} testId={`sort-${provider}-token_expires_at`}
+                    onToggle={toggle} testId={`sort-${groupKey}-token_expires_at`}
                     hint={<ColumnHint text="access token 距到期还有多久，取自凭证本身（0 表示渠道未给到期信息，显示 —）。预刷新任务每小时检查，进入 24 小时窗口自动续期；「已过期」＝上游会拒绝，需重登。" />} />
       {/* 成长中心列只在支持的渠道出现：其余渠道后端没有 growth 能力，常驻一列只会整列「—」。
           **但列数必须恒定**：表格是 auto 布局，少一格会重算整张表的列宽，下面展开的组
@@ -1393,13 +1463,18 @@ function ColumnHeaderRow({
       {showGrowth ? (
         <SortableHead label="成长中心" columnKey="growth_last_run_at"
                       active={sort === "growth_last_run_at"} direction={order}
-                      onToggle={toggle} testId={`sort-${provider}-growth_last_run_at`}
+                      onToggle={toggle} testId={`sort-${groupKey}-growth_last_run_at`}
                       hint={<ColumnHint text="仅 CodeBuddy：最近一轮成长中心（旅行礼物/任务/连登兑换/盲盒）的领取结果与时间，由定时任务或手动执行写入。汇报较长时截断，悬浮看全文。" />} />
       ) : (
         <TableHead aria-hidden />
       )}
       {canWrite && (
-        <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录在额度列下箭头。" /></span></TableHead>
+        writable ? (
+          <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录在额度列下箭头。" /></span></TableHead>
+        ) : (
+          // 只读组的操作列只留位置，不给列名（没有操作可做，写了反而像能点）
+          <TableHead aria-hidden />
+        )
       )}
     </TableRow>
   );
@@ -1407,11 +1482,14 @@ function ColumnHeaderRow({
 
 function Row({
   credential,
+  idSuffix,
+  ledger,
   now,
   expiryWindow,
   expirySecondaryWindow,
   tokenWarning,
   canWrite,
+  readOnly,
   showGrowth,
   busy,
   selected,
@@ -1422,11 +1500,17 @@ function Row({
   actions,
 }: {
   credential: Credential;
+  /** 行内 testid 后缀；CodeArts 只读组用 `-benefit`，避免与内置组那行撞 id */
+  idSuffix: string;
+  /** 本行讲哪一本账：credits＝积分账（内置组），pool＝每日池（其余） */
+  ledger: Ledger;
   now: number;
   expiryWindow: number;
   expirySecondaryWindow: number;
   tokenWarning: number;
   canWrite: boolean;
+  /** 只读组（CodeArts 福利）：只展示额度，勾选 / 操作 / 积分账全部收掉 */
+  readOnly: boolean;
   showGrowth: boolean;
   busy: boolean;
   selected: boolean;
@@ -1436,20 +1520,36 @@ function Row({
   onConfirmDelete: (id: string | null) => void;
   actions: Actions;
 }) {
+  // 能写 = 会话可写 且 本组不是只读组。列数不随之变化（见 ColumnHeaderRow）。
+  const writable = canWrite && !readOnly;
+  // 本行讲哪本账：内置组＝积分账（credits），其余（含福利组）＝每日池（pool）。
+  // 数值、口径说明、流水入口都按它取——两本账在上游是两个独立接口、量级差一个
+  // 数量级，混在一行里会被读成同一本账的两次读数。
+  const creditsLedger = ledger === "credits";
+  const remaining = creditsLedger
+    ? credential.quota_credits_remaining
+    : credential.quota_remaining;
+  const total = creditsLedger ? credential.quota_credits_total : credential.quota_total;
+  // 到期积分按本行那本账取：内置组读积分账字段，其余（含福利组）读主账字段。
+  // 后端已把两段合并阶梯按账本拆开，两组各显各的，互不串账。
   const expiring = expiringQuotaLabel(
-    credential.quota_expiring_credits, expiryWindow, "primary", QUOTA_UNIT);
+    creditsLedger
+      ? credential.quota_credits_expiring
+      : credential.quota_expiring_credits,
+    expiryWindow, "primary", QUOTA_UNIT);
   // 次窗口只在**比主窗口多**时才渲染：7 天窗口是 36h 的超集，两块数字相同
-  // 说明没有「超出主窗口的部分」（CodeArts 每日池当天清零，两窗口恒等），
-  // 再列一行只是把同一个数字说两遍。它的作用是解释「36h 内没有到期积分、
-  // 但一周内会过期」的账号为何仍被优先选中。
-  const expiringSecondary = expiring
-    ? null
-    : expiringQuotaLabel(
-        credential.quota_expiring_credits_secondary,
+  // 说明没有「超出主窗口的部分」，再列一行只是把同一个数字说两遍。它的作用是
+  // 解释「36h 内没有到期积分、但一周内会过期」的账号为何仍被优先选中。
+  const expiringSecondary = !expiring
+    ? expiringQuotaLabel(
+        creditsLedger
+          ? credential.quota_credits_expiring_secondary
+          : credential.quota_expiring_credits_secondary,
         expirySecondaryWindow,
         "secondary",
         QUOTA_UNIT,
-      );
+      )
+    : null;
   const health = healthView(credential.health, credential.provider);
   const state = credentialState(credential, now);
   const cooldown = cooldownRemaining(credential.cooling_until, now);
@@ -1458,19 +1558,36 @@ function Row({
 
   // 抽屉由调用方渲染成**独立的下一行**（见 TableBody）：塞进本行的最后一个单元格
   // 只会挤在「操作」列里——同行内的 colSpan 不生效，整行高度会被拉坏。
+  //
+  // testid 带 `idSuffix`：同一凭证在 CodeArts 内置 / 福利两组各有一行，行级
+  // testid 必须唯一，否则 `getByTestId` 会撞到两行。行内其它 testid（标签 /
+  // 限额徽章 / token 到期 / 模型避让）在只读组仍可能与内置组同名，测试里用
+  // `within(row)` 限定作用域即可。
   return (
-    <TableRow data-testid={`row-${credential.id}`}>
+    <TableRow data-testid={`row-${credential.id}${idSuffix}`}>
       {/* 选择格：与 ColumnHeaderRow 的空表头一一对应（列数恒定）。
-          checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。 */}
+          checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。
+          只读组渲染成**禁用** checkbox 而非空占位格：空占位格虽然保住了列数，
+          但这一格的内容宽度与其它组的 checkbox 不同，表格 auto 布局下本行各列
+          起点会与内置组错开；渲染同尺寸的禁用框才能真正对齐。 */}
       {canWrite && (
         <TableCell label="选择" className="w-8">
-          <Checkbox
-            checked={selected}
-            disabled={busy}
-            aria-label={`选择 ${credential.nickname || credential.id.slice(0, 12)}`}
-            data-testid={`select-${credential.id}`}
-            onCheckedChange={(checked) => onSelect(credential.id, checked === true)}
-          />
+          {writable ? (
+            <Checkbox
+              checked={selected}
+              disabled={busy}
+              aria-label={`选择 ${credential.nickname || credential.id.slice(0, 12)}`}
+              data-testid={`select-${credential.id}`}
+              onCheckedChange={(checked) => onSelect(credential.id, checked === true)}
+            />
+          ) : (
+            <Checkbox
+              checked={false}
+              disabled
+              aria-label={`${credential.nickname || credential.id.slice(0, 12)} 为只读渠道，不可选择`}
+              data-testid={`select-${credential.id}${idSuffix}`}
+            />
+          )}
         </TableCell>
       )}
       <TableCell label="凭证">
@@ -1528,33 +1645,36 @@ function Row({
       </TableCell>
       <TableCell label="额度" className="text-xs">
         <div className="flex flex-wrap items-baseline gap-x-2">
-          {/* 数字与积分记录入口同处一个 inline-flex：按钮跟数字做行内居中对齐，
+          {/* 数字与流水入口同处一个 inline-flex：按钮跟数字做行内居中对齐，
               而不是与整行 baseline 对齐（图标按钮没有文字基线，会明显偏低）。 */}
           <span className="inline-flex items-center gap-1">
             <span
-              // 周期语义（本周期剩余 / 账户剩余 / 每日池 / 重置日期）从独立的
-              // 第三行收进数字的悬浮说明：同一渠道所有行的这句话几乎完全一样，
-              // 逐行复读只是把行高撑高一倍。虚线下划线提示这里可悬浮。
+              // 周期语义（本周期剩余 / 账户剩余 / 每日池 / 积分账 / 重置日期）
+              // 从独立的第三行收进数字的悬浮说明：同一渠道所有行的这句话几乎
+              // 完全一样，逐行复读只是把行高撑高一倍。虚线下划线提示可悬浮。
               className="cursor-help underline decoration-dotted underline-offset-2"
-              title={quotaSemantics(credential)}
+              title={creditsLedger ? CREDITS_QUOTA_SEMANTICS : quotaSemantics(credential)}
             >
-              {formatNumber(credential.quota_remaining)} / {formatNumber(credential.quota_total)}
+              {formatNumber(remaining)} / {formatNumber(total)}
             </span>
-            {/* 积分记录入口紧贴它要解释的数字：曾经在「更多操作」菜单里，
-                打开前看不到任何余额上下文。下箭头是行内展开语义（非弹层），
-                展开后箭头翻转。仅 admin/operator 可用——接口本身就是该门槛。
-                zen / kilo 免费层没有额度接口、也没有额度探测，积分记录恒为空，
-                入口只会给出「无记录」的空抽屉，直接不渲染。 */}
-            {canWrite && hasQuotaProbe(credential.provider) && (
+            {/* 流水入口紧贴它要解释的数字：曾经在「更多操作」菜单里，打开前看不到
+                任何余额上下文。下箭头是行内展开语义（非弹层），展开后箭头翻转。
+                仅 admin/operator 可用——接口本身就是该门槛。zen / kilo 免费层没有
+                额度接口、也没有额度探测，流水恒为空，入口只会给出空抽屉，不渲染。
+                只读的福利组同样不渲染：它只展示每日池，不承载任何操作。
+                `ledger` 按本行讲的那本账传（内置组＝积分账），否则会读到另一本账。 */}
+            {writable && hasQuotaProbe(credential.provider) && (
               <Button
                 // 项目封装的 Button：variant="default" 即 shadcn 的 outline
                 variant="default"
                 size="icon"
-                aria-label="积分记录"
+                aria-label="变动流水"
                 aria-expanded={creditsOpen}
-                title="积分记录：两次额度探测的净变化"
-                data-testid={`credits-${credential.id}`}
-                onClick={() => actions.credits(credential)}
+                title={creditsLedger
+                  ? "积分流水：积分账两次探测的净变化"
+                  : "额度流水：每日额度池两次探测的净变化"}
+                data-testid={`credits-${credential.id}${idSuffix}`}
+                onClick={() => actions.credits(credential, ledger)}
                 // 与数字同处一个 inline-flex items-center：图标按钮没有文字基线，
                 // 靠 baseline 对齐会明显偏低。不要再加 translate 微调——按钮
                 // 中心与数字墨迹中心实测只差 0.26px（12px 字号），属亚像素。
@@ -1569,8 +1689,13 @@ function Row({
             )}
             <ModelCooldownList credential={credential} now={now} />
           </span>
-          <PackageLadder credential={credential} />
+          {/* 套餐明细：CodeBuddy / TRAE 的权益包与 CodeArts 的积分包都走这里。
+              福利组（只读）不渲染——它的 `quota_packages` 由积分账产生
+              （`parse_credits`），在福利组展示会把内置账的包名带进「只讲每日池」的组。 */}
+          {!readOnly && <PackageLadder credential={credential} />}
         </div>
+        {/* 到期积分：按本行那本账取（内置组＝积分账、其余含福利组＝每日池），
+            后端已把两段合并阶梯拆开，两组各显各的。 */}
         {expiring && (
           <div className="text-warn" data-testid="quota-expiring">
             {expiring}
@@ -1607,6 +1732,7 @@ function Row({
       {!showGrowth && <TableCell aria-hidden />}
       {canWrite && (
         <TableCell label="操作">
+          {writable ? (
           <div className="flex items-center justify-end gap-1">
             {confirming ? (
               <>
@@ -1712,6 +1838,10 @@ function Row({
               </>
             )}
           </div>
+          ) : (
+            // 只读组的操作列只留位置（列数恒定），与列头一样不放任何内容
+            <span aria-hidden />
+          )}
         </TableCell>
       )}
     </TableRow>
@@ -1719,14 +1849,18 @@ function Row({
 }
 
 /**
- * 积分记录抽屉：同一行内展开，不弹层。
+ * 变动流水抽屉：同一行内展开，不弹层。
  *
  * 语义纪律：这里展示的是**两次额度探测之间的净变化**，不是动作归因。上游
  * 签到/成长接口不打日志，diff 看不到分数是谁加的，所以文案一律说「净变化」，
  * 只有归因已知度（observed/sync）。把净变化说成「签到获得」就是拿猜测当事实。
+ *
+ * `ledger` 标明读的是哪本账：`credits`＝积分账（内置组），其余＝每日池。标题
+ * 与说明都按它写，否则内置组会把积分账的流水读成每日池的。
  */
 function CreditDrawer({
   credentialId,
+  ledger,
   events,
   sort,
   order,
@@ -1734,12 +1868,15 @@ function CreditDrawer({
   onClose,
 }: {
   credentialId: string;
+  /** 本抽屉讲哪一本账：credits＝积分账（内置组），pool＝每日池（其余） */
+  ledger: Ledger;
   events: CreditEvent[];
   sort: string;
   order: string;
   onSort: (columnKey: string) => void;
   onClose: () => void;
 }) {
+  const creditsLedger = ledger === "credits";
   return (
     <Card
       className="mt-4 gap-0 bg-muted/30 p-3 ring-border/60"
@@ -1747,9 +1884,11 @@ function CreditDrawer({
     >
       <div className="mb-2 flex items-center justify-between">
         <div className="text-sm font-medium">
-          积分记录
+          {creditsLedger ? "积分流水" : "额度流水"}
           <span className="ml-2 text-xs text-muted-foreground">
-            两次额度探测之间的净变化（非动作归因）
+            {creditsLedger
+              ? "积分账（内置模型计费）两次额度探测之间的净变化（非动作归因）"
+              : "每日额度池两次额度探测之间的净变化（非动作归因）"}
           </span>
         </div>
         <Button size="sm" variant="ghost" onClick={onClose} data-testid="credit-drawer-close">

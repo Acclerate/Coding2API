@@ -653,7 +653,11 @@ async def fetch_all(specs: Iterable[SourceSpec] = SOURCE_SPECS, *,
     if client is not None:
         return tuple(await asyncio.gather(
             *(fetch_source(spec, client=client, timeout=timeout) for spec in ordered)))
-    async with httpx.AsyncClient() as owned:
+    # `trust_env=False` 与 provider/proxy.build_client 同口径：不吃宿主环境
+    # / macOS 系统代理。这台机开了全局代理（scutil --proxy → 127.0.0.1:7897），
+    # httpx 默认 `trust_env=True` 会把它当出站代理，代理对状态页域名握手失败时
+    # 八个源全部 ConnectError（实测全站显示「抓取失败」）。
+    async with httpx.AsyncClient(trust_env=False) as owned:
         return tuple(await asyncio.gather(
             *(fetch_source(spec, client=owned, timeout=timeout) for spec in ordered)))
 

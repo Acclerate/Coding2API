@@ -132,8 +132,12 @@ def test_alert_repository_records_delivery_failure(tmp_path):
     db.close()
 
 
-def test_alert_repository_resolve_marks_latest_unresolved(tmp_path):
-    """恢复只写最近一条未恢复的记录（历史多轮循环各归各的）。"""
+def test_alert_repository_resolve_marks_all_unresolved_in_episode(tmp_path):
+    """恢复标记该 (rule, scope) **全部**未恢复的行：同一次故障的提醒行一起收尾。
+
+    只标最近一条会让更早的提醒永远停在未恢复——角标数 `resolved_at IS NULL`，
+    于是永远清不干净。历史已恢复的循环不受影响（它们已有 resolved_at）。
+    """
     db = Database(tmp_path / "t.sqlite3")
     apply_schema(db.connect())
     repo = AlertRepository(db)
@@ -141,13 +145,48 @@ def test_alert_repository_resolve_marks_latest_unresolved(tmp_path):
                 message="第一次", now=100)
     repo.record(rule="pool_empty", severity="critical", scope="pool",
                 message="第二次", now=200)
-    assert repo.resolve("pool_empty", "pool", now=250) == 1
+    assert repo.resolve("pool_empty", "pool", now=250) == 2
     rows = repo.recent()             # 倒序：第二条先
-    assert rows[0]["resolved_at"] == 250 and rows[0]["message"] == "第二次"
-    assert rows[1]["resolved_at"] is None
+    assert all(row["resolved_at"] == 250 for row in rows)
+    assert repo.count_unresolved() == 0
     # 已全部恢复：再 resolve 无事发生
-    assert repo.resolve("pool_empty", "pool", now=260) == 1
-    assert repo.resolve("pool_empty", "pool", now=270) == 0
+    assert repo.resolve("pool_empty", "pool", now=260) == 0
+    db.close()
+
+
+def test_alert_repository_resolve_by_id_touches_single_row(tmp_path):
+    """人工处置只动目标行：同组其它未恢复记录不受影响（不误收仍在告警的）。"""
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    repo = AlertRepository(db)
+    first = repo.record(rule="pool_empty", severity="critical", scope="pool",
+                        message="第一次", now=100)
+    second = repo.record(rule="pool_empty", severity="critical", scope="pool",
+                         message="第二次", now=200)
+    assert repo.resolve_by_id(first, now=250) == 1
+    rows = {row["id"]: row for row in repo.recent()}
+    assert rows[first]["resolved_at"] == 250
+    assert rows[second]["resolved_at"] is None
+    # 已恢复 / 不存在都返回 0（调用方据此回 400）
+    assert repo.resolve_by_id(first, now=260) == 0
+    assert repo.resolve_by_id("alert_missing", now=270) == 0
+    db.close()
+
+
+def test_alert_repository_unresolved_returns_only_open_rows(tmp_path):
+    """`unresolved()` 供 AlertTask 重启重建：只回未恢复行，含恢复文案所需字段。"""
+    db = Database(tmp_path / "t.sqlite3")
+    apply_schema(db.connect())
+    repo = AlertRepository(db)
+    repo.record(rule="pool_empty", severity="critical", scope="pool",
+                message="池空", detail='{"ready": 0}', now=100)
+    repo.record(rule="task_failed", severity="warning", scope="growth",
+                message="挂了", now=200)
+    repo.resolve("task_failed", "growth", now=210)
+    rows = repo.unresolved()
+    assert [row["rule"] for row in rows] == ["pool_empty"]
+    assert rows[0]["scope"] == "pool" and rows[0]["message"] == "池空"
+    assert rows[0]["detail"] == '{"ready": 0}' and rows[0]["severity"] == "critical"
     db.close()
 
 def test_alerts_requires_admin(admin_client):
@@ -163,6 +202,49 @@ def test_alerts_returns_recent(admin_client):
     body = client.get("/api/alerts").json()
     assert len(body["alerts"]) == 1
     assert body["alerts"][0]["rule"] == "task_failed"
+
+
+def test_resolve_alert_marks_one_row_and_audits(admin_client):
+    """人工标记恢复：只动目标行、写审计，其余未恢复行不受影响。"""
+    app, client = admin_client
+    alerts = app.state.services.alerts
+    alerts.record(rule="pool_empty", severity="critical", scope="pool",
+                  message="池空", now=100)
+    alerts.record(rule="task_failed", severity="warning", scope="growth",
+                  message="挂了", now=200)
+    target = alerts.recent()[0]["id"]      # 倒序：task_failed 那行
+
+    response = client.post(f"/api/alerts/{target}/resolve")
+
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    rows = {row["id"]: row for row in alerts.recent()}
+    assert rows[target]["resolved_at"] is not None
+    assert alerts.count_unresolved() == 1          # pool_empty 仍在告警中
+    audit = app.state.services.audit.query(action="alert.resolve")
+    assert len(audit) == 1
+    assert audit[0]["actor"] == "root" and audit[0]["target"] == target
+
+
+def test_resolve_alert_unknown_or_already_resolved_is_400(admin_client):
+    """不存在或已恢复都回 400：静默成功会让运维以为点对了。"""
+    app, client = admin_client
+    alerts = app.state.services.alerts
+    assert client.post("/api/alerts/alert_missing/resolve").status_code == 400
+    alerts.record(rule="pool_empty", severity="critical", scope="pool",
+                  message="池空", now=100)
+    target = alerts.recent()[0]["id"]
+    assert client.post(f"/api/alerts/{target}/resolve").status_code == 200
+    assert client.post(f"/api/alerts/{target}/resolve").status_code == 400
+
+
+def test_resolve_alert_requires_admin_and_csrf(admin_client):
+    """人工覆盖机器判定：admin-only + CSRF，且 viewer 不能动。"""
+    app, client = admin_client
+    app.state.services.alerts.record(rule="pool_empty", severity="critical",
+                                     scope="pool", message="池空", now=100)
+    target = app.state.services.alerts.recent()[0]["id"]
+    client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+    assert client.post(f"/api/alerts/{target}/resolve").status_code == 403
 
 def test_settings_snapshot_carries_alert_owner(admin_client):
     _app, client = admin_client

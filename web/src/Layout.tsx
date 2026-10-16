@@ -3,6 +3,7 @@ import { Outlet, useLocation, useOutletContext } from "react-router-dom";
 import { GitBranch, Menu, X } from "lucide-react";
 import type { SessionInfo } from "./api/types";
 import { api } from "./api/client";
+import { useNavBadges } from "./api/hooks";
 import { Button } from "./components/ui/button";
 import { ChangePasswordDialog } from "./components/ChangePasswordDialog";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -28,6 +29,8 @@ export function Layout({ session }: { session: SessionInfo }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
+  // 侧栏角标：一个聚合端点覆盖整个侧栏（60s 轮询），见 hooks.useNavBadges。
+  const { data: badges } = useNavBadges(session.username);
   // 抽屉的 Esc 关闭 / 焦点陷阱 / 滚动锁由 hook 统一处理。
   const drawerRef = useDialogFocus<HTMLDivElement>(() => setDrawerOpen(false), drawerOpen);
 
@@ -98,7 +101,7 @@ export function Layout({ session }: { session: SessionInfo }) {
         {/* 主体：桌面左侧导航栏 + 内容区（同一网格） */}
         <div className="mx-auto flex w-full max-w-[100rem] flex-1 items-start gap-6 px-3 py-6 sm:px-5 lg:px-8">
           <aside className="sticky top-20 hidden max-h-[calc(100vh-6rem)] w-52 shrink-0 self-start lg:flex lg:flex-col">
-            <SidebarNav session={session} />
+            <SidebarNav session={session} badges={badges} />
           </aside>
           <div className="flex min-w-0 flex-1 flex-col">
             <main ref={mainRef} tabIndex={-1} className="flex-1 focus:outline-none">
@@ -135,7 +138,7 @@ export function Layout({ session }: { session: SessionInfo }) {
                 <X />
               </Button>
             </div>
-            <SidebarNav session={session} onNavigate={() => setDrawerOpen(false)} />
+            <SidebarNav session={session} badges={badges} onNavigate={() => setDrawerOpen(false)} />
           </div>
         </div>
       )}

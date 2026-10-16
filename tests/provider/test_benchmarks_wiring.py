@@ -313,6 +313,19 @@ def test_model_catalog_endpoint_requires_session(tmp_path):
     with TestClient(app) as client:
         assert client.get("/api/model-catalog").status_code == 401
 
+
+def test_model_catalog_endpoint_rejects_viewer(tmp_path):
+    """viewer（非 operator）403：模型列表已移入管理组，与上游状态同门槛。"""
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {"m": (1.0, 2.0, 0.5)}, {}, {})
+    app = _price_app(tmp_path)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+        assert client.get("/api/model-catalog").status_code == 403
+
 # --------------------------------------------------------- 汇率热更
 
 def test_usd_cny_rate_is_hot_setting(tmp_path):

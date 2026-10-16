@@ -100,6 +100,10 @@ CREDENTIAL_SORT_KEYS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "pinned": lambda row: row["pinned"],
     "quota_remaining": lambda row: row["quota_remaining"],
     "quota_total": lambda row: row["quota_total"],
+    # 第二本账（CodeArts 积分账）：内置组按它排序，与「额度」列显示的账本同源
+    # ——否则点列头会按每日池排、却显示积分，数字看着不成序。其余渠道恒 None，
+    # 排在末尾（`sort_rows` 的 null 语义），组内保持原顺序。
+    "quota_credits_remaining": lambda row: row["quota_credits_remaining"],
     "quota_expiring_credits": lambda row: row["quota_expiring_credits"],
     # 0 = 上游未给到期信息，视为缺失（排最后），不当成「最早过期」
     "token_expires_at": lambda row: row["token_expires_at"] or None,
@@ -150,6 +154,10 @@ CREDIT_EVENT_SORT_COLUMNS: dict[str, str] = {
     "delta": "delta",
     "source": "source",
 }
+
+# 变动流水的账本白名单：pool＝每日 token 池（福利模型）/ credits＝积分账
+# （CodeArts 内置模型）。查询侧只认这两个取值，其余回落 pool。
+CREDIT_EVENT_LEDGERS: frozenset[str] = frozenset({"pool", "credits"})
 
 
 def _token_times_from_blob(
@@ -354,7 +362,7 @@ class CredentialRepository:
                 (self._cipher.encrypt(payload), expires_at, issued_at, credential_id))
 
     def save_quota(self, credential_id: str, quota: Quota) -> None:
-        """写回额度，并顺带记一条积分变动流水。
+        """写回额度，并顺带为每本账各记一条变动流水。
 
         流水必须在同一事务里与前值比较：分两次读改写会与并发探测交错，
         记出「before 是别人写过的值」的错行。因此这里先取旧余额，
@@ -362,29 +370,61 @@ class CredentialRepository:
         """
         with self._db.transaction() as conn:
             previous = conn.execute(
-                "SELECT quota_remaining, quota_probed_at FROM credentials WHERE id = ?",
+                "SELECT quota_remaining, quota_credits_remaining, quota_probed_at "
+                "FROM credentials WHERE id = ?",
                 (credential_id,)).fetchone()
             conn.execute(
                 "UPDATE credentials SET quota_remaining = ?, quota_total = ?, "
                 "quota_cycle_end = ?, quota_expiry_ladder = ?, quota_packages = ?, "
+                # 积分账用 COALESCE 保旧值：它是 best-effort 探测（积分接口偶发
+                # 失败只记 warning、不判整次探测失败），若直接写 NULL，右侧那行
+                # 会凭空消失一整轮，与主账「失败保留上次余额」的口径不一致。
+                # 无积分账的渠道两列本就恒 NULL，COALESCE 后仍是 NULL。
+                "quota_credits_remaining = COALESCE(?, quota_credits_remaining), "
+                "quota_credits_total = COALESCE(?, quota_credits_total), "
+                # 积分到期阶梯**不用** COALESCE：它与上面的合并阶梯同一次探测产出，
+                # 积分探测失败时合并阶梯也丢了那一段，若此处保旧值，读路径「合并阶梯
+                # 减积分阶梯」会算出负的每日池到期额。两者同生共死才自洽。
+                "quota_credits_expiry_ladder = ?, "
                 "quota_probed_at = ?, health = ? "
                 "WHERE id = ?",
                 (quota.remaining, quota.total, quota.cycle_end,
                  _ladder_text(quota.expiry_ladder), _packages_text(quota.packages),
+                 quota.credits_remaining, quota.credits_total,
+                 _ladder_text(quota.credits_expiry_ladder),
                  quota.probed_at,
                  health_score(quota), credential_id),
             )
-            self._record_credit_event(conn, credential_id, quota,
-                                      previous=previous)
+            if previous is not None:
+                window_start = previous["quota_probed_at"]
+                # 每日 token 池（福利模型）：各渠道的主账，CodeArts 之外唯一的一本。
+                self._record_credit_event(
+                    conn, credential_id, ledger="pool",
+                    before=previous["quota_remaining"], after=quota.remaining,
+                    probed_at=quota.probed_at, window_start=window_start)
+                # 积分账（CodeArts 内置模型）：探测失败（None）时库里经 COALESCE
+                # 保留旧值，账本**没有**变化，故用「保留后的值」当 after——否则会
+                # 把「这次没探到」记成「余额变未知」，与落库事实矛盾。其余渠道
+                # 两列恒 NULL，两端皆 None 自然不写行。
+                credits_after = (quota.credits_remaining
+                                 if quota.credits_remaining is not None
+                                 else previous["quota_credits_remaining"])
+                self._record_credit_event(
+                    conn, credential_id, ledger="credits",
+                    before=previous["quota_credits_remaining"], after=credits_after,
+                    probed_at=quota.probed_at, window_start=window_start)
 
     @staticmethod
-    def _record_credit_event(conn, credential_id: str, quota: Quota, *,
-                             previous) -> None:
-        """比对前后余额写一条 credit_events；无变化或无法量化时不写。
+    def _record_credit_event(conn, credential_id: str, *, ledger: str, before, after,
+                             probed_at: int, window_start: int | None) -> None:
+        """比对一本账的前后余额写一条 credit_events；无变化或无法量化时不写。
+
+        `ledger` 标明这是哪本账（pool＝每日 token 池 / credits＝积分账），
+        两本账的数值量级与语义都不同，混读会被当成同一本账的连续读数。
 
         只记「有信息量」的行：
-        - 首次探测（没有 previous 行）→ source=sync，只是建立基线；
-          此时 delta 为空，因为「从无到有」不是一次真实的积分变动。
+        - 首次探测（没有对照基线）→ source=sync，只是建立基线；
+          此时 delta 为空，因为「从无到有」不是一次真实的余额变动。
         - 余额未变 → 不写。否则每轮探测都落一行 0，表会被噪声淹没。
         - 任一端为 NULL（探测失败后的未知）→ delta 记空但**仍记行**：
           「余额从 100 变成未知」本身就是值得追的异常。
@@ -392,10 +432,6 @@ class CredentialRepository:
         绝不写「签到 +5」这类归因：上游不打日志，diff 看不到分数是谁加的
         （见 schema.sql 的表注释）。
         """
-        if previous is None:       # 凭证已被并发删除：不补记，避免悬挂行
-            return
-        before = previous["quota_remaining"]
-        after = quota.remaining
         if before is None:
             # 没有对照基线：只记「基线已建立」，不算积分数。
             # 连本次值都没有（两端皆未知）→ 什么也没学到，不写。
@@ -403,9 +439,9 @@ class CredentialRepository:
                 return
             conn.execute(
                 "INSERT INTO credit_events (id, credential_id, ts, window_start, "
-                "before, after, delta, source) VALUES (?,?,?,?,?,?,?,'sync')",
-                (_new_id("credit"), credential_id, quota.probed_at, None,
-                 None, after, None))
+                "before, after, delta, source, ledger) VALUES (?,?,?,?,?,?,?,'sync',?)",
+                (_new_id("credit"), credential_id, probed_at, None,
+                 None, after, None, ledger))
             return
         if after is not None and float(before) == float(after):
             return
@@ -419,9 +455,9 @@ class CredentialRepository:
         delta = None if after is None else round(float(after) - float(before), 6)
         conn.execute(
             "INSERT INTO credit_events (id, credential_id, ts, window_start, "
-            "before, after, delta, source) VALUES (?,?,?,?,?,?,?,'observed')",
-            (_new_id("credit"), credential_id, quota.probed_at,
-             previous["quota_probed_at"], before, after, delta))
+            "before, after, delta, source, ledger) VALUES (?,?,?,?,?,?,?,'observed',?)",
+            (_new_id("credit"), credential_id, probed_at,
+             window_start, before, after, delta, ledger))
 
     def mark_probe_failed(self, credential_id: str, now: int | None = None) -> None:
         with self._db.transaction() as conn:
@@ -507,6 +543,24 @@ class CredentialRepository:
                 counts["ready"] += 1
         return counts
 
+    def attention_counts(self) -> dict[str, int]:
+        """侧栏角标：**需人工介入**的凭证数（`disabled` + `exhausted`）。
+
+        - `disabled` = session 死亡硬禁用，需**重新登录**（最硬的可行动信号）。
+        - `exhausted` = `health < 0`（额度耗尽）。排除 `enabled=0`（用户有意
+          暂停）与「只有冷却」的号——冷却到点自愈，计入就变成永远亮着的噪声。
+
+        ⚠️ 与 `pool_counts()` 口径**不同**：那边复用
+        `Candidate.is_selectable`，只看 disabled / enabled / cooling、**不看
+        health**，所以额度耗尽的号在 `/healthz` 里仍算 `ready`。本方法是
+        「待办角标」的信号，不是可用数的另一种算法，两者不一致是刻意的。
+        """
+        row = self._db.connect().execute(
+            "SELECT COALESCE(SUM(disabled = 1), 0) AS disabled, "
+            "COALESCE(SUM(disabled = 0 AND enabled = 1 AND health < 0), 0) AS exhausted "
+            "FROM credentials").fetchone()
+        return {"disabled": int(row["disabled"]), "exhausted": int(row["exhausted"])}
+
     def credential_data(self, credential_id: str) -> dict[str, Any] | None:
         row = self._db.connect().execute(
             "SELECT data_enc FROM credentials WHERE id = ?", (credential_id,)).fetchone()
@@ -530,10 +584,13 @@ class CredentialRepository:
         admin/operator 返回，与 `/api/stats/events`、`by-credential` 口径一致；
         viewer 只看得到自己的记录，昵称对它没有用途。
 
-        附 `quota_expiring_credits`（主窗口内即将到期的积分，与调度排序第一级同源）；
-        附 `quota_expiring_credits_secondary`（次窗口，主窗口打平时才参与排序的第二级）；
-        附 `quota_expiry_ladder`（套餐到期阶梯，[[epoch, 剩余积分]]，按包独立到期的渠道）；
-        渠道无到期信息时三者都为 None，展示层据此隐藏。
+        附 `quota_expiring_credits`（主账窗口内即将到期的积分，与调度排序第一级同源）；
+        附 `quota_expiring_credits_secondary`（主账次窗口，主窗口打平时才参与排序的第二级）；
+        附 `quota_credits_expiring` / `quota_credits_expiring_secondary`（**积分账**
+        自己的窗口内到期积分，仅 CodeArts 有；其余渠道为 None）；
+        附 `quota_expiry_ladder`（两本账合并的套餐到期阶梯，[[epoch, 剩余积分]]，按包
+        独立到期的渠道）、`quota_credits_expiry_ladder`（仅积分账那一段，仅 CodeArts）；
+        渠道无到期信息时前两者为 None，展示层据此隐藏。
         附 `model_cooldowns`（model → 截止 epoch），只在模型级限流/负缓存时非空。
         附 `token_expires_at` / `token_issued_at`（token 到期展示）：只下发
         绝对 epoch，剩余时间与预警阈值判定交给展示层用同一个时钟现算——否则
@@ -545,7 +602,9 @@ class CredentialRepository:
             "SELECT id, provider, nickname, enabled, disabled, disabled_reason, pinned, "
             "health, cooling_until, err_count, quota_remaining, quota_total, quota_cycle_end, "
             "quota_probed_at, growth_last_run_at, growth_last_result, created_at, added_by, "
-            "quota_expiry_ladder, quota_packages, data_enc, token_expires_at, token_issued_at, "
+            "quota_expiry_ladder, quota_packages, quota_credits_remaining, "
+            "quota_credits_total, quota_credits_expiry_ladder, data_enc, "
+            "token_expires_at, token_issued_at, "
             "tags "
             "FROM credentials ORDER BY created_at").fetchall()
         cooling_rows = self._db.connect().execute(
@@ -573,16 +632,29 @@ class CredentialRepository:
             rec["token_issued_at"] = issued_at
             ladder = _ladder_value(row["quota_expiry_ladder"])
             rec["quota_expiry_ladder"] = ladder
+            credits_ladder = _ladder_value(row["quota_credits_expiry_ladder"])
+            rec["quota_credits_expiry_ladder"] = credits_ladder
             rec["quota_packages"] = _packages_value(row["quota_packages"])
             # 标签以列表下发（库里是逗号分隔文本）：展示层不必知道存储形态，
             # 脏数据由 tags_value 读路径容错滤掉。
             rec["tags"] = tags_value(row["tags"])
             primary, secondary = expiry_windows(expiring_window, expiring_secondary_window)
+            # 主账到期积分 = 合并阶梯 − 积分账那一段。`expiring_credits` 是对
+            # 阶梯逐条求和，合并阶梯是两本账的拼接，故相减即精确得到主账那一段；
+            # 非 CodeArts 的 `credits_ladder` 恒 None（求和为 0），结果与改动前
+            # 完全一致。积分账的到期额另起两个字段，供管理台内置组读取。
+            credits_primary = expiring_credits(credits_ladder, primary, now)
+            credits_secondary = expiring_credits(credits_ladder, secondary, now)
             rec["quota_expiring_credits"] = (
-                None if ladder is None else expiring_credits(ladder, primary, now))
+                None if ladder is None
+                else expiring_credits(ladder, primary, now) - credits_primary)
             rec["quota_expiring_credits_secondary"] = (
                 None if ladder is None
-                else expiring_credits(ladder, secondary, now))
+                else expiring_credits(ladder, secondary, now) - credits_secondary)
+            rec["quota_credits_expiring"] = (
+                None if credits_ladder is None else credits_primary)
+            rec["quota_credits_expiring_secondary"] = (
+                None if credits_ladder is None else credits_secondary)
             rec["model_cooldowns"] = cooling.get(row["id"], [])
             out.append(rec)
         # 排序在组装后做：额度占比 / 到期额度是派生字段，SQL 排不了。
@@ -712,6 +784,18 @@ class ApiKeyRepository:
             "SELECT COUNT(*) AS n FROM api_keys WHERE username = ?", (username,)).fetchone()
         return int(row["n"])
 
+    def count_expiring(self, username: str, before: int) -> int:
+        """该用户名下**已过期或即将过期**的 Key 数（`expires_at <= before`）。
+
+        `expires_at IS NULL` = 永不过期，不计；`<=` 让已过期的也计入——那同样
+        是「该续期或该删」的待办，不是「暂时没问题」。
+        """
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM api_keys "
+            "WHERE username = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            (username, int(before))).fetchone()
+        return int(row["n"])
+
     def delete(self, key_id: str, username: str) -> bool:
         with self._db.transaction() as conn:
             cursor = conn.execute(
@@ -778,17 +862,24 @@ class CreditEventRepository:
         self._db = db
 
     def recent(self, credential_id: str, limit: int = 20, sort: str | None = None,
-               order: str | None = None) -> list[dict[str, Any]]:
+               order: str | None = None, ledger: str = "pool",
+               ) -> list[dict[str, Any]]:
         """默认倒序返回变动记录；limit 收敛到 [1, 200] 防止一次拉爆前端。
+
+        `ledger`：读哪一本账的流水（pool＝每日 token 池 / credits＝积分账）。
+        **必须按账本过滤**：两本账的数值量级与语义都不同，混读会被当成同一本
+        账的连续读数（如每日池 1000 与积分账 14000 交替出现）。未知取值回落
+        `pool`——与老库默认列值一致，拼错也不会把两本账混在一起。
 
         `sort` / `order`：列头排序白名单见 `CREDIT_EVENT_SORT_COLUMNS`。
         """
+        ledger = ledger if ledger in CREDIT_EVENT_LEDGERS else "pool"
         clause = sql_order(sort, order, CREDIT_EVENT_SORT_COLUMNS,
                            default_key="ts", default_desc=True, tiebreak="id")
         rows = self._db.connect().execute(
-            f"SELECT * FROM credit_events WHERE credential_id = ? "
+            f"SELECT * FROM credit_events WHERE credential_id = ? AND ledger = ? "
             f"ORDER BY {clause} LIMIT ?",
-            (credential_id, max(1, min(200, limit)))).fetchall()
+            (credential_id, ledger, max(1, min(200, limit)))).fetchall()
         return [dict(row) for row in rows]
 
     def prune(self, *, keep_days: int, now: int | None = None) -> int:
@@ -846,6 +937,32 @@ class AlertRepository:
             "SELECT COUNT(*) AS n FROM alert_events").fetchone()
         return int(row["n"])
 
+    def count_unresolved(self) -> int:
+        """**仍在告警中**的条数（`resolved_at IS NULL`）——侧栏角标用。
+
+        与 `count_all()` 不是一回事：那个含已恢复的历史行，是分页总数。
+        角标只该数「现在还没好」的，否则恢复后角标永远不灭。
+        """
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM alert_events WHERE resolved_at IS NULL").fetchone()
+        return int(row["n"])
+
+    def unresolved(self) -> list[dict[str, Any]]:
+        """仍在告警中的记录（`resolved_at IS NULL`），按时间升序。
+
+        供 `AlertTask` 首轮重建进程内「告警中」集合：迟滞状态机不落库、重启
+        即失；不重建的话，重启前落库的告警永远等不到恢复——规则早已不再命中，
+        却没有任何一轮评估会去写 `resolved_at`（恢复分支只遍历进程内的
+        `_active`），角标与「已恢复」标记就永久卡住。
+
+        同一 `(rule, scope)` 可能有多行（静默窗过后仍命中会再记一条提醒）：
+        调用方按键去重、以最后一行为准。
+        """
+        rows = self._db.connect().execute(
+            "SELECT rule, scope, severity, message, detail FROM alert_events "
+            "WHERE resolved_at IS NULL ORDER BY ts, id").fetchall()
+        return [dict(row) for row in rows]
+
     def last_ts(self, rule: str, scope: str) -> int | None:
         """该 (规则, 对象) 最近一次落库时刻（静默去重用）；无记录返回 None。"""
         row = self._db.connect().execute(
@@ -853,19 +970,36 @@ class AlertRepository:
             (rule, scope)).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
-    def resolve(self, rule: str, scope: str, now: int | None = None) -> int:
-        """给该 (规则, 对象) 最近一条**尚未恢复**的告警写 `resolved_at`。
+    def resolve_by_id(self, alert_id: str, now: int | None = None) -> int:
+        """按 id 手动标记一条告警已恢复，返回受影响行数（0 = 不存在或已恢复）。
 
-        只更新最近一行：同一 (rule, scope) 可能历史上有多次告警/恢复循环，
-        恢复只属于「当前这一轮」那条记录。返回受影响行数（0 = 没有待恢复
-        的行，例如告警已被清理）。
+        给运维一个人工出口：规则已下线 / 误报 / 告警任务被关掉时，状态机不会
+        再有机会写 `resolved_at`，那行就会一直挂在「未恢复」里、角标永远亮。
+        只动这一行——不做「按 (rule, scope) 批量」，免得手滑一次把仍在告警的
+        同组记录一起收掉。
         """
         resolved_at = int(now if now is not None else time.time())
         with self._db.transaction() as conn:
             cursor = conn.execute(
-                "UPDATE alert_events SET resolved_at = ? WHERE id = ("
-                "  SELECT id FROM alert_events WHERE rule = ? AND scope = ?"
-                "  AND resolved_at IS NULL ORDER BY ts DESC, id DESC LIMIT 1)",
+                "UPDATE alert_events SET resolved_at = ? "
+                "WHERE id = ? AND resolved_at IS NULL", (resolved_at, alert_id))
+        return cursor.rowcount
+
+    def resolve(self, rule: str, scope: str, now: int | None = None) -> int:
+        """给该 (规则, 对象) **全部尚未恢复**的告警写 `resolved_at`，返回标记行数。
+
+        一次故障期间可能落多条：静默窗过后仍命中会再记一条「提醒」，它们同属
+        一次未恢复的故障，恢复时自然该一起标记。只标最近一条会让更早的提醒
+        永远停在「未恢复」——角标数的是 `resolved_at IS NULL`，于是永远清不
+        干净，看起来像「故障一直没好」。
+
+        返回受影响行数（0 = 没有待恢复的行，例如告警已被清理）。
+        """
+        resolved_at = int(now if now is not None else time.time())
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE alert_events SET resolved_at = ? "
+                "WHERE rule = ? AND scope = ? AND resolved_at IS NULL",
                 (resolved_at, rule, scope))
         return cursor.rowcount
 
@@ -957,6 +1091,17 @@ class UserRepository:
     def count_all(self) -> int:
         """用户总数（分页端点算页数用）。"""
         row = self._db.connect().execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"])
+
+    def count_pending_activation(self) -> int:
+        """**待激活**账号数（`activation_digest IS NOT NULL`）——侧栏角标用。
+
+        到期令牌也算在内：库里有令牌但已过期时用户其实激活不了，需要管理员
+        重新签发（`src/api/activate.py` 会在过期时拒绝），所以它是待办而非噪声。
+        """
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM users "
+            "WHERE activation_digest IS NOT NULL").fetchone()
         return int(row["n"])
 
     def list_usernames(self) -> tuple[str, ...]:

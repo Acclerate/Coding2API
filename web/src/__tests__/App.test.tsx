@@ -42,20 +42,33 @@ describe("Layout", () => {
     expect(menu).toHaveTextContent("guest · 只读");
   });
 
-  it("操作员角色显示操作员，且看不到管理员导航", async () => {
+  it("操作员角色显示操作员，管理组只露出上游状态与模型列表", async () => {
     renderWithProviders(<Layout session={{
       username: "op", is_operator: true, is_admin: false, role: "operator", must_change_password: false,
     }} />);
     // 凭证管理对操作员可见
     expect(screen.getByText("凭证管理")).toBeInTheDocument();
-    // 用户管理/审计/配置为 admin-only
+    // 用户管理/审计/告警/配置为 admin-only
     expect(screen.queryByText("用户管理")).not.toBeInTheDocument();
     expect(screen.queryByText("审计日志")).not.toBeInTheDocument();
     expect(screen.queryByText("运维告警")).not.toBeInTheDocument();
-    expect(screen.queryByText("上游状态")).not.toBeInTheDocument();
     expect(screen.queryByText("任务与配置")).not.toBeInTheDocument();
+    // 上游状态与模型列表对操作员开放（与 require_operator 同门槛）
+    expect(screen.getByText("上游状态")).toBeInTheDocument();
+    expect(screen.getByText("模型列表")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
     expect(await screen.findByRole("menu")).toHaveTextContent("op · 操作员");
+  });
+
+  it("只读用户看不到管理组与模型列表入口", async () => {
+    renderWithProviders(<Layout session={{
+      username: "guest", is_operator: false, is_admin: false, role: "viewer", must_change_password: false,
+    }} />);
+    expect(screen.getByText("凭证管理")).toBeInTheDocument();
+    // 模型列表已移入管理组：viewer 不再看到入口
+    expect(screen.queryByText("模型列表")).not.toBeInTheDocument();
+    expect(screen.queryByText("上游状态")).not.toBeInTheDocument();
+    expect(screen.queryByText("用户管理")).not.toBeInTheDocument();
   });
 
   it("管理员可在侧边栏看到管理类入口", async () => {
@@ -68,6 +81,7 @@ describe("Layout", () => {
     expect(within(nav).getByText("审计日志")).toBeInTheDocument();
     expect(within(nav).getByText("运维告警")).toBeInTheDocument();
     expect(within(nav).getByText("上游状态")).toBeInTheDocument();
+    expect(within(nav).getByText("模型列表")).toBeInTheDocument();
     expect(within(nav).getByText("任务与配置")).toBeInTheDocument();
     // 仓库入口已移出侧栏，改到顶栏图标按钮
     expect(within(nav).queryByText("项目仓库")).not.toBeInTheDocument();
@@ -93,7 +107,10 @@ describe("Layout", () => {
   });
 
   it("退出：POST /api/auth/logout 后跳登录页", async () => {
-    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const fetchSpy = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
     vi.stubGlobal("fetch", fetchSpy);
     vi.stubGlobal("location", { href: "/" });
     renderWithProviders(<Layout session={{
@@ -101,8 +118,13 @@ describe("Layout", () => {
     }} />);
     await userEvent.click(screen.getByRole("button", { name: "用户菜单" }));
     await userEvent.click(await screen.findByTestId("menu-logout"));
-    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    // 侧栏角标轮询也在用 fetch，按 URL 取那次登出调用（不假设它是第一次）
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.some((call) => call[0] === "/api/auth/logout")).toBe(true),
+    );
+    const [url, init] = fetchSpy.mock.calls.find(
+      (call) => call[0] === "/api/auth/logout",
+    ) as unknown as [string, RequestInit];
     expect(url).toBe("/api/auth/logout");
     expect((init.headers as Record<string, string>)["X-Requested-With"]).toBe("XMLHttpRequest");
     expect((globalThis as { location: { href: string } }).location.href).toBe("/login");
@@ -162,6 +184,9 @@ describe("App 路由守卫", () => {
         if (url === "/api/auth/session") {
           return new Response(JSON.stringify({ username: "root", is_admin: true }), { status: 200 });
         }
+        if (url === "/api/nav-badges") {
+          return new Response(JSON.stringify({}), { status: 200 });
+        }
         return new Response(JSON.stringify({ credentials: [], viewer: "root", is_admin: true }), {
           status: 200,
         });
@@ -220,6 +245,9 @@ describe("App 路由守卫", () => {
             must_change_password: false,
           }), { status: 200 });
         }
+        if (url === "/api/nav-badges") {
+          return new Response(JSON.stringify({}), { status: 200 });
+        }
         return new Response(JSON.stringify({ credentials: [], viewer: "op", is_admin: false }), {
           status: 200,
         });
@@ -235,5 +263,69 @@ describe("App 路由守卫", () => {
     // 落到首页而不是用户管理
     expect(await screen.findByTestId("credentials-page")).toBeInTheDocument();
     expect(screen.queryByTestId("users-page")).not.toBeInTheDocument();
+  });
+
+  it("操作员可直输 /models 与 /upstream（与 require_operator 同门槛）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/auth/session") {
+          return new Response(JSON.stringify({
+            username: "op", is_operator: true, is_admin: false, role: "operator",
+            must_change_password: false,
+          }), { status: 200 });
+        }
+        if (url === "/api/nav-badges") {
+          return new Response(JSON.stringify({}), { status: 200 });
+        }
+        if (url.startsWith("/api/model-catalog")) {
+          return new Response(JSON.stringify({
+            models: [], count: 0, total: 0, currency: "USD", usd_cny_rate: 7, saved_at: null,
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ credentials: [], viewer: "op", is_admin: false }), {
+          status: 200,
+        });
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/models"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("model-catalog-page")).toBeInTheDocument();
+  });
+
+  it("只读用户直输 /models 被守卫送回首页", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/auth/session") {
+          return new Response(JSON.stringify({
+            username: "guest", is_operator: false, is_admin: false, role: "viewer",
+            must_change_password: false,
+          }), { status: 200 });
+        }
+        if (url === "/api/nav-badges") {
+          return new Response(JSON.stringify({ api_keys: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ credentials: [], viewer: "guest", is_admin: false }), {
+          status: 200,
+        });
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={["/models"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("credentials-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("model-catalog-page")).not.toBeInTheDocument();
   });
 });

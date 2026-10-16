@@ -70,11 +70,20 @@ export function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * 未显式 mock 时也要能过的请求（Layout 每个页面都在发）。
+ *
+ * 侧栏角标：默认回「无待办」，调用方可用自己的同名路由覆盖。不兜底的话，
+ * 所有 `renderPage` 用例都会在未 mock 的 URL 上直接抛错。
+ */
+const DEFAULT_ROUTES: Record<string, unknown> = { "/api/nav-badges": {} };
+
 /** 按 URL 分派的 fetch mock；函数路由会收到完整 URL 字符串。 */
 export function mockFetch(routes: Record<string, unknown | ((url: string) => Response)>) {
+  const all = { ...DEFAULT_ROUTES, ...routes };
   const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
-    for (const [pattern, value] of Object.entries(routes)) {
+    for (const [pattern, value] of Object.entries(all)) {
       if (url.includes(pattern)) {
         if (typeof value === "function") return (value as (url: string) => Response)(url);
         return jsonResponse(value);
@@ -103,8 +112,13 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     quota_cycle_end: null,
     quota_expiring_credits: null,
     quota_expiring_credits_secondary: null,
+    quota_credits_expiring: null,
+    quota_credits_expiring_secondary: null,
     quota_expiry_ladder: null,
+    quota_credits_expiry_ladder: null,
     quota_packages: null,
+    quota_credits_remaining: null,
+    quota_credits_total: null,
     model_cooldowns: [],
     quota_probed_at: 1_700_000_000,
     token_expires_at: 0,

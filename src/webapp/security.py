@@ -61,7 +61,7 @@ def session_cookie_secure(request: Request, settings: Settings) -> bool:
     """会话 Cookie 是否加 `Secure`：按**请求的实际协议**判定。
 
     不能只看 PUBLIC_BASE_URL：同一实例可能同时有两条入口——LAN 直连
-    （http://192.168.124.35:8000）与 Cloudflare Tunnel
+    （http://192.168.124.4:8000）与 Cloudflare Tunnel
     （https://ai-api.robbs.work）。`Secure` Cookie 会被浏览器在 http 上丢弃，
     所以「一律 Secure」会让 LAN 登录失败，「一律不 Secure」又让公网 https
     会话失去保护。

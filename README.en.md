@@ -19,6 +19,7 @@ upstreams, with a shared credential pool, unified scheduling, and per-user usage
 - **Three-role accounts**: `admin` / `operator` / `viewer` in SQLite; one-time activation links (no shared initial secret), forced password change on first login, changing a role or disabling an account revokes its sessions immediately; logins and writes are audited.
 - **Growth center** (CodeBuddy only): travel gifts, Buddy dispatch, task rewards, streak repair, streak redemption, blind boxes; irreversible steps off via `GROWTH_IRREVERSIBLE_ACTIONS=false`; runnable from the admin UI.
 - **Privacy-preserving stats**: no conversation content stored; 90-day request detail, permanent hourly rollups; per user / channel / model / credential views; cost estimated from OpenRouter list prices (CNY primary).
+- **Sidebar to-dos**: count badges on sidebar entries for things you would otherwise only notice by visiting the page (credentials needing re-login or out of quota, unresolved alerts, failed background tasks, abnormal upstream sources, pending activations, your own expiring API keys, stale model catalog). One aggregate endpoint, role-filtered, counts only outstanding items.
 - **Admin security**: login rate limiting, CSRF checks, body limits, Host allowlist.
 - **Responsive tables**: wide tables (credentials, request detail, model list, …) turn into one card per row below 768px — column names collapse into a row of tappable sort chips and each cell shows its field name inline. The DOM is unchanged, so screen-reader semantics match the wide layout.
 
@@ -68,8 +69,8 @@ Accounts live in SQLite's `users` table; the *Users* page (admins only) handles 
 
 | Role | Can do |
 |---|---|
-| `admin` | User management, tasks & settings, credential read/write, all stats, audit log |
-| `operator` | Credential read/write (import / delete / pause / check-in / growth / account switch), all stats |
+| `admin` | User management, tasks & settings, credential read/write, all stats, audit log, upstream status, model list |
+| `operator` | Credential read/write (import / delete / pause / check-in / growth / account switch), all stats, upstream status, model list |
 | `viewer` | Read-only: dashboard, credential list, stats, Playground |
 
 **Adding users**: an admin sets a username + role and gets a **one-time activation link** (valid 24h, shown once). The user opens `/activate` and sets their own password — no "admin knows an initial password" secret exists. "Reset password" issues a new link.
@@ -93,7 +94,7 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
 
 ## Audit log
 
-The *Audit log* page (admins only) records logins and writes, filterable by actor/action and paginated: **logins** (success and failure), **account changes** (create, activate, role change, enable/disable, password change/reset, hard delete) and **credential writes** (import, delete, pause, pin, revive, account switch). Each row has time, actor, action, target, detail and source IP. **No passwords or token plaintext** (the one-time activation token appears once in the create response; only its SHA-256 digest is stored). Retention matches request detail (90 days), trimmed by the background cleanup task.
+The *Audit log* page (admins only) records logins and writes, filterable by actor/action and paginated: **logins** (success and failure), **account changes** (create, activate, role change, enable/disable, password change/reset, hard delete), **credential writes** (import, delete, pause, pin, revive, account switch) and **manual alert resolution**. Each row has time, actor, action, target, detail and source IP. **No passwords or token plaintext** (the one-time activation token appears once in the create response; only its SHA-256 digest is stored). Retention matches request detail (90 days), trimmed by the background cleanup task.
 
 ## Usage
 
@@ -122,7 +123,7 @@ Every model on the seven channels is unified into three fields:
 2. **Canonical key**: free-tier markers (`-free` / path segment `free`) and namespace prefixes stripped, then slugified — `kilo-auto`, `longcat-2.5-preview`. The list merges entries by it, so Zen's free tier and TRAE's paid tier collapse into one row.
 3. **Display name** (`name`): cleaned readable text, from upstream when given (`Qwen3.8-Max` → `Qwen3.8 Max`), otherwise derived; brand casing normalized (`DeepSeek` / `MiMo` / `GLM` / `GPT`).
 
-Every `id` in `GET /v1/models` is the canonical key; requests are translated back to the channel's raw id (`by_provider.{channel}.raw_id`). **All three spellings are directly requestable** (`kmodel_latest`, `Kimi K3`, `kimi-k3` all resolve to the same model).
+Every `id` in `GET /v1/models` is the canonical key; requests are translated back to the channel's raw id (`by_provider.{channel}.raw_id`). **All three spellings are directly requestable** (`kmodel_latest`, `Kimi K3`, `kimi-k3` all resolve to the same model). **`benefit` marker**: CodeArts models that draw on the daily free token pool get no rate from upstream, so their entries carry `benefit: true` (top level for single-channel, `by_provider.{channel}` for multi-channel); the Playground uses it to show a「福」badge on the channel pill, distinguishing them from the credit-billed built-in models.
 
 ### Streaming usage and reasoning tokens
 
@@ -165,9 +166,13 @@ Free models at [Kilo Gateway](https://kilo.ai) (`api.kilo.ai/api/gateway`), no a
 
 **Token refresh is rigid**: refresh_token, `client_id=codearts-agent` and the DPoP key are bound together and **single-use** — the new refresh_token must be written back or the account breaks; the pre-refresh task does this automatically (DPoP ES256/P-256). The pre-refresh window is capped at 45 minutes and must be **wider** than the polling interval (`REFRESH_INTERVAL_MINUTES`, default 30 min). A revoked renewal marks the credential "re-login required" and stops automatic retries until restored.
 
-**Daily check-in**: a "1000 credits/day" campaign (`GET /v1/ops/delivery` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`). The task claims automatically and can be triggered from the admin UI; `claim` alone is **not** enough (`CLAIMED` is a "claimed but unconfirmed" state), so both steps always run. This credit ledger is **separate from** the daily token pool: the pool feeds benefit models (`deepseek-v4.1-flash`), the credits feed built-in models (GLM-5.2 / OpenPangu).
+**Daily check-in**: a "1000 credits/day" campaign (`GET /v1/ops/delivery` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`). The task claims automatically and can be triggered from the admin UI; `claim` alone is **not** enough (`CLAIMED` is a "claimed but unconfirmed" state), so both steps always run. This credit ledger is **separate from** the daily token pool: the pool feeds benefit models (`deepseek-v4.1-flash`), the credits feed built-in models (GLM-5.2 / OpenPangu) — both ledgers are shown on the admin UI (see below).
 
 **Burn first**: the daily pool does not roll over, so the day's remainder is registered as midnight-expiring quota and scheduled **before** other channels. The upstream meters tokens, normalized to **credits** on the admin UI (1 credit = 10,000 tokens; a full daily pool = 1000 credits); pre-upgrade history is converted by `scripts/convert_codearts_credit_unit.py`. **This "credit" is a synthetic unit for cross-channel ordering, not the upstream check-in/plan credits.**
+
+**Two ledgers shown**: CodeArts is split into two groups on the credentials page, and **each group tells one ledger only** — **内置** shows the **credit ledger** (`GET {snap}/snap-manager/v1/statistics/plugin`, built-in models GLM-5.2 / OpenPangu), **福利** shows the **daily pool** (token-derived, benefit models). They are two independent upstream endpoints that never talk to each other and differ by an order of magnitude, so they live in separate groups with their own hover notes instead of one merged number. The credit sub-packages (`基础积分` / `按需积分` / `福利积分`) go into the "套餐 N 个" detail popover, and the plan's expiry date (`end_date`, verified to differ per account) is registered in the expiry ladder — unused credits are voided too, so "burn near-expiry first" also burns credits first. The **credit ledger does not feed health** (`health` still reads the daily pool only), and a failing credit endpoint only logs, leaving the balance probe result intact. **Change events are split per ledger** (`credit_events.ledger`): the 内置 group expands the credit-ledger history, other channels and the 福利 group expand the daily-pool history — mixing them would read as consecutive samples of one ledger.
+
+**The credentials page splits CodeArts into two channels**: **CodeArts 内置** (writable: all actions and the credit ledger) and **CodeArts 福利** (read-only: daily token pool only), each listing the same accounts once. This is a **front-end-only display split — the backend still has one `codearts` channel**: `refresh_token` is single-use and bound to `client_id` + the DPoP key, so two credential rows would each refresh once and the second would fail with `the refresh token has been used`, burning the ticket. The ledger split axis is the **model** (`is_benefit_model()` decides per request), not the channel, so this split only affects display and action entry points. **Expiring credits are split per ledger too**: the backend keeps the daily-pool rung and the credit-package rung apart (`quota_credits_expiry_ladder`), so the 福利 group shows the daily pool's expiring credits and the 内置 group shows the credit ledger's own.
 
 **Signing / cumulative SSE / pacing**: the upstream requires Huawei `SDK-HMAC-SHA256` (AK/SK + `X-Security-Token`), and `CODEARTS_ALLOWED_ENDPOINTS` must include the snap engine, STS, benefit gateway and portal hosts. Streaming `text` is **cumulative (replace semantics)**, reduced to incremental events for clients. Default `CODEARTS_CHAT_MIN_INTERVAL=5`; the upstream hard-limits **3 concurrent sessions per account**, so an in-flight cap (`CODEARTS_MAX_CONCURRENCY`) and a sliding window (`CODEARTS_REQUEST_WINDOW_SECONDS`, 3 starts per 60s) keep bursts ahead of `400 TM.00001041`. All hot-updatable.
 
@@ -282,8 +287,10 @@ Once the pool grows, the page splits "find that one account" into three layers, 
 - **Filter bar**: search (nickname / channel / id, case-insensitive) × channel × state × tag. The four are **AND**-combined and purely client-side — the backend still returns the full set ordered by `sort` / `order`. When any filter is active it shows "showing N / total" plus a *Clear* action; no match yields an empty state rather than a blank table. Counts in the channel / state / tag dropdowns come from the full set, so narrowing one filter never re-narrows the others. The **tag dropdown renders only when some credential actually carries a tag** (no permanent "all tags" control otherwise), and tags are a structured dimension that **does not participate in the search term** — otherwise finding a nickname that happens to be "prod" would be impossible.
 - **Tags**: each credential can carry any number of ops tags (comma-separated, up to 16 tags of ≤ 24 chars; half-width and full-width commas and semicolons all separate), edited via the row's *More → Set tags*. Tags are **display/filter only** — they never affect selection and never change request behaviour, since using them as policy would make a rename silently change traffic. A row shows at most two tags, collapsing the rest into `+N` with the full list in the hover title.
 - **Group sort**: a separate control reorders only the channel *groups* (never the rows inside them, which still follow the column header / backend `sort`). Default is **quota high→low**, ranked by the group's summed remaining quota so the channels that can still serve the most surface first; switchable to **channel order** (fixed, so 30s polling cannot make headers jump). Channels with no quota API (free tier) sort last rather than being treated as `0`, and ties fall back to channel order.
-- **Grouped by channel**: rows aggregate per channel; each group header is a compact **channel dashboard** — brand icon + channel name + account count, plus a **state breakdown** (icon + count, listing only states that occur, using the same `credentialState` as the state badge), a **total quota** figure (a share ring plus the number; the ring is a pure gauge and the exact percentage sits on the "total quota" label line; sums the group's non-null values, and the free tier zen / kilo shows `—` rather than `0` with no ring), and an **expiring credits** figure (one block for the primary 1.5-day window; the secondary 7-day window appears only when it holds **more** than the primary — the 7-day window is a superset, so an equal number means nothing expires beyond 1.5 days; CodeArts' daily pool zeroes at midnight and the two windows coincide, so only one block shows rather than repeating the same number). Clicking a header collapses / expands that channel — **collapsed by default** (see structure first, expand to inspect accounts); an active filter auto-expands matching channels, and clearing it returns to the collapsed overview. Group order is "quota high→low" by default and switchable from the toolbar to the fixed site-wide channel order (CodeBuddy, TRAE first); it does not follow the sort key. The channel name appears only in the header, never repeated per row.
+- **Grouped by channel**: rows aggregate per channel; each group header is a compact **channel dashboard** — brand icon + channel name + account count, plus a **state breakdown** (icon + count, listing only states that occur, using the same `credentialState` as the state badge), a **total quota** figure (a share ring plus the number; the ring is a pure gauge and the exact percentage sits on the "total quota / total credits" label line; sums the group's non-null values, and the free tier zen / kilo shows `—` rather than `0` with no ring), and an **expiring credits** figure (one block for the primary 1.5-day window; the secondary 7-day window appears only when it holds **more** than the primary — the 7-day window is a superset, so an equal number means nothing expires beyond 1.5 days). Clicking a header collapses / expands that channel — **collapsed by default** (see structure first, expand to inspect accounts); an active filter auto-expands matching channels, and clearing it returns to the collapsed overview. Group order is "quota high→low" by default and switchable from the toolbar to the fixed site-wide channel order (CodeBuddy, TRAE first); it does not follow the sort key. The channel name appears only in the header, never repeated per row. **The total reads the group's own ledger**: the CodeArts 内置 group totals the credit ledger (labelled "total credits"), every other group totals the daily pool.
 - **Column headers follow the expanded region**: there is no global table header; the column row (with sort buttons and column hints) renders inside each expanded channel group and sticks while the container scrolls. When collapsed, the group header *is* the overview and the column names have nothing to label; only an expanded group needs the "what is this column" anchor. Several groups can be expanded at once, and every group's header shares one sort state (clicking any of them writes the same backend `sort` parameter). The **"growth center" column appears only for channels that support it** (CodeBuddy); other channels get an empty placeholder cell — the column count stays constant, otherwise auto layout recomputes the widths and groups expanded below misalign.
+
+- **CodeArts splits into two channel groups**: **CodeArts 内置** (writable: all actions, the credit-history entry, the credit ledger and the package detail) and **CodeArts 福利** (read-only: daily token pool only), each listing the same accounts once, header labels suffixed "内置 / 福利" with 内置 first. **Each group tells one ledger**: the 内置 group's quota column is the credit ledger (`积分 x / y`, sort key `quota_credits_remaining`), the 福利 group is the daily token pool; the change-event entry follows the ledger too (内置 reads `ledger=credits`; 福利 renders no entry). **Expiring credits follow the ledger as well** — the backend splits the merged ladder per ledger (`quota_expiring_credits` = daily pool, `quota_credits_expiring` = credit ledger), so the 福利 group shows the daily pool's near-expiry quota and the 内置 group shows the credit ledger's own. The 福利 group drops probe / check-in / more-actions, the credit-history entry and the package detail, but the **column count stays constant**: the group-header and row checkboxes still render, only **disabled** — an empty placeholder cell is narrower than a real checkbox, so under auto table layout the row's column starts drift from the 内置 group; a same-size disabled box is what actually aligns them. This is a **front-end-only display split; the backend still has one `codearts` channel** (`refresh_token` is single-use, so two rows would burn each other's ticket), and the ledger split axis is the model, not the channel.
 - **Scrollable long list**: the table is capped at 70vh, and the group's sticky column header and row actions stay visible deep in the list.
 
 The quota number is dotted-underlined: hovering reveals **that row's cycle semantics** (this-cycle remainder / account balance / daily pool / free tier with no quota API); the per-row caption lives in that hover hint.
@@ -304,7 +311,7 @@ Playground and `GET /v1/models` use **stale-while-revalidate**: with a cache the
 
 ### Admin *Model list* page
 
-The admin *Model list* page (`GET /api/model-catalog`) is a read-only view of the public OpenRouter catalog: prices (input / output / cache read / cache write, USD per million tokens, switchable to CNY), context/output limits, input→output modalities, capabilities (reasoning / tool calling / attachments / structured output), knowledge cutoff, and the **Artificial Analysis indices** (intelligence / coding / agentic, via the public OpenRouter API — **not measured by this service**, never sorted). A missing catalog shows an empty state and does not affect chat or cost.
+The admin *Model list* page (`GET /api/model-catalog`, visible to admins and operators) is a read-only view of the public OpenRouter catalog: prices (input / output / cache read / cache write, USD per million tokens, switchable to CNY), context/output limits, input→output modalities, capabilities (reasoning / tool calling / attachments / structured output), knowledge cutoff, and the **Artificial Analysis indices** (intelligence / coding / agentic, via the public OpenRouter API — **not measured by this service**, never sorted). A missing catalog shows an empty state and does not affect chat or cost.
 
 OpenRouter lists hundreds of models and most are not connected here. Each row carries an `available` boolean (whether the model is **currently served by a channel with a usable credential**, same rule as `/v1/models`), and the page offers an **off-by-default** "only current channels" toggle that narrows the table locally to models fetched from current channels (no extra request).
 
@@ -332,6 +339,8 @@ The **Credit** column: CodeBuddy is the real upstream value; TRAE's `token_usage
 
 The drawer under a credential's quota number lists the **net change between consecutive quota probes**, attributing nothing to check-in / growth / chat (the upstream logs nothing), so the UI says "net change". The first probe records only a baseline; unchanged balances are skipped; a balance going unknown still records a row. 90-day retention.
 
+**Split per ledger**: CodeArts has two ledgers (daily token pool / credit ledger), so the table carries a `ledger` column (`pool` / `credits`) and each probe writes one row per ledger. The 内置 group expands the credit-ledger history (`ledger=credits`), other channels and the 福利 group expand the daily-pool history (`ledger=pool`); `GET /api/credentials/{id}/credit-events` takes a `ledger` query parameter (default `pool`, unknown values fall back to `pool`). **They must be read separately**: the two ledgers differ by an order of magnitude, and mixing them reads as consecutive samples of one ledger. On upgrading an old database every historical row lands in `pool` — those rows were produced by the daily-pool diff.
+
 ### Grouping and re-rollup
 
 The **Grouped stats** panel tabs four dimensions (channel / model / user / credential) over one table (requests / ok / success rate / input / output / cached / hit rate / credit / cost), endpoints `GET /api/stats/by-provider|by-model|by-user|by-credential`. Default sort is requests descending; **user and credential tabs are admin/operator only**. **Scope differs**: channel / model / user read the **hourly rollup** (permanent; the last 5 minutes are not yet counted); the **credential** dimension reads request detail (the rollup key has no `credential_id`), covering the **last 90 days**.
@@ -355,6 +364,23 @@ Nine tasks — quota probe, token pre-refresh, daily check-in, growth center, ac
 **Channel catalog refresh** (`MODEL_CATALOG_MINUTES`, default 30, floor 5) keeps the catalog fresh when nobody visits `/v1/models`; 30 minutes aligns with zen's 30-minute liveness cache, so going denser would only hit other channels' `/models` for nothing.
 
 **Growth center** is CodeBuddy-only; Buddy travels return every 1–4 hours, so the default cycle is 60 minutes (`GROWTH_INTERVAL_MINUTES`). Lottery / streak redemption / blind boxes / streak-repair cards are **irreversible** and skipped when `GROWTH_IRREVERSIBLE_ACTIONS=false`.
+
+### Operations alerts
+
+A periodic task evaluates four risks and persists hits to `alert_events`, reviewed on the *Operations alerts* page (admins only):
+
+| Rule | Fires when |
+|---|---|
+| `pool_empty` | The pool has credentials but fewer than `ALERT_POOL_READY_MIN` are usable |
+| `task_failed` | A background task fails `ALERT_TASK_FAILURES` times in a row (a success resets it) |
+| `token_expiring` | A credential's token has less than `ALERT_TOKEN_EXPIRY_HOURS` left |
+| `error_rate` | The window's upstream failure ratio reaches `ALERT_ERROR_RATE_THRESHOLD` with enough samples |
+
+- **Silence window** (`ALERT_SILENCE_MINUTES`): the same `(rule, target)` is recorded / pushed only once per window.
+- **Hysteresis** (`ALERT_FOR_TICKS` / `ALERT_CLEAR_TICKS`): consecutive hits before firing, consecutive misses before confirming recovery. On recovery every **still-unresolved** row for that `(rule, target)` gets `resolved_at` (the reminder rows of the same incident close together), and a `status="resolved"` webhook is emitted.
+- **Restart self-healing**: hysteresis **counters** live in-process and restart from zero, but "which alerts are still open" is a persisted fact — `AlertTask` rebuilds it from the unresolved rows at startup, so an alert recorded before a restart whose condition has since cleared is still marked resolved.
+- **Manual resolution**: each unresolved row has a *Mark resolved* button (`POST /api/alerts/{id}/resolve`, admin + CSRF + audit) for cases the state machine cannot judge (rule retired, false positive). It touches that row only.
+- **Retention**: same as request detail (90 days), trimmed by the cleanup task.
 
 ### Activity reporting (optional, off by default)
 
@@ -479,6 +505,69 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users   # exp
 The backend serves the frontend build at `/` (reading from disk per request), so a frontend-only change just needs a rebuild and a browser refresh; `localhost:5173` is the Vite dev server. `scripts/build-web.sh` builds only when stale, or unconditionally with `--force`.
 
 > Deployment specifics for the development machine (process management, paths, tool versions) live in `docs/local-environment.md`, which is gitignored and absent from clones.
+
+## Public entry point (VPS + frp reverse tunnel)
+
+Home broadband behind CGNAT has no inbound address, so the public entry point must be built by **dialing out** from the private side. The free Cloudflare Tunnel tier routes mainland traffic to the LAX edge (measured 1.1–2.4s end-to-end, ~60% packet loss); replacing it with an overseas VPS entry plus an frp tunnel drops that to 80–150ms. **Only the inbound path changes**: outbound calls to upstreams still use the local `PROVIDER_PROXIES`.
+
+```
+client ──443/TLS──> VPS (nginx) ──frp tunnel──> home Mac:8000
+```
+
+Artifacts: `deploy/frp/` (frps/frpc configs), `deploy/nginx/` (reverse proxy + TLS), `deploy/systemd/frps.service` (VPS side), `deploy/launchd/com.coding2api.frpc.plist` (Mac side). Config format targets frp v0.71.1 TOML.
+
+### VPS side (Linux + systemd)
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+# grab the linux_amd64 archive from https://github.com/fatedier/frp/releases, extract frps
+sudo install -m 755 frps /usr/local/bin/frps
+
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
+sudo install -d -m 755 /etc/frp
+sudo install -m 644 deploy/frp/frps.toml /etc/frp/frps.toml
+# shared token (use the same value when installing the client)
+openssl rand -hex 32 | sudo tee /etc/frp/frps-token >/dev/null
+sudo chmod 600 /etc/frp/frps-token && sudo chown frps:frps /etc/frp/frps-token
+
+sudo install -m 644 deploy/systemd/frps.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now frps
+
+# nginx: replace __TUNNEL_DOMAIN__ with your domain
+sed 's/__TUNNEL_DOMAIN__/ai-api.example.com/g' deploy/nginx/coding2api.conf \
+    | sudo tee /etc/nginx/sites-available/coding2api.conf >/dev/null
+sudo ln -sf /etc/nginx/sites-available/coding2api.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d ai-api.example.com     # issues the cert and sets up renewal
+```
+
+Point the domain's A record at the VPS public IP. An overseas VPS needs no ICP filing.
+
+### Home Mac side (launchd)
+
+```bash
+brew install frp                                # or download it and set FRPC_BIN
+./scripts/install-frpc.sh --server <VPS address> --token <same token as the VPS>
+launchctl print gui/$(id -u)/com.coding2api.frpc | grep -E 'state|pid'
+./scripts/install-frpc.sh --uninstall           # uninstall
+```
+
+`deploy/frp/frpc.toml` reads values through frp's native `{{ .Envs.FRP_SERVER_ADDR }}` templating, so the repo holds nothing machine-specific; the address and token file path are injected by the plist, and the token lives in `secrets/frpc-token` (mode 600, gitignored) rather than in the plist — `launchctl print` dumps the plist verbatim.
+
+### Three `.env` values to update
+
+| Variable | Value | What breaks if missed |
+|---|---|---|
+| `ALLOWED_HOSTS` | append the tunnel domain | every tunnel request gets 400 `invalid host header` |
+| `PUBLIC_BASE_URL` | `https://<tunnel domain>` | TRAE login callback base is wrong; no HSTS over https |
+| `HOST` | keep `127.0.0.1` | the tunnel loops back locally; there is **no need** to bind `0.0.0.0` |
+
+`TRUST_PROXY`: there is exactly one nginx hop on the VPS, so `true` is fine and lets an API key's `allowed_ips` see the real client IP (nginx forwards `X-Forwarded-For`). If you still want a direct LAN entry point, keep it `false` — otherwise peers on the same subnet can spoof XFF and bypass the allowlist.
+
+> Restart the service after changing `.env` (see "Deployment notes" above).
+> Both frpc and frps log to stdout → `logs/frpc.*.log` on the Mac (rotated by
+> newsyslog; `deploy/newsyslog/coding2api.conf` already has the two rules) and
+> journald on the VPS.
 
 ## Logs
 

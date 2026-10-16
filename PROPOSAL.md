@@ -36,10 +36,11 @@
 
 ### 2.4 CodeArts（`codearts`，真实账号）
 
-- 域：snap 引擎 `snap-access.cn-north-4.myhuaweicloud.com`、STS `sts.cn-north-4.myhuaweicloud.com`、福利网关 `opengw.developer.huaweicloud.com`、门户 `codearts.huaweicloud.com`。聊天 `POST /api/v2/chat/completions`（福利模型追加头 `maas_type: benefit`）；鉴权为华为云 **`SDK-HMAC-SHA256`**（AK/SK + `X-Security-Token`）。OAuth2 PKCE → `POST {snap-manager}/v1/oauth2/tokens` 换 AK/SK/security_token/refresh_token。模型内置 `GET {snap}/v1/model/builtin`（头 `Agent-Type: PromptCenter`）；福利 `GET {opengw}/api/v1/gateway/config`；领取 `POST /api/v1/benefit/claim`；余额 `GET /api/v1/user/tokens/balance`。
+- 域：snap 引擎 `snap-access.cn-north-4.myhuaweicloud.com`、STS `sts.cn-north-4.myhuaweicloud.com`、福利网关 `opengw.developer.huaweicloud.com`、门户 `codearts.huaweicloud.com`。聊天 `POST /api/v2/chat/completions`（福利模型追加头 `maas_type: benefit`）；鉴权为华为云 **`SDK-HMAC-SHA256`**（AK/SK + `X-Security-Token`）。OAuth2 PKCE → `POST {snap-manager}/v1/oauth2/tokens` 换 AK/SK/security_token/refresh_token。模型内置 `GET {snap}/v1/model/builtin`（头 `Agent-Type: PromptCenter`）；福利 `GET {opengw}/api/v1/gateway/config`；领取 `POST /api/v1/benefit/claim`；余额 `GET /api/v1/user/tokens/balance`（每日池）；积分账 `GET {snap-manager}/v1/statistics/plugin`（头 `Agent-Type: PromptCenter`）。
 - **令牌刷新是刚性的**：`refresh_token` 与 `client_id=codearts-agent` + DPoP 私钥三者绑定、**一次性**，刷新走 **DPoP ES256/P-256**，刷后必须回写新 `refresh_token`，由 token 预刷新任务独占轮转。续期凭据被上游作废时标记「需重新登录」并停止自动重试。
 - **每日签到**：`GET {snap}/v1/ops/delivery?channel=IDE` → `POST /v1/ops/claim`（`{campaignId:1, idempotentKey, channel:"IDE"}`）→ `POST /v1/ops/confirm`（`{campaignId:1}`）；**`/v1/ops/*` 挂在 snap 引擎根、不带 `snap-manager` 前缀**。`status` 四态必须区分：`ELIGIBLE`→claim+confirm；`CLAIMED`（已领未确认，非终态）→只补 confirm；`CONFIRMED`/`CONSUMED`→已签不写。**claim 时积分即到账**，confirm 只推进状态；业务码走 HTTP 200，不能只看状态码。
-- **单位折算**：上游余额按 token 计量（每日池 1000 万），统一折算为积分，**1 积分 = 10000 token**。该「积分」是为跨渠道排序合成的折算值，与上游签到/套餐积分同名不同物。**积分与每日 token 池是两套并行的账**：token 池给福利模型用，签到积分给系统内置模型用。**福利模型单请求扣池**：上游 usage 缺额度字段时按「输入 + 输出 token」补 `credit` 并标 `credit_estimated`（展示加 ≈）。
+- **单位折算**：上游余额按 token 计量（每日池 1000 万），统一折算为积分，**1 积分 = 10000 token**。该「积分」是为跨渠道排序合成的折算值，与上游签到/套餐积分同名不同物。**积分与每日 token 池是两套并行的账**：token 池给福利模型用，签到积分给系统内置模型用。**两本账都探测并展示**：`GET {snap}/snap-manager/v1/statistics/plugin`（前缀必带 `snap-manager`）的 `usageTotalPackageCredit` 进 `credentials.quota_credits_*`，分项包（基础/按需/福利）走 `quota_packages` 明细，套餐 `end_date` 登记到期阶梯（积分用不完作废，故也参与「快过期的先用」）；积分账**不参与 health**。**福利模型单请求扣池**：上游 usage 缺额度字段时按「输入 + 输出 token」补 `credit` 并标 `credit_estimated`（展示加 ≈）。
+- **凭证页把 CodeArts 拆成两个渠道**（纯前端展示拆分，后端仍一个 `codearts` provider）：**CodeArts 内置**（可写，承载全部操作与积分账）与 **CodeArts 福利**（只读，只展示每日 token 池），同一批账号各出现一次，**每组只讲一本账**（内置组额度列＝积分账、流水读 `ledger=credits`；福利组＝每日池）。**到期积分也按账本拆**：积分那一段另存 `quota_credits_expiry_ladder`（选号仍读两本账合并的 `quota_expiry_ladder`），管理台 `quota_expiring_credits` ＝「合并阶梯 − 积分账段」＝每日池段、`quota_credits_expiring` ＝积分账段，福利 / 内置两组各显各的。**为什么不在后端真拆**：`refresh_token` 一次性且与 `client_id` + DPoP 私钥绑定，两条凭证行会各刷一次、第二条必报 `the refresh token has been used` 并烧掉票据。两本账的区分轴是**模型**（`is_benefit_model()` 逐请求判断），不是渠道。
 - **并发上限**：上游硬限**每账号每约 60s 最多 3 个会话**，超出即 `400 TM.00001041`；配在途上限 `CODEARTS_MAX_CONCURRENCY` 与滑动窗口 `CODEARTS_REQUEST_WINDOW_SECONDS`。流式 `text` 是**累计全文（替换语义）**，解析层还原为增量事件。
 - **流内业务错误分类**：业务错误内嵌在 HTTP 200 的 SSE 里（`InferHub.<码>`），由 executor 转成冷却 + 轮换。分类统一由 `Event.error_kind` 承载，`UpstreamStreamError.kind()` 与 `executor._event_kind` 共用 `provider.base.event_error_kind` 兜底（缺失 → `OTHER`），避免两处各写一份而漂移。非多模态模型收到图片（`InferHub.001001020.406 The request model is not multimodal`）归 `REQUEST`：请求侧错误不冷却、不累计、不落库，仍换号重试。
 
@@ -80,7 +81,7 @@
 一个 FastAPI 进程内按**三个平面**组织，三面共享同一份 SQLite（WAL + `busy_timeout=5000`：账号 / 加密凭证 / 统计 / 审计）与 Provider 客户端：
 
 - **请求面**（鉴权 = API Key）：`/v1/chat/completions` · `/v1/responses` · `/v1/messages` · `/v1/models` · `/v1/user/balance` → 协议层（OpenAI / Responses / Anthropic 规范化与适配、模型名解析 `name` ｜ `name@provider`）→ 执行引擎（调度器 · 冷却状态机 · 会话粘性 · 截断续写 · 统计采集）→ 中立事件流 → 七个 Provider。
-- **管理面**（鉴权 = 会话 Cookie + RBAC）：React 管理台 → `/api/*`，含用户管理、审计、凭证运维、API Key、统计、任务与配置、上游状态。
+- **管理面**（鉴权 = 会话 Cookie + RBAC）：React 管理台 → `/api/*`，含用户管理、审计、凭证运维、API Key、统计、任务与配置、上游状态、模型列表。
 - **后台面**（无 HTTP 入口，`TaskRunner` 起 11 类循环）：额度探测 · token 预刷新 · 每日签到 · 成长中心 · 活跃上报 · 明细清理 · 数据库备份 · 渠道模型列表刷新 · 模型目录刷新（OpenRouter）· 运维告警 · 上游状态页聚合 → Provider 客户端 → 上游。
 
 **为什么按平面切**：请求面全程无状态、可并发，且不知道「人」是谁（只认 Key 的归属用户）；管理面与请求面**共用同一个执行引擎与仓储**，不做独立服务——自托管小实例里进程隔离只换来部署复杂度。两个鉴权面互不替代：API Key 进不了管理台，会话 Cookie 也进不了 `/v1`。后台面与请求面**共用 Provider 客户端与节流器**：各渠道风控按最小间隔生效，不能因为「后台签到」与「前台对话」是两条代码路径就各发各的。三面共享一份 SQLite，故升级只需重启**一个**进程。
@@ -126,7 +127,7 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ### 3.7 账号与权限面
 
-管理面身份来自 SQLite `users` 表。三角色：`admin`（用户管理、运行时配置、凭证写操作、全量统计、审计、运维告警、上游状态，`require_admin`）、`operator`（凭证写操作：导入 / 删除 / 启停 / pin / 切换账号 / 签到 / 成长，全量统计，`require_operator`）、`viewer`（只读：仪表盘、凭证列表、Playground、统计；审计为 admin-only，登录即可）。
+管理面身份来自 SQLite `users` 表。三角色：`admin`（用户管理、运行时配置、凭证写操作、全量统计、审计、运维告警、`require_admin`）、`operator`（凭证写操作：导入 / 删除 / 启停 / pin / 切换账号 / 签到 / 成长，全量统计，上游状态、模型列表，`require_operator`）、`viewer`（只读：仪表盘、凭证列表、Playground、统计；审计为 admin-only，登录即可）。
 
 - **鉴权链**：签名 Cookie（HMAC，payload 带用户名与 `session_epoch`）→ 用户仍存在且启用 → epoch 与 DB 一致 → 角色现读 DB。四者缺一即 401；**角色不进 Cookie**，降级立即生效。
 - **吊销不建会话表**：`users.session_epoch` 在改密 / 改角色 / 启停 / 硬删时 `+1`，旧 Cookie 立即失效。
@@ -136,7 +137,7 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ## 4. 数据模型
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 22`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCHEMA_VERSION = 24`。变更纪律：schema.sql **只加不改**；新增列走 `_MIGRATION_COLUMNS` 幂等补列，删表须在 `_MIGRATION_DROPS` 补一条。
 
 | 表 | 用途 |
 |---|---|
@@ -146,7 +147,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 | `usage_events` | 请求明细（token / credit / 缓存命中 / 成本 / 耗时 / 首字延迟 / 请求 ID），保留 90 天 |
 | `usage_hourly` | 小时汇总（永久保留），渠道 / 模型 / 用户维度统计读此表 |
 | `growth_events` | 成长中心每轮一行汇报（仅 CodeBuddy）；活跃上报复用同表 |
-| `credit_events` | 两次额度探测之间的**净变化**（含 `window_start` 与归因已知度 `source`），不是动作归因 |
+| `credit_events` | 两次额度探测之间的**净变化**（含 `window_start`、归因已知度 `source` 与账本 `ledger`＝`pool`/`credits`），不是动作归因 |
 | `credential_model_cooldowns` | (凭证, 模型) 级冷却与「无此模型」负缓存，含 `hits` 供指数退避 |
 | `runtime_settings` | 运行时配置覆盖（纯 key/value，只存管理台改过的 key），白名单校验在 `runtime_settings.HOT_SETTINGS` |
 | `users` | 账号（PBKDF2 密码哈希 + `role` + `enabled` + `must_change_password` + `session_epoch` + 一次性激活令牌摘要） |
@@ -159,15 +160,17 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 
 ## 5. API 契约
 
-**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate}` + 可选 `benchmarks`）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
+**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate, benefit}` + 可选 `benchmarks`；`benefit` 标福利模型，单渠道在顶层）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
 
-**管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、上游状态（admin-only）、任务与配置（admin-only）。
+**管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表（operator）、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、上游状态（operator）、任务与配置（admin-only）。
 
 - 账号：`GET|POST /api/users`、`PATCH /api/users/{username}`、`POST /api/users/{username}/{disable|enable|reset-password}`（**不提供 DELETE**）；自助改密 `POST /api/auth/password`；无鉴权的一次性激活流 `GET|POST /api/auth/activate`；审计查询 `GET /api/audit`。
 - 凭证运维：`POST /api/credentials/{id}/checkin|toggle|revive|probe|accounts/select`、`PUT /api/credentials/{id}/limits`（限额护栏整体替换，全关时删行）、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|accounts`。
 - 凭证批量运维：`POST /api/credentials/batch`（`{action: probe|toggle|checkin|revive, ids: [...]}`，可选 `enabled` 用于 `toggle`）。逐条隔离执行——单条失败不影响其余条，响应含 `{total, succeeded, failed, results[]}`；`toggle`/`revive` 落一条汇总审计，`probe`/`checkin` 与单条端点同为只读语义、不写审计。
 - 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`（手动跑一轮）。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
-- 上游状态聚合：`GET /api/upstream-status`（admin-only）返回后台任务抓取的内存快照（`summary` + `sources`）与任务的当前 `enabled` / `interval_seconds` / `server_time`；**不落盘**，重启后为「尚未抓取」。四种解析器（Statuspage v2 / OpenCode / Better Stack / Atom）归一化到六档，加源只需在 `SOURCE_SPECS` 加一行。
+- 运维告警：`GET /api/alerts`（倒序回看，分页）+ `POST /api/alerts/{id}/resolve`（人工标记一条已恢复，admin + CSRF + 审计；用于规则已下线 / 误报等状态机无法自动判定的情况）。后台正常路径会在规则不再命中时自动写 `resolved_at`，且 `AlertTask` 启动时从库里未恢复的行重建「告警中」集合，重启后仍能自愈。
+- 上游状态聚合：`GET /api/upstream-status`（operator）返回后台任务抓取的内存快照（`summary` + `sources`）与任务的当前 `enabled` / `interval_seconds` / `server_time`；**不落盘**，重启后为「尚未抓取」。四种解析器（Statuspage v2 / OpenCode / Better Stack / Atom）归一化到六档，加源只需在 `SOURCE_SPECS` 加一行。
+- 侧栏数据提醒：`GET /api/nav-badges` 一次返回侧栏各项的待办计数（凭证需重登/耗尽、未恢复告警、上次失败任务、异常上游源、待激活账号、本人将到期 Key、模型目录陈旧）。**按角色裁剪 payload**——缺失的键 = 无权看（admin-only 的告警/任务/用户不下发给 operator/viewer，operator 的上游/目录不下发给 viewer）；这是聚合端点，**不做整体 403**（viewer 也要看自己的 API Key）。各计数与对应页面数据**不是同一口径**：只数「待办」（如告警只数 `resolved_at IS NULL`、任务用「上次失败」而非「连续失败达阈值」）。
 
 实现以代码为准，使用说明见 [README.md](README.md)。
 

@@ -34,6 +34,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
+from ..auth.rbac import require_operator
 from ..benchmarks import BenchmarkTable
 from ..model_match import lookup, match_keys
 from ..sorting import sort_rows
@@ -129,14 +130,15 @@ def create_router(services: Services) -> APIRouter:
                                 q: str | None = None,
                                 only_available: bool = False,
                                 limit: int = 50, offset: int = 0,
-                                _principal=Depends(principal_from_request)):
-        """当前生效模型目录 + 元信息；仅要求登录（OpenRouter 是公开数据，各角色可看）。
+                                principal=Depends(principal_from_request)):
+        """当前生效模型目录 + 元信息；门槛 operator（admin / operator），与「模型列表」页一致。
 
         分页与筛选都在服务端：目录数百条，全量下发会拖慢首屏，而「搜索 id/名称」
         与「只看当前渠道」是两个常用收窄手段。`q` 大小写不敏感地匹配 id 与名称；
         `only_available` 只留 `available=true` 的行。返回的 `total` 是**筛选后**
         的总条数（供前端算页数），`count` 仍是目录全量（页头展示「N / 总数」）。
         """
+        require_operator(principal)
         state = request.app.state
         catalog: dict[str, dict] = state.models_dev_catalog
         # 先补能力分再排序：能力分排序键读 `row["benchmarks"]`，若在 enrich 之前

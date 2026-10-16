@@ -63,6 +63,8 @@ export function quotaSemantics(credential: Credential): string {
   // 1 积分 = 10000 token），当日 0 点清零——上游不给重置时间戳，固定按时段
   // 描述，不能退化成「本周期剩余」。这里的「积分」是合成折算值，与上游真积分
   // （内置模型计费单位）同名不同物，故文案用「额度池」而非「积分」。
+  // 另有并行的积分账（内置模型）在凭证页「CodeArts 内置」组单独展示，
+  // 见 CREDITS_QUOTA_SEMANTICS。
   if (credential.provider === "codearts") {
     return "每日额度池（token 折算，当日 0 点清零）";
   }
@@ -73,6 +75,19 @@ export function quotaSemantics(credential: Credential): string {
   const date = new Date(credential.quota_cycle_end * 1000).toLocaleDateString("zh-CN");
   return `本周期剩余，${date} 重置`;
 }
+
+/**
+ * 第二本账（CodeArts 积分）的口径说明：内置模型（GLM-5.2 / OpenPangu 等）
+ * 按积分计费，与福利模型走的每日 token 池是**并行的两本账**、互不通气
+ * （上游两个接口各自独立，实测）。其余渠道无此账（`quota_credits_*` 恒 null），
+ * 故调用方要先判空再渲染。
+ *
+ * 措辞刻意与主账区分：主账是「额度池（token 折算）」，这里是「积分」——
+ * 上游数值本身就是积分，不经 `units` 折算，两者同名不同物。
+ */
+export const CREDITS_QUOTA_SEMANTICS =
+  "内置模型积分（GLM-5.2 / OpenPangu 等）：与每日额度池并行的独立账本，" +
+  "按积分计费，套餐到期日作废。不参与健康度，但到期日计入「快过期先用」。";
 
 /**
  * 额度单位统一为「积分」：CodeArts 上游的 token 已在后端折成积分

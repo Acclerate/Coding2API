@@ -317,10 +317,14 @@ async def fetch_openrouter_models(url: str = OPENROUTER_MODELS_URL, *,
     """拉取 OpenRouter 模型列表原始 JSON；网络 / HTTP 异常向上抛。
 
     `transport` 只为测试注入（httpx.MockTransport），生产走真实网络。
+
+    `trust_env=False` 与 provider/proxy.build_client 同口径：不吃宿主环境
+    / macOS 系统代理。本机开着全局代理时 httpx 默认 `trust_env=True` 会把
+    它当出站代理，代理握手失败即整份目录抓不到（表现为成本与能力分全空）。
     """
     import httpx
 
-    kwargs: dict[str, Any] = {"timeout": timeout}
+    kwargs: dict[str, Any] = {"timeout": timeout, "trust_env": False}
     if transport is not None:
         kwargs["transport"] = transport
     async with httpx.AsyncClient(**kwargs) as client:

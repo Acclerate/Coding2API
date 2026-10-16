@@ -23,6 +23,7 @@ from .api import (
     admin_alerts,
     admin_audit,
     admin_auth,
+    admin_badges,
     admin_credentials,
     admin_keys,
     admin_model_catalog,
@@ -752,6 +753,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(admin_settings.create_router(services))
     app.include_router(admin_model_catalog.create_router(services))
     app.include_router(admin_alerts.create_router(services))
+    app.include_router(admin_badges.create_router(services))
     app.include_router(admin_upstream.create_router(services))
     app.include_router(admin_stats.create_router(services))
     app.include_router(admin_users.create_router(services))

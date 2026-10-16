@@ -106,11 +106,13 @@ function benchmarkLine(row: ModelCatalogEntry) {
 }
 
 /**
- * 模型列表页（控制台）：只读展示 OpenRouter 的模型目录。
+ * 模型列表页（管理）：只读展示 OpenRouter 的模型目录。
  *
  * 这份目录既是统计页「成本（估算）」的价格来源（输入 / 输出 / 缓存读，USD /
  * 百万 token），也带出上游更详细的元数据（上下文、模态、能力、知识截止等）。
  * 目录缺失（首次部署尚未拉取）时显示空态而非报错。
+ *
+ * 门槛与「上游状态」一致：operator（admin / operator）可见，与路由守卫同口径。
  */
 export function ModelCatalogPage() {
   const session = useSessionContext();
@@ -187,7 +189,7 @@ export function ModelCatalogPage() {
   return (
     <div className="space-y-6" data-testid="model-catalog-page">
       <PageHeader
-        eyebrow="控制台"
+        eyebrow="管理"
         title="模型列表"
         description="OpenRouter 模型目录：统计页「成本（估算）」的刊例价来源（输入 / 输出 / 缓存读，USD / 百万 token）与上下文、模态、知识截止等元数据；「能力分」来自 Artificial Analysis。"
         icon={<Boxes className="size-5" />}

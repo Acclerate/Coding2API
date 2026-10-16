@@ -1,7 +1,7 @@
-import { BellRing } from "lucide-react";
+import { BellRing, CheckCheck } from "lucide-react";
 import { useState } from "react";
 import { ALERT_RULE_LABEL, formatTime } from "../api/display";
-import { useAlerts } from "../api/hooks";
+import { useAlerts, useResolveAlert } from "../api/hooks";
 import { useSessionContext } from "../Layout";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
@@ -11,6 +11,7 @@ import { SortableHead } from "../components/SortableHead";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
   Badge,
+  Button,
   EmptyState,
   Notice,
   Panel,
@@ -37,9 +38,12 @@ export function AlertsPage() {
   // 30 秒轮询：告警是「刚刚发生了什么」，用户停留时自动刷新。
   const { data, isLoading, isFetching } = useAlerts(
     session.username, 30_000, sort, order, pageSize, page * pageSize);
+  const resolve = useResolveAlert(session.username);
 
   const alerts = data?.alerts ?? [];
   const total = data?.total ?? 0;
+  // 正在处置的那条：只禁用它自己的按钮，别把整张表锁住
+  const resolvingId = resolve.isPending ? resolve.variables : undefined;
 
   // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
   const toggleSort = (columnKey: string) => {
@@ -56,9 +60,17 @@ export function AlertsPage() {
       <PageHeader
         eyebrow="运维"
         title="运维告警"
-        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可推送 webhook；同一告警静默窗内只记一次，恢复后标「已恢复」并推送。"
+        description="后台周期评估四类风险：凭证池耗尽、后台任务连续失败、token 临近到期、上游错误率骤升。命中即落库并可推送 webhook；同一告警静默窗内只记一次，恢复后标「已恢复」并推送。规则不再命中时后台自动标记恢复；规则已下线或误报时可手动标记。"
         icon={<BellRing className="size-5" />}
       />
+
+      {resolve.isError && (
+        <div data-testid="resolve-error" role="alert">
+          <Notice tone="danger" className="text-sm">
+            标记恢复失败：{resolve.error instanceof Error ? resolve.error.message : "未知错误"}
+          </Notice>
+        </div>
+      )}
 
       <Panel
         title={`最近告警${data ? `（共 ${total} 条）` : ""}`}
@@ -89,6 +101,7 @@ export function AlertsPage() {
                   <TableHead>说明</TableHead>
                   <SortableHead label="推送" columnKey="delivered" active={sort === "delivered"}
                                 direction={order} onToggle={toggleSort} testId="sort-delivered" />
+                  <TableHead>操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -126,6 +139,22 @@ export function AlertsPage() {
                         </Badge>
                       )}
                     </TableCell>
+                    <TableCell label="操作">
+                      {alert.resolved_at === null ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          data-testid={`alert-resolve-${alert.id}`}
+                          disabled={resolvingId === alert.id}
+                          onClick={() => resolve.mutate(alert.id)}
+                        >
+                          <CheckCheck className="mr-1 size-3" />
+                          标记恢复
+                        </Button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -146,6 +175,7 @@ export function AlertsPage() {
       <Notice tone="muted">
         告警记录与请求明细同一保留期（默认 90 天），由后台清理任务裁剪。
         webhook 地址与各规则阈值见「任务与配置」页的「运维告警」卡片。
+        「标记恢复」用于规则已下线或误报等后台无法自动判定的情况，操作会记入审计。
       </Notice>
     </div>
   );

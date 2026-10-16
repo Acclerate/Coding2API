@@ -56,6 +56,9 @@ EP_MODEL_BUILTIN = "/v1/model/builtin"
 EP_BENEFIT_CONFIG = "/api/v1/gateway/config"
 EP_BENEFIT_CLAIM = "/api/v1/benefit/claim"
 EP_TOKEN_BALANCE = "/api/v1/user/tokens/balance"
+# 积分账（内置模型）统计：**挂在 snap 引擎根上、带 `snap-manager` 前缀**，
+# 与 `/v1/ops/*`（签到，不带前缀）相反；不带前缀回 APIG.0101（实测）。
+EP_STATISTICS_PLUGIN = "/snap-manager/v1/statistics/plugin"
 EP_LOGIN_TICKET = "/v1/login/ticket"
 EP_OAUTH_TOKENS = "/v1/oauth2/tokens"
 EP_CURRENT_USER = "/v1/current/user"

@@ -33,6 +33,15 @@ function RequireAdmin({ isAdmin, children }: { isAdmin: boolean; children: React
   return <>{children}</>;
 }
 
+/** 操作员（含 admin）页面的路由守卫：viewer 送回首页。与侧栏 `operator` 项同口径。 */
+function RequireOperator({ isOperator, children }: {
+  isOperator: boolean;
+  children: React.ReactNode;
+}) {
+  if (!isOperator) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
 export function App() {
   const session = useSession();
 
@@ -66,12 +75,12 @@ export function App() {
           <Route path="/credentials" element={<Navigate to="/" replace />} />
           <Route path="/api-keys" element={<ApiKeysPage />} />
           <Route path="/stats" element={<StatsPage />} />
-          <Route path="/models" element={<ModelCatalogPage />} />
           <Route path="/playground" element={<PlaygroundPage />} />
           <Route path="/users" element={<RequireAdmin isAdmin={session.data.is_admin}><UsersPage /></RequireAdmin>} />
           <Route path="/audit" element={<RequireAdmin isAdmin={session.data.is_admin}><AuditPage /></RequireAdmin>} />
           <Route path="/alerts" element={<RequireAdmin isAdmin={session.data.is_admin}><AlertsPage /></RequireAdmin>} />
-          <Route path="/upstream" element={<RequireAdmin isAdmin={session.data.is_admin}><UpstreamStatusPage /></RequireAdmin>} />
+          <Route path="/upstream" element={<RequireOperator isOperator={session.data.is_operator}><UpstreamStatusPage /></RequireOperator>} />
+          <Route path="/models" element={<RequireOperator isOperator={session.data.is_operator}><ModelCatalogPage /></RequireOperator>} />
           <Route path="/settings" element={<RequireAdmin isAdmin={session.data.is_admin}><SettingsPage /></RequireAdmin>} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

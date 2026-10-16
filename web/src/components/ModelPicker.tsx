@@ -31,6 +31,21 @@ export function providerRate(item: ModelInfo, provider: string): number | undefi
   return undefined;
 }
 
+/**
+ * 某渠道的模型是否为**福利模型**（当前只有 CodeArts）。
+ *
+ * 福利模型走每日 token 池、上游不给倍率，展示层在渠道徽章上打「福」标区分
+ * 于内置模型。判据与倍率同构：优先按渠道细分（`by_provider`），单渠道条目
+ * 回退顶层 `benefit`；多渠道缺细分标记时返回 false——**不能**拿顶层冒充，
+ * 否则会把福利标到同条目的其它渠道上。
+ */
+export function providerBenefit(item: ModelInfo, provider: string): boolean {
+  const perProvider = item.by_provider?.[provider]?.benefit;
+  if (perProvider !== undefined) return perProvider;
+  if (item.providers.length === 1) return item.benefit === true;
+  return false;
+}
+
 /** 模型排序用倍率：多渠道取各渠道最小倍率；无倍率视为最大（排最后）。 */
 export function modelRate(item: ModelInfo): number | undefined {
   const rates = item.providers
@@ -144,17 +159,21 @@ function sortProviders(providers: string[]): string[] {
 /**
  * 品牌着色渠道徽章：底/边/字都取自该渠道的图表主色，渠道一眼可辨。
  *
- * 倍率作为其内的加粗数字块单独强调（`x0.29`；免费额度显示「免费」）。
+ * 倍率作为其内的加粗数字块单独强调（`x0.29`；免费额度显示「免」）。
  * `rawId` 非空时作为 tooltip：该渠道实际请求的 key。
+ * `benefit` 为真时在渠道名后加一个「福」标：福利模型走每日 token 池、
+ * 上游不给倍率，没有倍率块可看，这个标是它与内置模型唯一的区分点。
  */
 function ChannelPill({
   provider,
   rate,
   rawId,
+  benefit,
 }: {
   provider: string;
   rate?: number;
   rawId?: string;
+  benefit?: boolean;
 }) {
   const color = providerChartColor(provider);
   return (
@@ -171,9 +190,18 @@ function ChannelPill({
     >
       <ProviderIcon provider={provider} size={13} />
       {providerLabel(provider)}
+      {benefit && (
+        <span
+          data-testid={`channel-benefit-${provider}`}
+          title="福利模型：走每日免费 token 池，不消耗积分"
+          className="rounded bg-warn/15 px-1 font-bold text-warn-ink"
+        >
+          福
+        </span>
+      )}
       {rate !== undefined && (
         <span className="rounded bg-background/70 px-1 font-bold tabular-nums">
-          {rate === 0 ? "免费" : `x${rate}`}
+          {rate === 0 ? "免" : `x${rate}`}
         </span>
       )}
     </span>
@@ -281,6 +309,7 @@ function ModelRow({
             provider={provider}
             rate={providerRate(item, provider)}
             rawId={providerRawId(item, provider)}
+            benefit={providerBenefit(item, provider)}
           />
         ))}
       </span>
@@ -387,6 +416,7 @@ export function ModelPicker({
                 provider={provider}
                 rate={providerRate(selectedItem, provider)}
                 rawId={providerRawId(selectedItem, provider)}
+                benefit={providerBenefit(selectedItem, provider)}
               />
             ))}
           </span>
@@ -430,6 +460,7 @@ export function ModelPicker({
                       provider={provider}
                       rate={providerRate(selectedItem, provider)}
                       rawId={providerRawId(selectedItem, provider)}
+                      benefit={providerBenefit(selectedItem, provider)}
                     />
                   </button>
                 ))}

@@ -14,6 +14,7 @@ import {
   taskReportLabel,
   tokenExpiryView,
   activeModelCooldowns,
+  CREDITS_QUOTA_SEMANTICS,
   credentialState,
   formatDuration,
   formatNumber,
@@ -361,6 +362,13 @@ describe("display helpers", () => {
     expect(codearts).toBe("每日额度池（token 折算，当日 0 点清零）");
 
     // 国际版 Qoder 无旧签到接口，但额度语义不变（不在此断言）
+  });
+
+  it("第二本账（积分）的口径文案", () => {
+    // 口径文案必须点明「与每日额度池并行的独立账本」，否则会被读成同一本账
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("独立账本");
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("内置模型");
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("不参与健康度");
   });
 
   it("凭证状态机覆盖全部状态", () => {

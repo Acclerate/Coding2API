@@ -4,6 +4,12 @@ services:
     image: ghcr.io/robbsluo/coding2api:latest
     container_name: coding2api
     restart: unless-stopped
+    # 让容器能通过 host.docker.internal 访问宿主（Docker Desktop 自带，
+    # Linux / Colima 需显式加这条）。用于 PROVIDER_PROXIES 指向宿主代理，
+    # 例如 codebuddy=http://host.docker.internal:7897 —— 写 127.0.0.1 在容器里
+    # 指向容器自身，代理静默连不上（启动期只校验格式、不校验可达）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # 必填：凭证列加密密钥。丢失后已存凭证全部不可解，只能重录。
       APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env}
@@ -73,6 +79,9 @@ services:
       # token 到期预警阈值（秒）：剩余时间低于该值时管理台标红；≤0 关闭预警
       TOKEN_EXPIRY_WARNING_SECONDS: ${TOKEN_EXPIRY_WARNING_SECONDS:-3600}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 时区：镜像默认 Asia/Shanghai，但 .env 里设的 TZ 不在这里透传就会被
+      # 静默忽略（compose 的 .env 只用于 ${} 插值，不自动注入容器）。
+      TZ: ${TZ:-Asia/Shanghai}
       # ---- 高级项：默认值已合适，需要时在 .env 里设即可生效 ----
       # 注意：compose 的 .env 只用于 ${VAR} 插值，只有在这里透传过的变量
       # 才会真正进容器；漏透传会让 .env 里的设置静默失效（无任何报错）。
@@ -165,7 +174,10 @@ services:
       # SQLite 与运行数据目录（容器内固定挂载点，一般无需改）
       DATA_DIR: ${DATA_DIR:-/app/data}
     ports:
-      - "${PORT:-8000}:8000"
+      # 两侧都引用 PORT：README 承诺「PORT 同时决定宿主机映射端口」，而它同时
+      # 是容器内 uvicorn 的监听端口。target 写死 8000 会让 PORT=9000 时
+      # 应用监听 9000、映射却指向 8000，容器永远不 healthy。
+      - "${PORT:-8000}:${PORT:-8000}"
     # 停机排空窗口：docker 发 SIGTERM 后等这么久再 SIGKILL。必须 >= 应用侧
     # uvicorn --timeout-graceful-shutdown(30，见 src/main.py GRACEFUL_SHUTDOWN_SECONDS)，
     # 留 5s 余量让 uvicorn 排空完成、统计落库，再被强杀。
@@ -175,7 +187,9 @@ services:
       - ./data:/app/data
       - ./secrets:/app/secrets:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      # 端口必须与上面的 PORT 同步：健康检查打的是容器内监听端口，写死 8000
+      # 会让非默认 PORT 的部署永远不 healthy。
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen(f\"http://127.0.0.1:{os.environ.get('PORT','8000')}/health\")"]
       interval: 30s
       timeout: 5s
       retries: 3

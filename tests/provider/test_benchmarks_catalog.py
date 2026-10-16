@@ -165,9 +165,12 @@ async def test_fetch_openrouter_models_default_transport_branch(monkeypatch):
     """不注入 transport 时走真实 AsyncClient 构造（替身覆盖该分支）。"""
     import httpx
 
+    seen: dict = {}
+
     class FakeClient:
-        def __init__(self, **_kwargs):
-            self.kwargs = _kwargs
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.kwargs = kwargs
 
         async def __aenter__(self):
             return self
@@ -182,3 +185,5 @@ async def test_fetch_openrouter_models_default_transport_branch(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     fetched = await fetch_openrouter_models("https://x")
     assert build_benchmark_table(fetched)["glm-5.3"]["coding_index"] == 74.8
+    # 回归：默认必须 trust_env=False，否则宿主/系统代理会劫持目录抓取
+    assert seen["trust_env"] is False

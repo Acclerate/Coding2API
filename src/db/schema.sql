@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS credentials (
     quota_cycle_end  INTEGER,                      -- 最早到期 epoch；渠道无此信息为 NULL
     quota_expiry_ladder TEXT,                      -- 到期阶梯 JSON [[epoch, 剩余积分]]；无到期信息为 NULL
     quota_packages   TEXT,                      -- 额度包明细 JSON [{"name","total","used","end"}]，仅展示
+    quota_credits_remaining REAL,               -- 第二本账（CodeArts 积分）：内置模型计费，与 token 池并行；其余渠道 NULL
+    quota_credits_total     REAL,               -- 同上，积分总量
+    quota_credits_expiry_ladder TEXT,           -- 积分账到期阶梯 JSON [[epoch, 剩余积分]]（仅 CodeArts，展示用）；其余渠道 NULL
     quota_probed_at  INTEGER,
     token_expires_at INTEGER,                   -- access token 到期 epoch；NULL=老库未回填，0=未知
     token_issued_at  INTEGER,                   -- access token 签发 epoch（JWT iat）：进度条满量程与「最后续期」
@@ -155,12 +158,17 @@ CREATE TABLE IF NOT EXISTS growth_events (
 
 CREATE INDEX IF NOT EXISTS idx_growth_cred_ts ON growth_events(credential_id, ts);
 
--- 积分变动流水：额度探测写回时比对余额，只增记一条。
+-- 变动流水：额度探测写回时比对余额，每本账各增记一条。
 --
 -- 为什么靠 diff：签到 / 成长中心的上游接口普遍不打日志，拿不到「这次动作
 -- 加了多少分」。所以本表记的是**两次探测之间的净变化**，不是动作归因——
 -- source 只表达归因已知度（observed=常规探测区间 / sync=首次建立基线），
 -- 绝不写「签到 +5」这种上游并未告知的结论。
+--
+-- `ledger` 区分两本账：`pool`＝每日 token 池（福利模型用，CodeArts 之外
+-- 各渠道的主账）、`credits`＝积分账（CodeArts 内置模型用）。两本账数值
+-- 量级与语义都不同（每日池约 1000、积分账约 14000），混在一个列表里会被
+-- 读成同一本账的连续读数，故查询侧按它分开读。
 --
 -- before/after 可空：只在两端都拿得到数值时才记 delta；任一为 NULL 时
 -- 本行说明「变化无法量化」（如探测失败后恢复），不猜 0。
@@ -172,8 +180,10 @@ CREATE TABLE IF NOT EXISTS credit_events (
     before         REAL,                         -- 上次观测余额（可空）
     after          REAL,                         -- 本次观测余额（可空）
     delta          REAL,                         -- after - before，仅两端可算时非空
-    source         TEXT NOT NULL DEFAULT 'observed'
+    source         TEXT NOT NULL DEFAULT 'observed',
                    -- observed=两次探测间净变化 | sync=首次建立基线（无对照）
+    ledger         TEXT NOT NULL DEFAULT 'pool'
+                   -- pool=每日 token 池（福利模型）| credits=积分账（内置模型）
 );
 
 CREATE INDEX IF NOT EXISTS idx_credit_events_cred_ts
@@ -283,3 +293,6 @@ CREATE TABLE IF NOT EXISTS alert_events (
 
 CREATE INDEX IF NOT EXISTS idx_alert_ts ON alert_events(ts);
 CREATE INDEX IF NOT EXISTS idx_alert_rule_scope ON alert_events(rule, scope);
+-- 注：resolved_at 上的索引不在这里，因为它引用的列本身是迁移补的
+-- （见 src/db/migrate.py 的 _MIGRATION_INDEXES）——老库执行到本脚本时该列
+-- 尚未补上，CREATE INDEX 会 no such column。新库由迁移循环统一建。

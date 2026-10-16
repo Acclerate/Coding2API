@@ -430,6 +430,121 @@ async def test_alert_task_resolve_without_webhook_writes_only(tmp_path):
     db.close()
 
 
+# ------------------------------------------------- 重启后重建「告警中」集合
+
+
+def _task_after_restart(tmp_path, rows, **kwargs):
+    """先落库若干告警行、再构造任务：模拟「重启后进程内状态为空、库里仍有未恢复行」。"""
+    from src.db.conn import Database
+    from src.db.migrate import apply_schema
+    from src.db.repo import AlertRepository
+    from src.tasks.alerting import AlertTask
+    from src.tasks.status import TaskStatusStore
+    from tests.tasks._alerting_support import StubStats
+
+    db = Database(tmp_path / "alert.sqlite3")
+    apply_schema(db.connect())
+    alerts = AlertRepository(db)
+    for row in rows:
+        alerts.record(**row)
+    task = AlertTask(
+        kwargs.pop("credentials", _StubCredentials()),
+        alerts, kwargs.pop("stats", StubStats()),
+        task_status=kwargs.pop("status", TaskStatusStore()), **kwargs)
+    return task, alerts, db
+
+
+async def test_alert_task_rehydrates_and_resolves_after_restart(tmp_path):
+    """重启后重建「告警中」：条件已消失的历史未恢复行被正常标记恢复。
+
+    不重建的话恢复分支只遍历空的 `_active`，那行永远等不到 `resolved_at`
+    ——角标（数 `resolved_at IS NULL`）与「已恢复」标记就永久卡住。
+    """
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="池空", detail='{"ready": 0}', now=100)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),  # 已恢复
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0, now=lambda: 1000)
+    report = await task.run_once()
+    assert report["resolved"] == 1
+    assert alerts.recent()[0]["resolved_at"] == 1000
+    assert alerts.count_unresolved() == 0
+    db.close()
+
+
+async def test_alert_task_rehydrated_entries_keep_latest_row_per_key(tmp_path):
+    """同一 (rule, scope) 的多次提醒：重建按键去重、以最后一行为准，恢复时一起收尾。"""
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="第一次", now=100),
+         dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="第二次", now=200)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0, now=lambda: 1000)
+    assert list(task._active) == ["pool_empty:pool"]
+    assert task._active["pool_empty:pool"].message == "第二次"
+    assert (await task.run_once())["resolved"] == 1
+    assert alerts.count_unresolved() == 0
+    db.close()
+
+
+async def test_alert_task_rehydrated_entry_respects_silence_window(tmp_path):
+    """重建的「告警中」条目仍受静默窗约束：窗口内再次命中不重复落库。"""
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="旧", now=1000)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 0}),  # 仍命中
+        silence_minutes=lambda: 30, now=lambda: 1000)
+    report = await task.run_once()
+    assert report == {"evaluated": 1, "fired": 0, "suppressed": 1, "pending": 0,
+                      "resolved": 0, "delivered": 0}
+    assert len(alerts.recent()) == 1
+    db.close()
+
+
+async def test_alert_task_rehydrated_resolve_masks_pii(tmp_path):
+    """重建的历史行仍带 PII 片段：恢复通知外发时昵称要打码，不泄露原文。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task, _alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="token_expiring", severity=SEVERITY_WARNING, scope="cred_1",
+              message="凭证「a@b.c」即将到期",
+              detail=json.dumps({"nickname": "a@b.c"}), now=100)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0,
+        webhook_url=lambda: "https://hook.example/a", client=client,
+        now=lambda: 1000)
+    await task.run_once()
+    assert seen[-1]["status"] == "resolved"
+    assert "a@b.c" not in seen[-1]["message"] and "***" in seen[-1]["message"]
+    assert seen[-1]["detail"]["nickname"] == "***"
+    await client.aclose()
+    db.close()
+
+
+def test_alert_from_row_tolerates_dirty_detail():
+    """重建时 detail 可能是空串 / 非法 JSON / 非对象（历史脏行）——一律归空。"""
+    from src.tasks.alerting import _alert_from_row
+
+    base = {"rule": "pool_empty", "severity": SEVERITY_CRITICAL, "scope": "pool",
+            "message": "池空"}
+    for dirty in ("", "not-json", "[1, 2]", '"text"', None):
+        rebuilt = _alert_from_row({**base, "detail": dirty})
+        assert rebuilt.detail == {} and rebuilt.pii == ()
+    # 有 nickname 则反推出 PII 片段（恢复通知据此打码）
+    rebuilt = _alert_from_row({**base, "detail": json.dumps({"nickname": "a@b.c"})})
+    assert rebuilt.pii == ("a@b.c",)
+
+
 def test_sign_webhook_body_is_stable_hmac():
     from src.tasks.alerting import sign_webhook_body
 

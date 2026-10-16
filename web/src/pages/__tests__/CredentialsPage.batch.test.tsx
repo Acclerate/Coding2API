@@ -95,9 +95,35 @@ describe("CredentialsPage 批量运维", () => {
     await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("select-cb1"));
     await userEvent.click(screen.getByTestId("select-cb2"));
-    await userEvent.click(screen.getByTestId("batch-toggle"));
+    await userEvent.click(screen.getByTestId("batch-pause"));
     await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
     expect(batchCall(spy)).toEqual({ action: "toggle", ids: ["cb1", "cb2"], enabled: false });
+    expect(screen.getByTestId("credentials-batch-result")).toHaveTextContent("已暂停：成功 2 / 2");
+  });
+
+  it("批量取消暂停显式传 enabled=true（暂停后可放回池子）", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "toggle", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "cb1", ok: true }, { id: "cb2", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", enabled: 0 }),
+        makeCredential({ id: "cb2", enabled: 0 }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("select-cb2"));
+    await userEvent.click(screen.getByTestId("batch-resume"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    expect(batchCall(spy)).toEqual({ action: "toggle", ids: ["cb1", "cb2"], enabled: true });
+    // 与「暂停」共用 action=toggle，结果措辞必须按触发按钮而非 action 反查，
+    // 否则取消暂停会弹出「已暂停」
+    expect(screen.getByTestId("credentials-batch-result"))
+      .toHaveTextContent("已取消暂停：成功 2 / 2");
   });
 
   it("组头全选纳入本渠道全部账号，再次点击取消", async () => {

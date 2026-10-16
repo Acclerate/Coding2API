@@ -28,6 +28,7 @@ import type {
   StatsOverview,
   TimelinePoint,
   ModelTimelineResponse,
+  NavBadges,
   StatsEventsResponse,
   StatsEventFilters,
   CsvExport,
@@ -174,9 +175,9 @@ export const api = {
     request<GrowthRunResult>(`/api/credentials/${id}/growth`, { method: "POST" }),
   growthHistory: (id: string) =>
     request<{ events: GrowthEvent[] }>(`/api/credentials/${id}/growth`),
-  creditEvents: (id: string, sort?: string, order?: string) =>
+  creditEvents: (id: string, ledger?: string, sort?: string, order?: string) =>
     request<{ events: CreditEvent[] }>(
-      `/api/credentials/${id}/credit-events${query({ sort, order })}`),
+      `/api/credentials/${id}/credit-events${query({ ledger, sort, order })}`),
   reportActivity: (id: string) =>
     request<ActivityReportResult>(`/api/credentials/${id}/activity`, { method: "POST" }),
 
@@ -231,8 +232,17 @@ export const api = {
   /** 运维告警记录：后台评估命中后落库，倒序回看（分页）。 */
   alerts: (sort?: string, order?: string, limit?: number, offset?: number) =>
     request<AlertsResponse>(`/api/alerts${query({ sort, order, limit, offset })}`),
+  /** 人工标记一条告警已恢复（规则已下线 / 误报时的显式出口；admin + CSRF + 审计）。 */
+  resolveAlert: (id: string) =>
+    request<{ ok: boolean }>(`/api/alerts/${encodeURIComponent(id)}/resolve`,
+                             { method: "POST" }),
   /** 上游官方状态页聚合快照（进程内、重启归零）：只读展示，不参与选号 / 熔断。 */
   upstreamStatus: () => request<UpstreamStatusResponse>("/api/upstream-status"),
+  /**
+   * 侧栏「数据提醒」角标：一个聚合端点覆盖整个侧栏，避免 Layout 挂 7 个页面级
+   * hook。**按角色裁剪**——缺失的键 = 无权看（见 `NavBadges`）。
+   */
+  navBadges: () => request<NavBadges>("/api/nav-badges"),
   /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示（服务端分页 + 筛选）。 */
   modelCatalog: (sort?: string, order?: string, q?: string, onlyAvailable?: boolean,
                  limit?: number, offset?: number) =>

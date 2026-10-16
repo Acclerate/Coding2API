@@ -2,6 +2,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { api } from "../api/client";
 import type {
   CredentialsResponse,
+  NavBadges,
   StatsEventFilters,
   StatsMetric,
 } from "../api/types";
@@ -59,7 +60,7 @@ export function usePlaygroundModels() {
   });
 }
 
-/** OpenRouter 模型目录（模型列表页）：服务端分页 + 筛选，翻页保留上一页避免闪烁。 */
+/** OpenRouter 模型目录（模型列表页，operator）：服务端分页 + 筛选，翻页保留上一页避免闪烁。 */
 export function useModelCatalog(username?: string, sort?: string, order?: string,
                                 q?: string, onlyAvailable?: boolean,
                                 limit?: number, offset?: number) {
@@ -109,7 +110,7 @@ export function useAlerts(username?: string, refetchIntervalMs = 30_000,
 }
 
 /**
- * 上游状态页聚合快照（admin only）。轮询：状态页是「现在上游怎么样」，
+ * 上游状态页聚合快照（operator：admin / operator）。轮询：状态页是「现在上游怎么样」，
  * 用户停留时自动刷新；抓取由后端周期任务负责，前端不触发。
  */
 export function useUpstreamStatus(username?: string, refetchIntervalMs = 60_000) {
@@ -117,6 +118,21 @@ export function useUpstreamStatus(username?: string, refetchIntervalMs = 60_000)
     queryKey: adminKey(username, "upstream-status"),
     queryFn: api.upstreamStatus,
     refetchInterval: refetchIntervalMs,
+  });
+}
+
+/**
+ * 侧栏「数据提醒」角标（一个聚合端点，见 `api.navBadges`）。
+ *
+ * 60s 轮询：侧栏在每个页面都在，频率再高只是白打后端的几条 COUNT，而「待办」
+ * 本身不是秒级观测量。窗口聚焦时也刷一次——离开一阵回来该看到最新待办。
+ */
+export function useNavBadges(username?: string) {
+  return useQuery<NavBadges>({
+    queryKey: adminKey(username, "nav-badges"),
+    queryFn: api.navBadges,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -163,6 +179,23 @@ export function useRunTask(username?: string) {
     mutationFn: (key: string) => api.runTask(key),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: adminKey(username, "tasks") });
+    },
+  });
+}
+
+/**
+ * 人工标记一条告警已恢复（规则已下线 / 误报时的显式出口）。
+ *
+ * 成功后失效告警列表与侧栏角标：角标数 `resolved_at IS NULL`，不立刻回读会
+ * 让用户看到「点了但角标没变」。
+ */
+export function useResolveAlert(username?: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.resolveAlert(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: adminKey(username, "alerts") });
+      void client.invalidateQueries({ queryKey: adminKey(username, "nav-badges") });
     },
   });
 }

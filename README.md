@@ -16,6 +16,7 @@
 - **成长中心**（仅 CodeBuddy）：自动领 Buddy 旅行礼物、派 Buddy、领任务奖、断登补登、连登兑换、开盲盒；不可逆动作可用 `GROWTH_IRREVERSIBLE_ACTIONS=false` 关停；管理台可手动执行。
 - **脱敏统计**：不存对话内容；明细 90 天、小时汇总永久；按人/渠道/模型/凭证可视化；按 OpenRouter 刊例价估算成本（人民币为主）。
 - **上游状态聚合**：把各模型 / 网关提供方的官方状态页（OpenCode Zen、Kilo、DeepSeek、Together、Moonshot、MiniMax、OpenAI、Anthropic）归一化后并排展示，用于区分「上游整体故障」与「本服务凭证 / 额度问题」。只做解释、不参与选号 / 熔断；快照只存内存、重启归零。
+- **侧栏数据提醒**：侧栏对应项上显示待办计数角标（凭证需重登/耗尽、未恢复告警、上次失败任务、异常上游源、待激活账号、本人将到期 Key、模型目录陈旧），不点进去也能看到；只数「待办」、按角色裁剪，见[下文](#侧栏数据提醒导航角标)。
 - **管理台安全加固**：登录限流、CSRF 校验、请求体上限、Host 白名单。
 - **窄屏表格转卡片**：列多的表格（凭证 / 明细 / 模型列表等）在 <768px 自动由「一行 = 一张卡」呈现——列名收成一排可点的排序片，每个字段在自己行首显示字段名；DOM 不变，读屏语义与宽屏一致。
 
@@ -70,8 +71,8 @@ docker compose pull
 
 | 角色 | 能做什么 |
 |---|---|
-| `admin` | 用户管理、任务与配置、凭证读写、全部统计、审计日志、上游状态 |
-| `operator` | 凭证读写（含导入 / 删除 / 启停 / 签到 / 成长 / 切换账号）、全部统计 |
+| `admin` | 用户管理、任务与配置、凭证读写、全部统计、审计日志、上游状态、模型列表 |
+| `operator` | 凭证读写（含导入 / 删除 / 启停 / 签到 / 成长 / 切换账号）、全部统计、上游状态、模型列表 |
 | `viewer` | 只读：看仪表盘、凭证列表、统计与 Playground |
 
 **加人**：管理员填用户名 + 角色，创建后得到**一次性激活链接**（有效 24 小时，只显示这一次）。把链接经可信渠道发给本人，对方打开 `/activate` 自设密码即可登录——系统里不存在「管理员知道但用户不知道」的初始密码。忘记密码同理：点「重置密码」生成新链接。
@@ -96,7 +97,7 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
 
 ## 审计
 
-「审计日志」页（仅管理员可见）记录登录与写操作，可按操作者/动作筛选、分页查看：**登录**（成败都记）、**账号变动**（新建、激活、改角色、禁用/启用、改密、重置密码、硬删）与**凭证写操作**（导入、删除、启停、指定 pin、复活、切换账号）。每条含时间、操作者、动作、对象、说明与来源 IP。**绝不包含密码或令牌明文**（一次性激活令牌明文只在创建响应出现一次，库里只有 SHA-256 摘要）。保留期与请求明细一致（默认 90 天），由后台清理任务裁剪。
+「审计日志」页（仅管理员可见）记录登录与写操作，可按操作者/动作筛选、分页查看：**登录**（成败都记）、**账号变动**（新建、激活、改角色、禁用/启用、改密、重置密码、硬删）、**凭证写操作**（导入、删除、启停、指定 pin、复活、切换账号）与**告警人工处置**（标记恢复）。每条含时间、操作者、动作、对象、说明与来源 IP。**绝不包含密码或令牌明文**（一次性激活令牌明文只在创建响应出现一次，库里只有 SHA-256 摘要）。保留期与请求明细一致（默认 90 天），由后台清理任务裁剪。
 
 ## 使用
 
@@ -125,7 +126,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 2. **归一键**：剥掉免费档标记（`-free` / 路径段 `free`）与命名空间前缀，再 slug 化——`kilo-auto`、`longcat-2.5-preview`。模型列表按它判断**哪个是同一个模型**并合并，故 Zen 的免费档能与 TRAE 的付费档并成一条。
 3. **展示名**（`name`）：清洗后的可读文本，如 `LongCat 2.5 Preview`、`Kimi K3`。上游给了可读名就用（`Qwen3.8-Max` → `Qwen3.8 Max`），没有就从原代号派生；品牌与缩写按官方写法纠正（`DeepSeek` / `MiMo` / `GLM` / `GPT`）。
 
-`GET /v1/models` 里**所有条目的 `id` 都是归一键**，转发到某渠道时自动换回该渠道原代号，`by_provider.{渠道}.raw_id` 可见。**原代号、展示名、归一键三种写法都能直接请求**（`kmodel_latest`、`Kimi K3`、`kimi-k3` 指向同一模型）。同渠道内归一键重复时退回原代号，避免撞名误并。
+`GET /v1/models` 里**所有条目的 `id` 都是归一键**，转发到某渠道时自动换回该渠道原代号，`by_provider.{渠道}.raw_id` 可见。**原代号、展示名、归一键三种写法都能直接请求**（`kmodel_latest`、`Kimi K3`、`kimi-k3` 指向同一模型）。同渠道内归一键重复时退回原代号，避免撞名误并。**福利模型标记 `benefit`**：CodeArts 走每日免费 token 池的模型上游不给倍率，条目会带 `benefit: true`（单渠道在顶层、多渠道在 `by_provider.{渠道}`），Playground 据此在渠道徽章上打「福」标，与按积分计费的内置模型区分。
 
 ### 流式 usage 与思考 token
 
@@ -168,9 +169,13 @@ Playground 请求表单可选填 `temperature` / `max_tokens` / `reasoning_effor
 
 **令牌刷新是刚性的**：refresh_token 与 `client_id=codearts-agent`、DPoP 私钥三者绑定且**一次性**，刷新后必须回写新 refresh_token，否则账号失效；由 token 预刷新任务自动完成（DPoP ES256/P-256 签名）。预刷新窗口封顶 45 分钟且必须**宽于**轮询周期（`REFRESH_INTERVAL_MINUTES`，默认 30 分钟）。续期凭据被上游作废时，该凭证标记「需重新登录」并停止自动重试，重新登录后按「恢复」解除。
 
-**每日签到**：上游有「每日签到领 1000 积分」活动（`GET /v1/ops/delivery` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`）。后台任务每日自动领取，管理台可手动触发；`claim` 后**必须** `confirm`（`CLAIMED` 是「已领未确认」而非终态），本服务两步一起做。**这套积分与每日 token 池是两套并行的账**：token 池给福利模型（`deepseek-v4.1-flash` 等）用，积分给系统内置模型（GLM-5.2 / OpenPangu 等）用，互不通气。
+**每日签到**：上游有「每日签到领 1000 积分」活动（`GET /v1/ops/delivery` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`）。后台任务每日自动领取，管理台可手动触发；`claim` 后**必须** `confirm`（`CLAIMED` 是「已领未确认」而非终态），本服务两步一起做。**这套积分与每日 token 池是两套并行的账**：token 池给福利模型（`deepseek-v4.1-flash` 等）用，积分给系统内置模型（GLM-5.2 / OpenPangu 等）用，互不通气——两本账都在管理台显示（见下）。
 
 **优先消耗**：每日池用完即弃，故当日剩余登记为「次日本地 0 点到期」的到期额度，调度器优先排在其它渠道之前。上游按 token 计量，管理台统一显示为**积分**（1 积分 = 10000 token，每日池满额 = 1000 积分）；升级前落库的历史数据由 `scripts/convert_codearts_credit_unit.py` 一次性折算。**该「积分」是为跨渠道排序合成的折算值，与上游签到/套餐积分同名但不同物**。
+
+**两本账的展示**：CodeArts 在凭证页拆成两组，**每组只讲一本账**——**内置**组显示**积分账**（`GET {snap}/snap-manager/v1/statistics/plugin`，内置模型 GLM-5.2 / OpenPangu 等用），**福利**组显示**每日额度池**（token 折算，福利模型用）。两本账在上游是两个独立接口、互不通气、数值量级差一个数量级，故分到两组、各带悬浮口径说明，不混在一个数字里。积分账的分项包（`基础积分` / `按需积分` / `福利积分`）走「套餐 N 个」悬浮明细，并登记**套餐到期日**（`end_date`，实测每账号不同）的到期阶梯——积分用不完同样作废，故调度「快过期的先用」也会先烧积分。**积分账不参与健康度**（`health` 仍只看每日池），积分接口失败只记日志、不影响余额探测结果。**变动流水按账本分流**（`credit_events.ledger`）：内置组展开的是积分账流水，其余渠道与福利组展开的是每日池流水，两本账各记各的，混读会被当成同一本账的连续读数。
+
+**凭证页拆成两个渠道**：管理台把 CodeArts 拆成 **CodeArts 内置**（可写，承载全部操作与积分账）与 **CodeArts 福利**（只读，只展示每日 token 池）两组，同一批账号各出现一次。**这是纯前端的展示拆分，后端仍是一个 `codearts` 渠道**——`refresh_token` 一次性且与 `client_id` + DPoP 私钥绑定，拆成两条凭证行会让两条各自刷新一次、第二条必报 `the refresh token has been used` 并烧掉票据。两本账的区分轴是**模型**（`is_benefit_model()` 逐请求判断），不是渠道，故这一拆分只影响展示与操作入口。
 
 **签名 / 累计全文 SSE / 节流与并发**：上游要求华为云 `SDK-HMAC-SHA256`（AK/SK + `X-Security-Token`），白名单 `CODEARTS_ALLOWED_ENDPOINTS` 必须含 snap 引擎、STS、福利网关与门户四个主机。流式 `text` 是**累计全文（替换语义）**而非增量，本服务在解析层还原为增量事件，对客户端透明。默认 `CODEARTS_CHAT_MIN_INTERVAL=5`；上游硬限**每账号并发会话数 3**，故配在途上限 `CODEARTS_MAX_CONCURRENCY` 与滑动窗口 `CODEARTS_REQUEST_WINDOW_SECONDS`（每账号每 60s 最多启动 3 次），把突发挡在 `400 TM.00001041` 之前。均可热更。
 
@@ -197,6 +202,14 @@ PROVIDER_PROXIES="codebuddy=http://127.0.0.1:7890;qoder=socks5://127.0.0.1:1080"
 ```
 
 格式 `渠道=代理URL;渠道2=代理URL2`，渠道取七个渠道名，协议支持 `http/https/socks5/socks5h`，留空 = 全部直连。作用于该渠道**全部出站请求**（聊天流、额度/模型拉取、后台任务与 OAuth 登录）。**启动期项**，改后需重启。**严格解析**：未知渠道 / 非法协议 / 缺 `=` 一律启动失败——「以为走了代理其实直连」比启动报错更糟。环境变量 `HTTP_PROXY` 等一律**不采信**（`trust_env=False`，防部署环境全局代理意外劫持带 Token 的上游请求）。
+
+> ⚠️ **容器部署时 `127.0.0.1` 指容器自身，不是宿主**。代理跑在宿主上（Clash / mihomo 等）时必须写成 `host.docker.internal`：
+>
+> ```
+> PROVIDER_PROXIES="codebuddy=http://host.docker.internal:7897"
+> ```
+>
+> compose 已声明 `extra_hosts: host.docker.internal:host-gateway`（Docker Desktop 自带，Linux / Colima 需显式加）。解析只校验格式、**不校验可达**，所以地址写错不会启动失败，只会让该渠道全部请求连不上——务必用 `docker logs` 确认没有 `All connection attempts failed`。
 
 ## 出口协议
 
@@ -298,13 +311,15 @@ claude
 
 ## 凭证批量运维
 
-池子一大，「逐个点签到 / 探测」就不现实。凭证页提供多选 + 批量操作条：每行一个 checkbox、组头一个「全选本渠道」，勾选后顶部出现操作条（探测额度 / 每日签到 / 暂停 / 恢复 / 取消选择）。
+池子一大，「逐个点签到 / 探测」就不现实。凭证页提供多选 + 批量操作条：每行一个 checkbox、组头一个「全选本渠道」，勾选后顶部出现操作条（探测额度 / 每日签到 / 暂停 / 取消暂停 / 恢复 / 取消选择）。
 
 - **后端批量端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive", ids: [...], enabled?}`（`enabled` 仅 `toggle` 用）。一次请求最多 200 条，重复 id 自动去重。
 - **逐条隔离**：单条失败不影响其余条——凭证不存在、渠道不支持该能力、上游报错都只体现在该条结果里，其余条照常执行。响应为 `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`：`ok` 表示该条动作是否成功；`error` 表示这条根本没执行到上游（`credential not found` / `credential does not support ...` / `action_failed`），`detail` 是动作自身的返回体（probe 的剩余额度、checkin 的积分与状态）。
-- **暂停是显式状态而非取反**：批量「暂停」对所有选中项传 `enabled=false`，不会让「已启用 + 已暂停」的混选走向相反方向。
+- **暂停是显式状态而非取反**：`toggle` 的 `enabled` 由请求体显式给出，不会让「已启用 + 已暂停」的混选走向相反方向。因此操作条把 `toggle` 拆成**「暂停」（`enabled=false`）与「取消暂停」（`enabled=true`）两个按钮**——只给一个按钮的话，批量暂停后再无入口放回池子（`revive` 清的是硬禁用 `disabled`，不碰 `enabled`）。
+- **「恢复」与「取消暂停」是两件事**：前者是 `revive`（解除渠道判定会话失效后的系统硬禁用，需先重新登录），后者是 `toggle enabled=true`（把管理员手动暂停的号放回调度）。
 - **只收已有单条端点的动作**：`refresh`（token 预刷新）没有单条入口且由后台按到期窗口驱动，批量强刷会白耗一次性票据；`delete` 破坏性太强，需要单独的二次确认流，都不走这个通道。
-- **审计只记一条汇总**（`toggle` / `revive`）：批量暂停 50 个号是一次操作、一个意图，逐条落库会把审计流水刷成噪声。`probe` / `checkin` 与单条端点同为只读语义，不写审计。
+- **审计只记一条汇总**（`toggle` / `revive`）：批量暂停 50 个号是一次操作、一个意图，逐条落库会把审计流水刷成噪声。`probe` / `checkin` 与单条端点同为只读语义，不写审计。`toggle` 的 detail 带方向（`批量 toggle（暂停）：N/M 成功`），否则暂停与取消暂停在流水里无法区分。
+- **审计写失败不影响操作结果**：审计落库失败只记 warning，端点仍返回逐条结果。逐条变更此时已提交生效，因留痕失败返回 500 会让操作员误以为整批没跑。
 
 ## 凭证限额护栏
 
@@ -336,8 +351,9 @@ claude
 - **筛选工具条**：搜索（昵称 / 渠道 / id，忽略大小写）× 渠道 × 状态 × 标签四件套。四者是 **AND** 关系，纯前端收敛，不改后端排序（后端仍按 `sort` / `order` 给全量）。命中时显示「筛选后 N / 总数」，并提供「清空」；无匹配给空态而非空白表格。渠道 / 状态 / 标签下拉里的计数来自当前全量，切换筛选不会自我缩窄。**标签下拉只在池里真的出现过标签时渲染**（没有标签时不留一个恒为「全部标签」的空控件）；标签是结构化维度，**不参与搜索词匹配**——否则「查一个恰好叫『生产』的昵称」会变得不可能。
 - **标签**：每条凭证可贴任意个运维标签（逗号分隔，最多 16 个、单个 ≤ 24 字符；半角/全角逗号与分号都当分隔符），入口在行内「更多操作 → 设置标签」。标签**只用于列表筛选与展示**，不参与选号、不改变任何请求行为——把标签当策略用会让改名静默改变线上流量。行内最多列两个标签，多余收成 `+N` 并在悬浮里给全量。
 - **组排序**：单独一个控件，只重排「渠道组」，不动组内行序（行序仍由列头 / 后端 `sort` 决定）。默认**额度从高到低**，按组内额度剩余合计排名，让还能打最多的渠道排前面；可切回**渠道顺序**（固定，30s 轮询不会让组头乱跳）。无额度接口的免费层垫底（不当 `0` 参与比较），额度相同（含都为 null）时回落到渠道顺序。
-- **按渠道分组**：列表按渠道聚合，组头做成一张紧凑的「渠道仪表盘」——品牌图标 + 渠道名 + 账号数，加上**状态分布**（图标 + 计数，只列出现过的态，口径与行内状态徽章同一套 `credentialState`）、**额度合计**（占比环 + 数字；环是纯图形仪表，精确百分比写在「额度合计」标签行，对组内非 null 值求和，免费层 zen / kilo 无额度接口时显示 `—` 而不是 `0`，也不出环），以及**到期积分**（主窗口 1.5 天一块，次窗口 7 天仅在**比主窗口多**时再出一块——次窗口是主窗口的超集，数字相同说明没有超出 1.5 天的部分，CodeArts 每日池当天清零、两窗口恒等，就只列一块，不把同一个数字说两遍）。点组头折叠 / 展开该渠道，**默认全折叠**（首屏先看结构，要看具体账号再展开）；筛选生效时自动展开命中渠道，清空筛选回到折叠总览。组顺序默认「额度从高到低」，也可用工具条切到固定的全站渠道顺序（CodeBuddy、TRAE 在前），不随行排序键变化。渠道名只出现在组头，行内不重复。
+- **按渠道分组**：列表按渠道聚合，组头做成一张紧凑的「渠道仪表盘」——品牌图标 + 渠道名 + 账号数，加上**状态分布**（图标 + 计数，只列出现过的态，口径与行内状态徽章同一套 `credentialState`）、**额度合计**（占比环 + 数字；环是纯图形仪表，精确百分比写在「额度合计 / 积分合计」标签行，对组内非 null 值求和，免费层 zen / kilo 无额度接口时显示 `—` 而不是 `0`，也不出环），以及**到期积分**（主窗口 1.5 天一块，次窗口 7 天仅在**比主窗口多**时再出一块——次窗口是主窗口的超集，数字相同说明没有超出 1.5 天的部分）。点组头折叠 / 展开该渠道，**默认全折叠**（首屏先看结构，要看具体账号再展开）；筛选生效时自动展开命中渠道，清空筛选回到折叠总览。组顺序默认「额度从高到低」，也可用工具条切到固定的全站渠道顺序（CodeBuddy、TRAE 在前），不随行排序键变化。渠道名只出现在组头，行内不重复。**额度合计按本组那本账取**：CodeArts 内置组是积分账合计（标签写「积分合计」），其余组是每日池合计。
 - **列头跟着展开区走**：没有全局表头，列头（含排序按钮与列说明）渲染在每个展开的渠道组内部，并在滚动容器里吸顶——折叠态下组头本身就是总览，列名没有对应内容，只有展开某组时才需要「这一列是什么」的锚点。同一时间可能有多个组展开，各组列头共用同一套排序状态（点任一处都写回同一个后端 `sort` 参数）。**「成长中心」列只在支持的渠道（CodeBuddy）出现**，其余渠道留一个空占位格——列数保持恒定，否则 auto 布局会重算列宽、下面展开的组整列错位。
+- **CodeArts 拆成两个渠道组**：**CodeArts 内置**（可写，承载全部操作、积分入口、积分账与套餐明细）与 **CodeArts 福利**（只读，只展示每日 token 池），同一批账号各出现一次，组头 label 带「内置 / 福利」后缀，内置在前。**两组各讲一本账**：内置组额度列是积分账（`积分 x / y`，排序键 `quota_credits_remaining`），福利组是每日 token 池；变动流水入口也按账本读（内置组读 `ledger=credits`，福利组不渲染入口）。**到期积分也按账本拆**：后端把两段合并阶梯分开存（积分那一段另存 `quota_credits_expiry_ladder`），福利组读每日池那一段、内置组读积分账那一段，两组各显各的、互不串账。福利组收掉探测 / 签到 / 更多操作、积分记录入口与套餐明细，但**列数不变**：组头与行内的选择框仍渲染，只是置为**禁用**——空占位格的内容宽度与内置组不同，表格 auto 布局下本行各列起点会与内置组错开，同尺寸的禁用框才能真正对齐。这是**纯前端展示拆分，后端仍是一个 `codearts` 渠道**（`refresh_token` 一次性，拆两条会互相烧票），两本账的区分轴是模型而非渠道。
 - **长列表可滚**：表格限高（70vh），滚到第 20 行时该组的吸顶列头与「操作」按钮仍在。
 
 额度列的数字带虚线下划线：悬浮显示**本行的周期口径**（本周期剩余 / 账户剩余 / 每日额度池 / 免费层无额度接口），逐行的同款文案收进悬浮说明。
@@ -358,7 +374,7 @@ Playground 与 `GET /v1/models` 走 **stale-while-revalidate**：有缓存立刻
 
 ### 管理台「模型列表」页
 
-管理台「模型列表」页（`GET /api/model-catalog`）只读展示 OpenRouter 公开目录：刊例价（输入 / 输出 / 缓存读 / 缓存写，USD / 百万 token，可切人民币）、上下文·输出上限、输入→输出模态、能力（推理 / 工具调用 / 附件 / 结构化输出）、知识截止，以及 **Artificial Analysis 三项指数**（综合智能 / 编程 / 智能体，经 OpenRouter 公开接口，**非本服务实测**，不做排序）。目录缺失时页面显示空态，不影响聊天与成本。
+管理台「模型列表」页（`GET /api/model-catalog`，管理员 / 操作员可见）只读展示 OpenRouter 公开目录：刊例价（输入 / 输出 / 缓存读 / 缓存写，USD / 百万 token，可切人民币）、上下文·输出上限、输入→输出模态、能力（推理 / 工具调用 / 附件 / 结构化输出）、知识截止，以及 **Artificial Analysis 三项指数**（综合智能 / 编程 / 智能体，经 OpenRouter 公开接口，**非本服务实测**，不做排序）。目录缺失时页面显示空态，不影响聊天与成本。
 
 OpenRouter 收录数百条，其中多数本服务没接。每行带 `available` 布尔（该模型是否**当前渠道真能提供**，口径与 `/v1/models` 一致），页面提供**默认关闭**的「只看当前渠道」开关，勾选后本地收窄到当前渠道获取到的模型（不重新请求）。
 
@@ -366,17 +382,39 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ### 管理台「上游状态」页
 
-管理台「上游状态」页（`GET /api/upstream-status`，仅管理员可见）聚合各模型 / 网关提供方的**官方状态页**，回答「这个报错是上游整体挂了，还是我这边凭证 / 额度的问题」——本服务自己的 429/5xx 冷却只能回答「这个号现在不行」，官方状态页补上另一半。
+管理台「上游状态」页（`GET /api/upstream-status`，管理员 / 操作员可见）聚合各模型 / 网关提供方的**官方状态页**，回答「这个报错是上游整体挂了，还是我这边凭证 / 额度的问题」——本服务自己的 429/5xx 冷却只能回答「这个号现在不行」，官方状态页补上另一半。
 
 - **来源**：OpenCode Zen（自定义 JSON，**逐模型 TTFT / tps**）、Kilo、Moonshot / Kimi、MiniMax、OpenAI、Anthropic（Statuspage v2）、Together AI（Better Stack JSON:API）、DeepSeek（Atom 事故史）。按 `scope` 分两组展示：`channel`（与本站渠道一一对应，如 zen / kilo）排在 `model`（经渠道间接使用）之前。
 - **归一化六档**：`operational` / `degraded`（性能下降）/ `partial`（部分中断）/ `major`（重大故障）/ `maintenance`（维护中）/ `unknown`（抓取失败）。Statuspage 的 `critical` 并入 `major`。整体档位取**最差**的源，但 `unknown` 排最后——一个源连不上不该压过其余源报出的真实故障。
 - **只做解释、不做决策**：官方状态页滞后于本服务的实时冷却（模型级冷却见 `src/provider/kilo/client.py`），把它并入选号 / 熔断只会让调度更慢更糊涂。
-- **只存内存、不落盘**：状态数据分钟级易变，重启后拿一份几小时前的「一切正常」比显示「尚未抓取」危险得多。抓取由后台任务（`UPSTREAM_STATUS_MINUTES`，默认 5 分钟）负责，单源失败只在该源卡片上标错误原因，绝不让整轮抛异常。
+- **只存内存、不落盘**：状态数据分钟级易变，重启后拿一份几小时前的「一切正常」比显示「尚未抓取」危险得多。抓取由后台任务（`UPSTREAM_STATUS_MINUTES`，默认 5 分钟）负责，单源失败只在该源那一行标错误原因，绝不让整轮抛异常。
+- **版式按「先结论、后明细」收敛**：顶部概况条给整体档位 + 档位分布 + 抓取运行态；下面按 `scope` 分两组、一行一个源（**异常源默认展开**，正常源折成一行摘要），另有「需要关注」条把非正常源提到最前面并锚点跳转。OpenCode Zen 逐模型展开 TTFT / tps，其余源给逐组件档位；单源组件明细超过 6 项时截断（**异常项排前面**，不会被折在「显示全部」后面），事故列表里进行中默认铺开、已恢复折进计数按钮。
 - **本页不覆盖**仅提供 HTML、无稳定机器可读端点的源（Groq、腾讯云、阿里云、华为云、SiliconFlow、Qoder、智谱、TRAE）——加源前先确认端点能稳定返回 JSON / XML，否则等于每天修一次 HTML 解析。
 
 ### token 到期展示
 
 凭证列表的 **token 剩余**列显示 access token 距到期还有多久，低于 `TOKEN_EXPIRY_WARNING_SECONDS`（默认 1 小时）标红。到期时间优先取上游 `expires_at`，缺失时回落 JWT `exp`；都取不到显示 `—`，**不猜本地 TTL**（否则是凭空捏造的预警）。
+
+## 侧栏数据提醒（导航角标）
+
+管理台侧栏（`web/src/components/Sidebar.tsx`）在每个页面都在。多个**不点进去就发现不了**的待办态（告警未恢复 / 后台任务失败 / 凭证需重登）在这里显示成计数角标，由单个聚合端点 `GET /api/nav-badges` 一次返回，侧栏 60s 轮询（不挂 7 个页面级 hook，避免反复拉全量列表）。
+
+| 导航项 | 门槛 | 角标口径 |
+|---|---|---|
+| 凭证管理 | operator+ | `disabled`（需重新登录）**或** `health < 0`（额度耗尽）的凭证数 |
+| 运维告警 | admin | `resolved_at IS NULL`（**仍在告警中**）的条数 |
+| 任务与配置 | admin | `enabled` 且**上次执行失败**（`last_ok === false`）的任务数 |
+| 上游状态 | operator+ | `summary.abnormal`（含维护中）；色调随整体档位（维护=黄，部分/整体故障=红） |
+| 用户管理 | admin | 有激活令牌（`activation_digest IS NOT NULL`）的账号数 |
+| API Key | 全员（仅本人） | 已过期或 **7 天内**到期的 Key 数 |
+| 模型列表 | operator+ | 快照陈旧标记（布尔文字「陈旧」，非计数） |
+
+- **按角色裁剪**：后端只下发当前角色有权看的键，**缺失 = 无权看**（不是 0），前端据此不渲染。凭证角标刻意不下发给 viewer——能看列表但无写权限，露出角标只会误导。
+- **与各页面数据不是同一口径**：角标只数「待办」。例如告警页 `total` 含已恢复历史，角标只数未恢复的；任务用「上次失败」（首次失败即提示）而非告警规则的「连续失败 ≥ 阈值」；`last_ok === null`（从未运行）与已关闭的任务都不计。
+- **凭证角标 ≠ `/healthz` 的可用数**：后者复用调度器 `is_selectable`，只看 disabled / enabled / cooling、**不看 health**，所以额度耗尽的号在 `/healthz` 里仍算 `ready`。两者不一致是刻意的。
+- **告警角标会自愈**：`AlertTask` 启动时从库里未恢复的行重建「告警中」集合，所以重启前落库、条件已消失的告警仍会被正常标记恢复；同一次故障期间的「提醒」行在恢复时一并收尾。详见 TECHNICAL.md 的「迟滞与恢复」。
+- **模型目录陈旧**：从未拉取（`price_saved_at` 为空）不算陈旧（新装部署不该一上来就报警）；已拉过但超过 **2 倍** `OPENROUTER_CATALOG_MINUTES` 未刷新才算。
+- 角标窗口（API Key 7 天）是后端模块常量，不做热更；不点进去也能看到待办，点进去即是可行动页面。
 
 ## 统计
 
@@ -399,7 +437,9 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ### 积分记录
 
-凭证**额度**列数字后的下箭头展开「积分记录」，记录**两次额度探测之间的净变化**，不是动作归因：签到、成长、对话都会改余额而上游不打日志，探测只能看到区间净变化，界面一律写「净变化」而非「签到 +5」。首次探测只建基线；余额没变不记；余额变「未知」仍记但不填变化量；保留 90 天。
+凭证**额度**列数字后的下箭头展开「变动流水」，记录**两次额度探测之间的净变化**，不是动作归因：签到、成长、对话都会改余额而上游不打日志，探测只能看到区间净变化，界面一律写「净变化」而非「签到 +5」。首次探测只建基线；余额没变不记；余额变「未知」仍记但不填变化量；保留 90 天。
+
+**按账本分流**：CodeArts 有两本账（每日 token 池 / 积分账），流水表因此带 `ledger` 列（`pool` / `credits`），同一轮探测为每本账各记一条。内置组展开的是积分账流水（`ledger=credits`），其余渠道与福利组展开的是每日池流水（`ledger=pool`）；接口 `GET /api/credentials/{id}/credit-events` 用 `ledger` 查询参数选账本（缺省 `pool`，未知取值回落 `pool`）。**必须分开读**：两本账数值量级差一个数量级，混在一个列表里会被当成同一本账的连续读数。老库升级时历史流水一律归 `pool`——它们本就由每日池的探测 diff 产生。
 
 ### 分组维度与重新汇总
 
@@ -442,6 +482,24 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 CodeBuddy 成长中心的「连登天数 / 活跃地图」按日统计客户端对话事件，账号长期只被本网关自动调用时会断连登。`ACTIVITY_REPORT_ENABLED=true` 时，后台任务在每天 `ACTIVITY_REPORT_HOUR`（默认 10 点）所在整点窗口为每个账号补发**一条** `chat_request_send` 事件续上连登——与积分、调度无关，上报失败不影响聊天请求。凭证行内菜单也可手动补报一次。适用于 CodeBuddy 与 CodeBuddy 国际版。
 
 > ⚠️ **风险与限制**：官方活动条款禁止用模拟器 / 脚本篡改活动数据，处罚为**取消资格并追回已发礼品**。默认关闭，开启前请自行评估账号风险。事件名与请求形状依赖上游实现，**上游改版即失效**，不承诺任何收益，不作为可靠性功能。实测（2026-09-21）：缺少 `userId` 时上游返回 HTTP 200 `{"code":0}` 却**静默丢弃**；OAuth 凭证的 `user_id`/`account_uid` 可能为空，此时回落取 bearer JWT 的 `sub`，仍缺失则跳过（不编造）。
+
+### 运维告警
+
+后台周期评估四类风险并落 `alert_events`（管理台「运维告警」页回看，admin-only）：
+
+| 规则 | 触发条件 |
+|---|---|
+| `pool_empty` | 池里有凭证但可用数少于 `ALERT_POOL_READY_MIN` |
+| `task_failed` | 某后台任务连续失败达到 `ALERT_TASK_FAILURES` 次（成功一轮清零） |
+| `token_expiring` | 某凭证 token 剩余寿命落在 `ALERT_TOKEN_EXPIRY_HOURS` 内 |
+| `error_rate` | 统计窗内上游失败占比达到 `ALERT_ERROR_RATE_THRESHOLD` 且样本足够 |
+
+- **静默窗**（`ALERT_SILENCE_MINUTES`）：同一 `(规则, 对象)` 窗口内只落库 / 推送一次，避免周期性评估把记录刷屏。
+- **迟滞**（`ALERT_FOR_TICKS` / `ALERT_CLEAR_TICKS`）：连续命中若干轮才真正告警，连续未命中若干轮才确认恢复。恢复时给该 `(规则, 对象)` **全部尚未恢复**的行写 `resolved_at`（同一次故障的「提醒」行一起收尾），并外推一条 `status="resolved"` 的 webhook；页面把 `resolved_at` 非空的行显示为「已恢复」。
+- **重启自愈**：迟滞**计数**进程内维护、重启归零重新累积；但「当前哪些告警未恢复」是已落库的事实，`AlertTask` 启动时从库里未恢复的行重建，所以重启前落库、条件已消失的告警仍会被正常标记恢复。
+- **人工处置**：页面每行未恢复的告警带「标记恢复」按钮（`POST /api/alerts/{id}/resolve`，admin + CSRF + 审计），用于规则已下线 / 误报等后台无法自动判定的情况。只标该行，不按 `(规则, 对象)` 批量——同组可能还有仍在告警的记录。
+- **保留期**：与请求明细一致（默认 90 天），由后台清理任务裁剪。
+- webhook 地址与各阈值见「任务与配置」页的「运维告警」卡片。
 
 ### 数据库备份与恢复
 
@@ -518,7 +576,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `ENABLE_DOCS` | `false` | 是否暴露 `/docs` 与 `/openapi.json`（默认关闭） |
 | `DUMP_REQUEST_BODIES` | `false` | 诊断：把 `/v1` 原始请求体落盘到 `data/dumps/`（**含对话内容**，仅排查用） |
 | `LOG_LEVEL` | `INFO` | 日志级别；审计日志是 INFO 级，调到 `WARNING` 会一并关掉 |
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址与端口（compose 默认 `0.0.0.0`） |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址与端口（compose 默认 `0.0.0.0`）。compose 里 `PORT` 同时决定**容器内监听端口与宿主机映射端口**（两侧一致，改一个即可） |
 | `CODEBUDDY_API_ENDPOINT` | `https://copilot.tencent.com` | CodeBuddy 上游地址；改动时必须同时加入 `CODEBUDDY_ALLOWED_ENDPOINTS` |
 | `CODEBUDDY_ALLOWED_ENDPOINTS` | 官方两站（见 compose） | 上游端点白名单，真实 Token 只发往白名单内地址 |
 | `CODEBUDDY_INTL_API_ENDPOINT` | `https://www.codebuddy.ai` | CodeBuddy 国际版上游地址；改动时必须同时加入 `CODEBUDDY_INTL_ALLOWED_ENDPOINTS` |
@@ -533,7 +591,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `QODER_ALLOWED_ENDPOINTS` | 国内 openapi+gateway + 国际版（见 compose） | Qoder 端点白名单，带 COSY 签名的请求只发往白名单内地址 |
 | `CODEARTS_API_ENDPOINT` | `https://snap-access.cn-north-4.myhuaweicloud.com` | CodeArts snap 引擎地址；改动时必须同时加入 `CODEARTS_ALLOWED_ENDPOINTS` |
 | `CODEARTS_ALLOWED_ENDPOINTS` | snap 引擎 + STS + 福利网关 + 门户（见 compose） | CodeArts 端点白名单，AK/SK 签名请求只发往白名单内地址 |
-| `PROVIDER_PROXIES` | `""` | **按渠道出站代理**（启动期项，改后需重启）；留空 = 全部直连 |
+| `PROVIDER_PROXIES` | `""` | **按渠道出站代理**（启动期项，改后需重启）；留空 = 全部直连。容器内 `127.0.0.1` 指容器自身，代理跑在宿主时须写 `host.docker.internal` |
 | `CODEBUDDY_CHAT_MIN_INTERVAL` | `5` | CB 聊天节流器最小间隔（秒）：按凭证分桶、**桶内允许并发**，只在同凭证顺序连发时补足间隔；`0` 关闭 |
 | `CODEBUDDY_INTL_CHAT_MIN_INTERVAL` | `5` | CB 国际版聊天最小间隔（秒），**独立**节流器；`0` 关闭 |
 | `ZEN_CHAT_MIN_INTERVAL` | `0` | Zen 聊天最小间隔（秒），独立节流器，默认关闭 |
@@ -574,7 +632,15 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
   mkdir -p data secrets && sudo chown -R 1001:1001 data secrets
   ```
 
-- **时区**：镜像默认 `TZ=Asia/Shanghai`；如需其它时区显式覆盖 `TZ`。
+- **时区**：镜像默认 `TZ=Asia/Shanghai`，`.env` 里的 `TZ` 会透传进容器（compose 已声明该变量）。签到 / 额度周期按「今天 9 点」判断，务必与宿主一致；基础镜像已装 `tzdata`，否则 `TZ` 会被静默忽略、退回 UTC。
+
+- **端口**：compose 里 `PORT` 同时决定容器内监听端口与宿主机映射端口，改一个即可（如 `PORT=9000` → 宿主 9000、容器内也监听 9000）。健康检查同步跟随，无需手工改。
+
+- **改代码后重建镜像**：compose 同时声明 `build: .` 与 `image:`，`docker compose up -d` **不带 `--build`** 会直接用本地已存在的 `ghcr.io/robbsluo/coding2api:latest`，跑的是旧代码。改 `src/` 或前端后务必：
+
+  ```bash
+  docker compose up -d --build
+  ```
 
 ### 升级后必须重启后端
 
@@ -606,6 +672,78 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users
 ```
 
 > **部署相关操作记在本地文档**：当前开发机的进程管理方式、路径与工具版本等见 `docs/local-environment.md`。该目录已在 `.gitignore` 中，**克隆仓库的人不会有这个文件**。
+
+## 公网入口（VPS + frp 反向隧道）
+
+家宽在 CGNAT 后没有可入站地址，公网入口只能由内网侧**主动连出**建隧道。
+Cloudflare Tunnel 免费版会把大陆流量绕到洛杉矶边缘（实测端到端 1.1–2.4s、丢包约 60%），
+换成「境外 VPS 做入口 + frp 隧道回源」后，端到端降到 80–150ms。**只改入站链路**：
+出站到上游仍走本机 `PROVIDER_PROXIES`，不受影响。
+
+```
+客户端 ──443/TLS──> VPS(nginx) ──frp 隧道──> 家中 Mac:8000
+```
+
+产物在 `deploy/frp/`（frps/frpc 配置）、`deploy/nginx/`（反代 + TLS）、
+`deploy/systemd/frps.service`（VPS 侧）、`deploy/launchd/com.coding2api.frpc.plist`
+（Mac 侧）。配置格式为 frp v0.71.1 的 TOML。
+
+### VPS 侧（Linux + systemd）
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+# 从 https://github.com/fatedier/frp/releases 取 linux_amd64 包，解出 frps
+sudo install -m 755 frps /usr/local/bin/frps
+
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
+sudo install -d -m 755 /etc/frp
+sudo install -m 644 deploy/frp/frps.toml /etc/frp/frps.toml
+# 两侧共用的 token（客户端安装时用同一个值）
+openssl rand -hex 32 | sudo tee /etc/frp/frps-token >/dev/null
+sudo chmod 600 /etc/frp/frps-token && sudo chown frps:frps /etc/frp/frps-token
+
+sudo install -m 644 deploy/systemd/frps.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now frps
+
+# nginx：把 __TUNNEL_DOMAIN__ 换成实际域名后安装
+sed 's/__TUNNEL_DOMAIN__/ai-api.example.com/g' deploy/nginx/coding2api.conf \
+    | sudo tee /etc/nginx/sites-available/coding2api.conf >/dev/null
+sudo ln -sf /etc/nginx/sites-available/coding2api.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d ai-api.example.com     # 签发证书并自动配置续期
+```
+
+DNS 侧把域名 A 记录指向 VPS 公网 IP；境外 VPS 无需 ICP 备案。
+
+### 家中 Mac 侧（launchd）
+
+```bash
+brew install frp                                # 或自行下载并设置 FRPC_BIN
+./scripts/install-frpc.sh --server <VPS 公网地址> --token <与 VPS 一致的 token>
+launchctl print gui/$(id -u)/com.coding2api.frpc | grep -E 'state|pid'
+./scripts/install-frpc.sh --uninstall           # 卸载
+```
+
+`deploy/frp/frpc.toml` 用 frp 原生的 `{{ .Envs.FRP_SERVER_ADDR }}` 模板取值，
+仓库里不含任何机器特定值；地址与 token 文件路径由 plist 注入，token 落在
+`secrets/frpc-token`（600，已在 `.gitignore` 中），不进 plist——`launchctl print`
+会把 plist 原样打印出来。
+
+### `.env` 要同步的三处
+
+| 变量 | 值 | 漏了会怎样 |
+|---|---|---|
+| `ALLOWED_HOSTS` | 追加隧道域名 | 隧道侧所有请求 400 `invalid host header` |
+| `PUBLIC_BASE_URL` | `https://<隧道域名>` | TRAE 登录回调基址错、https 下不下发 HSTS |
+| `HOST` | 保持 `127.0.0.1` | 隧道回源到本机回环即可，**不必**绑 `0.0.0.0` |
+
+`TRUST_PROXY`：VPS 上恰好一层 nginx，可置 `true`，让 API Key 的 `allowed_ips`
+看到真实客户端 IP（nginx 已转发 `X-Forwarded-For`）。若仍需保留局域网直连入口，
+保持 `false`——否则同网段可伪造 XFF 绕过白名单。
+
+> 改完 `.env` 必须重启服务才算生效（见上「部署注意」）。
+> frpc 与 frps 的日志都走 stdout → Mac 侧 `logs/frpc.*.log`（newsyslog 轮转，
+> `deploy/newsyslog/coding2api.conf` 已含两条规则）/ VPS 侧 journald。
 
 ## 日志
 

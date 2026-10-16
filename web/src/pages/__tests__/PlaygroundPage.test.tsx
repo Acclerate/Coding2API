@@ -206,9 +206,9 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     // 无倍率数据：只显示渠道徽章，不显示倍率
     const noRate = screen.getByTestId("model-option-no-rate@trae");
     expect(noRate).toHaveTextContent("TRAE");
-    // 无倍率数据：渠道徽章里没有倍率块（免费/「x」数字）
+    // 无倍率数据：渠道徽章里没有倍率块（「免」/「x」数字）
     expect(noRate.querySelector('[data-testid="channel-pill-trae"]')).toBeInTheDocument();
-    expect(noRate.textContent).not.toMatch(/x\d|免费/);
+    expect(noRate.textContent).not.toMatch(/x\d|免/);
   });
 
   it("多渠道徽章不挤压模型名：名称保底宽度、徽章在右侧折行", async () => {
@@ -292,7 +292,39 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByText("没有匹配的模型")).toBeInTheDocument();
   });
 
-  it("免费模型（x0）的倍率块显示「免费」，单渠道当前选择条不打自动路由标", async () => {
+  it("福利模型（CodeArts 每日池）在渠道徽章打「福」标，多渠道只标该渠道", async () => {
+    const BENEFIT_MODELS = {
+      object: "list",
+      data: [
+        {
+          id: "deepseek-v4.1-flash", object: "model", owned_by: "Coding2API",
+          providers: ["codearts", "trae"],
+          by_provider: {
+            codearts: { raw_id: "deepseek-v4.1-flash", benefit: true },
+            trae: { raw_id: "deepseek-v4.1-flash", credit_rate: 0.08 },
+          },
+        },
+        {
+          id: "benefit-only", object: "model", owned_by: "Coding2API",
+          providers: ["codearts"], benefit: true,
+        },
+      ],
+    };
+    mockFetch({ "/api/playground/models": BENEFIT_MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    // 多渠道：只有 codearts 那侧打「福」标（trae 侧不打）
+    const dual = screen.getByTestId("model-option-deepseek-v4.1-flash");
+    expect(within(dual).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
+    expect(within(dual).queryByTestId("channel-benefit-trae")).not.toBeInTheDocument();
+
+    // 单渠道福利：顶层 benefit 也打「福」标
+    const single = screen.getByTestId("model-option-benefit-only@codearts");
+    expect(within(single).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
+  });
+
+  it("免费模型（x0）的倍率块显示「免」，单渠道当前选择条不打自动路由标", async () => {
     const FREE_MODELS = {
       object: "list",
       data: [
@@ -308,7 +340,7 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
 
     const current = screen.getByTestId("model-current");
     expect(current).toHaveTextContent("kilo-auto/free");
-    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免费");
+    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免");
     // 单渠道模型不显示「自动路由」标
     expect(current).not.toHaveTextContent("自动路由");
   });

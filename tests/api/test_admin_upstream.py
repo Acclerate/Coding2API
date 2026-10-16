@@ -1,11 +1,13 @@
 """上游状态页只读端点：GET /api/upstream-status。
 
-守着三件事：**admin-only**、**未抓取时给空快照而不是 500**、**周期/开关取当前
-生效值**（热更后立刻反映，与「任务与配置」页同一口径）。
+守着四件事：**operator-only（admin / operator）**、**未抓取时给空快照而不是
+500**、**周期/开关取当前生效值**（热更后立刻反映，与「任务与配置」页同一口径）、
+以及**viewer 一律 403**。
 """
 
 from __future__ import annotations
 
+from src.auth.rbac import ROLE_OPERATOR
 from src.auth.session import create_session_token
 from src.upstream_status import (
     LEVEL_MAJOR,
@@ -32,10 +34,20 @@ def _status(key: str, level: str, *, error: str | None = None) -> SourceStatus:
                             updated_at=1_700_000_000, url="https://stspg.io/x"),))
 
 
-def test_requires_admin(admin_client):
+def test_requires_operator_rejects_viewer(admin_client):
+    """viewer（非 operator）一律 403：与「模型列表」同一门槛。"""
     _app, client = admin_client
     client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
     assert client.get(PATH).status_code == 403
+
+
+def test_operator_allowed(admin_client):
+    """operator 能读：页面与 require_operator 同门槛。"""
+    app, client = admin_client
+    app.state.user_repo.update_role("guest", ROLE_OPERATOR)     # epoch 0 → 1
+    client.cookies.set("coding2api_session",
+                       create_session_token("guest", SECRET, epoch=1))
+    assert client.get(PATH).status_code == 200
 
 
 def test_returns_empty_snapshot_before_first_fetch(admin_client):

@@ -61,12 +61,13 @@ def _hourly(db, *, provider, credit_sum, known, ts=1_700_000_000):
             ((ts // 3600) * 3600, provider, credit_sum, known, known))
 
 
-def _credit_event(db, *, id, credential_id, before=None, after=None, delta=None):
+def _credit_event(db, *, id, credential_id, before=None, after=None, delta=None,
+                  ledger="pool"):
     with db.transaction() as conn:
         conn.execute(
-            "INSERT INTO credit_events (id, credential_id, ts, before, after, delta, source)"
-            " VALUES (?,?,1,?,?,?,'observed')",
-            (id, credential_id, before, after, delta))
+            "INSERT INTO credit_events (id, credential_id, ts, before, after, delta,"
+            " source, ledger) VALUES (?,?,1,?,?,?,'observed',?)",
+            (id, credential_id, before, after, delta, ledger))
 
 
 def test_number_to_credits_passes_non_numbers_through():
@@ -128,6 +129,9 @@ def test_convert_rescales_codearts_and_leaves_others(db):
     _hourly(db, provider="trae", credit_sum=1845050.0, known=3)
     _credit_event(db, id="ce1", credential_id="c1", before=0, after=4414076.0, delta=-1132.0)
     _credit_event(db, id="ce2", credential_id="c2", before=0, after=500.0, delta=-1.0)
+    # 积分账流水（credits）本就是积分口径，折算只认 pool：这条必须原样不动
+    _credit_event(db, id="ce3", credential_id="c1", before=13500.0, after=13498.0,
+                  delta=-2.0, ledger="credits")
 
     counts = convert_codearts_credit_unit(db)
     assert counts == {"credentials": 1, "usage_events": 1, "usage_hourly": 1,
@@ -159,6 +163,11 @@ def test_convert_rescales_codearts_and_leaves_others(db):
     ce2 = db.connect().execute(
         "SELECT delta FROM credit_events WHERE id = 'ce2'").fetchone()[0]
     assert ce2 == -1.0
+    # credits 行的折算被 ledger 限定排除：值仍是积分口径，没有被再除一遍
+    ce3 = db.connect().execute(
+        "SELECT * FROM credit_events WHERE id = 'ce3'").fetchone()
+    assert ce3["before"] == 13500.0 and ce3["after"] == 13498.0
+    assert ce3["delta"] == -2.0 and ce3["ledger"] == "credits"
 
 
 def test_main_preview_does_not_write(db, capsys):

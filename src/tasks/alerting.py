@@ -125,6 +125,27 @@ def _public_detail(detail: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _parse_detail(raw: Any) -> dict[str, Any]:
+    """`alert_events.detail` 文本 → dict；非法或非对象一律当空（防御历史脏行）。"""
+    try:
+        detail = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _alert_from_row(row: dict[str, Any]) -> Alert:
+    """`alert_events` 一行 → `Alert`（重启后重建「告警中」集合用）。
+
+    `pii` 没落库：从 detail 里按 `_PII_DETAIL_KEYS` 反推。丢了这一步，恢复
+    通知的 `public_message()` 就没有可打码的片段，会把昵称原文推给 webhook。
+    """
+    detail = _parse_detail(row["detail"])
+    pii = tuple(str(detail[key]) for key in _PII_DETAIL_KEYS if detail.get(key))
+    return Alert(rule=row["rule"], severity=row["severity"], scope=row["scope"],
+                 message=row["message"], detail=detail, pii=pii)
+
+
 @dataclass(frozen=True)
 class Alert:
     """一条待投递的告警（规则判定结果，尚未落库/推送）。"""
@@ -237,8 +258,13 @@ class AlertTask:
     全部依赖可注入（取值器用零参 callable，热更配置每轮现读）。`now` 与
     `client` 供测试注入固定时钟与 httpx.MockTransport。
 
-    迟滞状态（连续命中/连续未命中）**进程内**维护：重启归零、重新累积，
-    与签到去重同范式（不落库、不编造重启前的计数）。
+    迟滞**计数**（连续命中/连续未命中）进程内维护：重启归零、重新累积，与
+    签到去重同范式（不落库、不编造重启前的计数）。
+
+    但「当前哪些告警仍未恢复」是**已落库的事实**（`resolved_at IS NULL`），
+    不能随进程消失：构造时从库重建 `_active`。否则重启后规则早已不再命中的
+    历史告警永远等不到 `resolve()`——恢复分支只遍历 `_active`——角标与
+    「已恢复」标记会永久卡住（见 `AlertRepository.unresolved`）。
     """
 
     def __init__(
@@ -283,10 +309,15 @@ class AlertTask:
         self._now = now or (lambda: int(time.time()))
         # 迟滞状态机（进程内）：dedup_key → 连续命中轮数；
         # dedup_key → 连续未命中轮数（仅对「告警中」的 key 累积）；
-        # dedup_key → (rule, scope, severity)，即当前处于告警中的告警。
+        # dedup_key → 当前处于告警中的 Alert（含重建的历史行，供恢复通知取文案）。
         self._streak: dict[str, int] = {}
         self._clear_streak: dict[str, int] = {}
-        self._active: dict[str, tuple[str, str, str]] = {}
+        # 从库重建「告警中」集合：同一 (rule, scope) 取最后一行为准（后写的
+        # 提醒行文案更新），迟滞计数仍从 0 起——重启不编造连续计数。
+        self._active: dict[str, Alert] = {
+            row_alert.dedup_key: row_alert
+            for row_alert in map(_alert_from_row, self._alerts.unresolved())
+        }
 
 
     async def run_once(self) -> dict[str, Any] | None:

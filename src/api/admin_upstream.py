@@ -3,8 +3,8 @@
 只读端点：数据由后台 UpstreamStatusTask 周期抓取并存在内存里，这里只是把它
 连同「这个任务当前是否启用 / 多久抓一次」一起回给管理台。
 
-admin-only——页面把「我们自己的入口」与「模型上游」的状态摆在一起看，属于
-运维视角，与「运维告警」同一门槛。
+operator-only（admin 与 operator 都放行）——页面把「我们自己的入口」与「模型
+上游」的状态摆在一起看，属于运维视角，与「模型列表」同一门槛。
 
 `server_time` 供前端算「上次抓取距今多久」：浏览器时钟偏移会把刚抓完的
 快照显示成几小时前（与 /api/tasks 同一理由）。
@@ -16,7 +16,7 @@ import time
 
 from fastapi import APIRouter, Depends, Request
 
-from ..auth.rbac import require_admin
+from ..auth.rbac import require_operator
 from .deps import Services, principal_from_request
 
 
@@ -31,7 +31,7 @@ def create_router(services: Services) -> APIRouter:
 
         未装配（测试 / 一次性构造）时返回空快照而不是 500：页面显示「尚未抓取」。
         """
-        require_admin(principal)
+        require_operator(principal)
         store = getattr(request.app.state, "upstream_status", None)
         payload = store.payload() if store is not None else {
             "summary": {"level": "unknown", "operational": 0, "abnormal": 0,

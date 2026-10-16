@@ -605,17 +605,36 @@ async def test_fetch_all_keeps_order_and_isolates_failures():
 
 
 async def test_fetch_all_owns_client_when_not_injected(monkeypatch):
-    """未注入 client 时自建一个（这里把真正抓取换掉，避免打外网）。"""
+    """未注入 client 时自建一个，且 `trust_env=False`（不吃宿主/系统代理）。
+
+    回归：本机开全局代理时 httpx 默认 trust_env=True 会把状态页请求交给代理，
+    代理握手失败 → 八个源全部 ConnectError（实测「上游状态全部抓取失败」）。
+    """
     calls: list[object] = []
+    seen_kwargs: list[dict] = []
+    real_client = httpx.AsyncClient
+
+    class _RecordingClient:
+        def __init__(self, **kwargs):
+            seen_kwargs.append(kwargs)
+            self._inner = real_client(**kwargs)
+
+        async def __aenter__(self):
+            return await self._inner.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._inner.__aexit__(*exc)
 
     async def fake_fetch(spec, *, client, timeout):
         calls.append(client)
         return SourceStatus(spec=spec, level=LEVEL_OPERATIONAL, fetched_at=NOW)
 
     monkeypatch.setattr("src.upstream_status.fetch_source", fake_fetch)
+    monkeypatch.setattr("src.upstream_status.httpx.AsyncClient", _RecordingClient)
     statuses = await fetch_all((_spec("kilo"), _spec("moonshot")))
     assert len(statuses) == 2
-    assert all(isinstance(client, httpx.AsyncClient) for client in calls)
+    assert all(isinstance(client, real_client) for client in calls)
+    assert seen_kwargs == [{"trust_env": False}]
 
 
 # ------------------------------------------------------------------ 存储
