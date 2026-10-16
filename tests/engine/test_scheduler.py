@@ -214,6 +214,50 @@ def test_select_pinned_still_wins_over_expiry_metric():
 def test_select_returns_none_when_empty():
     assert Scheduler().select([], set(), NOW) is None
 
+def test_select_prefers_least_inflight():
+    """最少连接：并发请求摊到空闲号，而不是全部压到排序确定的同一个号上。
+
+    两个号健康度/余额/到期完全相同（真实场景：codebuddy_intl 六个号全打平），
+    只有负载不同——在途多的排后，故并发请求会轮流命中空闲号。
+    """
+    s = Scheduler()
+    busy = cand("busy", health=100, quota_remaining=500.0, inflight=1)
+    idle = cand("idle", health=100, quota_remaining=500.0, inflight=0)
+    assert s.select([busy, idle], set(), NOW) == "idle"
+    # 打平（都为 0）时退回原链：余额多者优先
+    rich = cand("rich", health=100, quota_remaining=900.0)
+    assert s.select([idle, rich], set(), NOW) == "rich"
+
+def test_select_inflight_beats_expiring_credits():
+    """在途是负载指标，优先于到期额度：一个正在被占用的号，即便额度更紧迫，
+    也让位给空闲号——否则并发仍会全部压到「额度最紧迫」的那一个。"""
+    s = Scheduler()
+    busy_burning = cand("busy_burn", health=100,
+                        expiry_ladder=[(NOW + 600, 400.0)], inflight=2)
+    idle = cand("idle", health=100, inflight=0)
+    assert s.select([busy_burning, idle], set(), NOW) == "idle"
+    # 顺序请求（在途都为 0）不受影响，仍按到期额度选
+    burning = cand("burn", health=5, expiry_ladder=[(NOW + 600, 400.0)])
+    assert s.select([burning, idle], set(), NOW) == "burn"
+
+def test_select_free_tier_beats_inflight():
+    """免费档压过在途：省下的真金白银优先于分摊负载。"""
+    s = Scheduler()
+    idle_paid = cand("paid", provider="codebuddy", health=100, inflight=0,
+                     credit_rate=0.08)
+    busy_free = cand("free", provider="zen", credit_rate=0.0, inflight=3)
+    assert s.select([idle_paid, busy_free], set(), NOW) == "free"
+
+def test_select_inflight_tie_falls_back_to_expiry_then_health():
+    """在途打平时，后续排序链（到期 → 健康度）照常生效。"""
+    s = Scheduler()
+    soon = cand("soon", health=100, expiry_ladder=[(NOW + 600, 100.0)], inflight=1)
+    later = cand("later", health=100, expiry_ladder=[(NOW + 600, 10.0)], inflight=1)
+    assert s.select([soon, later], set(), NOW) == "soon"
+    healthy = cand("healthy", health=90, inflight=1)
+    weak = cand("weak", health=10, inflight=1)
+    assert s.select([healthy, weak], set(), NOW) == "healthy"
+
 def test_should_rotate_respects_max():
     # 入参是「实际尝试次数」而非 tried 集合大小：被 _skip_provider 排除、
     # 从未打过的上游不能占满轮换预算（H2）。

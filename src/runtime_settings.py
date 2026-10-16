@@ -113,7 +113,9 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("max_inflight_per_credential", int, "单账号在途上限",
                "同一凭证的并发请求达到该值后不再参与选号，避免把单账号打进上游"
                "限流/封号（跨渠道全局生效）。0 = 不限。租约在请求结束后释放，"
-               "另有 600s TTL 兜底漏释放。", minimum=0, group="affinity"),
+               "另有 600s TTL 兜底漏释放。在途数同时是选号的负载键：并发请求"
+               "按「在途最少优先」摊到空闲号（0 = 不限时也照常计数）。",
+               minimum=0, group="affinity"),
     HotSetting("growth_irreversible_actions", bool, "成长中心不可逆动作",
                "是否允许抽奖 / 连登兑换 / 开盲盒 / 消耗补登卡。关闭后仍会领取"
                "旅行礼物与任务奖励。", task="growth"),

@@ -12,7 +12,7 @@ upstreams, with a shared credential pool, unified scheduling, and per-user usage
 ## Features
 
 - **OpenAI-compatible surface**: `/v1/chat/completions` (streaming + non-streaming), `/v1/responses` (for the Codex CLI), `/v1/messages` (Anthropic Messages / Claude Code), `/v1/models`, `/v1/user/balance` (DeepSeek-compatible).
-- **Unified scheduling**: bare model names auto-route by health, `model@provider` pins an upstream. When free channels are candidates, **free wins**; then three-state health with tiered cooldowns, ties broken by **largest balance first**. A model-scoped limit sidelines only that model (the same account's other models stay available); a model held by a single cooling channel returns "model temporarily unavailable" instead of fanning out. A multi-turn conversation keeps one credential and rotates only on error.
+- **Unified scheduling**: bare model names auto-route by health, `model@provider` pins an upstream. When free channels are candidates, **free wins**; then **least in-flight first** (concurrent requests spread across idle credentials), then expiring credits, then three-state health with tiered cooldowns, ties broken by **largest balance first**. A model-scoped limit sidelines only that model (the same account's other models stay available); a model held by a single cooling channel returns "model temporarily unavailable" instead of fanning out. A multi-turn conversation keeps one credential and rotates only on error.
 - **Expiry-aware burn**: credits expiring within the main window (default 36h) burn largest-first (near-expiry quota not wasted), ties fall to a 7-day window. Units unify to credits.
 - **Credential-gated model list**: only channels with a currently usable credential are fetched and shown, so a never-connected channel never shows phantom models; pausing or losing credentials hides a channel's models until it recovers.
 - **Shared credential pool**: admins maintain credentials, everyone shares them, encrypted at rest (`APP_SECRET`); device-code login, account switching, quota probing, daily check-in, token pre-refresh.
@@ -273,7 +273,7 @@ The per-row *Pause* action removes a credential from **chat traffic only**: quot
 
 ## Per-credential in-flight cap
 
-`MAX_INFLIGHT_PER_CREDENTIAL` (default `0` = unlimited) stops a credential from being selected once its concurrent request count reaches the cap, keeping a single account from being hammered into upstream rate limits or bans; it is global across channels (orthogonal to the per-channel `CODEARTS_MAX_CONCURRENCY`).
+`MAX_INFLIGHT_PER_CREDENTIAL` (default `0` = unlimited) stops a credential from being selected once its concurrent request count reaches the cap, keeping a single account from being hammered into upstream rate limits or bans; it is global across channels (orthogonal to the per-channel `CODEARTS_MAX_CONCURRENCY`). The in-flight count doubles as the **load key**: the executor injects it into `Candidate.inflight` and the scheduler sorts by **least in-flight first** (after the free tier, before expiring credits), so concurrent requests spread across idle credentials; with the cap at `0` leases are still registered, so the load key stays live even when concurrency is unlimited.
 
 - The counter is **in-process** (single-instance semantics, like the `/api/tasks` state).
 - Leases release when the request ends (success, rotation, error, client disconnect), with a **600s TTL** reclaiming any that leak—better to occasionally admit one extra request than to silently retire a credential.
@@ -462,7 +462,7 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `CONTEXT_COMPRESS_MIN_KEEP_MESSAGES` | `4` | Recent messages always kept |
 | `CONTEXT_COMPRESS_SAFETY_RATIO` | `0.95` | Budget as a fraction of the model limit |
 | `UPSTREAM_COMPLETE_TIMEOUT_SECONDS` | `600` | Non-streaming aggregate timeout (retried as transient); `≤0` disables |
-| `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | Per-credential in-flight cap (global across channels): a credential at its cap stops being selected; `0` = unlimited. Leases release when the request ends, with a 600s TTL guarding leaked ones |
+| `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | Per-credential in-flight cap (global across channels): a credential at its cap stops being selected; `0` = unlimited. The count also serves as the scheduler's least-in-flight load key. Leases release when the request ends, with a 600s TTL guarding leaked ones |
 | `METRICS_ENABLED` | `true` | Expose `GET /metrics` (Prometheus text format, **unauthenticated**, same stance as `/healthz`); `false` disables it (404). Hot-updatable |
 | `FORCE_DISABLE_THINKING` | `false` | Strip reasoning from outbound responses: no more `reasoning_content` / Anthropic `thinking` blocks / Responses reasoning items. **Response-side only — the request body is untouched** (upstream still reasons). Applies to all three exits, streaming and non-streaming. Hot-updatable |
 | `REASONING_EFFORT_MAP` | `""` | Outbound `reasoning_effort` remap: `channel=from:to,from:to;*=from:to` (channel is a `KNOWN_PROVIDERS` id, `*` is the fallback); a target of `none` deletes the key and lets the channel default apply. Only rewrites values the client **explicitly** sent — a channel's own `setdefault` is untouched. Empty = pass through. Hot-updatable |

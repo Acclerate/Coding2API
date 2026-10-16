@@ -371,7 +371,7 @@ class Scheduler:
 - **错误语义**：全部候选都因限额被跳过时走「无可用凭证」`no_healthy_credential`（账号级原因）——`_all_model_cooled` 判据不含限额，故不会被误判成 `model_unavailable`。
 
 ### 6.6 凭证在途租约
-`MAX_INFLIGHT_PER_CREDENTIAL`（全局热更，默认 `0` = 不限）：同一凭证的并发请求达到上限后不再参与选号，避免把单账号打进上游限流 / 封号（同类项目的 `pool.max_in_flight` / `QODER_MAX_CONCURRENCY`）。
+`MAX_INFLIGHT_PER_CREDENTIAL`（全局热更，默认 `0` = 不限）：同一凭证的并发请求达到上限后不再参与选号，避免把单账号打进上游限流 / 封号（同类项目的 `pool.max_in_flight` / `QODER_MAX_CONCURRENCY`）。**在途计数兼作负载键**：`Executor._selectable` 把在途数注入 `Candidate.inflight`，调度器按「最少连接」排（在 `Scheduler.select` 排序链里，免费档之后、到期额度之前），并发请求自动摊到空闲号；上限为 0（不限）时 `blocked()` 恒 False 但租约照常登记，故不限并发时负载键仍可用。
 
 - **实现**（`src/engine/inflight.py`）：`InflightTracker` 是 `credential_id → 活跃租约开始时刻列表` 的**进程内**计数；`InflightGuard` 包一层热更上限。租约只记开始时刻、不绑请求标识——同一凭证的多个租约彼此等价，释放任意一个即可（先入先出），调用方在请求两侧各调一次，不必在轮换 / fallback 的多层 `finally` 里传递句柄。
 - **为什么同步（不用 `asyncio.Lock`）**：`acquire` / `release` / `count` 只在 executor 的事件循环里调用，且「选号 → 登记」之间没有任何 `await`（选号、压缩、创建上游迭代器都是同步的），单线程下不会交错。加异步锁反而会要求 `_selectable` 变成 async，把一个纯过滤函数染上异步。

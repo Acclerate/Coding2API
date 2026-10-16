@@ -92,13 +92,14 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 ### 3.3 调度器
 
-统一实现，各 provider 共用。**选号前先在 `Executor._selectable` 做两道过滤**（不进 `Candidate.is_selectable`）：① 凭证限额护栏（触顶的号不参与，见 §限额护栏）；② 在途租约 `MAX_INFLIGHT_PER_CREDENTIAL`（全局热更，默认 0 = 不限）——同一账号并发达到上限后**整号不参与选号**，避免把单账号打进上游限流/封号。在途计数进程内、租约在请求结束时释放（含断开/异常），另有 600s TTL 兜底漏释放；跨渠道全局，与 CodeArts 的渠道内 `CODEARTS_MAX_CONCURRENCY` 正交。过滤后按下列排序链出号：
+统一实现，各 provider 共用。**选号前先在 `Executor._selectable` 做两道过滤**（不进 `Candidate.is_selectable`）：① 凭证限额护栏（触顶的号不参与，见 §限额护栏）；② 在途租约 `MAX_INFLIGHT_PER_CREDENTIAL`（全局热更，默认 0 = 不限）——同一账号并发达到上限后**整号不参与选号**，避免把单账号打进上游限流/封号。在途计数进程内、租约在请求结束时释放（含断开/异常），另有 600s TTL 兜底漏释放；跨渠道全局，与 CodeArts 的渠道内 `CODEARTS_MAX_CONCURRENCY` 正交。**在途计数兼作负载键**：`Executor._selectable` 把在途数注入 `Candidate.inflight`，调度器按「最少连接」排（见下）；上限为 0 时也照常登记，故不限并发时负载键仍可用。过滤后按下列排序链出号：
 
 
 1. **免费优先档**：候选池存在 `credit_rate == 0` 的渠道时，免费渠道整体排在付费渠道之前。`credit_rate=None`（目录未就绪 / 缺该模型 / 上游未给倍率）**不算免费**，与 `0.0` 严格区分。**为什么排在到期额度之前**：省下的真金白银比「几百积分快过期先用」值钱。
 2. **手动 pin 优先**；会话粘性命中且可选时直接复用，不参与排序。
-3. **到期额度两级字典序**：先比主窗口（`QUOTA_EXPIRY_WINDOW_SECONDS`，默认 36h）内将过期的额度，打平再比次窗口（`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`，默认 7 天）。
-4. **健康度三态**：`known` 降序 > `unknown` > `exhausted`；健康度打平时**账户剩余积分多者优先**，再同分按 `credential_id` 稳定。无可用返回 None。
+3. **在途最少优先**（最少连接负载均衡）：在途数少的号排前，并发请求摊到空闲号。**为什么排在到期额度之前**：到期/健康度是静态指标，按它们排出的次序确定，所有并发会算出同一个最优号并全压上去（实测 codebuddy_intl 六号全打平、2 小时内一个号吃 180+ 次、其余闲置）；在途把它拆开，顺序请求（在途恒 0）不受影响。免费档仍压过在途。
+4. **到期额度两级字典序**：先比主窗口（`QUOTA_EXPIRY_WINDOW_SECONDS`，默认 36h）内将过期的额度，打平再比次窗口（`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`，默认 7 天）。
+5. **健康度三态**：`known` 降序 > `unknown` > `exhausted`；健康度打平时**账户剩余积分多者优先**，再同分按 `credential_id` 稳定。无可用返回 None。
 
 **为什么冷却分「账号级」与「模型级」两层**：上游拒绝语义不都是账号级问题——`429 + 6004` 是「这个模型在当前账号上用超了」，`400/404 + 11102` 是「当前账号没有这个模型」。一律记账号级会让一次模型级限流把整个账号踢出池。故账号级写 `credentials.cooling_until`，模型级另建 `credential_model_cooldowns`；账号级冷却出现时清空该凭证的模型级条目，防「切模型」绕过。业务码识别只认 `"code": N` 键值形态，不搜裸数字。冷却时长：`PLAN` 12h、`SOFT` 60s（不累计）、`OTHER` 连续 3 次→10m、`MODEL` 600s 起翻倍封顶 2h、`BLOCKED`（无此模型负缓存）6h 起翻倍封顶 24h、`CONCURRENCY` 固定 60s（不翻倍）、`CREDIT` 冷却到次日 04:00。
 

@@ -134,7 +134,8 @@ class ExecutorDeps:
     limits: Any | None = None
     # 凭证在途租约（src/engine/inflight.py 的 InflightGuard）：选号前过滤掉
     # 「并发已占满」的候选，选中后登记、请求结束（含断开/异常）释放；
-    # None 表示不启用（向后兼容）。
+    # 在途计数同时注入候选快照供调度器做「最少连接」负载均衡。None 表示
+    # 不启用（向后兼容，此时无过滤也无负载键）。
     inflight: Any | None = None
     # 出站剥离思考内容：真值 → 丢掉 `EventKind.REASONING` 事件（三个出口
     # 一致生效，流式/非流式都覆盖）。**只过滤响应、不改请求体**：上游仍照常
@@ -1036,7 +1037,9 @@ class Executor:
         后者仍报 model_unavailable（限额是账号级原因，换个模型也未必能用）。
 
         再按在途租约过滤（`deps.inflight`，未装配则跳过）：并发已达上限的
-        凭证本轮不参与选号，避免把单账号打进上游限流/封号。
+        凭证本轮不参与选号，避免把单账号打进上游限流/封号。同一份在途计数
+        顺手注入候选快照（`Candidate.inflight`），供调度器做「最少连接」负载
+        均衡——未装配时恒为 0，排序退回原链。
         """
         rates = self._model_rates(target)
         guard = self._deps.limits
@@ -1047,6 +1050,9 @@ class Executor:
             and (guard is None or not guard.blocked(c, target.model))
             and (inflight is None or not inflight.blocked(c.credential_id))
         ]
+        if inflight is not None:
+            selected = [replace(c, inflight=inflight.count(c.credential_id))
+                        for c in selected]
         if not rates:
             return selected
         return [
