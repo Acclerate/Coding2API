@@ -385,6 +385,14 @@ export function CredentialsPage() {
     () => new Map(credentials.map((item) => [item.id, item.nickname || item.id.slice(0, 12)])),
     [credentials],
   );
+  // 「全部签到」的作用域：与行内「签到」按钮同一口径（有额度探测且渠道支持
+  // 签到）。zen / kilo 免费层与 CodeBuddy 国际站没有签到能力，混进批量只会
+  // 整排「该渠道不支持此操作」的失败噪声，提交前直接剔除。
+  const checkinTargets = useMemo(
+    () => credentials.filter(
+      (item) => hasQuotaProbe(item.provider) && supportsCheckin(item.provider)),
+    [credentials],
+  );
   // 限额对话框当前编辑的凭证：按 id 从最新列表取，轮询替换后仍是最新快照
   const limitsCredential = useMemo(
     () => credentials.find((item) => item.id === limitsFor) ?? null,
@@ -456,16 +464,14 @@ export function CredentialsPage() {
   };
 
   /**
-   * 批量动作：一次提交所有选中项，结果**逐条**汇报。
+   * 批量动作核心：一次提交一组 id，结果**逐条**汇报。
    *
    * 与逐行循环调单条端点的区别在于错误处理：这里一次请求拿到「成功 N / 失败 M」
-   * 与失败明细，而不是在第 3 条报错时丢掉前两条的结果。选中集合在成功后清空——
-   * 同一批号再点一次「签到」没有意义；失败项也一并清空，避免用户以为要重试
-   * 却把成功项又跑一遍（失败原因通常需要先修凭证）。
+   * 与失败明细，而不是在第 3 条报错时丢掉前两条的结果。返回请求是否成功送达
+   * （部分失败也算送达——失败的明细已在浮层里逐条给出）。
    */
-  const runBatch = async (action: BatchAction, enabled?: boolean) => {
-    const ids = selectedIds.map((credential) => credential.id);
-    if (ids.length === 0) return;
+  const runBatchIds = async (action: BatchAction, ids: string[], enabled?: boolean) => {
+    if (ids.length === 0) return false;
     setBusy(true);
     try {
       const result = await api.batchCredentials(action, ids, enabled);
@@ -475,14 +481,32 @@ export function CredentialsPage() {
         testId: "credentials-batch-result",
         content: <BatchToastContent result={result} names={credentialNames} />,
       });
-      setSelected(new Set());
       await refresh();
+      return true;
     } catch (caught) {
       showError(caught instanceof Error ? caught.message : "批量操作失败");
+      return false;
     } finally {
       setBusy(false);
     }
   };
+
+  /**
+   * 批量动作（作用于多选集合）：成功后清空选中——同一批号再点一次「签到」
+   * 没有意义；失败项也一并清空，避免用户以为要重试却把成功项又跑一遍
+   * （失败原因通常需要先修凭证）。请求级失败（网络断 / 403）不清空，
+   * 让用户可以直接重试。
+   */
+  const runBatch = async (action: BatchAction, enabled?: boolean) => {
+    const done = await runBatchIds(
+      action, selectedIds.map((credential) => credential.id), enabled);
+    if (done) setSelected(new Set());
+  };
+
+  /** 全部渠道一键签到：与行内「签到」按钮同口径（见 checkinTargets），
+   * 不动多选集合——它不是一次「全选 + 签到」，勾选状态不应被顺带清掉。 */
+  const checkinAll = () =>
+    void runBatchIds("checkin", checkinTargets.map((item) => item.id));
 
   /** 勾选 / 取消勾选一条；用于行内 checkbox 与组头「全选本渠道」。 */
   const toggleSelected = (credentialId: string, checked: boolean) => {
@@ -668,15 +692,33 @@ export function CredentialsPage() {
       <Panel
         title="凭证池"
         action={canWrite && (
-          <Button
-            size="sm"
-            variant="primary"
-            data-testid="open-add-dialog"
-            disabled={busy}
-            onClick={() => setAddOpen(true)}
-          >
-            <Plus className="size-4" /> 添加凭证
-          </Button>
+          <div className="flex items-center gap-2">
+            {/* 全部渠道一键签到：挂在面板标题栏（池级动作），语义是「整个池」
+                而不是「当前筛选出的那部分」——筛选工具条收敛的是查看，不是签到。
+                没有可签的号（纯免费层池 / 国际站）时禁用而不是隐藏：入口常驻，
+                用户才看得出「这个池本可以一键签到」。 */}
+            <Button
+              size="sm"
+              variant="default"
+              data-testid="checkin-all"
+              disabled={busy || checkinTargets.length === 0}
+              title={checkinTargets.length === 0
+                ? "池内没有支持签到的凭证"
+                : `对池内 ${checkinTargets.length} 个可签到的凭证执行每日签到`}
+              onClick={checkinAll}
+            >
+              <CalendarCheck className="size-4" /> 全部签到
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              data-testid="open-add-dialog"
+              disabled={busy}
+              onClick={() => setAddOpen(true)}
+            >
+              <Plus className="size-4" /> 添加凭证
+            </Button>
+          </div>
         )}
       >
         {credentials.length === 0 ? (

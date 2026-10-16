@@ -120,6 +120,72 @@ describe("CredentialsPage 批量运维", () => {
     expect(screen.queryByTestId("credentials-batch-bar")).not.toBeInTheDocument();
   });
 
+  it("全部签到：对池内全部可签到凭证提交批量，免费层与国际站剔除", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "checkin", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "trae1", ok: true }, { id: "cb1", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "trae1", nickname: "TRAE 号" }),
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "CB 号" }),
+        // zen 免费层无签到能力、CodeBuddy 国际站 checkin=None：行内没有
+        // 签到按钮，也不该混进一键签到
+        makeCredential({ id: "zen1", provider: "zen", nickname: "免费层" }),
+        makeCredential({ id: "intl1", provider: "codebuddy_intl", nickname: "国际站" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    // 按钮在面板标题栏，分组折叠时也可见、可点
+    await userEvent.click(screen.getByTestId("checkin-all"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    expect(batchCall(spy)).toEqual({ action: "checkin", ids: ["trae1", "cb1"] });
+    expect(screen.getByTestId("credentials-batch-result"))
+      .toHaveTextContent("签到完成：成功 2 / 2");
+  });
+
+  it("全部签到不动多选集合：签完选中项仍保留", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "checkin", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "cb1", ok: true }, { id: "cb2", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy" }),
+        makeCredential({ id: "cb2", provider: "codebuddy" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("checkin-all"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    // 提交的是全池（与勾选无关），勾选也不被顺带清空——它不是「全选 + 签到」
+    expect(batchCall(spy).ids).toEqual(["cb1", "cb2"]);
+    expect(screen.getByTestId("batch-selected-count")).toHaveTextContent("已选 1 个");
+  });
+
+  it("池内没有可签到凭证时「全部签到」禁用而非消失", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "zen1", provider: "zen" }),
+        makeCredential({ id: "intl1", provider: "codebuddy_intl" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    expect(screen.getByTestId("checkin-all")).toBeDisabled();
+  });
+
+  it("只读用户看不到「全部签到」", async () => {
+    mockFetch({ "/api/credentials": listBody([makeCredential({ id: "cb1" })], false) });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    expect(screen.queryByTestId("checkin-all")).not.toBeInTheDocument();
+  });
+
   it("部分失败：浮层列出失败原因与昵称，色调为 warn", async () => {
     mockFetch({
       "/api/credentials/batch": {
