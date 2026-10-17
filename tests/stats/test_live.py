@@ -72,7 +72,7 @@ def test_default_subscriber_limit_is_used_by_build_app():
 
 def test_event_matches_filters():
     event = {"username": "alice", "provider": "trae", "model": "m",
-             "credential_id": "cred-1"}
+             "credential_id": "cred-1", "ok": 0}
     assert _event_matches(event, username=None, provider=None, model=None,
                           credential_id=None)
     assert _event_matches(event, username="alice", provider="trae", model="m",
@@ -85,6 +85,11 @@ def test_event_matches_filters():
                               credential_id=None)
     assert not _event_matches(event, username=None, provider=None, model=None,
                               credential_id="cred-2")
+    # 成功/失败过滤：与明细端点同一语义（None = 不限制）
+    assert _event_matches(event, username=None, provider=None, model=None,
+                          credential_id=None, ok=0)
+    assert not _event_matches(event, username=None, provider=None, model=None,
+                              credential_id=None, ok=1)
 
 def test_sse_frame_is_single_data_line():
     frame = _sse_frame({"model": "glm-5.2", "ok": 1})
@@ -134,6 +139,19 @@ async def test_stream_skips_name_lookup_without_credential_id():
         FakeRequest(disconnect_after=1), hub, subscription, username=None,
         provider=None, model=None, credential_id=None, resolve_name=resolve)]
     assert "credential_name" not in frames[1]
+
+async def test_stream_filters_only_failed_events():
+    """`ok=0` 订阅只推失败行（失败归因下钻后开实时流）。"""
+    hub = LiveEventHub()
+    subscription = hub.subscribe()
+    hub.publish({"id": "e1", "provider": "trae", "model": "m", "ok": 1})
+    hub.publish({"id": "e2", "provider": "trae", "model": "m", "ok": 0})
+    frames = [frame async for frame in _stream_events(
+        FakeRequest(disconnect_after=1), hub, subscription, username=None,
+        provider=None, model=None, credential_id=None, resolve_name=None, ok=0)]
+    assert frames[0] == ": connected\n\n"
+    assert '"id":"e2"' in frames[1]
+    assert len(frames) == 2
 
 async def test_stream_sends_heartbeat_when_idle():
     """空闲时按 `heartbeat` 发注释帧保活（代理会断掉静默连接）。"""

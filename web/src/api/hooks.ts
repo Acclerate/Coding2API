@@ -267,20 +267,27 @@ export function useStatsModelTimeline(username?: string, target?: string, since?
  *
  * `username` 是**作用域收窄**（钻取到某个用户时才有值）：为空则按会话作用域
  * （admin/operator 看全量、viewer 看自己），传值则只看该用户（viewer 传了也
- * 会被后端强制改回自己）。 */
+ * 会被后端强制改回自己）。
+ *
+ * `filters.ok`：只看成功（1）/ 只看失败（0）。失败归因卡片点行下钻时带 0——
+ * 不进 query key 的话，切换失败过滤不会重新取数。 */
 export function useStatsEvents(username?: string, since?: number, until?: number,
                                before?: number, limit?: number, sort?: string,
                                order?: string, offset?: number,
-                               filters?: StatsEventFilters) {
+                               filters?: StatsEventFilters & { ok?: number }) {
   const provider = filters?.provider;
   const model = filters?.model;
   const credentialId = filters?.credential_id;
+  const ok = filters?.ok;
   return useQuery({
     queryKey: adminKey(username, "stats-events", since, until, before, limit, sort, order,
-                       offset, provider, model, credentialId),
+                       offset, provider, model, credentialId, ok),
     queryFn: () => api.statsEvents(username, since, until, before, limit, sort, order,
                                    offset,
-                                   { provider, model, credential_id: credentialId }),
+                                   // `ok` 不在 StatsEventFilters 里（那个类型描述分组表
+                                   // 钻取）；client 会把对象整体展开进 query，故额外属性生效
+                                   { provider, model, credential_id: credentialId,
+                                     ok } as StatsEventFilters),
     placeholderData: keepPreviousData,
   });
 }
@@ -297,13 +304,14 @@ export function useStatsEvents(username?: string, since?: number, until?: number
 export function useStatsEventStream(options: {
   enabled: boolean;
   username?: string;
-  filters?: StatsEventFilters;
+  filters?: StatsEventFilters & { ok?: number };
   onEvent: (row: UsageEventRow) => void;
 }) {
   const { enabled, username, filters, onEvent } = options;
   const provider = filters?.provider;
   const model = filters?.model;
   const credentialId = filters?.credential_id;
+  const ok = filters?.ok;
   // 回调放 ref：调用方每次渲染都可能传新函数，不应触发重连
   const handler = useRef(onEvent);
   handler.current = onEvent;
@@ -320,7 +328,8 @@ export function useStatsEventStream(options: {
       return;
     }
     const url = api.statsEventsStreamUrl(username,
-      { provider, model, credential_id: credentialId });
+      // 同 `useStatsEvents`：`ok` 由 client 展开进 query，类型层面额外属性
+      { provider, model, credential_id: credentialId, ok } as StatsEventFilters);
     const source = new EventSource(url);
     setStatus("live");
     source.onmessage = (event: MessageEvent<string>) => {
@@ -337,7 +346,7 @@ export function useStatsEventStream(options: {
     return () => {
       source.close();
     };
-  }, [enabled, username, provider, model, credentialId]);
+  }, [enabled, username, provider, model, credentialId, ok]);
 
   return status;
 }

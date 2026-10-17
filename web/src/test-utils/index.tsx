@@ -76,7 +76,12 @@ export function jsonResponse(body: unknown, status = 200): Response {
  * 侧栏角标：默认回「无待办」，调用方可用自己的同名路由覆盖。不兜底的话，
  * 所有 `renderPage` 用例都会在未 mock 的 URL 上直接抛错。
  */
-const DEFAULT_ROUTES: Record<string, unknown> = { "/api/nav-badges": {} };
+const DEFAULT_ROUTES: Record<string, unknown> = {
+  "/api/nav-badges": {},
+  // 失败归因（StatsPage 对 operator+ 恒发）：默认「没有失败」，避免每个用例
+  // 都要 mock 一条；需要真实数据的用例覆盖同名路由即可。
+  "/api/stats/errors": { errors: [] },
+};
 
 /** 按 URL 分派的 fetch mock；函数路由会收到完整 URL 字符串。 */
 export function mockFetch(routes: Record<string, unknown | ((url: string) => Response)>) {

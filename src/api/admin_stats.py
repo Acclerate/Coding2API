@@ -15,7 +15,7 @@ from ..auth.rbac import Principal, require_operator
 from ..compat.openai.errors import error_payload
 from ..stats.csv import CSV_BOM, EXPORT_HEADERS, csv_line, event_cells
 from ..stats.live import LiveEventHub, Subscription, TooManySubscribers
-from ..stats.query import EXPORT_MAX_ROWS
+from ..stats.query import ERROR_MAX_GROUPS, EXPORT_MAX_ROWS
 from .deps import Services, principal_from_request
 
 # 心跳间隔：代理/浏览器对「长时间没数据」的连接会主动断（nginx 默认 60s）。
@@ -46,7 +46,7 @@ def _csv_stream(rows: list[dict]) -> Iterator[str]:
 
 def _event_matches(event: dict[str, Any], *, username: str | None,
                    provider: str | None, model: str | None,
-                   credential_id: str | None) -> bool:
+                   credential_id: str | None, ok: int | None = None) -> bool:
     """实时行是否属于该订阅者的过滤条件（与 `/api/stats/events` 同口径）。
 
     过滤放在**订阅者侧**而不是发布侧：一条事件可能同时被多个订阅者看到，
@@ -57,6 +57,8 @@ def _event_matches(event: dict[str, Any], *, username: str | None,
     if provider is not None and event.get("provider") != provider:
         return False
     if model is not None and event.get("model") != model:
+        return False
+    if ok is not None and event.get("ok") != ok:
         return False
     return not (credential_id is not None and event.get("credential_id") != credential_id)
 
@@ -75,6 +77,7 @@ async def _stream_events(request: Request, hub: LiveEventHub,
                          username: str | None, provider: str | None,
                          model: str | None, credential_id: str | None,
                          resolve_name: Callable[[str], str | None] | None,
+                         ok: int | None = None,
                          heartbeat: float = HEARTBEAT_SECONDS) -> AsyncIterator[str]:
     """SSE 主体：订阅 → 逐条下发 → 心跳 → 断开即注销。
 
@@ -92,7 +95,8 @@ async def _stream_events(request: Request, hub: LiveEventHub,
             if batch:
                 for event in batch:
                     if not _event_matches(event, username=username, provider=provider,
-                                          model=model, credential_id=credential_id):
+                                          model=model, credential_id=credential_id,
+                                          ok=ok):
                         continue
                     if resolve_name is not None and event.get("credential_id"):
                         event = {**event,
@@ -174,6 +178,23 @@ def create_router(services: Services) -> APIRouter:
             sort=sort, order=order,
             include_credential_name=principal.is_operator)}
 
+    @router.get("/api/stats/errors")
+    async def stats_errors(principal=Depends(principal_from_request),
+                           username: str | None = None, since: int | None = None,
+                           until: int | None = None, limit: int = 100):
+        """失败归因（operator+）：按渠道 / 模型 / 错误类型分组计数。
+
+        仅 operator/admin 可见：这是「池子里哪里在坏」的运维视图，跨用户聚合；
+        viewer 的失败明细已在 `/api/stats/events` 里（只看自己）。
+
+        窗口缺省为最近 24 小时（明细表几十万行，不给下界等于全表扫）；
+        `limit` 夹到 `1..ERROR_MAX_GROUPS`，按失败数降序取前 N 组。
+        """
+        require_operator(principal)
+        return {"errors": stats_query.errors(
+            username=_scope(principal, username), since=since, until=until,
+            limit=max(1, min(limit, ERROR_MAX_GROUPS)))}
+
     @router.get("/api/stats/events")
     async def stats_events(principal=Depends(principal_from_request),
                            username: str | None = None, since: int | None = None,
@@ -183,6 +204,7 @@ def create_router(services: Services) -> APIRouter:
                            order: str | None = None,
                            provider: str | None = None, model: str | None = None,
                            credential_id: str | None = None,
+                           ok: int | None = None,
                            format: str = "json"):
         # 明细保留 90 天；单页上限 200，防止一次拉爆
         # 凭证昵称来自共享池：仅 admin/operator 可见，viewer 只看自己的记录
@@ -194,7 +216,7 @@ def create_router(services: Services) -> APIRouter:
             require_operator(principal)
             rows = stats_query.export_events(
                 username=scope, since=since, until=until, include_credential_name=names,
-                provider=provider, model=model, credential_id=credential_id)
+                provider=provider, model=model, credential_id=credential_id, ok=ok)
             truncated = len(rows) > EXPORT_MAX_ROWS
             rows = rows[:EXPORT_MAX_ROWS]
             now = int(datetime.now(tz=UTC).timestamp())
@@ -210,7 +232,7 @@ def create_router(services: Services) -> APIRouter:
                                   before=before, limit=max(1, min(limit, 200)),
                                   offset=max(0, offset), sort=sort, order=order,
                                   provider=provider, model=model,
-                                  credential_id=credential_id,
+                                  credential_id=credential_id, ok=ok,
                                   include_credential_name=names)
 
     @router.get("/api/stats/events/stream")
@@ -219,12 +241,13 @@ def create_router(services: Services) -> APIRouter:
                                   username: str | None = None,
                                   provider: str | None = None,
                                   model: str | None = None,
-                                  credential_id: str | None = None):
+                                  credential_id: str | None = None,
+                                  ok: int | None = None):
         """明细实时流（SSE）：`StatsCollector.record` 落库后逐条推送。
 
         与 `/api/stats/events` 同一套作用域与过滤（`username` / `provider` /
-        `model` / `credential_id`），只是「新记录主动推」而不是翻页拉。凭证昵称
-        仅 admin/operator 解析（与明细端点同口径）；`since`/`until` 不参与——
+        `model` / `credential_id` / `ok`），只是「新记录主动推」而不是翻页拉。凭证
+        昵称仅 admin/operator 解析（与明细端点同口径）；`since`/`until` 不参与——
         实时流没有时间窗语义，客户端自己按需丢弃。
 
         订阅数超上限回 429（不排队）：每个订阅者占一条长连接，静默接受会
@@ -244,7 +267,8 @@ def create_router(services: Services) -> APIRouter:
         return StreamingResponse(
             _stream_events(request, services.live_events, subscription,
                            username=scope, provider=provider, model=model,
-                           credential_id=credential_id, resolve_name=resolve_name),
+                           credential_id=credential_id, ok=ok,
+                           resolve_name=resolve_name),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"},
