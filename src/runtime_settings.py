@@ -250,6 +250,13 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
                "（不含凭证 ID / 用户名）。关闭后端点返回 404。",
                group="observability"),
+    HotSetting("request_log_enabled", bool, "请求级结构化日志",
+               "每个业务请求（`/api/*`、`/v1/*`、`/authorize`）写一行 logfmt："
+               "`event=request request_id=… method=… route=… status=… duration_ms=…`。"
+               "路由用模板（`/api/credentials/{credential_id}`）而不是实际 ID；"
+               "**不写 query string、请求体、用户名**。5xx 记 WARNING、其余记 INFO。"
+               "关闭后只剩 uvicorn 的裸 access log。",
+               group="observability"),
     # reasoning 控制：只给机制、不给策略（不内置默认矩阵——未核实就是编造）
     HotSetting("force_disable_thinking", bool, "剥离思考内容",
                "开启后出站响应不再包含模型的思考内容（chat 的 reasoning_content / "
@@ -775,6 +782,10 @@ class RuntimeSettings:
     @property
     def metrics_enabled(self) -> bool:
         return bool(self.get("metrics_enabled"))
+
+    @property
+    def request_log_enabled(self) -> bool:
+        return bool(self.get("request_log_enabled"))
 
     # ------------------------------------------------------ reasoning 控制
 

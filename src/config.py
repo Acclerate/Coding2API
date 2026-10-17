@@ -268,6 +268,11 @@ class Settings(BaseSettings):
     # Prometheus 指标出口（GET /metrics）：默认开启。与 /healthz 同口径**不鉴权**，
     # 指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。可热更。
     metrics_enabled: bool = True
+    # 请求级结构化日志（logfmt，见 src/webapp/access_log.py）：默认开启。
+    # 只记 /api、/v1、/authorize 这些业务请求，每行含 request_id / 路由模板 /
+    # 状态码 / 耗时；**不写 query string、请求体、用户名**（脱敏口径见
+    # PROPOSAL §6）。关闭后回到只有 uvicorn 的裸 access log。可热更。
+    request_log_enabled: bool = True
     # 全局剥离响应里的思考内容（`EventKind.REASONING`）：默认关闭。开启后
     # **只过滤出站响应**、不改写请求体——上游仍照常思考（`reasoning_effort`
     # 原样透传），只是不再把思考交给客户端。刻意不做请求侧改写：实测 CB

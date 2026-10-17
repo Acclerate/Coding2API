@@ -614,15 +614,16 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `UPSTREAM_COMPLETE_TIMEOUT_SECONDS` | `600` | 非流式聚合整体超时（秒）：超时按瞬态错误换号重试；`≤0` 关闭 |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | 单账号在途请求上限（跨渠道全局）：并发占满的号不再参与选号；`0` = 不限。租约请求结束释放，另有 600s TTL 兜底漏释放 |
 | `METRICS_ENABLED` | `true` | 是否暴露 `GET /metrics`（Prometheus text 格式，**不鉴权**，与 `/healthz` 同口径）；`false` 关闭（返回 404）。可热更 |
+| `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 `event=request request_id=… method=… route=… status=… duration_ms=…`。路由用模板（`/api/credentials/{credential_id}`）不用实际 ID；**不写 query string、请求体、用户名**，靠 `request_id` 关联 `usage_events`。5xx 记 WARNING、其余 INFO；静态资源与探针不记。`false` 回到只有 uvicorn 裸 access log。可热更 |
 | `FORCE_DISABLE_THINKING` | `false` | 出站剥离思考内容：开启后响应里不再有 `reasoning_content` / Anthropic `thinking` 块 / Responses reasoning item，**只过滤响应、不改请求体**（上游仍照常思考）。三个出口、流式与非流式一致生效。可热更 |
 | `REASONING_EFFORT_MAP` | `""` | 出站 `reasoning_effort` 档位映射：格式 `渠道=from:to,from:to;*=from:to`（渠道取 `KNOWN_PROVIDERS`，`*` 兜底）；目标写 `none` = 删除该键、走渠道默认。只改写客户端**显式**给的档位，渠道自身 `setdefault` 补的默认档不受影响。留空 = 原样透传。可热更 |
 | `ANTHROPIC_THINKING_EFFORTS` | `""` | Anthropic 入站 `thinking.budget_tokens` → 上游 `reasoning_effort`：格式 `预算:档位,预算:档位,disabled:档位`（`disabled` 匹配 `thinking.type=="disabled"`；其余取「阈值 ≤ budget_tokens 中最大的那一档」，低于最小阈值不映射）。留空 = 完全不映射（`thinking` 照旧忽略）。可热更 |
 
 ### 管理台热更（「任务与配置」页）
 
-上表中带「可热更」语义的 **50 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
+上表中带「可热更」语义的 **51 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
 
-`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`。
+`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`。
 
 要点：**优先级 `DB 覆盖值 > .env`**——改过后 .env 对该项不再生效，页面标「DB 覆盖」，点「恢复默认」删掉覆盖行才回落 .env。值存 `runtime_settings` 表（纯 key/value），新增可热更项无需迁移；白名单外的 key、非法类型 / 越界值写入前即拒。启动期项（`APP_SECRET` / `PORT` / `DATA_DIR` / `USERS_FILE` / `OPENROUTER_MODELS_URL` / 上游端点白名单）**不在**白名单。接口 `GET /api/settings` 读快照、`PUT /api/settings` 写（admin + CSRF），传 `null` 恢复默认。该页同时展示**后台任务运行态**，页面按 tab 组织；运行态是**进程内**的（`GET /api/tasks`，admin，页面每 30 秒刷新），重启归零。
 
@@ -759,6 +760,21 @@ launchctl print gui/$(id -u)/com.coding2api.frpc | grep -E 'state|pid'
 | **裸跑** | 终端 stderr | 无 | 自己重定向并自备轮转 |
 
 级别用 `LOG_LEVEL`（默认 `INFO`）。**审计日志是 INFO 级**，调到 `WARNING` 会把它一并关掉。
+
+### 请求级结构化日志
+
+除 uvicorn 自带的裸 access log 外，每个业务请求（`/api/*`、`/v1/*`、`/authorize`）额外写一行 logfmt：
+
+```
+event=request request_id=9f2c… method=POST route=/v1/chat/completions status=200 duration_ms=1234
+```
+
+- **`route` 是路由模板**（`/api/credentials/{credential_id}`），不是实际路径——资源 ID 不进日志，日志也不会按 ID 无限分叉；未匹配到路由（404、被安全中间件拒掉）时回落为清洗过的原始路径（白名单字符 + 120 字符截断）。
+- **不写 query string、请求体、响应体、请求头、用户名**。query 里可能被客户端塞 token；身份靠 `request_id` 去 `usage_events.request_id` 关联（那里已有 `username` 列），日志系统保留更久、权限更宽，能少放就少放。
+- `request_id` 与响应头 `X-Request-ID` 同值，可双向对照。
+- **级别**：`5xx` 记 WARNING（服务端自己的问题，值得抓），`4xx` 与成功记 INFO（否则 401 探测、拼错路径会把告警日志淹没）。
+- **不记**静态资源（`assets/*.js`）与探针（`/health`、`/healthz`、`/metrics`）——它们由 uvicorn access log 覆盖，重复记录只会把业务行挤出视野。
+- 开关 `REQUEST_LOG_ENABLED`（默认 `true`，可热更），关掉后回到只有 uvicorn 的裸 access log。
 
 > 容器里的 `data/dumps/`（诊断开关 `DUMP_REQUEST_BODIES=true` 写入）不在 docker 日志体系内，由应用自行保持最多 200 份。
 

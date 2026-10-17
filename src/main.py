@@ -107,6 +107,7 @@ from .upstream_status import UpstreamStatusStore
 from .version import app_version
 from .webapp import limits as _limits
 from .webapp import static as _static
+from .webapp.access_log import RequestLogMiddleware
 from .webapp.handlers import register_exception_handlers
 from .webapp.limits import BodySizeLimitMiddleware
 from .webapp.logging import configure_logging
@@ -774,6 +775,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     _static.register_spa_routes(app)
 
     app.add_middleware(BodySizeLimitMiddleware)
+    # 请求级结构化日志：在 RequestId 内侧（要用它生成的 ID）、在 BodySizeLimit
+    # 外侧（413 也是请求结果，要记下来）。热更开关走取值器，改完下一请求生效。
+    app.add_middleware(RequestLogMiddleware,
+                       enabled=lambda: bool(runtime.request_log_enabled))
     # 请求 ID 必须比 BodySizeLimitMiddleware 更外层：请求体超限时后者自己造
     # 413 响应（不经过更内层的 security），只有最外层才能保证**任何**响应
     # （含 413 / Host 校验 400）都带上 X-Request-ID。

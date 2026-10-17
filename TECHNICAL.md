@@ -587,6 +587,14 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 
 三个口径要点：① **禁高基数标签**——不打 `credential_id` / `api_key_id` / `username` / `request_id`，一个账号一条时间序列会让 Prometheus 内存与查询失控；② `requests_total` / `tokens_total` 读**永久**小时汇总而非 90 天明细，故 scrape 不做明细全表扫描、且计数跨重启单调；③ 进程内计数器（失败原因、任务失败）随重启归零，Prometheus 原生按 counter reset 处理。文本转义只处理 `\` / `"` / 换行（模型名可能含引号，不转义会拼坏整份响应）。**已知偏离扫描报告**：报告写 `upstream_errors_total` 数据源为 `usage_hourly`，但小时汇总没有 `error_type` 维度，用明细当 `_total` 会随裁剪下降，故 `kind` 改用进程内计数。
 
+### 11.3b 请求级结构化日志（`src/webapp/access_log.py`）
+`RequestLogMiddleware`（纯 ASGI）在每个**业务请求**结束时写一行 logfmt：`event=request request_id=… method=… route=… status=… duration_ms=…`。它是 uvicorn 裸 access log 的补充而非替代——后者的行里带完整 query string（客户端可能塞 token）、没有请求 ID、没有耗时，也没法和 `usage_events.request_id` 对上。
+
+- **脱敏口径**：只取 `scope["path"]`，**从不读 `query_string`**；不碰 body / 请求头；**不写用户名**（靠 `request_id` 关联 `usage_events`，那里才有身份列）。路由用**模板**（`scope["route"].path`）而不是实际路径，资源 ID 不进日志也不会让日志按 ID 分叉；命中 SPA catch-all `/​{path:path}` 或根本没匹配到路由时回落为清洗过的原始路径（`[A-Za-z0-9._~/%:@-]` 之外替换为 `?`、截断 120 字符，防换行注入）。
+- **只记业务请求**：`/api/*`、`/v1/*`、`/authorize`。静态资源与 `/health`、`/healthz`、`/metrics` 不记——uvicorn 已覆盖，重复记只会把业务行挤出视野。
+- **级别**：`5xx` → WARNING，其余（含 4xx）→ INFO。`finally` 里发日志，故下游异常冒泡（服务器回 500）也留痕，`status` 取不到时按 500 记。
+- **装配顺序**：在 `RequestIdMiddleware` 内侧（要用它生成的 ID）、在 `BodySizeLimitMiddleware` 外侧（413 也是请求结果，要记）。热更开关 `REQUEST_LOG_ENABLED` 走取值器，改完下一请求生效。
+
 ### 11.4 面向用户的错误语义
 管理端点返回的失败原因必须是**稳定的机器可读枚举**，不能是 Python 异常类名（类名是实现细节，重构时会漂移）。`POST /api/credentials/{id}/probe` 的失败响应：
 
@@ -628,7 +636,7 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 | 类别 | 例子 | 位置 | 变更方式 |
 |---|---|---|---|
 | 启动期不可变项 | `APP_SECRET` / `HOST` / `PORT` / `DATA_DIR` / `USERS_FILE` / 上游端点白名单 / `PROVIDER_PROXIES` | `config.Settings`（frozen） | 改 env + 重启；**不进白名单** |
-| 运行时可覆盖项 | `runtime_settings.HOT_SETTINGS`（50 项） | `RuntimeSettings` 覆盖层 | 管理台改，立即生效 |
+| 运行时可覆盖项 | `runtime_settings.HOT_SETTINGS`（51 项） | `RuntimeSettings` 覆盖层 | 管理台改，立即生效 |
 
 启动期项拒绝热更的原因：它们决定进程如何启动（监听地址、加密密钥、上游白名单）或作用于连接池；运行期变更只会让「当前进程」与「磁盘配置」静默分叉。**生效优先级**：`runtime_settings` 表（DB 覆盖）> `.env`（默认值来源）。覆盖行只有被管理台改过的 key；「恢复默认」= 删除该行，不是写入 env 当前值。**读取机制**：`RuntimeSettings` 对热更 key 返回覆盖值，其余属性 `__getattr__` 透明委托给 `Settings`——调用方仍写 `settings.default_model`。覆盖值在内存缓存，写入后 `reload()` 刷新；读取路径不查库。**消费端**：`config.live(value)` 把「标量或零参 callable」统一成取值器；生产装配传 `lambda: runtime.xxx`（每次读当前值），测试与一次性任务传标量。已接线的热更点：`Scheduler.expiry_window` / `secondary_expiry_window`（读取时跑 `expiry_windows()` 归一化）、`ConversationAffinity.ttl_seconds`、`Pacer.min/max_seconds`（校验从构造期挪到读取期）、`Executor.default_model` / `max_auto_continues` / `force_disable_thinking` / `reasoning_effort_map`、`GrowthTask.allow_irreversible`、`TaskRunner` 周期与活跃上报开关时点、上下文压缩四项、`USD_CNY_RATE`、Anthropic 出口的 `anthropic_thinking_efforts`（在 `api/messages.py` 的 parse 闭包里现读）。**校验**：白名单外 key 直接拒绝；类型与范围（min/max）写入前校验；跨字段组合（`pacer_min ≤ pacer_max`）用「这一批写完之后」的对端值比较，失败则整批不落库。表里坏行读取时跳过并记警告。**接口**：`GET /api/settings`（admin）返回 `snapshot()`（`key`/`env_name`/`label`/`description`/`kind`/`value`/`default`/`overridden`/`task`/`group`）+ 覆盖计数 + 网关卡组表 `groups`；`PUT /api/settings`（admin + CSRF）body `{"values": {key: 标量 | null}}`，`null` 表示恢复默认。写操作记审计日志。`snapshot()` 里的 `task` 是**配置项 → 后台任务 key** 的归属（`null` = 非任务项），`group` 是**非任务项 → 网关卡组 key** 的归属（`GATEWAY_GROUPS`：模型路由 / 选号与会话 / 渠道节流 / 后台任务节流 / 可观测性）。不变量：每项**要么**属于一个任务，**要么**落在一个网关卡组，两者互斥且都有归属（测试守住，否则前端会漏渲染该配置项）。
 ### 13.2 后台任务可视化（管理台「任务与配置」页）
