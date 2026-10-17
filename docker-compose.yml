@@ -146,6 +146,12 @@ services:
       # 截断续写：上游 finish_reason=length 时同凭证自动续写的最多次数；0 关闭
       AUTO_CONTINUE_MAX: ${AUTO_CONTINUE_MAX:-10}
       UPSTREAM_COMPLETE_TIMEOUT_SECONDS: ${UPSTREAM_COMPLETE_TIMEOUT_SECONDS:-600}
+      # 流式首事件超时（秒）：出帧前长时间无数据帧就换号重试；0 关闭
+      STREAM_FIRST_EVENT_TIMEOUT_SECONDS: ${STREAM_FIRST_EVENT_TIMEOUT_SECONDS:-0}
+      # 流式空闲超时（秒）：已出帧后长时间无数据只能以错误帧收尾；0 关闭
+      STREAM_IDLE_TIMEOUT_SECONDS: ${STREAM_IDLE_TIMEOUT_SECONDS:-0}
+      # 短冷却「等待续上」（秒）：全池都在短冷却时最多等这么久再取一次；0 关闭
+      SHORT_COOLDOWN_WAIT_SECONDS: ${SHORT_COOLDOWN_WAIT_SECONDS:-0}
       # 单账号在途请求上限（跨渠道全局）；0 = 不限
       MAX_INFLIGHT_PER_CREDENTIAL: ${MAX_INFLIGHT_PER_CREDENTIAL:-0}
       # Prometheus 指标出口（GET /metrics，无鉴权，与 /healthz 同口径）；false 关闭
@@ -165,6 +171,8 @@ services:
       CONTEXT_COMPRESS_SAFETY_RATIO: ${CONTEXT_COMPRESS_SAFETY_RATIO:-0.95}
       # 跨渠道 fallback 兼容组：主渠道全不可用时按组回退到同义模型（留空关闭）
       MODEL_FALLBACK_GROUPS: ${MODEL_FALLBACK_GROUPS:-}
+      # 用户自定义模型别名（对外名=模型@渠道;...）：留空不启用
+      MODEL_ALIASES: ${MODEL_ALIASES:-}
       # 按渠道出站代理（启动期）：渠道=代理URL;渠道2=代理URL2，留空直连
       PROVIDER_PROXIES: ${PROVIDER_PROXIES:-}
       ENABLE_DOCS: ${ENABLE_DOCS:-false}

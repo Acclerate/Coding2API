@@ -12,7 +12,12 @@
 
 from __future__ import annotations
 
-from ..request_context import REQUEST_ID_HEADER, resolve_request_id, set_request_id
+from ..request_context import (
+    REQUEST_ID_HEADER,
+    resolve_request_id,
+    set_api_key_id,
+    set_request_id,
+)
 
 
 def _header(scope, name: bytes) -> str | None:
@@ -43,4 +48,10 @@ class RequestIdMiddleware:
                 message.setdefault("headers", []).append(header)
             await send(message)
 
-        await self.app(scope, receive, send_with_header)
+        try:
+            await self.app(scope, receive, send_with_header)
+        finally:
+            # 复原 Key 归属：contextvar 由鉴权依赖设置，而流式响应体在依赖
+            # 的 finally **之后**才发送，只靠依赖复原会让「响应体期间」的
+            # 后台写入串到下一个请求。中间件包住整个 ASGI 调用，最可靠。
+            set_api_key_id(None)

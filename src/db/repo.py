@@ -720,22 +720,36 @@ class ApiKeyRepository:
 
     def create(self, username: str, name: str = "", now: int | None = None,
                *, provider_binding: str = "", allowed_ips: str = "",
-               allowed_models: str = "", expires_at: int | None = None) -> dict[str, Any]:
+               allowed_models: str = "", expires_at: int | None = None,
+               quota: str = "") -> dict[str, Any]:
         plaintext = generate_api_key()
         key_id = _new_id("key")
         created_at = int(now if now is not None else time.time())
         with self._db.transaction() as conn:
             conn.execute(
                 "INSERT INTO api_keys (id, username, name, key_digest, preview, created_at, "
-                "provider_binding, allowed_ips, allowed_models, expires_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "provider_binding, allowed_ips, allowed_models, expires_at, quota) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (key_id, username, name, digest_api_key(plaintext), preview_api_key(plaintext),
-                 created_at, provider_binding, allowed_ips, allowed_models, expires_at),
+                 created_at, provider_binding, allowed_ips, allowed_models, expires_at, quota),
             )
         return {"id": key_id, "username": username, "name": name, "api_key": plaintext,
                 "preview": preview_api_key(plaintext), "created_at": created_at,
                 "provider_binding": provider_binding, "allowed_ips": allowed_ips,
-                "allowed_models": allowed_models, "expires_at": expires_at}
+                "allowed_models": allowed_models, "expires_at": expires_at,
+                "quota": quota}
+
+    def set_quota(self, key_id: str, username: str, quota: str) -> bool:
+        """整体替换一把 Key 的配额配置（空串 = 清除配额）。
+
+        带上 username 条件：管理台只能改自己名下的 Key，否则任何登录用户都能
+        改别人的配额（越权写）。返回 False 表示 Key 不存在或不属于该用户。
+        """
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE api_keys SET quota = ? WHERE id = ? AND username = ?",
+                (quota, key_id, username))
+        return cursor.rowcount > 0
 
     def authenticate(self, api_key: str) -> dict[str, Any] | None:
         """校验 Key 并返回其策略行（含 provider_binding / allowed_ips / 策略）。
@@ -750,7 +764,7 @@ class ApiKeyRepository:
         digest = digest_api_key(api_key)
         row = self._db.connect().execute(
             "SELECT id, username, provider_binding, allowed_ips, allowed_models, "
-            "expires_at, last_used_at FROM api_keys WHERE key_digest = ?",
+            "expires_at, last_used_at, quota FROM api_keys WHERE key_digest = ?",
             (digest,)).fetchone()
         if row is None:
             return None
@@ -763,7 +777,7 @@ class ApiKeyRepository:
         # 返回值形状与旧实现一致：last_used_at 只用于上面的节流判定
         return {key: row[key] for key in
                 ("id", "username", "provider_binding", "allowed_ips",
-                 "allowed_models", "expires_at")}
+                 "allowed_models", "expires_at", "quota")}
 
     def verify(self, api_key: str) -> str | None:
         row = self.authenticate(api_key)
@@ -781,12 +795,14 @@ class ApiKeyRepository:
         if limit is None:
             rows = self._db.connect().execute(
                 "SELECT id, username, name, preview, created_at, last_used_at, "
-                "provider_binding, allowed_ips, allowed_models, expires_at FROM api_keys "
+                "provider_binding, allowed_ips, allowed_models, expires_at, quota "
+                "FROM api_keys "
                 f"WHERE username = ? ORDER BY {clause}", (username,)).fetchall()
         else:
             rows = self._db.connect().execute(
                 "SELECT id, username, name, preview, created_at, last_used_at, "
-                "provider_binding, allowed_ips, allowed_models, expires_at FROM api_keys "
+                "provider_binding, allowed_ips, allowed_models, expires_at, quota "
+                "FROM api_keys "
                 f"WHERE username = ? ORDER BY {clause} LIMIT ? OFFSET ?",
                 (username, max(1, min(500, limit)), max(0, offset))).fetchall()
         return [dict(row) for row in rows]

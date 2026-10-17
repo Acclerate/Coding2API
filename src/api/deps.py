@@ -29,6 +29,7 @@ from ..auth.session import SESSION_COOKIE, verify_session_token
 from ..auth.throttle import LoginThrottle
 from ..compat.openai.request import InvalidRequest
 from ..config import Settings
+from ..db.key_usage import KeyUsageRepository
 from ..db.limits import LimitsRepository
 from ..db.repo import (
     AlertRepository,
@@ -41,6 +42,8 @@ from ..db.repo import (
 )
 from ..engine.executor import Executor
 from ..engine.limits import LimitGuard
+from ..key_quota import KeyQuota, KeyQuotaGuard, load_key_quota
+from ..request_context import set_api_key_id
 from ..runtime_settings import RuntimeSettings
 from ..stats.live import LiveEventHub
 from ..stats.query import StatsQuery
@@ -90,6 +93,11 @@ class Services:
     alerts: AlertRepository
     # 凭证级限额护栏配置（/api/credentials/{id}/limits）。
     limits: LimitsRepository
+    # Key 级配额：准入判定（当日用量注入 KeyUsageRepository）+ 自助用量共用。
+    # 进程内滑动窗口/在途计数在 guard 里，重启清零（单进程部署语义）。
+    key_quota: KeyQuotaGuard
+    # 按 API Key 聚合用量（Key 配额判定与 GET /v1/usage 的数据源）。
+    key_usage: KeyUsageRepository
     # 同一个限流护栏实例（executor 也持它）：管理台改完限额后 invalidate()
     # 让新值立即生效，不必等选号侧的快照 TTL。
     limit_guard: LimitGuard
@@ -176,6 +184,8 @@ class ApiKeyPrincipal:
     username: str
     provider_binding: str = ""      # '' = 不限定渠道
     allowed_models: str = ""        # '' = 不限定模型（fnmatch glob，逗号分隔）
+    key_id: str = ""                # api_keys.id（Key 级配额与自助用量的归属）
+    quota: KeyQuota = field(default_factory=KeyQuota)  # 该 Key 的配额（全关=不受限）
 
 
 def _api_key_principal(services: Services, request: Request,
@@ -190,9 +200,15 @@ def _api_key_principal(services: Services, request: Request,
     source = request_ip(request, services.settings)
     if not ip_allowed(source, record.get("allowed_ips") or ""):
         raise ForbiddenError("source ip not allowed for this api key")
-    return ApiKeyPrincipal(username=record["username"],
-                           provider_binding=record.get("provider_binding") or "",
-                           allowed_models=record.get("allowed_models") or "")
+    principal = ApiKeyPrincipal(username=record["username"],
+                                provider_binding=record.get("provider_binding") or "",
+                                allowed_models=record.get("allowed_models") or "",
+                                key_id=record["id"],
+                                quota=load_key_quota(record.get("quota")))
+    # 归属权只认鉴权结果（绝不读入站头）：统计写入经 contextvar 现读，
+    # 请求结束由 RequestIdMiddleware 复原（流式响应体也在中间件作用域内）。
+    set_api_key_id(principal.key_id)
+    return principal
 
 
 async def api_key_user(request: Request) -> ApiKeyPrincipal:

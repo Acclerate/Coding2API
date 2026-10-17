@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Copy, KeyRound, Plus, Share2, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Gauge, KeyRound, Plus, Share2, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "../api/client";
 import { Button as RawButton } from "../components/ui/button";
@@ -15,6 +15,17 @@ import { buildSections, displayName, modelValue } from "../components/ModelPicke
 import { PROVIDER_LABEL, PROVIDER_ORDER } from "../api/providers";
 import { buildCcSwitchLink, CCSWITCH_TARGETS } from "../lib/ccSwitch";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
+import {
+  EMPTY_QUOTA,
+  QUOTA_FIELDS,
+  type KeyQuota,
+  quotaInput,
+  quotaOf,
+  quotaSummary,
+  setApiKeyQuota,
+  usageTodayLabel,
+  usageTodayOf,
+} from "../api/keyQuota";
 import type { ApiKey, ApiKeyCreated } from "../api/types";
 import {
   Badge,
@@ -470,6 +481,74 @@ export function CcSwitchImportButtons({
   );
 }
 
+/** 六项配额输入：创建对话框与「改配额」对话框共用。 */
+function QuotaFields({
+  value,
+  onChange,
+  testidPrefix,
+}: {
+  value: KeyQuota;
+  onChange: (next: KeyQuota) => void;
+  testidPrefix: string;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid={`${testidPrefix}-fields`}>
+      {QUOTA_FIELDS.map((field) => (
+        <Field key={field.key} label={field.label} hint={field.hint}
+               htmlFor={`${testidPrefix}-${field.key}`}>
+          <Input
+            id={`${testidPrefix}-${field.key}`}
+            type="number"
+            min={0}
+            step={field.step ?? "1"}
+            value={value[field.key] === 0 ? "" : String(value[field.key])}
+            placeholder="0"
+            data-testid={`${testidPrefix}-${field.key}`}
+            onChange={(event) => {
+              const raw = event.target.value.trim();
+              const numeric = raw === "" ? 0 : Number(raw);
+              onChange({ ...value, [field.key]: Number.isFinite(numeric) && numeric > 0 ? numeric : 0 });
+            }}
+          />
+        </Field>
+      ))}
+    </div>
+  );
+}
+
+/** 配额区块的折叠外壳（低频配置，默认收起，避免创建对话框过长）。 */
+function QuotaSection({
+  title,
+  value,
+  onChange,
+  testid,
+}: {
+  title: string;
+  value: KeyQuota;
+  onChange: (next: KeyQuota) => void;
+  testid: string;
+}) {
+  return (
+    <Collapsible data-testid={testid} className="rounded-lg border border-border px-3 py-2">
+      <CollapsibleTrigger
+        data-testid={`${testid}-trigger`}
+        className="flex w-full cursor-pointer select-none items-center gap-2 text-sm"
+      >
+        <span>{title}</span>
+        <span className="text-xs text-muted-foreground">{quotaSummary(value)}</span>
+        <ChevronDown className="ml-auto size-4" />
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-3">
+        <QuotaFields value={value} onChange={onChange} testidPrefix={`${testid}-input`} />
+        <p className="mt-2 text-xs text-muted-foreground">
+          0 = 不限制。每日类按北京时间自然日统计（与凭证限额同一口径）；
+          RPM/TPM/并发是进程内计数，重启清零。
+        </p>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 export function ApiKeysPage() {
   const { sort, order, toggle } = useSort("created_at", "asc", { last_used_at: "desc" });
   const [page, setPage] = useState(0);
@@ -491,6 +570,10 @@ export function ApiKeysPage() {
   const [allowedIps, setAllowedIps] = useState("");
   const [allowedModels, setAllowedModels] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
+  const [quota, setQuota] = useState<KeyQuota>({ ...EMPTY_QUOTA });
+  // 列表行「改配额」对话框：整体替换一把 Key 的配额
+  const [editingQuota, setEditingQuota] = useState<ApiKey | null>(null);
+  const [quotaDraft, setQuotaDraft] = useState<KeyQuota>({ ...EMPTY_QUOTA });
   const [created, setCreated] = useState<ApiKeyCreated | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -507,12 +590,16 @@ export function ApiKeysPage() {
     event.preventDefault();
     setError(null);
     try {
+      const quotaPayload = quotaInput(quota);
       const result = await api.createApiKey({
         name,
         provider_binding: binding,
         allowed_ips: allowedIps.trim(),
         allowed_models: allowedModels.trim(),
         expires_at: parseExpiresAt(expiresAt),
+        // 全 0（= 不限制）时不带该字段：保持与老后端/老请求体一致，
+        // 也让「没配配额」与「显式传空配额」在日志里可区分。
+        ...(quotaPayload ? { quota: quotaPayload } : {}),
       });
       setCreated(result);
       setName("");
@@ -520,10 +607,29 @@ export function ApiKeysPage() {
       setAllowedIps("");
       setAllowedModels("");
       setExpiresAt("");
+      setQuota({ ...EMPTY_QUOTA });
       setCopied(false);
       await client.invalidateQueries({ queryKey: ["admin"] });
     } catch {
-      setError("创建失败：请检查渠道绑定、模型白名单、IP 白名单与到期时间格式");
+      setError("创建失败：请检查渠道绑定、模型白名单、IP 白名单与到期时间格式（配额须为非负数字）");
+    }
+  };
+
+  const openQuotaEditor = (key: ApiKey) => {
+    setEditingQuota(key);
+    setQuotaDraft(quotaOf(key));
+    setError(null);
+  };
+
+  const saveQuota = async () => {
+    if (!editingQuota) return;
+    setError(null);
+    try {
+      await setApiKeyQuota(editingQuota.id, quotaDraft);
+      setEditingQuota(null);
+      await client.invalidateQueries({ queryKey: ["admin"] });
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "保存配额失败");
     }
   };
 
@@ -613,6 +719,8 @@ export function ApiKeysPage() {
                               onToggle={toggleSort} testId="sort-last_used_at" />
                 <TableHead>来源 IP</TableHead>
                 <TableHead>模型白名单</TableHead>
+                <TableHead>配额</TableHead>
+                <TableHead>当日已用</TableHead>
                 <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
                               direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <TableHead className="text-right">操作</TableHead>
@@ -638,6 +746,12 @@ export function ApiKeysPage() {
                   <TableCell label="模型白名单" className="font-mono text-xs" data-testid={`key-models-${key.id}`}>
                     {key.allowed_models || "不限制"}
                   </TableCell>
+                  <TableCell label="配额" className="text-xs" data-testid={`key-quota-${key.id}`}>
+                    {quotaSummary(quotaOf(key))}
+                  </TableCell>
+                  <TableCell label="当日已用" className="text-xs" data-testid={`key-usage-${key.id}`}>
+                    {usageTodayLabel(usageTodayOf(key))}
+                  </TableCell>
                   <TableCell label="创建时间" className="text-xs">
                     {formatTime(key.created_at)}
                   </TableCell>
@@ -653,6 +767,15 @@ export function ApiKeysPage() {
                       </span>
                     ) : (
                       <span className="inline-flex flex-wrap justify-end gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          data-testid={`edit-quota-${key.id}`}
+                          onClick={() => openQuotaEditor(key)}
+                        >
+                          <Gauge className="mr-1 size-3.5" />
+                          配额
+                        </Button>
                         <Button
                           size="sm"
                           variant="ghost"
@@ -792,6 +915,8 @@ export function ApiKeysPage() {
                     onChange={(event) => setExpiresAt(event.target.value)}
                   />
                 </Field>
+                <QuotaSection title="配额（可选）" value={quota} onChange={setQuota}
+                              testid="key-quota" />
                 {/* 创建结果（成功/失败）无焦点变化，aria-live 让读屏可感知 */}
                 <div aria-live="polite">
                   {error && (
@@ -811,6 +936,61 @@ export function ApiKeysPage() {
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 列表行「配额」对话框：整体替换该 Key 的配额（全 0 = 清除） */}
+      {editingQuota && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm"
+          onClick={() => setEditingQuota(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="设置 Key 配额"
+            data-testid="key-quota-dialog"
+            onClick={(event) => event.stopPropagation()}
+            className="max-h-[90vh] w-full max-w-lg animate-in overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl fade-in-0 zoom-in-95"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <Gauge className="size-4 text-muted-foreground" />
+                设置配额 · {editingQuota.name || editingQuota.preview}
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="关闭"
+                data-testid="key-quota-close"
+                onClick={() => setEditingQuota(null)}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+            <div className="space-y-3">
+              <QuotaFields value={quotaDraft} onChange={setQuotaDraft}
+                           testidPrefix="key-quota-edit" />
+              <p className="text-xs text-muted-foreground">
+                全部填 0 = 清除配额（恢复不限制）。保存后下一个请求立即生效。
+              </p>
+              <div aria-live="polite">
+                {error && (
+                  <div role="alert">
+                    <Notice tone="danger">{error}</Notice>
+                  </div>
+                )}
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={() => setEditingQuota(null)}>
+                  取消
+                </Button>
+                <Button variant="primary" data-testid="key-quota-save" onClick={() => void saveQuota()}>
+                  保存
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       )}

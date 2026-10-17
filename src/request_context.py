@@ -60,3 +60,20 @@ def get_request_id() -> str | None:
 def resolve_request_id(header: str | None) -> str:
     """入站头 → 最终请求 ID：合法则沿用（便于与客户端日志对齐），否则自生成。"""
     return sanitize_request_id(header) or new_request_id()
+
+
+# 发起请求的 API Key id（api_keys.id）。同上：走 contextvar 是因为调用链
+# `鉴权依赖 → api 出口 → executor → stats_collector` 跨引擎层，不该为一个计量
+# 字段污染所有中间层签名。**只由鉴权层设置**（`src/api/deps.py` 校验通过后），
+# 绝不从请求头读——入站头是客户端可写的，信它等于把归属权交给调用方。
+_api_key_id: ContextVar[str | None] = ContextVar("api_key_id", default=None)
+
+
+def set_api_key_id(value: str | None) -> None:
+    """在当前上下文设置 API Key id（鉴权依赖在放行之前调用；None=复原）。"""
+    _api_key_id.set(value)
+
+
+def get_api_key_id() -> str | None:
+    """读当前上下文的 API Key id；无请求上下文（后台任务/脚本）返回 None。"""
+    return _api_key_id.get()

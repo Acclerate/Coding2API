@@ -149,3 +149,65 @@ def test_record_without_request_context_stores_null(db):
     assert get_request_id() is None
     collector.record(username="u", provider="trae", model="m", ok=True)
     assert query.events(username="u")["events"][0]["request_id"] is None
+
+
+# --------------------------------------------------- Key 归属 contextvar
+
+def test_middleware_resets_api_key_id_after_request():
+    """Key 归属必须随请求结束复原（含流式响应体期间的写入）。"""
+    from src.request_context import get_api_key_id, set_api_key_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/keyed")
+    async def keyed():
+        set_api_key_id("key_1")        # 模拟鉴权依赖
+        return {"key": get_api_key_id()}
+
+    with TestClient(app) as client:
+        assert client.get("/keyed").json() == {"key": "key_1"}
+        # 同一线程的下一个请求看不到上一个请求的归属
+        assert client.get("/plain").status_code == 404
+    assert get_api_key_id() is None
+
+
+def test_middleware_resets_api_key_id_even_when_handler_raises():
+    from src.request_context import get_api_key_id, set_api_key_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/boom")
+    async def boom():
+        set_api_key_id("key_2")
+        raise RuntimeError("handler exploded")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.get("/boom").status_code == 500
+    assert get_api_key_id() is None
+
+
+def test_record_persists_api_key_id_from_context(db):
+    from src.request_context import set_api_key_id
+    from src.stats.collector import StatsCollector
+
+    collector = StatsCollector(db)
+    set_api_key_id("key_ctx")
+    try:
+        collector.record(username="u", provider="trae", model="m", ok=True)
+    finally:
+        set_api_key_id(None)
+    assert db.connect().execute(
+        "SELECT api_key_id FROM usage_events").fetchone()["api_key_id"] == "key_ctx"
+
+
+def test_record_without_key_context_stores_null(db):
+    """后台任务 / 内部请求没有 Key 归属 → NULL（= 未归属，不猜）。"""
+    from src.stats.collector import StatsCollector
+    from src.stats.query import StatsQuery
+
+    collector, _query = StatsCollector(db), StatsQuery(db)
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert db.connect().execute(
+        "SELECT api_key_id FROM usage_events").fetchone()["api_key_id"] is None

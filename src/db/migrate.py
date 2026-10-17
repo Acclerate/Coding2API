@@ -57,7 +57,10 @@ SCHEMA_NAME = "schema.sql"
 # 26：usage_events 新增 api_key_id（发起请求的 API Key id，供按 Key 计量与
 # 自助用量）。老库补列后历史行为 NULL ＝「未归属到具体 Key」，读路径按未归属
 # 处理，与补列前行为一致；索引 idx_usage_key 在补列之后建（见 _MIGRATION_INDEXES）。
-SCHEMA_VERSION = 26
+# 27：api_keys 新增 quota（Key 级配额 JSON 文本：当日请求/当日 token/当日成本/
+# RPM/TPM/并发，''=不限制）。老库补列后为 '' ＝「所有 Key 不受配额约束」，
+# 出口行为与补列前完全一致。
+SCHEMA_VERSION = 27
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -120,6 +123,8 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 发起请求的 API Key（按 Key 计量 / 自助用量）：老库补列后历史行为 NULL
     # ＝「未归属到具体 Key」，读路径按未归属处理，与补列前一致。
     ("usage_events", "api_key_id TEXT"),
+    # Key 级配额（JSON 文本）：老库补 '' ＝「不限制」，出口行为不变。
+    ("api_keys", "quota TEXT NOT NULL DEFAULT ''"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。

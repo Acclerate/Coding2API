@@ -30,7 +30,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     -- Key 细粒度策略：模型白名单（fnmatch glob，逗号分隔，''=不限制）
     -- 与到期时间（epoch 秒，NULL=永不过期）。
     allowed_models TEXT NOT NULL DEFAULT '',
-    expires_at    INTEGER
+    expires_at    INTEGER,
+    -- Key 级配额（JSON 文本，''=不限制）。结构见 src/auth/access.py
+    -- 的 parse_key_quota：daily_requests / daily_tokens / daily_cost_usd /
+    -- rpm / tpm / max_concurrency，0 或缺失的键 = 该项关闭。
+    -- 存文本而不是拆列：配额项是「可增可减的策略集合」，拆列会让每次加一项
+    -- 都要走迁移；读路径宽容解析，坏行退化为「不限制」而不是崩掉出口。
+    quota         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS credentials (

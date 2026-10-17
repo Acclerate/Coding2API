@@ -39,6 +39,7 @@ from .api import (
     models,
     playground,
     responses,
+    usage,
 )
 from .api.context import build_context_compressor
 from .api.deps import Services
@@ -64,6 +65,7 @@ from .config import (
 )
 from .db.conn import Database
 from .db.crypto import CredentialCipher
+from .db.key_usage import KeyUsageRepository
 from .db.limits import LimitsRepository, day_usage
 from .db.migrate import apply_schema
 from .db.repo import (
@@ -82,6 +84,7 @@ from .engine.inflight import InflightGuard
 from .engine.limits import LimitGuard
 from .engine.model_resolver import KNOWN_PROVIDERS, parse_fallback_groups
 from .engine.scheduler import Scheduler
+from .key_quota import KeyQuotaGuard
 from .provider.codearts import CodeArtsProvider
 from .provider.codearts.client import CodeArtsClient
 from .provider.codearts.oauth import CodeArtsOAuth
@@ -462,6 +465,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     limits_repo = LimitsRepository(db)
     limit_guard = LimitGuard(limits_repo,
                              lambda since: day_usage(db, since=since))
+    # Key 级配额：当日用量按 api_key_id 聚合（明细表），RPM/TPM/并发走进程内
+    # 滑动窗口——不落库、重启清零，单进程部署下即精确。
+    key_usage = KeyUsageRepository(db)
+    key_quota = KeyQuotaGuard(key_usage.for_key)
     # 凭证在途租约：跨渠道的「单账号并发上限」，选号前过滤 + 请求结束释放。
     # 上限现读运行态覆盖层，管理台改完下一请求即生效（无快照，无需 invalidate）。
     inflight_guard = InflightGuard(lambda: runtime.max_inflight_per_credential)
@@ -710,6 +717,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         alerts=alerts,
         limits=limits_repo,
         limit_guard=limit_guard,
+        key_quota=key_quota,
+        key_usage=key_usage,
         stats_query=app.state.stats_query,
         login_throttle=app.state.login_throttle,
         live_events=live_events,
@@ -775,6 +784,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(balance.create_router(services))
     app.include_router(playground.create_router(services))
     app.include_router(authorize.create_router(services))
+    app.include_router(usage.create_router(services))
     # Prometheus 指标出口（无鉴权，与 /healthz 同口径）：必须注册在 SPA
     # catch-all 之前，否则会被通配路由吞掉返回 index.html。
     app.include_router(metrics.create_router(services))
