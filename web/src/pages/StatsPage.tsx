@@ -14,6 +14,7 @@ import {
   useStatsTimeline,
 } from "../api/hooks";
 import { formatCacheRate, formatCompact, formatCredit, formatLatency, formatMoney, formatNumber, formatTime, usageErrorLabel } from "../api/display";
+import { useStatsErrors } from "../api/statsErrors";
 import { ModelTrendChart } from "../components/ModelTrendChart";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -26,7 +27,7 @@ import { UsageChart } from "../components/UsageChart";
 import { providerLabel } from "../api/providers";
 import { api } from "../api/client";
 import { buildCustomRange, toLocalInput } from "../lib/customRange";
-import type { GroupStats, StatsDrill, UsageEventRow } from "../api/types";
+import type { GroupStats, StatsDrill, StatsEventFilters, UsageEventRow } from "../api/types";
 import {
   Button,
   Checkbox,
@@ -104,16 +105,24 @@ const GROUP_TOKEN_COLUMNS = [
   { key: "cached_tokens", label: "命中" },
 ] as const;
 
-/** 分组表两种延迟口径：均值读小时汇总，P95 读明细（菜单即排序键白名单）。 */
+/** 分组表两种延迟口径：均值读小时汇总，分位读明细（菜单即排序键白名单）。 */
 const GROUP_AVG_LATENCY_COLUMNS = [
   { key: "avg_latency_ms", label: "平均耗时" },
   { key: "avg_ttfb_ms", label: "平均首字" },
 ] as const;
 
-const GROUP_P95_LATENCY_COLUMNS = [
-  { key: "p95_latency_ms", label: "P95 耗时" },
-  { key: "p95_ttfb_ms", label: "P95 首字" },
-] as const;
+/**
+ * 分组表分位档：后端一次算好 P50/P90/P95/P99，前端只切展示哪一档。
+ *
+ * 四档全铺成列会把表头撑爆，故合并成一列 + 档位切换；默认 P95 保持既有
+ * 观感与 testId（`group-p95-latency` / `group-sort-p95-latency`）。
+ */
+const PERCENTILES = ["p50", "p90", "p95", "p99"] as const;
+type Percentile = (typeof PERCENTILES)[number];
+
+const PERCENTILE_TABS = PERCENTILES.map((value) => ({
+  value, label: value.toUpperCase(),
+}));
 
 /**
  * 分组统计的维度。后端各维度的行结构一致（分组键 + 同一组公共指标），
@@ -129,14 +138,25 @@ const GROUP_DIMENSIONS = [
   { value: "credential", label: "按凭证", groupKey: "credential_id", label2: "凭证", operatorOnly: true },
 ] as const;
 
-/** 公共指标 + 至多一个分组键（键名随维度变化，用可选字段统一承载）。 */
-type GroupRow = GroupStats & {
+/** 分位列名（后端按 PERCENTILES 下发；types.ts 的 GroupStats 只写死了 P95）。 */
+type PercentileField = `${Percentile}_latency_ms` | `${Percentile}_ttfb_ms`;
+
+/** 公共指标 + 分位列 + 至多一个分组键（键名随维度变化，用可选字段统一承载）。 */
+type GroupRow = GroupStats & Partial<Record<PercentileField, number | null>> & {
   provider?: string;
   model?: string;
   username?: string;
   credential_id?: string;
   credential_name?: string | null;
 };
+
+/**
+ * 页面级钻取状态 = 既有 `StatsDrill` + 成功/失败过滤。
+ *
+ * `ok` 不进 `types.ts` 的 `StatsDrill`（那个类型描述的是「分组表点行」的通用
+ * 形态）：只有失败归因卡片需要它。这里本地扩展，`applyDrill` 合并时一并带上。
+ */
+type PageDrill = StatsDrill & { ok?: number };
 
 /** 凭证文案：昵称优先，回落 ID 前 12 位（ID 很长）。分组表与明细表共用，
  *  保证同一凭证在两处显示成同一个名字。 */
@@ -204,8 +224,10 @@ export function StatsPage() {
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState(20);
   const [cursors, setCursors] = useState<(number | undefined)[]>([undefined]);
+  // 分组表分位档：默认 P95（既有观感）；四档后端一次算好，切换只换展示列
+  const [percentile, setPercentile] = useState<Percentile>("p95");
   // 钻取：点分组表的行 → 只看该渠道/模型/用户/凭证的明细。空对象 = 未钻取。
-  const [drill, setDrill] = useState<StatsDrill>({});
+  const [drill, setDrill] = useState<PageDrill>({});
   // 导出反馈（行数/截断/失败），一次性展示，再次导出即覆盖
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -244,7 +266,7 @@ export function StatsPage() {
     drill.username, effectiveSince, effectiveUntil, eventBefore, pageSize,
     eventSort.sort, eventSort.order, eventOffset,
     { provider: drill.provider, model: drill.model,
-      credential_id: drill.credential_id });
+      credential_id: drill.credential_id, ok: drill.ok });
   const eventRows = events.data?.events ?? [];
   // 实时流：只保留最近 50 条（新→旧）。缓冲由前端自己管：页面长时间开着时
   // 不无限增长，且「刚发生的」永远在最上面。
@@ -252,7 +274,7 @@ export function StatsPage() {
     enabled: live,
     username: drill.username,
     filters: { provider: drill.provider, model: drill.model,
-               credential_id: drill.credential_id },
+               credential_id: drill.credential_id, ok: drill.ok },
     onEvent: (row) => {
       setLiveRows((prev) => [row, ...prev].slice(0, LIVE_MAX_ROWS));
     },
@@ -301,7 +323,7 @@ export function StatsPage() {
    * 依次点行即可层层收窄（provider=trae AND model=glm-5.2），这正是钻取
    * 相对「跳转看全量」的价值。换过滤即换数据集，分页回到第一页。
    */
-  const applyDrill = (next: StatsDrill) => {
+  const applyDrill = (next: PageDrill) => {
     setDrill((prev) => ({ ...prev, ...next }));
     setPageIndex(0);
     setCursors([undefined]);
@@ -318,6 +340,7 @@ export function StatsPage() {
   if (drill.provider) drillLabels.push(`渠道：${providerLabel(drill.provider)}`);
   if (drill.model) drillLabels.push(`模型：${drill.model}`);
   if (drill.credential_id) drillLabels.push(`凭证：${drill.credential_id.slice(0, 12)}`);
+  if (drill.ok !== undefined) drillLabels.push(drill.ok === 0 ? "只看失败" : "只看成功");
 
   const exportCsv = async () => {
     setExporting(true);
@@ -325,8 +348,9 @@ export function StatsPage() {
     try {
       const { blob, rowCount, truncated } = await api.statsEventsCsv(
         drill.username, effectiveSince, effectiveUntil,
+        // `ok` 由 client 展开进 query（类型层面额外属性）
         { provider: drill.provider, model: drill.model,
-          credential_id: drill.credential_id });
+          credential_id: drill.credential_id, ok: drill.ok } as StatsEventFilters);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -363,6 +387,13 @@ export function StatsPage() {
                                     effectiveUntil, metric);
   const modelTimeline = useStatsModelTimeline(session.username, undefined, effectiveSince,
                                               effectiveUntil, metric);
+  // 失败归因：端点仅 operator+（viewer 打开会 403），故按角色禁用查询
+  const errors = useStatsErrors(session.username, effectiveSince, effectiveUntil,
+                                undefined, session.is_operator);
+  const errorRows = errors.data?.errors ?? [];
+  // 计数条按本批最大值归一（相对长度才有意义）；全 0 时给 1 避免除零
+  const maxFailures = Math.max(1, ...errorRows.map((row) => row.failures));
+  const barWidth = (failures: number) => Math.round((failures / maxFailures) * 100);
 
   // 四个维度一次性取数（各维度行结构一致），切 tab 只换渲染、不再发请求；
   // viewer 看不到用户/凭证 tab，若状态残留则回落到渠道维度
@@ -545,6 +576,16 @@ export function StatsPage() {
           testId="group-tabs"
         />
       }>
+        {/* 分位档切换：四档后端一次算好，这里只决定展示哪一档（避免四列撑爆表头） */}
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">延迟分位</span>
+          <Tabs value={percentile} options={PERCENTILE_TABS}
+                onChange={(value) => setPercentile(value as Percentile)}
+                testId="percentile-tabs" compact />
+          <span className="text-xs text-muted-foreground">
+            取自逐请求明细（仅 90 天），只统计成功请求
+          </span>
+        </div>
         {groupRows.length === 0 ? (
           <Empty data-testid="no-group-stats">该范围内没有请求</Empty>
         ) : (
@@ -569,14 +610,21 @@ export function StatsPage() {
                 <SortMenuHead label="Token" options={[...GROUP_TOKEN_COLUMNS]}
                               activeKey={groupSort.sort} direction={groupSort.order}
                               onToggle={groupSort.toggle} testId="group-sort-token" />
-                {/* 延迟两列：均值读小时汇总（与总览同口径），P95 读明细表（仅 90 天）。
+                {/* 延迟两列：均值读小时汇总（与总览同口径），分位读明细表（仅 90 天）。
                     两套口径各自合并成一列，靠表尾说明与悬停文案区分。 */}
                 <SortMenuHead label="平均延迟" options={[...GROUP_AVG_LATENCY_COLUMNS]}
                               activeKey={groupSort.sort} direction={groupSort.order}
                               onToggle={groupSort.toggle} testId="group-sort-avg-latency" />
-                <SortMenuHead label="P95 延迟" options={[...GROUP_P95_LATENCY_COLUMNS]}
+                <SortMenuHead label={`${percentile.toUpperCase()} 延迟`}
+                              options={[
+                                { key: `${percentile}_latency_ms`,
+                                  label: `${percentile.toUpperCase()} 耗时` },
+                                { key: `${percentile}_ttfb_ms`,
+                                  label: `${percentile.toUpperCase()} 首字` },
+                              ]}
                               activeKey={groupSort.sort} direction={groupSort.order}
-                              onToggle={groupSort.toggle} testId="group-sort-p95-latency" />
+                              onToggle={groupSort.toggle}
+                              testId={`group-sort-${percentile}-latency`} />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -663,7 +711,7 @@ export function StatsPage() {
                       </span>
                     </Tip>
                   </TableCell>
-                  {/* 延迟两列：均值与 P95 都只算成功请求；无成功请求显示 — */}
+                  {/* 延迟两列：均值与分位都只算成功请求；无成功请求显示 — */}
                   <TableCell label="平均延迟" className="text-right"
                              data-testid="group-avg-latency">
                     <Tip content={`平均耗时 ${formatLatency(row.avg_latency_ms)}`
@@ -676,14 +724,17 @@ export function StatsPage() {
                       </span>
                     </Tip>
                   </TableCell>
-                  <TableCell label="P95 延迟" className="text-right"
-                             data-testid="group-p95-latency">
-                    <Tip content={`P95 耗时 ${formatLatency(row.p95_latency_ms)}`
-                      + ` · P95 首字 ${formatLatency(row.p95_ttfb_ms)}`}>
+                  <TableCell label={`${percentile.toUpperCase()} 延迟`} className="text-right"
+                             data-testid={`group-${percentile}-latency`}>
+                    <Tip content={`${percentile.toUpperCase()} 耗时 `
+                      + `${formatLatency(row[`${percentile}_latency_ms`])}`
+                      + ` · ${percentile.toUpperCase()} 首字 `
+                      + `${formatLatency(row[`${percentile}_ttfb_ms`])}`}>
                       <span className="tabular-nums">
-                        {formatLatency(row.p95_latency_ms)}
-                        <span className="text-muted-foreground" data-testid="group-p95-ttfb">
-                          {" / "}{formatLatency(row.p95_ttfb_ms)}
+                        {formatLatency(row[`${percentile}_latency_ms`])}
+                        <span className="text-muted-foreground"
+                              data-testid={`group-${percentile}-ttfb`}>
+                          {" / "}{formatLatency(row[`${percentile}_ttfb_ms`])}
                         </span>
                       </span>
                     </Tip>
@@ -704,9 +755,91 @@ export function StatsPage() {
             混在同一行里不说明会被读成「同一个范围」。 */}
         <p className="mt-1 text-xs text-muted-foreground">
           延迟列只统计成功请求。平均耗时 / 平均首字取自小时汇总（与总览卡片同口径）；
-          P95 为第 95 百分位（向上取整名次），取自逐请求明细，只覆盖最近 90 天。
+          分位为第 P50/P90/P95/P99 百分位（向上取整名次，默认 P95），取自逐请求明细，
+          只覆盖最近 90 天。
         </p>
       </Panel>
+
+      {/* 失败归因（operator+）：跨用户看「哪里在坏」。点行 → 钻取到该渠道+模型
+          的失败明细（ok=0），与下方「请求明细」联动。 */}
+      {session.is_operator && (
+        <Panel data-testid="error-panel" title="失败归因" action={
+          <span className="text-xs text-muted-foreground">
+            按渠道 / 模型 / 错误类型分组 · 取自逐请求明细（仅 90 天）
+          </span>
+        }>
+          {errors.isError ? (
+            <div data-testid="errors-error">
+              <Notice tone="danger">
+                失败归因加载失败，请刷新重试；若刚升级服务，请确认后端已重启加载新端点。
+              </Notice>
+            </div>
+          ) : (errors.data?.errors.length ?? 0) === 0 ? (
+            <Empty data-testid="no-errors">该范围内没有失败请求</Empty>
+          ) : (
+            <Table data-testid="error-table" cards>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>渠道</TableHead>
+                  <TableHead>模型</TableHead>
+                  <TableHead>错误类型</TableHead>
+                  <TableHead className="text-right">失败数</TableHead>
+                  <TableHead className="text-right">最近失败</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {errorRows.map((row) => (
+                  <TableRow
+                    key={`${row.provider}/${row.model}/${row.error_type ?? "null"}`}
+                    data-testid={`error-row-${row.provider}-${row.model}-${row.error_type ?? "unknown"}`}
+                    className="cursor-pointer"
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`查看 ${row.provider} / ${row.model} 的失败明细`}
+                    onClick={() => applyDrill({ provider: row.provider, model: row.model,
+                                                ok: 0 })}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        applyDrill({ provider: row.provider, model: row.model, ok: 0 });
+                      }
+                    }}>
+                    <TableCell label="渠道">
+                      <span className="inline-flex items-center gap-1.5">
+                        <ProviderIcon provider={row.provider} size={13} />
+                        {providerLabel(row.provider)}
+                      </span>
+                    </TableCell>
+                    <TableCell label="模型" className="max-w-48 truncate" title={row.model}>
+                      {row.model}
+                    </TableCell>
+                    <TableCell label="错误类型" className="text-destructive">
+                      {usageErrorLabel(row.error_type)}
+                    </TableCell>
+                    <TableCell label="失败数" className="text-right">
+                      <span className="inline-flex items-center gap-2 tabular-nums">
+                        <span className="hidden h-1.5 w-16 overflow-hidden rounded-full bg-muted sm:block">
+                          <span className="block h-full rounded-full bg-destructive"
+                                style={{ width: `${barWidth(row.failures)}%` }} />
+                        </span>
+                        {formatNumber(row.failures)}
+                      </span>
+                    </TableCell>
+                    <TableCell label="最近失败"
+                               className="whitespace-nowrap text-right tabular-nums">
+                      {formatTime(row.last_ts)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+          <p className="mt-2 text-xs text-muted-foreground">
+            窗口缺省为最近 24 小时（与上方时间范围一致时按所选范围统计）；
+            未上报错误类型的历史行显示为「失败」。点任意一行可钻取到下方「请求明细」（只看失败）。
+          </p>
+        </Panel>
+      )}
 
       <Panel data-testid="events-panel" title="请求明细" action={
         <div className="flex items-center gap-3 text-xs text-muted-foreground">

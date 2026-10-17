@@ -36,9 +36,9 @@ def _app(tmp_path, users: list[tuple[str, str, bool]] | None = None):
 def _fake_stream(captured: dict):
     """替身生成器：记下调用参数，吐两帧就结束（端点逻辑不依赖真实推送）。"""
     async def stream(request, hub, subscription, *, username, provider, model,
-                     credential_id, resolve_name):
+                     credential_id, ok, resolve_name):
         captured.update({"username": username, "provider": provider, "model": model,
-                         "credential_id": credential_id,
+                         "credential_id": credential_id, "ok": ok,
                          "resolve_name": resolve_name,
                          "subscribers": hub.subscriber_count})
         yield ": connected\n\n"
@@ -53,7 +53,7 @@ def test_stream_returns_sse_frames_and_headers(tmp_path, monkeypatch):
     with TestClient(app) as client:
         client.cookies.set("coding2api_session", create_session_token("root", SECRET))
         response = client.get("/api/stats/events/stream",
-                              params={"provider": "trae", "model": "m"})
+                              params={"provider": "trae", "model": "m", "ok": 0})
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     # 中间层缓存/缓冲会把「实时」变成批量，这两个头是硬要求
@@ -63,6 +63,7 @@ def test_stream_returns_sse_frames_and_headers(tmp_path, monkeypatch):
     assert frames[0] == ": connected"
     assert json.loads(frames[1].removeprefix("data: ")) == {"id": "e1"}
     assert captured["provider"] == "trae" and captured["model"] == "m"
+    assert captured["ok"] == 0        # 失败过滤透传到生成器
     # admin 未指定 username → 全量（scope 为 None）
     assert captured["username"] is None
     assert captured["subscribers"] == 1

@@ -25,13 +25,19 @@ def test_stats_endpoints_scope_by_principal(admin_client):
         {"username": "other", "requests": 1, "ok_count": 1, "input_tokens": 0,
          "output_tokens": 0, "cached_tokens": None, "credit": None,
          "credit_estimated": False, "cost_usd": None, "cost_cny": None,
-         "avg_latency_ms": 0, "avg_ttfb_ms": 0, "p95_latency_ms": None,
-         "p95_ttfb_ms": None},
+         "avg_latency_ms": 0, "avg_ttfb_ms": 0,
+         "p50_latency_ms": None, "p50_ttfb_ms": None,
+         "p90_latency_ms": None, "p90_ttfb_ms": None,
+         "p95_latency_ms": None, "p95_ttfb_ms": None,
+         "p99_latency_ms": None, "p99_ttfb_ms": None},
         {"username": "root", "requests": 1, "ok_count": 1, "input_tokens": 0,
          "output_tokens": 0, "cached_tokens": None, "credit": None,
          "credit_estimated": False, "cost_usd": None, "cost_cny": None,
-         "avg_latency_ms": 0, "avg_ttfb_ms": 0, "p95_latency_ms": None,
-         "p95_ttfb_ms": None},
+         "avg_latency_ms": 0, "avg_ttfb_ms": 0,
+         "p50_latency_ms": None, "p50_ttfb_ms": None,
+         "p90_latency_ms": None, "p90_ttfb_ms": None,
+         "p95_latency_ms": None, "p95_ttfb_ms": None,
+         "p99_latency_ms": None, "p99_ttfb_ms": None},
     ]
     # 凭证分组读明细：本用例两条记录都没带 credential_id，故为空
     assert client.get("/api/stats/by-credential").json() == {"credentials": []}

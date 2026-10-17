@@ -390,6 +390,51 @@ describe("StatsPage 分组与明细", () => {
     expect(fallbackCell.querySelector("svg")).not.toBeNull();
   });
 
+  it("分组统计：分位档可切换，列头标签/单元格/排序键随所选档变化", async () => {
+    const spy = mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": EVENTS_EMPTY,
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    // 默认 P95：既有 testId 与列头文案不变
+    expect(screen.getByTestId("percentile-tabs-p95"))
+      .toHaveAttribute("aria-selected", "true");
+    const row = screen.getByTestId("group-row-trae");
+    expect(within(row).getByTestId("group-p95-latency")).toHaveTextContent("22.2 s");
+    expect(screen.getByTestId("group-sort-p95-latency")).toHaveTextContent("P95 延迟");
+
+    // 切 P50：单元格换成 P50 值（6200ms → 6.2 s），排序菜单键也跟着换
+    await userEvent.click(screen.getByTestId("percentile-tabs-p50"));
+    await waitFor(() => expect(screen.getByTestId("group-sort-p50-latency")).toBeInTheDocument());
+    expect(screen.getByTestId("group-sort-p50-latency")).toHaveTextContent("P50 延迟");
+    const p50Row = screen.getByTestId("group-row-trae");
+    expect(within(p50Row).getByTestId("group-p50-latency")).toHaveTextContent("6.2 s");
+    expect(within(p50Row).getByTestId("group-p50-ttfb")).toHaveTextContent("1.8 s");
+    expect(within(p50Row).queryByTestId("group-p95-latency")).not.toBeInTheDocument();
+
+    // P50 列头下拉按 p50 键排序（后端白名单已含）
+    await userEvent.click(screen.getByTestId("group-sort-p50-latency"));
+    await userEvent.click(screen.getByTestId("group-sort-p50-latency-p50_ttfb_ms"));
+    await waitFor(() => {
+      const last = spy.mock.calls.map((call) => String(call[0]))
+        .filter((url) => url.includes("/api/stats/by-provider")).at(-1)!;
+      expect(last).toContain("sort=p50_ttfb_ms");
+    });
+
+    // P99 同样可用（四档后端一次算好，切换不发新请求）
+    const callsBefore = spy.mock.calls.length;
+    await userEvent.click(screen.getByTestId("percentile-tabs-p99"));
+    await waitFor(() => expect(screen.getByTestId("group-sort-p99-latency")).toBeInTheDocument());
+    expect(spy.mock.calls.length).toBe(callsBefore);
+  });
+
   it("分组统计：只读用户看不到按用户/按凭证 tab", async () => {
     mockFetch({
       "/api/stats/overview": OVERVIEW,

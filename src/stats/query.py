@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..sorting import parse_sort_order, sql_order
@@ -16,6 +17,11 @@ METRIC_COLUMNS: dict[str, str] = {
     "cost": "cost_cny_sum",
 }
 
+# 分组统计下发的分位档：P50 / P90 / P95 / P99（latency 与 ttfb 各一组列）。
+# **不加进 METRIC_COLUMNS**：图表指标读小时汇总，只存 sum/count，数学上无法
+# 还原分布；分位只能从明细表算（见 `_percentile_join`）。
+PERCENTILES: tuple[int, ...] = (50, 90, 95, 99)
+
 
 # 分组统计排序白名单：API 键 → 聚合列别名（`group` 指分组键列 `group_key`）。
 # 默认按请求数降序（「哪家/哪个模型用得最多」才是分组表的用途），并列时按
@@ -25,8 +31,8 @@ METRIC_COLUMNS: dict[str, str] = {
 # - 均值（avg_*）：小时汇总上的 `*_sum ÷ ok_count`，SQLite 允许 ORDER BY 引用
 #   SELECT 别名并做表达式；`ok_count = 0` 时除零得 NULL，降序自然排最后（与
 #   其它可空列同语义）。
-# - 分位（p95_*）：由 `_percentile_join` 的 LEFT JOIN 子查询算出，排序直接走
-#   该列别名。
+# - 分位（p50_* / p90_* / p95_* / p99_*）：由 `_percentile_join` 的 LEFT JOIN
+#   子查询算出，排序直接走该列别名。
 GROUP_SORT_COLUMNS: dict[str, str] = {
     "group": "group_key",
     "requests": "requests",
@@ -38,8 +44,14 @@ GROUP_SORT_COLUMNS: dict[str, str] = {
     "cost_cny": "cost_cny_sum",
     "avg_latency_ms": "CAST(latency_sum AS REAL) / ok_count",
     "avg_ttfb_ms": "CAST(ttfb_sum AS REAL) / ok_count",
+    "p50_latency_ms": "p50_latency_ms",
+    "p50_ttfb_ms": "p50_ttfb_ms",
+    "p90_latency_ms": "p90_latency_ms",
+    "p90_ttfb_ms": "p90_ttfb_ms",
     "p95_latency_ms": "p95_latency_ms",
     "p95_ttfb_ms": "p95_ttfb_ms",
+    "p99_latency_ms": "p99_latency_ms",
+    "p99_ttfb_ms": "p99_ttfb_ms",
 }
 
 
@@ -77,24 +89,53 @@ _GROUP_KEYS = frozenset({"provider", "model", "username", "credential_id"})
 # 撑爆响应。超上限时明确告知「被截断、请收窄条件」，而不是静默给半份文件。
 EXPORT_MAX_ROWS = 10000
 
-# 分位值的 nearest-rank 名次：第 p 百分位 = 第 ⌈p·n⌉ 小的值。用整数运算写
-# `(p_num * n + p_den - 1) / p_den`（SQLite 整数除法即向下取整，加分母−1 后
-# 等价于对分子向上取整），避免浮点误差把名次算偏。
-_P95_NUMER = 95
-_P95_DENOM = 100
+# 失败归因（`/api/stats/errors`）：默认窗口 24 小时、单次最多 5000 组。
+# 窗口是硬要求——没有 `ts` 下界就是全表扫（明细留 90 天，几十万行）。
+ERROR_WINDOW_SECONDS = 86400
+ERROR_MAX_GROUPS = 5000
+
+# 分位值的 nearest-rank 名次：第 p 百分位 = 第 ⌈p·n/100⌉ 小的值。用整数运算写
+# `(p * n + 99) / 100`（SQLite 整数除法即向下取整，加分母−1 后等价于对分子
+# 向上取整），避免浮点误差把名次算偏。与原 P95 的 `(95*n+99)/100` 逐字节一致。
+_PERCENT_DENOM = 100
 
 # 分位 JOIN 子查询的别名：`_percentile_join` 与两个分组路径共用，别名固定。
 _PERCENTILE_ALIAS = "lat"
 
+# 每档分位在结果行里下发的列名（latency 与 ttfb 各一列）。`_group_row` 按此
+# 生成返回 dict——加档只需改 `PERCENTILES`，不用再改三处 SQL/映射。
+_PERCENTILE_FIELDS: tuple[str, ...] = tuple(
+    f"p{pct}_{kind}" for pct in PERCENTILES for kind in ("latency_ms", "ttfb_ms"))
 
-def _percentile_rank(n_expr: str) -> str:
-    """`⌈0.95·n⌉` 的 SQL 表达式（整数运算，避免浮点误差）。"""
-    return f"({_P95_NUMER} * {n_expr} + {_P95_DENOM - 1}) / {_P95_DENOM}"
+
+def _percentile_rank(n_expr: str, pct: int) -> str:
+    """`⌈pct/100·n⌉` 的 SQL 表达式（整数运算，避免浮点误差）。"""
+    return f"({pct} * {n_expr} + {_PERCENT_DENOM - 1}) / {_PERCENT_DENOM}"
+
+
+def _percentile_select(pct: int, *, indent: str = "                   ") -> str:
+    """子查询里某一档分位的两列（latency / ttfb）。"""
+    return (
+        f"{indent}MAX(CASE WHEN ranked.lat_rn = {_percentile_rank('ranked.lat_n', pct)}\n"
+        f"{indent}         THEN ranked.latency_ms END) AS p{pct}_latency_ms,\n"
+        f"{indent}MAX(CASE WHEN ranked.ttfb_rn = {_percentile_rank('ranked.ttfb_n', pct)}\n"
+        f"{indent}         THEN ranked.ttfb_ms END) AS p{pct}_ttfb_ms"
+    )
+
+
+def _percentile_columns(outer: str = _PERCENTILE_ALIAS) -> str:
+    """主查询里取各档分位列的 SELECT 片段（逗号分隔，不含前导逗号）。"""
+    return ",\n                   ".join(
+        f"{outer}.{name} AS {name}" for name in _PERCENTILE_FIELDS)
 
 
 def _percentile_join(key: str, *, where: str = "", params: list[Any] | None = None,
                      suffix: str = "e2", outer: str = "") -> tuple[str, list[Any]]:
-    """按 `key` 分组算 P95 延迟的 LEFT JOIN 子查询（挂到主聚合查询上）。
+    """按 `key` 分组算 P50/P90/P95/P99 延迟的 LEFT JOIN 子查询（挂到主聚合查询上）。
+
+    四档分位在**同一次**窗口函数扫描里算完：明细表按分组排一次序、按 latency 与
+    ttfb 各生成一套 row_number，再用条件聚合按名次挑出各档的值。拆成四个 JOIN
+    会把同一批明细扫四遍。
 
     分位值**只能从明细表算**：小时汇总只存 `latency_sum` / `ttfb_sum`（和与
     成功计数），数学上无法还原分布。代价是只覆盖明细保留期（90 天），均值列
@@ -117,13 +158,11 @@ def _percentile_join(key: str, *, where: str = "", params: list[Any] | None = No
     if key not in _GROUP_KEYS:
         raise ValueError(f"非法分组键: {key!r}")
     inner = f"{suffix}.{key}"
+    pct_selects = ",\n".join(_percentile_select(pct) for pct in PERCENTILES)
     return f"""
         LEFT JOIN (
             SELECT ranked.group_key AS group_key,
-                   MAX(CASE WHEN ranked.lat_rn = {_percentile_rank("ranked.lat_n")}
-                            THEN ranked.latency_ms END) AS p95_latency_ms,
-                   MAX(CASE WHEN ranked.ttfb_rn = {_percentile_rank("ranked.ttfb_n")}
-                            THEN ranked.ttfb_ms END) AS p95_ttfb_ms
+{pct_selects}
             FROM (
                 SELECT {inner} AS group_key, {suffix}.latency_ms AS latency_ms,
                        {suffix}.ttfb_ms AS ttfb_ms,
@@ -181,6 +220,7 @@ class StatsQuery:
     @staticmethod
     def _where(*, username: str | None = None, provider: str | None = None,
                model: str | None = None, credential_id: str | None = None,
+               ok: int | None = None,
                since: int | None = None, since_col: str = "ts",
                until: int | None = None, until_col: str = "ts",
                before: int | None = None, before_col: str = "rowid",
@@ -193,6 +233,8 @@ class StatsQuery:
 
         `before` 是**游标**不是时间：它按 `rowid`（插入序）取「更小的一页」，
         与 90 天时间窗无关，故与 `until` 分开、各用一列。
+
+        `ok`：只看成功（1）或只看失败（0）的明细。`None` = 不限制（历史行为）。
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -208,6 +250,9 @@ class StatsQuery:
         if credential_id is not None:
             clauses.append(f"{alias}credential_id = ?")
             params.append(credential_id)
+        if ok is not None:
+            clauses.append(f"{alias}ok = ?")
+            params.append(ok)
         if since is not None:
             clauses.append(f"{alias}{since_col} >= ?")
             params.append(since)
@@ -339,8 +384,7 @@ class StatsQuery:
             "cost_cny": row["cost_cny_sum"] if row["cost_known"] else None,
             "avg_latency_ms": round(row["latency_sum"] / ok_count) if ok_count else None,
             "avg_ttfb_ms": round(row["ttfb_sum"] / ok_count) if ok_count else None,
-            "p95_latency_ms": row["p95_latency_ms"],
-            "p95_ttfb_ms": row["p95_ttfb_ms"],
+            **{name: row[name] for name in _PERCENTILE_FIELDS},
             **{name: row[name] for name in extra},
         }
 
@@ -376,8 +420,7 @@ class StatsQuery:
                    SUM(cost_known) AS cost_known,
                    COALESCE(SUM(latency_sum), 0) AS latency_sum,
                    COALESCE(SUM(ttfb_sum), 0) AS ttfb_sum,
-                   {_PERCENTILE_ALIAS}.p95_latency_ms AS p95_latency_ms,
-                   {_PERCENTILE_ALIAS}.p95_ttfb_ms AS p95_ttfb_ms
+                   {_percentile_columns()}
             FROM usage_hourly
             {join}
             {where} GROUP BY {key} ORDER BY {_group_order(sort, order)}
@@ -436,8 +479,7 @@ class StatsQuery:
                    COALESCE(SUM(CASE WHEN e.ok = 1 THEN e.ttfb_ms END), 0) AS ttfb_sum,
                    COALESCE(c.provider, MAX(e.provider)) AS provider,
                    {name_expr} AS credential_name,
-                   {_PERCENTILE_ALIAS}.p95_latency_ms AS p95_latency_ms,
-                   {_PERCENTILE_ALIAS}.p95_ttfb_ms AS p95_ttfb_ms
+                   {_percentile_columns()}
             FROM usage_events e
             LEFT JOIN credentials c ON c.id = e.credential_id
             {join}
@@ -528,7 +570,8 @@ class StatsQuery:
                include_credential_name: bool = False, sort: str | None = None,
                order: str | None = None, offset: int = 0,
                provider: str | None = None, model: str | None = None,
-               credential_id: str | None = None) -> dict[str, Any]:
+               credential_id: str | None = None,
+               ok: int | None = None) -> dict[str, Any]:
         """逐请求明细（默认新→旧，rowid 游标分页）。明细仅保留 90 天。
 
         **两种分页模式**：
@@ -544,6 +587,9 @@ class StatsQuery:
 
         `provider` / `model` / `credential_id`：钻取过滤（分组表点行 → 只看该
         渠道/模型/凭证的明细）。三者独立、可叠加，`AND` 语义。
+
+        `ok`：只看成功（1）/ 只看失败（0）的明细。失败归因卡片点行即带 `ok=0`
+        下钻——否则「失败 12 次」点进去会看到同一组的成功记录，对不上账。
 
         `include_credential_name`：凭证昵称取自**全局共享池**（常含邮箱/手机），
         只对 admin/operator 返回；viewer 即便只看自己的记录也不该看到池里他人
@@ -562,7 +608,8 @@ class StatsQuery:
             "e.cost_usd, e.cost_cny, e.latency_ms, "
             f"e.ttfb_ms, e.request_id, {name_expr} AS credential_name"
         )
-        filters = {"provider": provider, "model": model, "credential_id": credential_id}
+        filters = {"provider": provider, "model": model, "credential_id": credential_id,
+                   "ok": ok}
         if cursor_mode:
             where, params = self._where(username=username, since=since, until=until,
                                         before=before, alias="e.", **filters)
@@ -605,16 +652,19 @@ class StatsQuery:
                       include_credential_name: bool = False,
                       provider: str | None = None, model: str | None = None,
                       credential_id: str | None = None,
+                      ok: int | None = None,
                       limit: int = EXPORT_MAX_ROWS) -> list[dict[str, Any]]:
         """导出用明细（旧→新，按 rowid 升序），最多 `limit + 1` 条。
 
         与 `events()` 的差异：固定**升序**（导出文件从头读起更符合直觉）、不做
         分页、不带 `rowid` 语义。多取一条供调用方判断是否被截断（超上限时明确
         告知用户「收窄条件」，而不是静默给一份不全的文件）。
+
+        `ok`：与 `events()` 同义（失败归因下钻后导出，导出的就该是同一批失败）。
         """
         where, params = self._where(
             username=username, since=since, until=until, alias="e.",
-            provider=provider, model=model, credential_id=credential_id)
+            provider=provider, model=model, credential_id=credential_id, ok=ok)
         name_expr = ("NULLIF(c.nickname, '')" if include_credential_name else "NULL")
         rows = self._db.connect().execute(
             f"""
@@ -629,6 +679,40 @@ class StatsQuery:
             ORDER BY e.rowid ASC LIMIT ?
             """, [*params, limit + 1]).fetchall()
         return [dict(row) for row in rows]
+
+    def errors(self, *, username: str | None = None, since: int | None = None,
+               until: int | None = None, limit: int = ERROR_MAX_GROUPS,
+               now: int | None = None) -> list[dict[str, Any]]:
+        """失败归因：按 `(provider, model, error_type)` 分组计数 + 最近失败时刻。
+
+        数据源是**明细表**（`usage_hourly` 没有 `error_type` 维度），故只覆盖明细
+        保留期（90 天）；调用方必须给窗口，未给 `since` 时默认「最近 24 小时」，
+        避免一次扫全表。
+
+        `error_type` 为 NULL 的历史行（老库 / 未上报）单独成组：它们也是失败，
+        藏起来会让「失败总数」对不上明细——前端把它显示成「失败」。
+
+        `limit` 按失败数降序取前 N 组：归因卡片是「谁最该修」的排行榜，长尾
+        组合（同渠道同模型的不同错误类型各算一组）容易把响应撑大。
+
+        `now` 可注入（测试确定性）：只在 `since` 缺省时用于推算默认窗口。
+        """
+        if since is None:
+            since = (now if now is not None else int(time.time())) - ERROR_WINDOW_SECONDS
+        where, params = self._where(username=username, since=since, since_col="ts",
+                                    until=until, until_col="ts", ok=0)
+        rows = self._db.connect().execute(
+            f"""
+            SELECT provider, model, error_type, COUNT(*) AS failures,
+                   MAX(ts) AS last_ts
+            FROM usage_events {where}
+            GROUP BY provider, model, error_type
+            ORDER BY failures DESC, provider, model, error_type
+            LIMIT ?
+            """, [*params, max(1, limit)]).fetchall()
+        return [{"provider": row["provider"], "model": row["model"],
+                 "error_type": row["error_type"], "failures": int(row["failures"]),
+                 "last_ts": int(row["last_ts"])} for row in rows]
 
     def model_timeline(self, *, username: str | None = None,
                        since: int | None = None, until: int | None = None,
