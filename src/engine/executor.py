@@ -88,6 +88,67 @@ class _AggregateOverflow(Exception):
         self.limit = limit
 
 
+class _StreamTimeout(Exception):
+    """流式取下一事件的计时超时（A1）。
+
+    `phase` 区分两种语义完全不同的超时：
+
+    - `first_event`：还没向客户端出过帧。此时切换凭证是安全的（客户端没
+      收到任何内容），按 SOFT 冷却后继续换号。
+    - `idle`：已经出过帧。半截输出不可回滚，换号会把两个账号的内容拼进
+      同一条回复，只能以错误帧收尾。
+
+    `kind()` 让通用的 `_classify` 也能识别（SOFT：短冷却、不累计），
+    `error_code` 供 `_error_summary` 生成受控的对外标识。
+    """
+
+    def __init__(self, seconds: float, phase: str) -> None:
+        super().__init__(f"upstream {phase} timed out after {seconds:g}s")
+        self.seconds = seconds
+        self.phase = phase
+        # 统计口径（collector 白名单）与对外受控标识（`_error_summary`）
+        self.error_code = f"upstream_{phase}_timeout"
+        self.summary = f"upstream {phase.replace('_', '-')} timeout"
+
+    def kind(self) -> ErrKind:
+        return ErrKind.SOFT
+
+
+class _TimedReader:
+    """带超时地取下一个上游事件：**可复用 Task**，超时绝不取消上游。
+
+    不能用 `asyncio.wait_for(anext(gen))`：超时会 cancel 掉 `anext` 协程，
+    取消穿透进上游生成器并把它关闭——计时超时反而变成断流（`with_keepalive`
+    的 docstring 已踩过这个坑）。这里用 `asyncio.wait` 与超时竞争，超时后
+    `_pending` 原样保留，下一次 `next()` 继续等同一个 Task。
+    """
+
+    def __init__(self, iterator: Any) -> None:
+        self._iterator = iterator
+        self._pending: asyncio.Task[Event] | None = None
+
+    async def next(self, timeout: float | None) -> Event:
+        """取下一个事件；`timeout=None` 表示不设上限（关闭超时）。"""
+        if self._pending is None:
+            self._pending = asyncio.ensure_future(anext(self._iterator))
+        if timeout is not None:
+            done, _ = await asyncio.wait({self._pending}, timeout=timeout)
+            if not done:
+                # 保留 pending：上游可能只是慢，稍后还会吐；取消它就断流了
+                raise TimeoutError
+        try:
+            return await self._pending
+        finally:
+            self._pending = None
+
+    async def aclose(self) -> None:
+        """关闭前清掉在途任务（避免 "Task was destroyed" 告警）。"""
+        pending, self._pending = self._pending, None
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
 @dataclass(slots=True)
 class ExecutorDeps:
     """注入点：provider 客户端、仓储、调度器、统计采集。"""
@@ -121,6 +182,17 @@ class ExecutorDeps:
     # 输出）而不结束，`events` 会无界增长直到 OOM——超时只兜住「慢」，兜不住
     # 「快而无穷」。超过即按瞬态错误换号重试；≤0 关闭
     complete_max_events: int = 200_000
+    # 流式首事件超时（秒）：接了连接却迟迟不吐第一个**数据事件**时，在出帧前
+    # 换号（此时客户端还没收到任何内容，切换安全）。注释帧/心跳不算数据，
+    # 不重置计时。≤0 关闭（默认）。标量或零参 callable（热更），见 config.live
+    first_event_timeout_seconds: Any = 0
+    # 流式空闲超时（秒）：**已出帧**后上游长时间不再吐数据，只能以错误帧收尾
+    # （半截输出不可回滚）。≤0 关闭（默认）。标量或零参 callable（热更）
+    stream_idle_timeout_seconds: Any = 0
+    # 短冷却「等待续上」（秒）：全池都在短冷却、没有任何立即可用候选时，若
+    # 最短的剩余冷却 ≤ 该值则等它到期后重取一次（而不是直接 503）。等待期间
+    # 不占在途租约，也不消耗轮换预算。≤0 关闭（默认）。标量或零参 callable
+    short_cooldown_wait_seconds: Any = 0
     # 跨渠道 fallback 兼容组：配置文本 → 组的解析值（dict）；None 表示
     # 关闭。零参 callable 时每次请求现读（热更）。空 dict 与 None 等价（无组）。
     fallback_groups: Any | None = None
@@ -161,6 +233,9 @@ class ExecutorDeps:
 class Executor:
     def __init__(self, deps: ExecutorDeps) -> None:
         self._deps = deps
+        # 流式超时的时钟：默认真实单调钟，测试可换成假时钟以精确断言
+        # 「只有数据事件重置计时」而不必真的等满窗口（见 test_executor_stream_timeout）
+        self._clock = time.monotonic
 
     def _record_invalid(self, username: str, provider_id: str, credential_id: str,
                         model: str, started: float, error: object) -> None:
@@ -488,7 +563,7 @@ class Executor:
             return state.translator.error_frame(message, code)
 
         while True:
-            pick = self._pick(target, tried, state.affinity_id)
+            pick = await self._pick(target, tried, state.affinity_id)
             if pick is None:
                 # 走到这里 emitted 必为 False：已出帧的路径在上面 `if emitted or
                 # not should_rotate` 就 return 了，所以 `terminal()` 在这里**必定**
@@ -529,8 +604,14 @@ class Executor:
             # 在途登记放在创建迭代器之后、`try` 之前：选号到此全同步，不会与
             # 并发请求交错超额；释放统一走下面的 finally，覆盖成功/轮换/断开。
             self._lease(credential_id)
+            reader = _TimedReader(iterator)
+            state.deadline = None
+            broken = False
             try:
-                async for event in iterator:
+                while True:
+                    event = await self._next_event(reader, state, emitted)
+                    if event is None:
+                        break                       # 上游正常结束
                     if hide_reasoning and event.kind is EventKind.REASONING:
                         # 出站剥离思考：上游仍照常生成，只是不交给客户端
                         continue
@@ -548,19 +629,23 @@ class Executor:
                             last_error = UpstreamStreamError(event)
                             last_kind = ErrKind.INVALID
                             self._skip_provider(provider_id, tried)
+                            broken = True
                             break
                         logger.warning(
                             "上游 %s 流内错误（凭证 %s，kind=%s）: code=%s %s",
                             provider_id, credential_id, kind,
                             event.error_code, event.error_message)
-                        self._note_upstream_error(credential_id, kind, provider_id, target.model)
+                        self._note_upstream_error(credential_id, kind, provider_id,
+                                                  target.model, event)
                         last_error = UpstreamStreamError(event)
+                        broken = True
                         break
                     for frame in state.translator.translate(event):
                         state.mark_first_byte()
                         emitted = True
                         yield frame
-                else:
+                if not broken:
+                    # 上游正常结束：清错误累计、重新粘定、按成功记账并收尾
                     self._deps.credentials.save_success(
                         credential_id, model=self._model_scope(provider_id, target.model))
                     self._remember(request, state.username, credential_id)
@@ -585,10 +670,14 @@ class Executor:
                 else:
                     logger.warning("上游 %s 错误（凭证 %s，kind=%s）: %s",
                                    provider_id, credential_id, kind, error)
-                    self._note_upstream_error(credential_id, kind, provider_id, target.model)
+                    self._note_upstream_error(credential_id, kind, provider_id, target.model, error)
                     last_error = error
             finally:
-                # break / 异常 / 客户端断开都走到这里：同步归还节流名额
+                # break / 异常 / 客户端断开都走到这里：先清掉在途的取帧任务
+                # （超时后它可能还在等上游），再关闭上游流归还节流名额。
+                # 顺序不能反：生成器正在被 anext 驱动时 aclose 会抛
+                # "asynchronous generator is already running"。
+                await reader.aclose()
                 await aclose_stream(iterator)
                 self._release(credential_id)
             if not self._deps.scheduler.should_rotate(attempts) or emitted:
@@ -599,20 +688,67 @@ class Executor:
                                         self._suggestions(target.model)),
                         "invalid_request")
                     return
-                kind = _classify(last_error) if last_error is not None else None
                 # 已出帧后收尾：上游可能已生成内容（真实计费），按已知用量记账，
                 # 否则这次尝试的 token 全部漏记（与断开路径同一理由）
                 usage = state.translator.usage
                 self._deps.record(
                     username=state.username, provider=provider_id,
                     credential_id=credential_id, model=target.model, ok=False,
-                    error_type=_error_type_for(kind) if kind else "upstream_protocol",
+                    error_type=_stream_error_type(last_error),
                     input_tokens=_usage_field(usage, "input_tokens"),
                     output_tokens=_usage_field(usage, "output_tokens"),
                     latency_ms=_elapsed_ms(state.started))
+                if isinstance(last_error, _StreamTimeout):
+                    # 空闲超时（已出帧）：半截输出不可回滚，不换号，直接以错误帧
+                    # 收尾；对外文案带上受控标识（A1 验收口径）
+                    yield state.translator.error_frame(
+                        _unavailable_message(last_error), "no_healthy_credential")
+                    return
                 yield terminal(self._unavailable_text(target, last_error),
                                "no_healthy_credential")
                 return
+
+    async def _next_event(self, reader: _TimedReader, state: _StreamState,
+                          emitted: bool) -> Event | None:
+        """取下一个上游事件，按出帧状态施加首事件/空闲超时（A1）。
+
+        返回 None 表示上游流正常结束；超时抛 `_StreamTimeout`，由外层
+        `_stream_loop` 统一按 SOFT 冷却（未出帧 → 换号；已出帧 → 错误帧收尾）。
+
+        计时口径：
+
+        - 未出帧 → `first_event_timeout_seconds`；已出帧 → `stream_idle_timeout_seconds`
+        - **只有数据事件重置计时**：注释帧在更外层（`with_keepalive`）且不经过
+          这里，空事件（无内容/无工具调用/无 usage/finish）直接 continue 重取，
+          都不刷新 deadline——否则一个只会发心跳或空 delta 的上游永远不超时。
+        - ≤0 关闭对应计时（行为与历史版本一致）。
+
+        截止时刻存进 `state`：跨尝试保留（换号后重新计时的语义是「新尝试
+        重新计首事件」，故每次进入新凭证时由 `_stream_loop` 重置）。
+        """
+        first = float(live(self._deps.first_event_timeout_seconds)() or 0)
+        idle = float(live(self._deps.stream_idle_timeout_seconds)() or 0)
+        timeout = idle if emitted else first
+        phase = "idle" if emitted else "first_event"
+        remaining = None
+        if timeout > 0:
+            deadline = state.deadline
+            now = self._clock()
+            if deadline is None:
+                deadline = now + timeout
+                state.deadline = deadline
+            # 可能为负（时钟跳过窗口，如进程被挂起）：负超时让等待立刻返回
+            # 「未完成」，等价于「窗口已耗尽」，不必单独判一次
+            remaining = deadline - now
+        try:
+            event = await reader.next(remaining)
+        except StopAsyncIteration:
+            return None
+        except TimeoutError:
+            raise _StreamTimeout(timeout, phase) from None
+        if _is_data_event(event):
+            state.deadline = None
+        return event
 
     def _compress_payload(self, request: ChatRequest, provider_id: str | None,
                           model: str) -> dict[str, Any]:
@@ -747,7 +883,7 @@ class Executor:
         hide_reasoning = self._thinking_disabled()
 
         while True:
-            pick = self._pick(target, tried, affinity_id)
+            pick = await self._pick(target, tried, affinity_id)
             if pick is None:
                 if last_kind is ErrKind.INVALID:
                     # 所有候选上游都拒绝了该模型：400 而非 503
@@ -830,7 +966,7 @@ class Executor:
                 else:
                     logger.warning("上游 %s 错误（凭证 %s，kind=%s）: %s",
                                    provider_id, credential_id, kind, error)
-                    self._note_upstream_error(credential_id, kind, provider_id, target.model)
+                    self._note_upstream_error(credential_id, kind, provider_id, target.model, error)
                     last_error = error
             else:
                 try:
@@ -848,7 +984,8 @@ class Executor:
                         last_error, last_kind = error, ErrKind.INVALID
                         self._skip_provider(provider_id, tried)
                     else:
-                        self._note_upstream_error(credential_id, kind, provider_id, target.model)
+                        self._note_upstream_error(credential_id, kind, provider_id,
+                                                  target.model, error)
                         last_error = error
                 else:
                     self._deps.credentials.save_success(
@@ -903,22 +1040,96 @@ class Executor:
         if self._deps.affinity is not None:
             self._deps.affinity.remember(request.raw, username, credential_id)
 
-    def _pick(self, target: ModelTarget, tried: set[str],
-              affinity_id: str | None = None):
+    async def _pick(self, target: ModelTarget, tried: set[str],
+                    affinity_id: str | None = None):
         """选一个「仓库里还在」的凭证；被并发删除就换下一个。
 
         循环而不是递归：候选池理论上无上限，`tried` 又只在删一个后加一项，
         极端情况下（大量凭证被并发删除）递归深度能顶到 Python 的递归上限。
         循环写法没有这个上限，也省掉每次递归的栈开销。
+
+        短冷却「等待续上」（A4，`short_cooldown_wait_seconds`）：没有任何
+        **立即可用**候选、但最短的剩余冷却不超过该上限时，等待到期后重取
+        一次。目的：全池都在 60s 软冷却时，与其立刻 503 让客户端自己重试
+        （重试往往更密集），不如在原连接上等几秒续上。
+
+        约束（计划 A4 明确要求）：
+
+        - 只在「一个立即可用候选都没有」时等待——有可用号就必须马上用，
+          等冷却中的号等于白降吞吐。
+        - 等待期间**不占在途租约**（租约在选中之后才 acquire），所以等待
+          不会把并发堆成连接洪峰：N 个请求一起等，到期后仍按原规则分摊。
+        - **不计入 `max_rotate`**：等待发生在选号阶段，`attempts` 由调用方
+          按真正打过的凭证数计，这里不碰。
+        - 只重取一次：到期后仍有别的请求抢走名额就照常返回 None（503），
+          不做「等第二轮」，否则慢请求会在池子打满时层层排队。
         """
+        waited = False
         while True:
             credential_id = self._select(target, tried, affinity_id)
             if credential_id is None:
-                return None
+                # 没有立即可用候选：短冷却「等待续上」只允许一次（见 docstring）
+                if waited or not await self._wait_short_cooldown(target, tried):
+                    return None
+                waited = True
+                continue
             credential_data = self._deps.credentials.credential_data(credential_id)
             if credential_data is not None:
                 return credential_id, credential_data
             tried.add(credential_id)  # 并发删除：标记后重选
+
+    async def _wait_short_cooldown(self, target: ModelTarget,
+                                   tried: set[str]) -> bool:
+        """没有立即可用候选时，若最短剩余冷却够短则等它到期；返回是否等待过。
+
+        `remaining` 取**所有候选里最短的**剩余冷却（账号级与模型级取小）：
+        池子里只要有一个号 N 秒后可用，等 N 秒就能续上；上限是热更的
+        `short_cooldown_wait_seconds`（≤0 关闭，直接快速失败）。
+
+        候选来源与 `_select` 完全一致（`_selectable` 过滤掉限额/在途之后），
+        但这里刻意**不套 `_selectable`**：被在途占满的号不是「等几秒就好」
+        （它要等一个完整请求跑完，可能几分钟），把它算进等待会放大排队。
+        因此只统计「冷却中 / 启用中」的候选，并按 `tried` 排除本轮已试过的。
+        """
+        limit = float(live(self._deps.short_cooldown_wait_seconds)() or 0)
+        if limit <= 0:
+            return False
+        registered = [pid for pid in self._narrow_providers(target)
+                      if pid in self._deps.providers]
+        if not registered:
+            return False
+        now = int(time.time())
+        remaining: int | None = None
+        for candidate in self._deps.credentials.candidates(registered):
+            if candidate.credential_id in tried:
+                continue
+            if candidate.disabled or not candidate.enabled:
+                continue
+            if (self._deps.limits is not None
+                    and self._deps.limits.blocked(candidate, target.model)):
+                continue
+            if (self._deps.inflight is not None
+                    and self._deps.inflight.blocked(candidate.credential_id)):
+                continue
+            until = candidate.cooling_until
+            model_until = candidate.model_cooling_until(
+                self._model_scope(candidate.provider, target.model))
+            # 账号级与模型级取**较晚**的那个：两个都过期才真的可用
+            if model_until is not None:
+                until = model_until if until is None else max(until, model_until)
+            # 没有冷却、或冷却已经过期却仍不可选（被别的条件挡掉）：等几秒
+            # 也不会变好，跳过它——只统计「真的在冷却」的候选
+            if until is None or until <= now:
+                continue
+            wait = until - now
+            if remaining is None or wait < remaining:
+                remaining = wait
+        if remaining is None or remaining > limit:
+            return False
+        logger.info("全部候选处于短冷却（最短剩余 %ss ≤ %.0fs），等待续上",
+                    remaining, limit)
+        await asyncio.sleep(remaining)
+        return True
 
     def _sticky(self, candidates: list, tried: set[str],
                 affinity_id: str | None) -> str | None:
@@ -1071,7 +1282,8 @@ class Executor:
             self._deps.inflight.release(credential_id)
 
     def _note_upstream_error(self, credential_id: str, kind: ErrKind,
-                             provider_id: str, model: str) -> None:
+                             provider_id: str, model: str,
+                             error: Exception | None = None) -> None:
         """对一次上游错误作出反应：记账 + 落库，REQUEST 类零动作。
 
         请求级错误（11101 请求体坏 / 11115 上下文超限 / 11128 渠道风控 /
@@ -1079,12 +1291,16 @@ class Executor:
         凭证踢掉。
         也绝不落库——save_error 会把已有 cooling_until 写成 NULL，
         等于顺手解掉别的错误留下的冷却。调用方只换号重试。
+
+        `error` 带 `retry_at` 时（上游 `Retry-After`，见 provider.base）交给
+        调度器在**该错误分类的作用域**内覆盖冷却时长；缺失/过去时刻回落常量。
         """
         if kind is ErrKind.REQUEST:
             return
         outcome = self._deps.scheduler.note_error(
             self._candidate(credential_id), kind, int(time.time()),
-            model=self._model_scope(provider_id, model))
+            model=self._model_scope(provider_id, model),
+            retry_at=getattr(error, "retry_at", None))
         self._deps.credentials.save_error(credential_id, outcome)
 
     def _model_scope(self, provider_id: str, model: str) -> str:
@@ -1105,6 +1321,9 @@ class _StreamState:
     _first_byte_at: float | None = None
     # 已记账标记：断开分支防与正常成功路径重复记账
     recorded: bool = False
+    # 流式超时的截止时刻（monotonic）：None = 下一次取事件时重新计时。
+    # 只被数据事件重置（见 `_is_data_event`），跨尝试由 _stream_loop 显式清空
+    deadline: float | None = None
 
     def mark_first_byte(self) -> None:
         if self._first_byte_at is None:
@@ -1118,6 +1337,22 @@ class _StreamState:
 
 def _elapsed_ms(started: float, end: float | None = None) -> int:
     return int(((end if end is not None else time.monotonic()) - started) * 1000)
+
+
+def _is_data_event(event: Event) -> bool:
+    """该事件是否算「数据」（重置流式空闲计时）。
+
+    只认真正推进响应的帧：正文 / 思考 / 工具调用 / usage / 结束。空事件
+    （所有载荷字段都为空的 delta）与流内 error 都不算——否则上游只要每
+    N 秒发一个空 delta，空闲计时就永远不触发，超时形同虚设。
+    """
+    if event.kind in (EventKind.CONTENT, EventKind.REASONING):
+        return bool(event.content)
+    if event.kind is EventKind.TOOL_CALLS:
+        return bool(event.tool_calls)
+    if event.kind is EventKind.USAGE:
+        return event.usage is not None
+    return event.kind is EventKind.FINISH
 
 
 def _event_kind(event: Event) -> ErrKind:
@@ -1147,6 +1382,9 @@ def _error_summary(error: Exception | None) -> str:
     """
     if error is None:
         return ""
+    summary = getattr(error, "summary", None)
+    if isinstance(summary, str) and summary:
+        return summary
     status = getattr(error, "status", None)
     if isinstance(status, int) and status > 0:
         return f"upstream status {status}"
@@ -1204,6 +1442,19 @@ def _reject_message(model: str, last_error: Exception | None,
     if suggestions:
         message += f" (similar available models: {', '.join(suggestions)})"
     return message
+
+
+def _stream_error_type(error: Exception | None) -> str:
+    """流已开始后的失败类型：流式超时单独成类，其余沿用通用映射。
+
+    `_StreamTimeout.kind()` 是 SOFT（冷却口径），但统计页要把「上游首字超时」
+    与「上游流中断」分开看（A1 验收），所以这里先按异常类型分流，再落到
+    `_error_type_for`。三个取值都在 collector 的受控白名单里。
+    """
+    if isinstance(error, _StreamTimeout):
+        return error.error_code
+    kind = _classify(error) if error is not None else None
+    return _error_type_for(kind) if kind else "upstream_protocol"
 
 
 def _error_type_for(kind: ErrKind) -> str:

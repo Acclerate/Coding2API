@@ -6,9 +6,13 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -77,6 +81,105 @@ def body_hint(body: bytes, limit: int = 2048) -> str:
 BOUNDED_BODY_LIMIT = 256 * 1024
 
 
+_RETRY_AFTER_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*([A-Za-z]+)")
+_RETRY_AFTER_PREFIX = re.compile(r"^(?:try\s+again\s+)?(?:in\s+)?", re.IGNORECASE)
+# 文本式 `Retry-After` 的单位（`Try again in 17h 59m`）：h/m/s 及其常见长写法
+_RETRY_AFTER_UNITS = {
+    "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
+    "m": 60.0, "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
+    "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
+}
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """按名取响应头（大小写不敏感，兼容 httpx.Headers 与普通 dict）。"""
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        value = getter(name)
+        if value is not None:
+            return str(value)
+    items = getattr(headers, "items", None)
+    if items is None:
+        return ""
+    lowered = name.lower()
+    for key, value in items():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
+
+
+def _retry_after_delta(raw: str, now: int) -> float | None:
+    """`Retry-After` 原始值 → 距现在多少秒；无法识别返回 None。
+
+    支持三种真实形态：整数秒（RFC 9110 标准）、HTTP-date（标准）、以及
+    部分上游回的「Try again in 17h 59m」文本（实测 cline-proxy 一类网关）。
+    负数 / 过去时刻 / 无法整除的脏值一律 None：宁可回落本地常量，也不
+    让一个坏头把所有凭证瞬间打爆（见 scheduler.note_error 的双端钳制）。
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return float(int(text))
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        moment = None
+    if moment is not None:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.timestamp() - now
+    body = _RETRY_AFTER_PREFIX.sub("", text)
+    total = 0.0
+    cursor = 0
+    matched = False
+    for match in _RETRY_AFTER_TEXT.finditer(body):
+        # token 之间只允许空白 / 逗号 / and（`17h 59m`、`1 hour, 30 min`）
+        if not re.fullmatch(r"[\s,]*(?:and\s+)?", body[cursor:match.start()]):
+            return None
+        unit = _RETRY_AFTER_UNITS.get(match.group(2).lower())
+        if unit is None:
+            return None
+        total += float(match.group(1)) * unit
+        matched = True
+        cursor = match.end()
+    if not matched or body[cursor:].strip():
+        return None
+    if not math.isfinite(total):
+        return None
+    return total
+
+
+def parse_retry_after(headers: Any, now: int) -> int | None:
+    """上游 `Retry-After` → 「何时恢复」的 epoch 秒；缺头/非法返回 None。
+
+    这是唯一解析入口：七渠道在构造 `UpstreamHTTPError` 时统一调用
+    `retry_hints`（本函数的薄包装），再交给调度器按错误分类的作用域钳制。
+    """
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return int(now + delta)
+
+
+def parse_retry_after_seconds(headers: Any, now: int) -> float | None:
+    """上游 `Retry-After` → 距现在多少秒（同上，保留小数供诊断）。"""
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return delta
+
+
+def retry_hints(headers: Any, now: int | None = None) -> dict[str, Any]:
+    """`UpstreamHTTPError` 的 retry 关键字参数（无头时两值均为 None）。
+
+    让各渠道的 raise 点保持一行：`**retry_hints(response.headers)`。
+    """
+    moment = int(time.time()) if now is None else now
+    return {"retry_at": parse_retry_after(headers, moment),
+            "retry_after_seconds": parse_retry_after_seconds(headers, moment)}
+
+
 async def read_body_bounded(response: Any, limit: int = BOUNDED_BODY_LIMIT) -> bytes:
     """有界读取响应体：最多读 `limit` 字节即停止。
 
@@ -131,13 +234,22 @@ class UpstreamHTTPError(Exception):
 
     `kind()` 由子类绑定各自的 classify_status，因为 1005 等业务码的
     判定规则是上游协议私有的。
+
+    `retry_at` / `retry_after_seconds` 来自上游 `Retry-After` 头（见
+    `parse_retry_after`）：调度器在**该错误分类的作用域**内据此拉长冷却，
+    实现「上游说什么时候恢复就什么时候恢复」。缺头时为 None，行为与
+    历史版本逐字节一致。
     """
 
     classify_status: ClassVar[Callable[[int, bytes], ErrKind]]
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(self, status: int, body: bytes, *,
+                 retry_at: int | None = None,
+                 retry_after_seconds: float | None = None) -> None:
         self.status = status
         self.body = body
+        self.retry_at = retry_at
+        self.retry_after_seconds = retry_after_seconds
         # 异常文本里的 body 摘要只进服务端日志（executor 对这些异常打 warning）；
         # 对外响应经 `_error_summary` 只取 status/受控标识，绝不回显上游正文。
         super().__init__(f"upstream http {status}: {body_hint(body)}")

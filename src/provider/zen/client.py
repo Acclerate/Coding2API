@@ -385,7 +385,8 @@ class ZenClient:
                     continue
                 if response.status_code >= 400:
                     raw = await base.read_body_bounded(response)
-                    raise UpstreamHTTPError(response.status_code, raw)
+                    raise UpstreamHTTPError(response.status_code, raw,
+                                            **base.retry_hints(response.headers))
                 async for frame in iter_frames(response.aiter_bytes()):
                     for event in zen_events.parse_all_events(frame):
                         if event.kind is EventKind.TOOL_CALLS and event.tool_calls:

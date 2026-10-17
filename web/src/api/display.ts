@@ -439,7 +439,9 @@ export type UsageErrorType =
   | "no_healthy_credential"
   | "rate_limit"
   | "upstream_error"
-  | "upstream_protocol";
+  | "upstream_protocol"
+  | "upstream_first_event_timeout"
+  | "upstream_idle_timeout";
 
 /** 明细失败类型的中文说明（TECHNICAL §11.2：界面只展示稳定枚举的翻译）。 */
 export const USAGE_ERROR_LABEL: Record<UsageErrorType, string> = {
@@ -451,6 +453,8 @@ export const USAGE_ERROR_LABEL: Record<UsageErrorType, string> = {
   rate_limit: "额度耗尽",
   upstream_error: "渠道错误",
   upstream_protocol: "渠道响应异常",
+  upstream_first_event_timeout: "上游首字超时",
+  upstream_idle_timeout: "上游流中断",
 };
 
 /** 未知取值不得原样透传（TECHNICAL §11.2），兜底为「失败」。 */
