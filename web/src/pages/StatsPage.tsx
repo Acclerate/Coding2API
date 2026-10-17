@@ -80,6 +80,27 @@ const LATENCY_COLUMNS = [
 ] as const;
 
 /**
+ * 分组表 Token 合并列的子列：输入 / 输出 / 命中（+命中率，派生列不可排序）。
+ * 只取明细表同名集合的前三项——`cache_rate` 后端没有分组排序键。
+ */
+const GROUP_TOKEN_COLUMNS = [
+  { key: "input_tokens", label: "输入" },
+  { key: "output_tokens", label: "输出" },
+  { key: "cached_tokens", label: "命中" },
+] as const;
+
+/** 分组表两种延迟口径：均值读小时汇总，P95 读明细（菜单即排序键白名单）。 */
+const GROUP_AVG_LATENCY_COLUMNS = [
+  { key: "avg_latency_ms", label: "平均耗时" },
+  { key: "avg_ttfb_ms", label: "平均首字" },
+] as const;
+
+const GROUP_P95_LATENCY_COLUMNS = [
+  { key: "p95_latency_ms", label: "P95 耗时" },
+  { key: "p95_ttfb_ms", label: "P95 首字" },
+] as const;
+
+/**
  * 分组统计的维度。后端各维度的行结构一致（分组键 + 同一组公共指标），
  * 前端按 key 取出分组键列即可，表格本身不分叉。
  *
@@ -512,38 +533,19 @@ export function StatsPage() {
                 <SortableHead label="成本" columnKey="cost_cny"
                               active={groupSort.sort === "cost_cny"} direction={groupSort.order}
                               onToggle={groupSort.toggle} align="right" testId="sort-cost_cny" />
-                <SortableHead label="输入 token" columnKey="input_tokens"
-                              active={groupSort.sort === "input_tokens"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-input_tokens" />
-                <SortableHead label="输出 token" columnKey="output_tokens"
-                              active={groupSort.sort === "output_tokens"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-output_tokens" />
-                <SortableHead label="命中缓存" columnKey="cached_tokens"
-                              active={groupSort.sort === "cached_tokens"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-cached_tokens" />
-                {/* 命中率 = 命中 ÷ 输入，派生列不排序（与「成功率」同例） */}
-                <TableHead className="text-right">命中率</TableHead>
-                {/* 延迟四列：均值读小时汇总（与总览同口径），P95 读明细表（仅 90 天）。
-                    两套口径在同一行并存，靠表尾说明与列头文案区分。 */}
-                <SortableHead label="平均耗时" columnKey="avg_latency_ms"
-                              active={groupSort.sort === "avg_latency_ms"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-avg_latency_ms" />
-                <SortableHead label="平均首字" columnKey="avg_ttfb_ms"
-                              active={groupSort.sort === "avg_ttfb_ms"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-avg_ttfb_ms" />
-                <SortableHead label="P95 耗时" columnKey="p95_latency_ms"
-                              active={groupSort.sort === "p95_latency_ms"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-p95_latency_ms" />
-                <SortableHead label="P95 首字" columnKey="p95_ttfb_ms"
-                              active={groupSort.sort === "p95_ttfb_ms"}
-                              direction={groupSort.order} onToggle={groupSort.toggle}
-                              align="right" testId="sort-p95_ttfb_ms" />
+                {/* Token 合并列：输入 / 输出 · 命中率，悬停展开命中 token。
+                    列头下拉仍可分别按输入 / 输出 / 命中排序。 */}
+                <SortMenuHead label="Token" options={[...GROUP_TOKEN_COLUMNS]}
+                              activeKey={groupSort.sort} direction={groupSort.order}
+                              onToggle={groupSort.toggle} testId="group-sort-token" />
+                {/* 延迟两列：均值读小时汇总（与总览同口径），P95 读明细表（仅 90 天）。
+                    两套口径各自合并成一列，靠表尾说明与悬停文案区分。 */}
+                <SortMenuHead label="平均延迟" options={[...GROUP_AVG_LATENCY_COLUMNS]}
+                              activeKey={groupSort.sort} direction={groupSort.order}
+                              onToggle={groupSort.toggle} testId="group-sort-avg-latency" />
+                <SortMenuHead label="P95 延迟" options={[...GROUP_P95_LATENCY_COLUMNS]}
+                              activeKey={groupSort.sort} direction={groupSort.order}
+                              onToggle={groupSort.toggle} testId="group-sort-p95-latency" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -609,35 +611,45 @@ export function StatsPage() {
                              title={`美元 ${formatMoney(row.cost_usd, "USD")}`}>
                     {formatMoney(row.cost_cny, "CNY")}
                   </TableCell>
-                  <TableCell label="输入 token" className="text-right tabular-nums">
-                    {formatCompact(row.input_tokens)}
+                  <TableCell label="Token" className="text-right"
+                             data-testid="group-token">
+                    <Tip content={
+                      `输入 ${formatCompact(row.input_tokens)}`
+                      + ` · 输出 ${formatCompact(row.output_tokens)}`
+                      + ` · 命中 ${formatCompact(row.cached_tokens)}`
+                    }>
+                      <span className="tabular-nums">
+                        {formatCompact(row.input_tokens)} / {formatCompact(row.output_tokens)}
+                        <span className="text-muted-foreground" data-testid="group-cache-rate">
+                          {" · "}{formatCacheRate(row.cached_tokens, row.input_tokens)}
+                        </span>
+                      </span>
+                    </Tip>
                   </TableCell>
-                  <TableCell label="输出 token" className="text-right tabular-nums">
-                    {formatCompact(row.output_tokens)}
-                  </TableCell>
-                  <TableCell label="命中缓存" className="text-right tabular-nums">
-                    {formatCompact(row.cached_tokens)}
-                  </TableCell>
-                  <TableCell label="命中率" className="text-right tabular-nums"
-                             data-testid="group-cache-rate">
-                    {formatCacheRate(row.cached_tokens, row.input_tokens)}
-                  </TableCell>
-                  {/* 延迟四列：均值与 P95 都只算成功请求；无成功请求显示 — */}
-                  <TableCell label="平均耗时" className="text-right tabular-nums"
+                  {/* 延迟两列：均值与 P95 都只算成功请求；无成功请求显示 — */}
+                  <TableCell label="平均延迟" className="text-right"
                              data-testid="group-avg-latency">
-                    {formatLatency(row.avg_latency_ms)}
+                    <Tip content={`平均耗时 ${formatLatency(row.avg_latency_ms)}`
+                      + ` · 平均首字 ${formatLatency(row.avg_ttfb_ms)}`}>
+                      <span className="tabular-nums">
+                        {formatLatency(row.avg_latency_ms)}
+                        <span className="text-muted-foreground" data-testid="group-avg-ttfb">
+                          {" / "}{formatLatency(row.avg_ttfb_ms)}
+                        </span>
+                      </span>
+                    </Tip>
                   </TableCell>
-                  <TableCell label="平均首字" className="text-right tabular-nums"
-                             data-testid="group-avg-ttfb">
-                    {formatLatency(row.avg_ttfb_ms)}
-                  </TableCell>
-                  <TableCell label="P95 耗时" className="text-right tabular-nums"
+                  <TableCell label="P95 延迟" className="text-right"
                              data-testid="group-p95-latency">
-                    {formatLatency(row.p95_latency_ms)}
-                  </TableCell>
-                  <TableCell label="P95 首字" className="text-right tabular-nums"
-                             data-testid="group-p95-ttfb">
-                    {formatLatency(row.p95_ttfb_ms)}
+                    <Tip content={`P95 耗时 ${formatLatency(row.p95_latency_ms)}`
+                      + ` · P95 首字 ${formatLatency(row.p95_ttfb_ms)}`}>
+                      <span className="tabular-nums">
+                        {formatLatency(row.p95_latency_ms)}
+                        <span className="text-muted-foreground" data-testid="group-p95-ttfb">
+                          {" / "}{formatLatency(row.p95_ttfb_ms)}
+                        </span>
+                      </span>
+                    </Tip>
                   </TableCell>
                 </TableRow>
                 );

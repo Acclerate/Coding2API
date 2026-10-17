@@ -126,18 +126,47 @@ describe("StatsPage 分组与明细", () => {
       .filter((url) => url.includes("/api/stats/by-provider"))
       .at(-1)!;
 
-    // 均值列：SQL 表达式排序（hourly 的 sum ÷ ok_count）
-    await userEvent.click(screen.getByTestId("sort-avg_latency_ms"));
+    // 均值列：合并列下拉选「平均耗时」→ SQL 表达式排序（hourly 的 sum ÷ ok_count）
+    await userEvent.click(screen.getByTestId("group-sort-avg-latency"));
+    await userEvent.click(screen.getByTestId("group-sort-avg-latency-avg_latency_ms"));
     await waitFor(() => expect(lastProviderCall()).toContain("sort=avg_latency_ms"));
     // 再点一次同列 → 切升序
-    await userEvent.click(screen.getByTestId("sort-avg_latency_ms"));
+    await userEvent.click(screen.getByTestId("group-sort-avg-latency"));
+    await userEvent.click(screen.getByTestId("group-sort-avg-latency-avg_latency_ms"));
     await waitFor(() => expect(lastProviderCall()).toContain("order=asc"));
 
     // 分位列：LEFT JOIN 子查询算出的列
-    await userEvent.click(screen.getByTestId("sort-p95_latency_ms"));
+    await userEvent.click(screen.getByTestId("group-sort-p95-latency"));
+    await userEvent.click(screen.getByTestId("group-sort-p95-latency-p95_latency_ms"));
     await waitFor(() => expect(lastProviderCall()).toContain("sort=p95_latency_ms"));
-    await userEvent.click(screen.getByTestId("sort-p95_ttfb_ms"));
+    await userEvent.click(screen.getByTestId("group-sort-p95-latency"));
+    await userEvent.click(screen.getByTestId("group-sort-p95-latency-p95_ttfb_ms"));
     await waitFor(() => expect(lastProviderCall()).toContain("sort=p95_ttfb_ms"));
+  });
+
+  it("分组统计排序：Token 合并列下拉选子列即按其排序", async () => {
+    const spy = mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": EVENTS_EMPTY,
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    const lastProviderCall = () => spy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes("/api/stats/by-provider"))
+      .at(-1)!;
+
+    for (const key of ["input_tokens", "output_tokens", "cached_tokens"]) {
+      await userEvent.click(screen.getByTestId("group-sort-token"));
+      await userEvent.click(screen.getByTestId(`group-sort-token-${key}`));
+      await waitFor(() => expect(lastProviderCall()).toContain(`sort=${key}`));
+    }
   });
 
   it("请求明细排序：换列从 rowid 游标切到 offset 分页", async () => {
@@ -278,10 +307,13 @@ describe("StatsPage 分组与明细", () => {
     await settle();
     let row = within(screen.getByTestId("group-table")).getByText("glm-5.2").closest("tr")!;
     expect(row).toHaveTextContent("95.0%");
-    expect(row).toHaveTextContent("100");
     expect(row).toHaveTextContent("¥5.36");
-    // 命中率列 = 命中 100 ÷ 输入 300 = 33.3%
+    // Token 合并列：默认「输入 / 输出 · 命中率」，命中 token 落在悬停详情里
+    expect(within(row).getByTestId("group-token")).toHaveTextContent("300 / 900");
+    // 命中率列 = 命中 100 ÷ 输入 300 = 33.3%（命中 token 本身在悬停详情中）
     expect(within(row).getByTestId("group-cache-rate")).toHaveTextContent("33.3%");
+    await userEvent.hover(within(row).getByTestId("group-cache-rate"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("命中 100");
     // 延迟四列：均值 4200/900 ms、P95 9500/2400 ms（都 ≥1s → 显示 s）
     expect(within(row).getByTestId("group-avg-latency")).toHaveTextContent("4.2 s");
     expect(within(row).getByTestId("group-avg-ttfb")).toHaveTextContent("900 ms");
