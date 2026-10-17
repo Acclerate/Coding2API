@@ -31,8 +31,10 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 
 from ..benchmarks import BenchmarkTable
+from ..compat.openai.errors import error_payload
 from .deps import ApiKeyPrincipal, Services, api_key_user
 from .model_catalog import load_catalog, save_catalog
 from .model_merge import (
@@ -239,17 +241,16 @@ def _schedule_refresh(services: Services, connected: set[str],
     task.add_done_callback(_done)
 
 
-def _build_response(services: Services, connected: set[str],
-                    allowed_models: str = "",
-                    benchmarks: BenchmarkTable | None = None) -> dict:
-    """按当前缓存合并出响应（不碰上游），并就地 publish 别名表。
+def _served_entries(services: Services, connected: set[str],
+                    allowed_models: str = "") -> list[dict[str, Any]]:
+    """合并 + 定稿 + 就地 publish 别名表，并按 Key 白名单过滤。
 
     `allowed_models` 非空时按该 Key 的模型白名单过滤展示：白名单是
     Key 级策略，执行时的权威判定在出口（`model_allowed`），这里只是让
     `/v1/models` 与 Key 实际能用的模型一致。
 
-    `benchmarks` 为能力分表（`app.state.model_benchmarks`）；None/空表时条目
-    不带 `benchmarks` 字段，与加该字段前的行为一致。
+    列表与单模型查询（`serve_model`）共用这一段，保证两条出口看到的是
+    同一份「定稿后」条目（`_publish` 会就地 finalize，id 撞车消歧只发生一次）。
     """
     entries = merged_entries(services, connected)
     _publish(services, entries)
@@ -257,8 +258,64 @@ def _build_response(services: Services, connected: set[str],
         from ..auth.access import model_allowed
         entries = [entry for entry in entries
                    if model_allowed(entry["id"], allowed_models)]
+    return entries
+
+
+def _build_response(services: Services, connected: set[str],
+                    allowed_models: str = "",
+                    benchmarks: BenchmarkTable | None = None) -> dict:
+    """按当前缓存合并出响应（不碰上游），并就地 publish 别名表。
+
+    `benchmarks` 为能力分表（`app.state.model_benchmarks`）；None/空表时条目
+    不带 `benchmarks` 字段，与加该字段前的行为一致。
+    """
+    entries = _served_entries(services, connected, allowed_models)
     return {"object": "list", "data": [_entry_response(entry, benchmarks)
                                        for entry in entries]}
+
+
+def _match_entry(entries: list[dict[str, Any]],
+                 model_id: str) -> dict[str, Any] | None:
+    """按对外 id / 展示名 / 任一渠道原 id 查单条（大小写不敏感）。
+
+    三种写法都要认，否则「列表里复制 id」能用、「手写上游原 id」却 404：
+    别名表（`_register_aliases`）在执行侧本来就认这三种，单模型查询保持同口径。
+    返回 `None` = 不存在或不在该 Key 的白名单内（调用方统一 404，不泄露
+    「存在但你没权限」）。
+    """
+    target = model_id.strip().lower()
+    if not target:
+        return None
+    for entry in entries:
+        if entry["id"].lower() == target:
+            return entry
+        name = entry["meta"].get("name")
+        if isinstance(name, str) and name.lower() == target:
+            return entry
+        if any(str(raw).lower() == target for raw in entry["raw_ids"].values()):
+            return entry
+    return None
+
+
+async def _revalidated_providers(services: Services) -> set[str]:
+    """按 SWR 策略刷新过期渠道，返回「当前有可用凭证」的渠道集合。
+
+    列表（`serve_models`）与单模型查询（`serve_model`）共用：两者的刷新时机
+    必须一致，否则会出现「列表里有、单查 404」的错觉。
+    """
+    connected = credential_providers(services)
+    stale = {provider_id for provider_id in connected
+             if _needs_refresh(services, provider_id, now=time.monotonic())}
+    if any(not services.model_list_cache.get(provider_id) for provider_id in stale):
+        # 无可回退模型（冷启动无快照 / 新接入渠道）：必须同步拉一次
+        await _refresh_providers(services, connected)
+    elif stale:
+        _schedule_refresh(services, connected, stale)
+    return connected
+
+
+def _benchmarks_of(request: Request | None) -> BenchmarkTable | None:
+    return getattr(request.app.state, "model_benchmarks", None) if request else None
 
 
 async def serve_models(services: Services, allowed_models: str = "",
@@ -278,16 +335,26 @@ async def serve_models(services: Services, allowed_models: str = "",
     条目透出（与 `models_dev_catalog` 同一形态：运行数据挂 app.state，不是
     Services 依赖）。不传（测试 / 内部调用）时条目不带 `benchmarks` 字段。
     """
-    connected = credential_providers(services)
-    stale = {provider_id for provider_id in connected
-             if _needs_refresh(services, provider_id, now=time.monotonic())}
-    if any(not services.model_list_cache.get(provider_id) for provider_id in stale):
-        # 无可回退模型（冷启动无快照 / 新接入渠道）：必须同步拉一次
-        await _refresh_providers(services, connected)
-    elif stale:
-        _schedule_refresh(services, connected, stale)
-    benchmarks = getattr(request.app.state, "model_benchmarks", None) if request else None
-    return _build_response(services, connected, allowed_models, benchmarks)
+    connected = await _revalidated_providers(services)
+    return _build_response(services, connected, allowed_models, _benchmarks_of(request))
+
+
+async def serve_model(services: Services, model_id: str, allowed_models: str = "",
+                      request: Request | None = None) -> dict[str, Any] | None:
+    """单模型查询（`GET /v1/models/{id}`）：命中返回条目，否则 None。
+
+    刷新与合并完全复用列表那一段（`_revalidated_providers` + `_served_entries`）：
+    单查也要能看到「刚接入的渠道」，否则列表有、单查 404 会让人以为是权限问题。
+
+    **不在 Key 白名单内的模型与不存在同样返回 None**（调用方统一 404）：
+    `_served_entries` 已按白名单过滤，查不到即 404——不能让客户端用单查探测
+    「池子里还有哪些模型」。
+    """
+    connected = await _revalidated_providers(services)
+    entry = _match_entry(_served_entries(services, connected, allowed_models), model_id)
+    if entry is None:
+        return None
+    return _entry_response(entry, _benchmarks_of(request))
 
 
 async def list_models(services: Services,
@@ -325,5 +392,25 @@ def create_router(services: Services) -> APIRouter:
     async def list_v1_models(request: Request,
                              principal: ApiKeyPrincipal = Depends(api_key_user)):
         return await serve_models(services, principal.allowed_models, request)
+
+    @router.get("/v1/models/{model_id:path}")
+    async def get_v1_model(model_id: str, request: Request,
+                           principal: ApiKeyPrincipal = Depends(api_key_user)):
+        """单模型查询（OpenAI `GET /v1/models/{model}` 同形）。
+
+        `:path` 而非普通路径参数：上游原 id 允许带命名空间（kilo 的
+        `dots-studio/dots-3-note-preview:free`），普通参数会在斜杠处 404。
+        三种写法都认（对外 id / 展示名 / 任一渠道原 id），与执行侧别名表同口径。
+
+        找不到（或不在该 Key 的白名单内）一律 404 + OpenAI 错误形状：白名单外
+        的模型不能靠单查探测出「池子里有它」。
+        """
+        item = await serve_model(services, model_id, principal.allowed_models, request)
+        if item is None:
+            return JSONResponse(
+                status_code=404,
+                content=error_payload(f"model not found: {model_id}",
+                                      "model_not_found", 404))
+        return item
 
     return router
