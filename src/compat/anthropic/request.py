@@ -38,12 +38,43 @@ from ..openai.request import (
 )
 
 
-def _text_from_system(system: Any) -> str:
-    """`system` 字符串或 text 块数组 → 纯文本；其余形状 400。"""
+def _cache_control(block: dict[str, Any], where: str) -> dict[str, Any] | None:
+    """取 Anthropic 内容块上的 `cache_control` 标记（缺省 None）。
+
+    只做**结构**校验，取值原样透传：Anthropic 目前只有 `{"type": "ephemeral",
+    "ttl"?: "5m"|"1h"}`，但它属于「缓存提示」而非本网关要解释的语义——本网关是
+    管道，未知取值交给上游裁决（显式 400 会把上游将来新增的取值挡在门外）。
+    结构不合法（非对象 / 无 type / ttl 非字符串）仍显式 400：静默丢弃会把
+    客户端的意图悄悄吃掉，与本模块「不静默降级」一致。
+
+    透传落点（2026-10-17 实测七渠道全部接受，见 `scripts/probe_cache_control.py`
+    与 `docs/competitor-comparison.md` §3.1）：system/user/assistant/tool 消息的
+    内容块、`tool_calls` 元素顶层、`tools` 元素顶层。
+    """
+    marker = block.get("cache_control")
+    if marker is None:
+        return None
+    if not isinstance(marker, dict):
+        raise InvalidRequest(f"{where}.cache_control must be an object")
+    if not isinstance(marker.get("type"), str) or not marker["type"]:
+        raise InvalidRequest(f"{where}.cache_control.type must be a non-empty string")
+    ttl = marker.get("ttl")
+    if ttl is not None and not isinstance(ttl, str):
+        raise InvalidRequest(f"{where}.cache_control.ttl must be a string")
+    return marker
+
+
+def _system_content(system: Any) -> str | list[dict[str, Any]]:
+    """`system` 字符串或 text 块数组 → system 消息的 content。
+
+    不带 `cache_control` 时折成一个字符串（**与旧行为逐字节一致**：会话粘性
+    指纹与上游前缀缓存都依赖这个形状）。带标记时保留内容块数组，把标记挂在
+    对应块上——折成字符串会丢掉「缓存在这里断点」的信息。
+    """
     if isinstance(system, str):
         return system
     if isinstance(system, list):
-        parts: list[str] = []
+        parts: list[dict[str, Any]] = []
         for index, block in enumerate(system):
             if not isinstance(block, dict):
                 raise InvalidRequest(f"system[{index}] must be an object")
@@ -54,8 +85,14 @@ def _text_from_system(system: Any) -> str:
             text = block.get("text")
             if not isinstance(text, str):
                 raise InvalidRequest(f"system[{index}].text must be a string")
-            parts.append(text)
-        return "".join(parts)
+            part: dict[str, Any] = {"type": "text", "text": text}
+            marker = _cache_control(block, f"system[{index}]")
+            if marker is not None:
+                part["cache_control"] = marker
+            parts.append(part)
+        if any("cache_control" in part for part in parts):
+            return parts
+        return "".join(part["text"] for part in parts)
     if system is None:
         return ""
     raise InvalidRequest("system must be a string or an array")
@@ -85,27 +122,39 @@ def _image_part(block: dict[str, Any], where: str) -> dict[str, Any]:
             raise InvalidRequest(f"{where}.source.media_type must be a non-empty string")
         if not isinstance(data, str) or not data:
             raise InvalidRequest(f"{where}.source.data must be a non-empty string")
-        return {"type": "image_url",
-                "image_url": {"url": f"data:{media_type};base64,{data}"}}
-    if kind == "url":
+        part: dict[str, Any] = {"type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"}}
+    elif kind == "url":
         url = source.get("url")
         if not isinstance(url, str) or not url:
             raise InvalidRequest(f"{where}.source.url must be a non-empty string")
-        return {"type": "image_url", "image_url": {"url": url}}
-    raise InvalidRequest(f"{where}.source.type {kind!r} is not supported by this gateway")
+        part = {"type": "image_url", "image_url": {"url": url}}
+    else:
+        raise InvalidRequest(
+            f"{where}.source.type {kind!r} is not supported by this gateway")
+    marker = _cache_control(block, where)
+    if marker is not None:
+        part["cache_control"] = marker
+    return part
 
 
 def _text_part(block: dict[str, Any], where: str) -> dict[str, Any]:
-    return {"type": "text", "text": _block_text(block, where)}
+    part: dict[str, Any] = {"type": "text", "text": _block_text(block, where)}
+    marker = _cache_control(block, where)
+    if marker is not None:
+        part["cache_control"] = marker
+    return part
 
 
 def _merge_parts(parts: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
-    """内容块数组 → chat content：纯文本折成字符串，含图片时保留数组。
+    """内容块数组 → chat content：纯文本折成字符串，含图片/缓存标记时保留数组。
 
-    纯文本折成字符串是为了与旧行为**逐字节一致**——历史请求（不含图片）经此
-    出口映射后必须与改动前完全相同，否则会话粘性指纹与上游前缀缓存都会失效。
+    纯文本折成字符串是为了与旧行为**逐字节一致**——历史请求（不含图片、不带
+    `cache_control`）经此出口映射后必须与改动前完全相同，否则会话粘性指纹与
+    上游前缀缓存都会失效。带缓存标记时不能折：标记挂在块上，折成字符串就丢了。
     """
-    if all(part.get("type") == "text" for part in parts):
+    if all(part.get("type") == "text" for part in parts) and not any(
+            "cache_control" in part for part in parts):
         return "".join(part["text"] for part in parts)
     # 必须返回副本：调用方紧接着会 clear() 自己的 pending 列表，直接返回同一
     # 对象会把已存入消息的 content 一并清空（数组 part 场景下表现为 content=[]）。
@@ -186,8 +235,17 @@ def _user_messages(blocks: list[Any]) -> list[dict[str, Any]]:
                 raise InvalidRequest(
                     "tool_result.tool_use_id must be a non-empty string")
             flush()
-            messages.append({"role": "tool", "tool_call_id": tool_use_id,
-                             "content": _tool_result_text(block.get("content"))})
+            tool_message: dict[str, Any] = {
+                "role": "tool", "tool_call_id": tool_use_id,
+                "content": _tool_result_text(block.get("content")),
+            }
+            marker = _cache_control(block, where)
+            if marker is not None:
+                # 挂在消息顶层而不是内容块里：字符串 content 塞不下标记，包成
+                # 数组又要多造一个空 text 块（会进模型上下文）。实测七渠道接受
+                # 消息顶层标记（scripts/probe_cache_control.py）。
+                tool_message["cache_control"] = marker
+            messages.append(tool_message)
         elif kind == "document":
             raise InvalidRequest(
                 f"content block type {kind!r} is not supported by this gateway")
@@ -198,16 +256,22 @@ def _user_messages(blocks: list[Any]) -> list[dict[str, Any]]:
 
 
 def _assistant_message(blocks: list[Any]) -> dict[str, Any] | None:
-    """assistant 内容块 → 单条 chat assistant 消息（空则 None）。"""
-    content_parts: list[str] = []
+    """assistant 内容块 → 单条 chat assistant 消息（空则 None）。
+
+    正文默认折成字符串（与旧行为逐字节一致）；任一块带 `cache_control` 时保留
+    内容块数组，标记挂在对应块上。`tool_use` 的标记挂在 `tool_calls` 元素顶层
+    ——chat 的 `function` 对象只认 name/arguments，多塞字段属于伪造 schema。
+    """
+    content_parts: list[dict[str, Any]] = []
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     for index, block in enumerate(blocks):
         if not isinstance(block, dict):
             raise InvalidRequest(f"messages.content[{index}] must be an object")
+        where = f"messages.content[{index}]"
         kind = block.get("type")
         if kind == "text":
-            content_parts.append(_block_text(block, f"messages.content[{index}]"))
+            content_parts.append(_text_part(block, where))
         elif kind == "thinking":
             thinking = block.get("thinking")
             if not isinstance(thinking, str):
@@ -220,18 +284,26 @@ def _assistant_message(blocks: list[Any]) -> dict[str, Any] | None:
             name = block.get("name")
             if not isinstance(name, str) or not name:
                 raise InvalidRequest("tool_use.name must be a non-empty string")
-            tool_calls.append({
+            tool_call: dict[str, Any] = {
                 "id": block.get("id") or "call",
                 "type": "function",
                 "function": {"name": name,
                              "arguments": _input_arguments(block.get("input"))},
-            })
+            }
+            marker = _cache_control(block, where)
+            if marker is not None:
+                tool_call["cache_control"] = marker
+            tool_calls.append(tool_call)
         else:
             raise InvalidRequest(f"unknown content block type {kind!r}")
     if not content_parts and not reasoning_parts and not tool_calls:
         return None
-    message: dict[str, Any] = {"role": "assistant",
-                               "content": "".join(content_parts)}
+    marked = any("cache_control" in part for part in content_parts)
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content_parts if marked else "".join(
+            str(part["text"]) for part in content_parts),
+    }
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
@@ -280,7 +352,14 @@ def _map_tools(tools: Any) -> list[dict[str, Any]]:
         schema = tool.get("input_schema")
         if isinstance(schema, dict):
             function["parameters"] = schema
-        mapped.append({"type": "function", "function": function})
+        entry: dict[str, Any] = {"type": "function", "function": function}
+        marker = _cache_control(tool, f"tools[{index}]")
+        if marker is not None:
+            # 挂在工具对象顶层（`function` 内部只认 name/description/parameters，
+            # 塞进去属于伪造 schema）。Claude Code 会把标记打在最后一个工具上，
+            # 表示「工具定义到此为止可缓存」。
+            entry["cache_control"] = marker
+        mapped.append(entry)
     return mapped
 
 
@@ -321,7 +400,7 @@ def parse_messages_request(body: Any, *, thinking_efforts: str = "") -> ChatRequ
         raise InvalidRequest("messages must be a non-empty array")
 
     messages: list[dict[str, Any]] = []
-    system = _text_from_system(body.get("system"))
+    system = _system_content(body.get("system"))
     if system:
         messages.append({"role": "system", "content": system})
     messages.extend(_map_messages(raw_messages))
