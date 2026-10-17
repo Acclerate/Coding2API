@@ -403,6 +403,9 @@ describe("display helpers", () => {
     expect(usageErrorLabel("client_disconnect")).toBe("客户端中断");
     expect(usageErrorLabel("model_unavailable")).toBe("该模型暂时不可用");
     expect(usageErrorLabel("no_healthy_credential")).toBe("无可用凭证");
+    // A1 流式超时：两个新枚举都要有中文文案（不能落到兜底「失败（xxx）」）
+    expect(usageErrorLabel("upstream_first_event_timeout")).toBe("上游首字超时");
+    expect(usageErrorLabel("upstream_idle_timeout")).toBe("上游流中断");
     expect(usageErrorLabel(null)).toBe("失败");
     expect(usageErrorLabel(undefined)).toBe("失败");
     // 后端新增枚举时前端不能显示空白：兜底文案带原值便于对照排查

@@ -38,8 +38,29 @@ def require_positive_int(value: Any, name: str, *, maximum: int) -> int:
 # 采样参数：OpenAI 语义是 [-2, 2]，这里只做有限值 + 该范围校验。
 SAMPLING_PENALTY_KEYS = ("presence_penalty", "frequency_penalty")
 MAX_PENALTY_ABS = 2.0
-# `n`（生成候选数）上限：本网关不做多候选聚合，过大的值只会放大上游开销。
-MAX_CHOICES = 8
+# `n`（生成候选数）：本网关出口**结构上只能产生单个 choice**
+# （`provider/openai_chunk.py::first_choice` 只取 choices[0]，
+# `compat/openai/response.py` 恒单 choice），所以只接受 1。此前允许 1..8
+# 属于「假装支持」——客户端要多候选，网关静默只回一个，比显式 400 更难排查。
+# 这是**破坏性语义变更**（README 兼容性表已标注）。
+MAX_CHOICES = 1
+
+
+def validate_n(raw: dict[str, Any]) -> None:
+    """`n != 1` 显式 400：出口只能产生单个 choice，不接受多候选。
+
+    与 `require_positive_int` 分开：那里的报错是「超出范围 1..N」，而这里
+    要说清「不是范围问题，是结构不支持」——否则用户会以为调小到 2 就好。
+    """
+    if "n" not in raw:
+        return
+    value = raw["n"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidRequest("n must be an integer")
+    if value != MAX_CHOICES:
+        raise InvalidRequest(
+            "n must be 1: this gateway's response structure can only produce "
+            f"a single choice (got n={value})")
 
 
 def validate_numeric_fields(raw: dict[str, Any]) -> None:
@@ -70,8 +91,8 @@ def validate_numeric_fields(raw: dict[str, Any]) -> None:
         if not math.isfinite(value):
             raise InvalidRequest("seed must be a finite number")
         raw["seed"] = int(value)
-    if "n" in raw:
-        require_positive_int(raw["n"], "n", maximum=MAX_CHOICES)
+    # 无条件调用：缺省 `n` 也要走一遍校验入口，避免「调用点漏判」时静默放行
+    validate_n(raw)
     if "logit_bias" in raw:
         bias = raw["logit_bias"]
         if not isinstance(bias, dict):

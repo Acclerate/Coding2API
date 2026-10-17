@@ -74,3 +74,40 @@ def test_prefix_only_changes_message_path():
         normalize_response_format({"type": "nope"}, prefix="text.format")
     assert normalize_response_format({"type": "text"}, prefix="text.format") == {
         "type": "text"}
+
+
+# ----------------------------------------------------------------- A3：`n` 口径
+#
+# 出口结构上只能产生单个 choice（`provider/openai_chunk.py::first_choice` 只取
+# choices[0]，`compat/openai/response.py` 恒单 choice），所以 `n` 只接受 1；
+# 其余显式 400，而不是静默只回一个候选。
+
+
+def test_n_one_is_accepted_and_passed_through():
+    assert _parse(n=1)["n"] == 1
+
+
+def test_n_absent_is_accepted():
+    """缺省即 1（OpenAI 默认），不得因为收紧而变成必填。"""
+    assert "n" not in _parse()
+
+
+@pytest.mark.parametrize("value", [0, 2, 3, 8, 99])
+def test_n_other_than_one_is_400(value):
+    with pytest.raises(InvalidRequest, match="n must be 1"):
+        _parse(n=value)
+
+
+@pytest.mark.parametrize("value", [True, False, "1", 1.0, None])
+def test_n_non_integer_is_400(value):
+    """bool / 字符串 / 浮点 / null 都不是合法的 `n`（不能悄悄当成 1）。"""
+    with pytest.raises(InvalidRequest, match="n must be an integer"):
+        _parse(n=value)
+
+
+def test_n_error_message_explains_structural_limit():
+    """文案要说清「不是范围问题，是结构不支持」，否则用户会以为调到 2 就好。"""
+    with pytest.raises(InvalidRequest) as caught:
+        _parse(n=2)
+    assert "single choice" in str(caught.value)
+    assert "n=2" in str(caught.value)

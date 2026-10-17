@@ -46,7 +46,8 @@ class _Scheduler:
     def should_rotate(self, tried):
         return False
 
-    def note_error(self, candidate, kind, now):  # pragma: no cover
+    def note_error(self, candidate, kind, now, *, model=None,
+                   retry_at=None):  # pragma: no cover
         raise AssertionError("unexpected error path")
 
 class _Collector:
@@ -217,7 +218,10 @@ async def test_stream_done_disconnect_without_credential(monkeypatch):
     executor = Executor(ExecutorDeps(
         providers={"trae": Provider()}, credentials=Creds(),
         scheduler=_Scheduler(), stats=_Collector(recorded)))
-    monkeypatch.setattr(executor, "_pick", lambda target, tried, affinity_id=None: (None, None))
+    async def _no_pick(target, tried, affinity_id=None):
+        return None, None
+
+    monkeypatch.setattr(executor, "_pick", _no_pick)
 
     stream = executor.stream(_request(), username="alice")
     while True:

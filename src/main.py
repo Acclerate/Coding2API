@@ -483,6 +483,16 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      max_auto_continues=config.auto_continue_max,
                                      complete_timeout_seconds=(
                                          config.upstream_complete_timeout_seconds),
+                                     # A1 流式计时（默认 0=关，管理台可热更）：每次取
+                                     # 下一个上游事件时现读，改完下一帧即生效
+                                     first_event_timeout_seconds=lambda: (
+                                         runtime.stream_first_event_timeout_seconds),
+                                     stream_idle_timeout_seconds=lambda: (
+                                         runtime.stream_idle_timeout_seconds),
+                                     # A4 短冷却「等待续上」（默认 0=关）：全池都在
+                                     # 短冷却时等最近的一个到期，而不是直接 503
+                                     short_cooldown_wait_seconds=lambda: (
+                                         runtime.short_cooldown_wait_seconds),
                                      affinity=ConversationAffinity(
                                          ttl_seconds=lambda: runtime.conversation_sticky_seconds),
                                      upstream_model_name=lambda provider_id, model_name: (

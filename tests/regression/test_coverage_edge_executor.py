@@ -270,7 +270,7 @@ async def test_complete_exhausts_rotation_without_last_error(tmp_path):
     assert str(caught.value) == "all credentials unavailable"
     db.close()
 
-def test_pick_returns_none_when_all_cooling(tmp_path):
+async def test_pick_returns_none_when_all_cooling(tmp_path):
     """_pick 在候选全部冷却时返回 None（executor 154-155）。"""
     import time
 
@@ -284,7 +284,7 @@ def test_pick_returns_none_when_all_cooling(tmp_path):
     credentials.save_error(
         credential_id, Scheduler().note_error(candidate, ErrKind.PLAN, int(time.time())))
     executor = _executor(credentials, _Provider([GOOD]))
-    assert executor._pick(resolve("glm-5.2", "glm-5.2"), set()) is None
+    assert await executor._pick(resolve("glm-5.2", "glm-5.2"), set()) is None
     db.close()
 
 def test_unavailable_text_prefers_model_scoped_wording(tmp_path):

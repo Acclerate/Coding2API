@@ -340,18 +340,19 @@ def test_openai_chat_rejects_penalty_seed_n_and_logit_bias():
                 {"presence_penalty": 3}, {"frequency_penalty": -3},
                 {"presence_penalty": True}, {"frequency_penalty": "x"},
                 {"seed": inf}, {"seed": True}, {"seed": "x"},
-                {"n": 0}, {"n": 99}, {"n": True},
+                {"n": 0}, {"n": 2}, {"n": 99}, {"n": True},
                 {"logit_bias": "x"}, {"logit_bias": {1: 1}},
                 {"logit_bias": {"1": inf}}):
         with pytest.raises(InvalidRequest):
             parse_chat_request({**base, **bad})
-    # 合法值：penalty 归一为 float，seed 取整，n 通过，logit_bias 原样
+    # 合法值：penalty 归一为 float，seed 取整，n 只允许 1（A3：出口结构单 choice），
+    # logit_bias 原样
     parsed = parse_chat_request({**base, "presence_penalty": -1.5,
                                  "frequency_penalty": 2, "seed": 42.9,
-                                 "n": 3, "logit_bias": {"1": -100}})
+                                 "n": 1, "logit_bias": {"1": -100}})
     assert parsed.raw["presence_penalty"] == -1.5
     assert parsed.raw["frequency_penalty"] == 2.0
-    assert parsed.raw["seed"] == 42 and parsed.raw["n"] == 3
+    assert parsed.raw["seed"] == 42 and parsed.raw["n"] == 1
     assert parsed.raw["logit_bias"] == {"1": -100}
 
 def test_openai_chat_validates_image_url_parts():

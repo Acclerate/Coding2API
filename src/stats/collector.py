@@ -31,9 +31,12 @@ CONTROLLED_ERROR_TYPES = frozenset({
     #                            冷却不可用（_exhaust_error_type；换个模型即可用）
     #   rate_limit         — 权益耗尽（_error_type_for(PLAN)）
     #   upstream_error / upstream_protocol — 其它上游失败
+    #   upstream_first_event_timeout — 出帧前上游不吐首个数据事件（A1）
+    #   upstream_idle_timeout        — 已出帧后上游停止吐数据（A1）
     "client_disconnect", "credential_unavailable",
     "invalid_request", "no_healthy_credential", "model_unavailable",
     "rate_limit", "upstream_error", "upstream_protocol",
+    "upstream_first_event_timeout", "upstream_idle_timeout",
 })
 MAX_MODEL_LENGTH = 64
 
