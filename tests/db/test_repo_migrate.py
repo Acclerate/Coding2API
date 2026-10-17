@@ -110,6 +110,15 @@ def test_migrate_adds_cached_tokens_to_legacy_db(tmp_path):
     assert {"cost_usd", "cost_cny"} <= events_columns
     # 请求 ID（响应头 X-Request-ID 同值）：老库补列后历史行为 NULL
     assert "request_id" in events_columns
+    # 发起请求的 API Key：老库补列后历史行 NULL＝未归属，读路径按未归属处理
+    assert "api_key_id" in events_columns
+    legacy_event = db.connect().execute(
+        "SELECT api_key_id FROM usage_events LIMIT 1").fetchone()
+    assert legacy_event is None                  # 老库无明细行，仅确认列可读
+    # 按 Key 计量的索引建在补列之后（api_key_id 是第 26 版才补的列）
+    event_indexes = {row[1] for row in db.connect().execute(
+        "PRAGMA index_list(usage_events)")}
+    assert "idx_usage_key" in event_indexes
     alert_columns = {row[1] for row in db.connect().execute("PRAGMA table_info(alert_events)")}
     # 告警恢复时刻：老库补列后历史行 NULL（视为未恢复，不影响既有记录展示）
     assert "resolved_at" in alert_columns

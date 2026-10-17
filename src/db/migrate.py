@@ -54,7 +54,10 @@ SCHEMA_NAME = "schema.sql"
 # 供管理台按账本展示到期积分：福利组＝每日池 / 内置组＝积分账）。老库补列后为
 # NULL ＝「无积分到期信息」，展示层按「无到期积分」处理，health / 选号不受影响
 # （选号读的是两本账合并的 quota_expiry_ladder，不读这一列）。
-SCHEMA_VERSION = 25
+# 26：usage_events 新增 api_key_id（发起请求的 API Key id，供按 Key 计量与
+# 自助用量）。老库补列后历史行为 NULL ＝「未归属到具体 Key」，读路径按未归属
+# 处理，与补列前行为一致；索引 idx_usage_key 在补列之后建（见 _MIGRATION_INDEXES）。
+SCHEMA_VERSION = 26
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -114,6 +117,9 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 积分账到期阶梯（仅 CodeArts，展示用）：老库补列后为 NULL ＝「无积分到期
     # 信息」，管理台按「无到期积分」处理；选号读合并阶梯，不受本列影响。
     ("credentials", "quota_credits_expiry_ladder TEXT"),
+    # 发起请求的 API Key（按 Key 计量 / 自助用量）：老库补列后历史行为 NULL
+    # ＝「未归属到具体 Key」，读路径按未归属处理，与补列前一致。
+    ("usage_events", "api_key_id TEXT"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。
@@ -127,6 +133,9 @@ _MIGRATION_DROPS: tuple[str, ...] = ("checkins", "model_cache")
 _MIGRATION_INDEXES: tuple[tuple[str, str, str], ...] = (
     # 侧栏角标只数「仍在告警中」（resolved_at IS NULL）：避免每次轮询全表扫。
     ("idx_alert_unresolved", "alert_events", "resolved_at"),
+    # 按 Key 计量 / 自助用量只查「某把 Key + 时间窗」，必须走索引不能全表扫；
+    # api_key_id 是第 26 版才补的列，索引只能在这里建。
+    ("idx_usage_key", "usage_events", "api_key_id, ts"),
 )
 
 

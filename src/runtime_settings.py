@@ -98,6 +98,24 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "格式 `组名=成员1,成员2;组名2=成员3`；成员可带 `@渠道` 固定回退渠道。"
                "留空 = 不启用。回退会用尽该组（×3 轮换预算）后正常 503。",
                group="routing"),
+    HotSetting("model_aliases", str, "自定义模型别名",
+               "给客户端一个稳定的对外模型名（上游改 id 时只改这里）。格式 "
+               "`对外名=模型@渠道;对外名2=模型`；列表与请求解析用同一份。"
+               "与真实模型 id 或自动别名撞车视为配置错误，不静默覆盖。"
+               "留空 = 不启用。", group="routing"),
+    HotSetting("stream_first_event_timeout_seconds", float, "流式首事件超时（秒）",
+               "上游接了连接却长时间不吐第一个数据帧时，在**出帧前**换号重试"
+               "（此时切换安全）。注释帧/心跳不重置计时。0 = 关闭；实测慢上下文"
+               "首字可达 40–71s，内置默认必须保持关闭，用时按部署实际填（推荐 60）。",
+               minimum=0.0, group="routing"),
+    HotSetting("stream_idle_timeout_seconds", float, "流式空闲超时（秒）",
+               "**已出帧**后上游长时间不再吐数据时断流并以错误帧收尾——半截输出"
+               "不可回滚，换号会把两个账号的内容拼给客户端。0 = 关闭（推荐 300）。",
+               minimum=0.0, group="routing"),
+    HotSetting("short_cooldown_wait_seconds", float, "短冷却等待上限（秒）",
+               "全池都在短冷却、没有任何立即可用候选时，最短剩余冷却不超过该值"
+               "则等待后续上（而非直接 503）。等待期间不占在途租约。0 = 关闭"
+               "（快速失败，保持旧行为）。", minimum=0.0, group="affinity"),
     HotSetting("quota_expiry_window_seconds", int, "到期积分主窗口（秒）",
                "把「距到期 ≤ 该秒数」的积分加总作为选号第一排序指标；"
                "≤0 关闭整套到期排序（次窗口一并失效）。", minimum=0,
@@ -591,6 +609,22 @@ class RuntimeSettings:
     @property
     def model_fallback_groups(self) -> str:
         return str(self.get("model_fallback_groups"))
+
+    @property
+    def model_aliases(self) -> str:
+        return str(self.get("model_aliases"))
+
+    @property
+    def stream_first_event_timeout_seconds(self) -> float:
+        return float(self.get("stream_first_event_timeout_seconds"))
+
+    @property
+    def stream_idle_timeout_seconds(self) -> float:
+        return float(self.get("stream_idle_timeout_seconds"))
+
+    @property
+    def short_cooldown_wait_seconds(self) -> float:
+        return float(self.get("short_cooldown_wait_seconds"))
 
     @property
     def blocklist_patterns(self) -> tuple[str, ...]:

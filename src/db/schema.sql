@@ -109,7 +109,11 @@ CREATE TABLE IF NOT EXISTS usage_events (
     ttfb_ms          INTEGER,             -- 首字延迟（请求开始到首个内容帧）
     -- 请求 ID（响应头 X-Request-ID 同值）：把「用户报的一个请求」与这行明细、
     -- 以及与上游日志对齐。NULL=老库历史行（未回填）；入站未带头时自生成。
-    request_id       TEXT
+    request_id       TEXT,
+    -- 发起请求的 API Key id（api_keys.id）。NULL = 老库历史行、Cookie 会话调用
+    -- 或未带 Key 的调用。只由鉴权层写入（请求头不可信），供按 Key 计量与自助
+    -- 用量查询；`usage_hourly` 刻意不加该维度（会炸维度，聚合走明细表）。
+    api_key_id       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
