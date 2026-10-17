@@ -63,7 +63,10 @@ from fnmatch import fnmatch
 from typing import Any
 
 from ..benchmarks import BenchmarkTable
+from ..engine.reasoning import DELETE_EFFORT, WILDCARD_CHANNEL
+from ..model_alias import ModelAlias
 from ..model_match import lookup
+from ..pricing import PriceTable
 from ..provider.base import Model
 from ..provider.naming import display_model_name, normalize_model_key  # noqa: F401
 
@@ -350,6 +353,103 @@ def _fallback_ids(entry: dict[str, Any]) -> list[str]:
     return [normalized, f"{normalized}-{providers[0]}"]
 
 
+def _find_target_entry(entries: list[dict[str, Any]],
+                       model: str) -> dict[str, Any] | None:
+    """按对外 id / 展示名 / 任一渠道原 id 找一条已定稿条目（大小写不敏感）。
+
+    与 `api.models._match_entry` 同口径：别名目标写成这三种任一形式都能命中。
+    只匹配**真实**条目（自定义别名在全部真实条目解析完之后才注入，故不会形成
+    别名链——链式别名会让「A→B→C」的失败模式变得不可解释）。
+    """
+    target = model.strip().lower()
+    if not target:
+        return None
+    for entry in entries:
+        if entry["id"].lower() == target:
+            return entry
+        name = entry["meta"].get("name")
+        if isinstance(name, str) and name.lower() == target:
+            return entry
+        if any(str(raw).lower() == target for raw in entry["raw_ids"].values()):
+            return entry
+    return None
+
+
+def _alias_entry(alias: ModelAlias, target: dict[str, Any]) -> dict[str, Any]:
+    """把一条自定义别名按目标条目克隆成对外条目（id 换成别名）。
+
+    克隆而非共享目标条目：别名要带自己的 id 与 `custom_alias` 标记，而
+    `_entry_response` / `_disambiguate` 都按条目就地写字段。`raw_ids` /
+    `provider_meta` 按已钉的渠道裁剪——别名钉了 `@渠道` 时列表只该显示那一
+    个渠道，请求也只该路由到它。
+    """
+    providers = (sorted(target["providers"]) if alias.provider is None
+                 else [alias.provider])
+    raw_ids = {pid: target["raw_ids"][pid] for pid in providers}
+    provider_meta = {pid: target["provider_meta"][pid] for pid in providers}
+    meta = dict(target["meta"])
+    # 展示名用别名本身：用户在列表里选到的值与实际请求值必须一致，否则
+    # 「列表显示 A、请求 A 却 404」的错配又要靠翻服务端日志才发现。
+    meta["name"] = alias.name
+    return {
+        "key": alias.name.lower(), "id": alias.name, "providers": set(providers),
+        "meta": meta, "provider_meta": provider_meta, "raw_ids": raw_ids,
+        "labels": set(), "name_keyed": set(), "scoped": False,
+        "custom_alias": True, "alias_target": target["id"],
+    }
+
+
+def _apply_custom_aliases(entries: list[dict[str, Any]],
+                          custom: dict[str, ModelAlias],
+                          aliases: dict[str, dict[str, str]]) -> None:
+    """把用户自定义别名注入条目表与别名表（**列表与执行侧同一份**）。
+
+    必须在 `_register_aliases` 之后跑：撞车判据是「真实对外 id 或已存在的自动
+    别名」，两者此时才齐。撞任何一项都**跳过该段并记明确错误**——静默覆盖真实
+    id 会让用户在列表里选到的模型变成另一个，比配置写错本身危险得多。
+
+    注入的是**条目**（不只是别名表）：`/v1/models` 与 `GET /v1/models/{id}`
+    都从条目渲染，只写别名表会出现「请求能用、列表里没有」。别名表里给每个
+    候选渠道登记「别名 → 该渠道原 id」，执行侧 `upstream_model_name` /
+    `_narrow_providers` 据此路由到目标渠道。
+    """
+    if not custom:
+        return
+    # 只在**真实条目**里找目标：别名链（A→B→C）会让「改一处影响两条」静默
+    # 发生，排障时无从判断最终落到哪个模型，故明确不支持。
+    real_entries = list(entries)
+    existing_ids = {entry["id"].lower() for entry in real_entries}
+    for alias in custom.values():
+        if "@" in alias.name:
+            logger.error("自定义别名 %r 无效：对外名不能含 `@`（那是 @渠道 语法）",
+                         alias.name)
+            continue
+        key = alias.name.lower()
+        if key in existing_ids:
+            logger.error("自定义别名 %r 与真实模型 id 撞车，已跳过", alias.name)
+            continue
+        if any(key in provider_aliases for provider_aliases in aliases.values()):
+            logger.error("自定义别名 %r 与已有自动别名撞车，已跳过", alias.name)
+            continue
+        target = _find_target_entry(real_entries, alias.model)
+        if target is None:
+            logger.error("自定义别名 %r 的目标模型 %r 不存在，已跳过",
+                         alias.name, alias.model)
+            continue
+        if alias.provider is not None and alias.provider not in target["providers"]:
+            logger.error("自定义别名 %r 的目标模型 %r 不在渠道 %s 上，已跳过",
+                         alias.name, alias.model, alias.provider)
+            continue
+        entry = _alias_entry(alias, target)
+        entries.append(entry)
+        existing_ids.add(key)
+        for provider_id, raw_id in entry["raw_ids"].items():
+            aliases.setdefault(provider_id, {})[key] = raw_id
+    # 别名条目按渠道优先级归位，与真实条目同一展示口径（追加到末尾会让它
+    # 孤零零落在列表最后，用户很难判断它到底挂在哪条渠道上）。
+    entries.sort(key=_sort_key)
+
+
 def _register_aliases(entries: list[dict[str, Any]],
                       aliases: dict[str, dict[str, str]]) -> None:
     """把「对外 id → 各渠道原 id」写进别名表。
@@ -380,18 +480,64 @@ def _register_aliases(entries: list[dict[str, Any]],
                     provider_aliases[label_key] = raw_id
 
 
-def _build_aliases(entries: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
-    """定稿全部分组并产出别名表。"""
+def _build_aliases(entries: list[dict[str, Any]],
+                   custom: dict[str, ModelAlias] | None = None
+                   ) -> dict[str, dict[str, str]]:
+    """定稿全部分组并产出别名表（含用户自定义别名）。
+
+    `custom` 是 `MODEL_ALIASES` 的解析结果（`model_alias.parse_model_aliases`）：
+    在真实条目定稿、自动别名登记完之后注入，撞车判据才齐（见
+    `_apply_custom_aliases`）。None / 空 = 与加别名功能前的行为完全一致。
+    """
     for entry in entries:
         _finalize(entry)
     _disambiguate(entries)
     aliases: dict[str, dict[str, str]] = {}
     _register_aliases(entries, aliases)
+    _apply_custom_aliases(entries, custom or {}, aliases)
     return aliases
 
 
+def _cost_of(prices: PriceTable | None, entry: dict[str, Any]
+             ) -> dict[str, float] | None:
+    """条目 → `cost`（USD / 百万 token）；查不到价返回 None（不带该字段）。
+
+    匹配口径与成本估算、能力分共用 `model_match.lookup`（对外 id + 展示名两路
+    等值、唯一命中才采用），故「列表里显示的价格」与「统计里估算成本用的价」
+    是同一份数据。我们只有 `input` / `output` / `cache_read` 三项——上游的
+    `cache_write` 本服务不采集，**不编**。
+    """
+    price = lookup(prices or {}, entry["id"], entry["meta"].get("name"))
+    if not isinstance(price, (list, tuple)) or len(price) != 3:
+        return None
+    return {"input": price[0], "output": price[1], "cache_read": price[2]}
+
+
+def _reasoning_efforts(entry: dict[str, Any],
+                       effort_map: dict[str, dict[str, str]] | None
+                       ) -> list[str] | None:
+    """条目 → 该渠道生效中的目标档位集合（去重、稳定排序）；未配置返回 None。
+
+    取 `REASONING_EFFORT_MAP` 在**该条目各渠道**的目标值（渠道项优先、`*` 兜底，
+    与 `engine.reasoning.map_effort` 同一解析），丢掉 `none`——那个目标表示
+    「删除该键、走渠道默认」，不是一个可选档位。多渠道条目取并集：用户选这条
+    id 时可能落到任一渠道，客户端需要知道所有可能接受的档位。
+    """
+    if not effort_map:
+        return None
+    values: set[str] = set()
+    for provider_id in sorted(entry["providers"]):
+        targets = effort_map.get(provider_id) or effort_map.get(WILDCARD_CHANNEL) or {}
+        values.update(target for target in targets.values()
+                      if target != DELETE_EFFORT)
+    return sorted(values) or None
+
+
 def _entry_response(entry: dict[str, Any],
-                    benchmarks: BenchmarkTable | None = None) -> dict[str, Any]:
+                    benchmarks: BenchmarkTable | None = None,
+                    prices: PriceTable | None = None,
+                    efforts: dict[str, dict[str, str]] | None = None
+                    ) -> dict[str, Any]:
     """合并后的 grouped 条目 → OpenAI 兼容响应条目。
 
     多渠道模型额外给 `by_provider.{pid}`：各渠道倍率不同时前端按渠道分别
@@ -402,6 +548,12 @@ def _entry_response(entry: dict[str, Any],
 
     `benchmarks` 非空时按对外 id 与展示名两路查能力分（唯一命中才带），
     查不到就不带该字段——调用方不传（默认 None）时行为与加该字段前完全一致。
+    `prices` / `efforts` 同理：分别为刊例价（`cost`，USD / 百万 token）与生效
+    中的档位映射（`reasoning_efforts`）。缺价 / 未配置**不带字段**，绝不填 0
+    或空数组——那会被读成「免费」「没有档位」。
+
+    用户自定义别名条目额外带 `custom_alias: true`（前端据此打「自定义别名」
+    徽章）与 `alias_target`（别名指向的真实对外 id，排障用）。
     """
     result: dict[str, Any] = {
         "id": entry["id"], "object": "model", "owned_by": "Coding2API",
@@ -411,6 +563,9 @@ def _entry_response(entry: dict[str, Any],
         **{field: value for field, value in entry["meta"].items()
            if value is not None and value != ""},
     }
+    if entry.get("custom_alias"):
+        result["custom_alias"] = True
+        result["alias_target"] = entry.get("alias_target", "")
     by_provider: dict[str, dict[str, Any]] = {}
     for pid, meta in entry["provider_meta"].items():
         detail: dict[str, Any] = {"raw_id": entry["raw_ids"][pid]}
@@ -429,6 +584,12 @@ def _entry_response(entry: dict[str, Any],
     score = lookup(benchmarks or {}, entry["id"], entry["meta"].get("name"))
     if score is not None:
         result["benchmarks"] = score
+    cost = _cost_of(prices, entry)
+    if cost is not None:
+        result["cost"] = cost
+    reasoning_efforts = _reasoning_efforts(entry, efforts)
+    if reasoning_efforts is not None:
+        result["reasoning_efforts"] = reasoning_efforts
     return result
 
 

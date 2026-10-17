@@ -24,12 +24,14 @@ function stubCatalog(models: Array<Record<string, unknown>>, status = 200) {
     const url = new URL(String(input), "http://localhost");
     const q = (url.searchParams.get("q") ?? "").toLowerCase();
     const onlyAvailable = url.searchParams.get("only_available") === "true";
+    const onlySuspected = url.searchParams.get("only_suspected") === "true";
     const limit = Number(url.searchParams.get("limit") ?? 50);
     const offset = Number(url.searchParams.get("offset") ?? 0);
     const sort = url.searchParams.get("sort") ?? "id";
     const order = url.searchParams.get("order") ?? "asc";
     let rows = models.filter((row) => {
       if (onlyAvailable && !row.available) return false;
+      if (onlySuspected && !row.suspected) return false;
       if (!q) return true;
       return String(row.id).toLowerCase().includes(q)
         || String(row.name ?? "").toLowerCase().includes(q);
@@ -51,6 +53,7 @@ function stubCatalog(models: Array<Record<string, unknown>>, status = 200) {
       currency: "USD",
       usd_cny_rate: 7,
       saved_at: 1_700_000_000,
+      availability_days: 7,
     }), { status, headers: { "Content-Type": "application/json" } });
   });
   vi.stubGlobal("fetch", spy);
@@ -355,5 +358,118 @@ describe("ModelCatalogPage（模型列表）", () => {
     await userEvent.click(screen.getByTestId("sort-intelligence"));
     await settle();
     expect(urls().at(-1)!).toContain("order=asc");
+  });
+
+  // ------------------------------------------------ 疑似下线 / 一键黑名单
+
+  const SUSPECTED = {
+    ...MODELS[1],
+    suspected: {
+      provider: "trae",
+      model: "glm-5.2",
+      failures: 3,
+      last_failed_at: 1_700_000_000,
+      blocked: false,
+    },
+  };
+
+  it("「疑似下线」筛选只留窗口内有模型级失败的行", async () => {
+    stubCatalog([MODELS[0], SUSPECTED]);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    // 默认关闭：两条都在；可用性列只对有失败记录的行渲染
+    expect(screen.getByTestId("model-row-a-model")).toBeInTheDocument();
+    expect(screen.getByTestId("model-availability-glm-5.2")).toHaveTextContent(
+      "近 7 天失败 3 次");
+    expect(screen.queryByTestId("model-availability-a-model")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("model-suspected-toggle"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("model-row-a-model")).not.toBeInTheDocument());
+    expect(screen.getByTestId("model-row-glm-5.2")).toBeInTheDocument();
+    expect(screen.getByText("模型列表（1 / 2）")).toBeInTheDocument();
+  });
+
+  it("「疑似下线」筛选无命中时给出专属空态", async () => {
+    stubCatalog(MODELS);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("model-suspected-toggle"));
+    await waitFor(() => expect(screen.getByTestId("no-model-match")).toHaveTextContent(
+      "最近 7 天没有模型级失败"));
+  });
+
+  it("「加入黑名单」把模型追加进 MODEL_BLOCKLIST（读现值再写，不覆盖已有项）", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/settings" && init?.method === "PUT") {
+        return new Response(JSON.stringify({ settings: [], overridden: 2, groups: [] }),
+          { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url === "/api/settings") {
+        return new Response(JSON.stringify({
+          settings: [{ key: "model_blocklist", value: "custom_model_*" }],
+          overridden: 1,
+          groups: [],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        models: [SUSPECTED], count: 1, total: 1, currency: "USD",
+        usd_cny_rate: 7, saved_at: 1_700_000_000, availability_days: 7,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", spy);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("model-block-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-blocklist-toast"))
+      .toHaveTextContent("已把 glm-5.2 加入黑名单"));
+
+    const put = calls.find((call) => call.init?.method === "PUT");
+    expect(put).toBeDefined();
+    expect(JSON.parse(String(put!.init!.body))).toEqual({
+      values: { model_blocklist: "custom_model_*,glm-5.2" },
+    });
+  });
+
+  it("已命中黑名单的行按钮置灰（避免重复写审计）", async () => {
+    stubCatalog([{ ...SUSPECTED, suspected: { ...SUSPECTED.suspected, blocked: true } }]);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    expect(screen.getByTestId("model-availability-glm-5.2")).toHaveTextContent("已屏蔽");
+    expect(screen.getByTestId("model-block-glm-5.2")).toBeDisabled();
+  });
+
+  it("加入黑名单失败时给出错误提示", async () => {
+    const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        return new Response(JSON.stringify({
+          error: { code: "forbidden", message: "admin only" },
+        }), { status: 403, headers: { "Content-Type": "application/json" } });
+      }
+      if (String(input) === "/api/settings") {
+        return new Response(JSON.stringify({
+          settings: [{ key: "model_blocklist", value: "" }],
+          overridden: 0, groups: [],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        models: [SUSPECTED], count: 1, total: 1, currency: "USD",
+        usd_cny_rate: 7, saved_at: 1_700_000_000, availability_days: 7,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", spy);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("model-block-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-blocklist-toast"))
+      .toHaveTextContent("加入黑名单失败"));
   });
 });

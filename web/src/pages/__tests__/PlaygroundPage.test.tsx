@@ -54,6 +54,26 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.queryByTestId("playground-key")).not.toBeInTheDocument();
   });
 
+  it("自定义别名条目在选择器里带「自定义别名」徽章（当前选择条同样标）", async () => {
+    mockFetch({ "/api/playground/models": {
+      object: "list",
+      data: [
+        {
+          id: "team-fast", object: "model", owned_by: "Coding2API",
+          providers: ["trae"], name: "team-fast",
+          custom_alias: true, alias_target: "glm-5.2",
+        },
+      ],
+    } });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const option = screen.getByTestId("model-option-team-fast@trae");
+    expect(within(option).getByTestId("model-alias-badge")).toHaveTextContent("自定义别名");
+    expect(within(screen.getByTestId("model-current"))
+      .getByTestId("model-current-alias")).toHaveTextContent("自定义别名");
+  });
+
   it("默认选中倍率最小的模型；选中后展示上限与能力，双渠道倍率在选择器里按渠道显示", async () => {
     const META_MODELS = {
       object: "list",

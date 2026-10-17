@@ -292,6 +292,63 @@ def test_model_catalog_filters_and_paginates_server_side(tmp_path, monkeypatch):
         assert page["total"] == 3
 
 
+def test_model_catalog_marks_suspected_from_recent_failures(tmp_path, monkeypatch):
+    """`suspected`：最近窗口内该模型有过模型级失败（口径见可用性视图）。
+
+    目录 id（`z-ai/glm-5.3`）与网关侧对外名（`glm-5.3`）靠候选键对上；没有
+    失败记录的行**不带**该字段（「没数据」不等于「确认健康」）。`only_suspected`
+    只留带该字段的行，`availability_days` 随响应下发供前端显示「近 N 天」。
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+        "moonshotai/kimi-k3": {"id": "moonshotai/kimi-k3", "name": "Kimi K3",
+                               "provider": "moonshotai", "input": 0.5, "output": 1.0,
+                               "cache_read": 0.05},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    db = app.state.stats_collector._db  # noqa: SLF001 - 直接造明细（见下）
+    now = int(time.time())
+    with db.transaction() as conn:
+        # `upstream_blocked` 不在受控集合里，必须直接写库（走 record 会被置 None）
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_1", now - 60, "root", "trae", "glm-5.3", 0, "upstream_blocked"))
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_2", now - 90, "root", "trae", "glm-5.3", 0, "invalid_request"))
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_3", now - 120, "root", "kilo", "glm-5.3", 0, "invalid_request"))
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        payload = client.get("/api/model-catalog").json()
+        only = client.get("/api/model-catalog",
+                          params={"only_suspected": True}).json()
+        clamped = client.get("/api/model-catalog",
+                             params={"availability_days": 999}).json()
+    rows = {row["id"]: row for row in payload["models"]}
+    assert rows["z-ai/glm-5.3"]["suspected"]["failures"] == 2
+    # 同一候选键对应两条 (渠道, 模型)：只保留失败最多的那条
+    assert rows["z-ai/glm-5.3"]["suspected"]["provider"] == "trae"
+    assert "suspected" not in rows["moonshotai/kimi-k3"]
+    assert [row["id"] for row in only["models"]] == ["z-ai/glm-5.3"]
+    assert only["total"] == 1
+    assert payload["availability_days"] == 7
+    assert clamped["availability_days"] == 30
+
+
 def test_model_catalog_endpoint_empty_table(tmp_path, monkeypatch):
     """无快照时回空表 + saved_at=None（页面显示空态，不是错误）。"""
     async def no_models(_url):

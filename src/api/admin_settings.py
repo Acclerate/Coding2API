@@ -17,11 +17,12 @@ import time
 
 from fastapi import APIRouter, Depends, Request
 
+from ..audit.actions import ACTION_SETTINGS_UPDATE
 from ..auth.rbac import require_admin
 from ..compat.openai.request import InvalidRequest
 from ..runtime_settings import GATEWAY_GROUPS, InvalidSetting
 from ..tasks.runner import UnknownTaskError
-from .deps import Services, csrf_protected, principal_from_request
+from .deps import Services, csrf_protected, principal_from_request, request_ip
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def create_router(services: Services) -> APIRouter:
         return snapshot_payload()
 
     @router.put("/api/settings")
-    async def update_settings(payload: dict,
+    async def update_settings(payload: dict, request: Request,
                               _csrf: None = Depends(csrf_protected),
                               principal=Depends(principal_from_request)):
         require_admin(principal)
@@ -58,6 +59,12 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(str(error)) from error
         keys = ", ".join(sorted(values)) or "(空)"
         logger.info("管理员 %s 更新运行时配置 %s（DB 覆盖 .env）", principal.username, keys)
+        # 配置写入本身就是一次「谁能改网关行为」的变更，必须留痕：模型黑名单
+        # （C3 的一键黑名单按钮也走这条接口）与告警 webhook 被改掉却不进审计，
+        # 事后无法回答「是谁把它关的」。
+        services.audit.record(
+            actor=principal.username, action=ACTION_SETTINGS_UPDATE,
+            detail=keys, ip=request_ip(request, services.settings))
         return snapshot_payload()
 
     @router.get("/api/tasks")

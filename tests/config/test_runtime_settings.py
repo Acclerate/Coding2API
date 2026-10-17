@@ -472,6 +472,32 @@ def test_put_settings_rejects_non_object_values(admin_app):
     assert client.put("/api/settings", json={}).status_code == 400
 
 
+def test_put_settings_is_audited(admin_app):
+    """配置写入留痕：谁在什么时候把哪几个键改成了什么。
+
+    模型黑名单（「加入黑名单」按钮）与告警 webhook 都走这条接口，改掉却不进
+    审计，事后无法回答「是谁把它关的」。失败的写入（非法值 / 非 admin）不留痕。
+    """
+    app, client = admin_app
+    client.put("/api/settings", json={"values": {"model_blocklist": "glm-*"}})
+    events = app.state.audit.query(action="settings.update")
+    assert len(events) == 1
+    assert events[0]["actor"] == "root"
+    assert events[0]["detail"] == "model_blocklist"
+
+    # 多键一次提交：detail 是排序后的键名清单（不记录值，避免把密钥写进审计）
+    client.put("/api/settings", json={"values": {
+        "model_blocklist": "", "quota_probe_minutes": 5}})
+    details = sorted(event["detail"] for event in
+                     app.state.audit.query(action="settings.update"))
+    assert details == ["model_blocklist", "model_blocklist, quota_probe_minutes"]
+
+    # 非法值在落库前就被拒，不该产生审计
+    assert client.put("/api/settings",
+                      json={"values": {"activity_report_hour": 99}}).status_code == 400
+    assert len(app.state.audit.query(action="settings.update")) == 2
+
+
 def test_put_settings_rejects_invalid_value_with_actionable_message(admin_app):
     _app, client = admin_app
     response = client.put("/api/settings",

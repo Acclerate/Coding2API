@@ -2,9 +2,10 @@ import { useMemo, useState } from "react";
 import { Check, RefreshCw, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ModelBenchmarks, ModelInfo } from "../api/types";
+import { aliasTitle, isCustomAlias } from "../api/modelExtras";
 import { providerChartColor, providerLabel, providerRank } from "../api/providers";
 import { ProviderIcon } from "./ProviderIcon";
-import { Input } from "../ui";
+import { Badge, Input } from "../ui";
 
 /** 列表条目：原始 ModelInfo + 受控选中值。 */
 export type PickableModel = ModelInfo & { value: string };
@@ -302,6 +303,11 @@ function ModelRow({
           自身 `flex-wrap`，多渠道放不下时**在右侧区域内折行**，而不是整组掉到
           名称下方独占一行（内层 `justify-end` 让每行都贴右）。 */}
       <span className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+        {isCustomAlias(item) && (
+          <span data-testid="model-alias-badge" title={aliasTitle(item)}>
+            <Badge tone="accent">自定义别名</Badge>
+          </span>
+        )}
         <BenchmarkBadge item={item} />
         {providers.map((provider) => (
           <ChannelPill
@@ -407,6 +413,11 @@ export function ModelPicker({
             )}
           </span>
           <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+            {isCustomAlias(selectedItem) && (
+              <span data-testid="model-current-alias" title={aliasTitle(selectedItem)}>
+                <Badge tone="accent">自定义别名</Badge>
+              </span>
+            )}
             <BenchmarkBadge item={selectedItem} />
             {/* 不可指定渠道（单渠道 / 无 onPin）时，这里直接列渠道徽章；
                 可指定时徽章本身就是下面的渠道按钮，避免同一组渠道渲染两遍 */}

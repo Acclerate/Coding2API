@@ -38,6 +38,13 @@ from ..auth.rbac import require_operator
 from ..benchmarks import BenchmarkTable
 from ..model_match import lookup, match_keys
 from ..sorting import sort_rows
+from .admin_model_availability import (
+    DEFAULT_WINDOW_DAYS,
+    MAX_LIMIT,
+    MAX_WINDOW_DAYS,
+    failure_rows,
+    suspected_index,
+)
 from .deps import Services, principal_from_request
 from .model_merge import _finalize
 from .models import credential_providers, merged_entries
@@ -100,17 +107,39 @@ def _with_availability(rows: list[dict[str, Any]],
             for row in rows]
 
 
+def _with_suspected(rows: list[dict[str, Any]],
+                    index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """给目录行补 `suspected`：最近窗口内该模型是否有模型级失败（疑似下线）。
+
+    与 `available` 同一套候选键：目录 id（`z-ai/glm-5.3`）与网关侧对外名
+    （`glm-5.3`）靠 `model_match` 对上。无命中则**不带**该字段（不是 false），
+    与 `benchmarks` 同口径——「没数据」和「确认健康」是两件事。
+    """
+    if not index:
+        return rows
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        hit = next((index[key] for key in match_keys(row.get("id"), row.get("name"))
+                    if key in index), None)
+        enriched.append({**row, "suspected": hit} if hit is not None else row)
+    return enriched
+
+
 def _filter_catalog(rows: list[dict[str, Any]], q: str | None,
-                    only_available: bool) -> list[dict[str, Any]]:
+                    only_available: bool,
+                    only_suspected: bool = False) -> list[dict[str, Any]]:
     """目录的服务端筛选：`q` 匹配 id / 名称，`only_available` 只留可用行。
 
     provider 不参与匹配：它恒为 id 的厂商前缀（id 的子串），匹配它等于匹配 id。
     与前端旧实现同口径，避免搜索行为在迁移后悄悄变化。
+    `only_suspected` 只留带 `suspected` 字段的行（最近窗口内有模型级失败）。
     """
     needle = (q or "").strip().lower()
     out: list[dict[str, Any]] = []
     for row in rows:
         if only_available and not row.get("available"):
+            continue
+        if only_suspected and row.get("suspected") is None:
             continue
         if needle and not (
             str(row.get("id") or "").lower().find(needle) >= 0
@@ -129,14 +158,18 @@ def create_router(services: Services) -> APIRouter:
                                 order: str | None = None,
                                 q: str | None = None,
                                 only_available: bool = False,
+                                only_suspected: bool = False,
+                                availability_days: int = DEFAULT_WINDOW_DAYS,
                                 limit: int = 50, offset: int = 0,
                                 principal=Depends(principal_from_request)):
         """当前生效模型目录 + 元信息；门槛 operator（admin / operator），与「模型列表」页一致。
 
         分页与筛选都在服务端：目录数百条，全量下发会拖慢首屏，而「搜索 id/名称」
         与「只看当前渠道」是两个常用收窄手段。`q` 大小写不敏感地匹配 id 与名称；
-        `only_available` 只留 `available=true` 的行。返回的 `total` 是**筛选后**
-        的总条数（供前端算页数），`count` 仍是目录全量（页头展示「N / 总数」）。
+        `only_available` 只留 `available=true` 的行；`only_suspected` 只留最近
+        `availability_days` 天有模型级失败的行（口径见
+        `admin_model_availability`）。返回的 `total` 是**筛选后**的总条数（供
+        前端算页数），`count` 仍是目录全量（页头展示「N / 总数」）。
         """
         require_operator(principal)
         state = request.app.state
@@ -146,7 +179,10 @@ def create_router(services: Services) -> APIRouter:
         rows = _with_benchmarks([catalog[model] for model in sorted(catalog)],
                                 getattr(state, "model_benchmarks", None))
         rows = _with_availability(rows, _available_keys(services))
-        rows = _filter_catalog(rows, q, only_available)
+        window = max(1, min(MAX_WINDOW_DAYS, int(availability_days)))
+        failures = failure_rows(services, days=window, limit=MAX_LIMIT)
+        rows = _with_suspected(rows, suspected_index(failures["rows"]))
+        rows = _filter_catalog(rows, q, only_available, only_suspected)
         total = len(rows)
         # 默认按模型 id 升序：结果确定（前端无需再排），与历史行为一致。
         models = sort_rows(rows, sort, order,
@@ -162,6 +198,8 @@ def create_router(services: Services) -> APIRouter:
             # 快照时刻：价格、明细与能力分同一次抓取，故只有一个时刻。缺失即
             # 「本次启动以来没拉到过」，页面显示 —。
             "saved_at": state.price_saved_at,
+            # 疑似下线判定窗口（天）：前端据此显示「近 N 天」而不硬编码。
+            "availability_days": window,
         }
 
     return router
