@@ -162,13 +162,6 @@ services:
       FORCE_DISABLE_THINKING: ${FORCE_DISABLE_THINKING:-false}
       # 出站 reasoning_effort 档位映射：渠道=from:to,from:to;*=from:to；留空原样透传
       REASONING_EFFORT_MAP: ${REASONING_EFFORT_MAP:-}
-      # 用户自定义模型别名：对外名=模型@渠道;...；留空关闭（列表与执行侧同一份）
-      MODEL_ALIASES: ${MODEL_ALIASES:-}
-      # 流式首事件 / 空闲超时（秒）：0 = 关闭（默认，慢上下文首字可能 40–71s）
-      STREAM_FIRST_EVENT_TIMEOUT_SECONDS: ${STREAM_FIRST_EVENT_TIMEOUT_SECONDS:-0}
-      STREAM_IDLE_TIMEOUT_SECONDS: ${STREAM_IDLE_TIMEOUT_SECONDS:-0}
-      # 短冷却「等待续上」（秒）：全池短冷却且最短剩余 ≤ 该值时等一次再重取；0 关闭
-      SHORT_COOLDOWN_WAIT_SECONDS: ${SHORT_COOLDOWN_WAIT_SECONDS:-0}
       # Anthropic thinking.budget_tokens → reasoning_effort：预算:档位,...；留空不映射
       ANTHROPIC_THINKING_EFFORTS: ${ANTHROPIC_THINKING_EFFORTS:-}
       # 上下文压缩：按模型目录里的输入上限裁剪过长对话，避免撞上游硬限制
@@ -178,7 +171,7 @@ services:
       CONTEXT_COMPRESS_SAFETY_RATIO: ${CONTEXT_COMPRESS_SAFETY_RATIO:-0.95}
       # 跨渠道 fallback 兼容组：主渠道全不可用时按组回退到同义模型（留空关闭）
       MODEL_FALLBACK_GROUPS: ${MODEL_FALLBACK_GROUPS:-}
-      # 用户自定义模型别名（对外名=模型@渠道;...）：留空不启用
+      # 用户自定义模型别名：对外名=模型@渠道;...；留空关闭（列表与执行侧同一份）
       MODEL_ALIASES: ${MODEL_ALIASES:-}
       # 按渠道出站代理（启动期）：渠道=代理URL;渠道2=代理URL2，留空直连
       PROVIDER_PROXIES: ${PROVIDER_PROXIES:-}

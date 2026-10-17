@@ -128,12 +128,28 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 `GET /v1/models` 里**所有条目的 `id` 都是归一键**，转发到某渠道时自动换回该渠道原代号，`by_provider.{渠道}.raw_id` 可见。**原代号、展示名、归一键三种写法都能直接请求**（`kmodel_latest`、`Kimi K3`、`kimi-k3` 指向同一模型）。同渠道内归一键重复时退回原代号，避免撞名误并。**福利模型标记 `benefit`**：CodeArts 走每日免费 token 池的模型上游不给倍率，条目会带 `benefit: true`（单渠道在顶层、多渠道在 `by_provider.{渠道}`），Playground 据此在渠道徽章上打「福」标，与按积分计费的内置模型区分。
 
-**`GET /v1/models/{id}` 单模型查询**（OpenAI 同形）：上面三种写法都认，大小写不敏感，路径参数用 `:path` 故带命名空间的原代号（`dots-studio/dots-3-note-preview:free`）也能查。找不到、或该模型**不在当前 Key 的模型白名单内**，一律 404 + OpenAI 错误形状（`code=model_not_found`）——白名单外与不存在同形，客户端无法用单查探测「池子里还有哪些模型」。能力分与列表条目同源（同一份合并结果），刷新时机也一致（列表有、单查不会 404）。
+**价格与档位**：条目可选带 `cost {input, output, cache_read}`（USD / 百万 token，与统计侧成本估算同一份 OpenRouter 价表）与 `reasoning_efforts`（该渠道生效中的 `REASONING_EFFORT_MAP` 目标档位去重集合）。两者都是**有才给**：缺价、未配置档位映射时**不带该字段**，不填 0 也不编造。
+
+**自定义模型别名**（`MODEL_ALIASES`，可热更）：给客户端一个稳定的对外名，上游改 id 时只改配置。格式 `对外名=模型@渠道;对外名2=模型`，`@渠道` 省略则自动选。**列表与请求解析用同一份别名表**（不会出现「列表有、请求 404」），条目带 `custom_alias: true`。与真实模型 id 或自动别名撞车、目标模型不存在、钉的渠道不持有该模型时，该段记 ERROR 并**跳过**（不静默覆盖真实 id，也不因一条笔误让整份配置失效）；不支持别名链。`GET /v1/models/{id}` 同样认别名。
+
+**`GET /v1/models/{id}` 单模型查询**（OpenAI 同形）：上面三种写法都认（外加自定义别名），大小写不敏感，路径参数用 `:path` 故带命名空间的原代号（`dots-studio/dots-3-note-preview:free`）也能查。找不到、或该模型**不在当前 Key 的模型白名单内**，一律 404 + OpenAI 错误形状（`code=model_not_found`）——白名单外与不存在同形，客户端无法用单查探测「池子里还有哪些模型」。能力分与列表条目同源（同一份合并结果），刷新时机也一致（列表有、单查不会 404）。
+
+**`n` 参数只接受 1**：本网关的出口结构（`choices[0]` + 单 choice 响应体）只能产生一个候选，`n != 1` 一律 400 `invalid_request` 并说明原因，不做「假装支持、静默只返回一个」。
 
 ### 流式 usage 与思考 token
 
 - **流式带 usage 帧**：收尾时在 finish chunk 之后、`data: [DONE]` 之前补一帧 `choices: []` 的 usage（OpenAI 标准形态），只从流里读用量的客户端据此显示 tok/s、上下文占用率与会话 token 统计；上游没上报时不补（不发 0 占位），非流式出口的 `usage` 同理，未上报字段一律为 `null`。
 - **思考 token 需客户端带 `reasoning_effort`**：CodeBuddy 渠道在客户端**未给**时补 `medium`（上游缺此字段会把整段思考以「可见推演」写进正文）；显式给的值原样透传、不被覆盖。
+
+### 流式超时（默认关闭）
+
+七条渠道的上游流读取都设了 `read=None`（长回答不能被读超时打断），因此「上游接了连接却一直不吐数据」只能由网关自己兜：
+
+- **首事件超时**（`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`，默认 `0`）：客户端还**没收到任何内容**时超时，安全地换号重试——记 `upstream_first_event_timeout`，按瞬态错误处理（短冷却、不累计）。注释帧 / 心跳**不**重置计时。
+- **流内空闲超时**（`STREAM_IDLE_TIMEOUT_SECONDS`，默认 `0`）：**已出帧**后超时只能断流并以错误帧收尾（记 `upstream_idle_timeout`），**不换号**——半截输出无法回滚，换号会把两个账号的内容拼给客户端。
+- 实现上**不能**用 `asyncio.wait_for(anext(...))`：超时会 cancel 上游生成器直接断流。这里用可复用的 Task + `asyncio.wait`，超时只放弃等待、任务继续跑，下一次继续等同一个任务。
+
+两项都默认关闭是刻意的：实测慢上下文首字可达 40–71s，给一个「看起来合理」的默认值会静默杀掉正常长请求。要用请在管理台按部署实际打开（推荐 `60` / `300`）。
 
 ### Playground 高级参数
 
@@ -314,6 +330,7 @@ claude
 - **来源 IP 白名单**：逗号分隔的 IP 或 CIDR（如 `203.0.113.9,10.0.0.0/8`），留空 = 不限制；写入时校验并规范化（`10.0.0.1` → `10.0.0.1/32`），来源不在白名单返回 403。**默认不采信 `X-Forwarded-For`**（客户端可写）；仅 `TRUST_PROXY=true` 时按 XFF 判定、取**最后一个**条目，故只适用于「本服务前恰好一层受信反代」。
 - **模型白名单**：逗号分隔的模型名或 fnmatch glob（如 `glm-*,kimi-k3`），留空 = 不限制；匹配不区分大小写，`模型@渠道` 后缀不参与匹配，白名单外返回 400，`/v1/models` 也只列白名单内模型。
 - **到期时间**：epoch 秒，留空 = 永不过期，到期后立即 401（与「Key 不存在」统一文案，不泄露可枚举信息）。
+- **配额**：一个 JSON 字段，六项各自独立、`0` 或留空 = 不限制：`daily_requests`（当日请求数）、`daily_tokens`（当日 token）、`daily_cost_usd`（当日成本）、`rpm`（每分钟请求）、`tpm`（每分钟 token，用**预估**值判定——真实用量要等响应结束才知道）、`max_concurrency`（在途并发）。当日类按**北京时间自然日**统计（与凭证护栏同一口径），速率与并发是**进程内**滑动窗口（重启清零，不落库）。超限返回 429 + `{"error":{"type":"quota_exceeded",...}}`，`Retry-After` 指向可重试时刻（当日类 = 距次日 0 点；RPM/TPM = 最早一条滑出窗口；并发 = 1 秒）。**判定本身出异常时一律放行并记 warning**——配额是拒绝语义，但计量故障不能把正常请求打死。持 Key 的调用方可用 `GET /v1/usage?days=1|7|30` 自助查询自己的用量、剩余额度与当前速率占用（只读本地明细，不触发上游，不含凭证昵称或池级信息）。
 
 **导入 CC Switch**：Key 列表每行的「导入 CC Switch」按钮打开对话框，粘贴创建时保存的完整 Key（列表只存脱敏 `preview`，服务端不再保留明文，故必须由用户提供），再选一个默认模型，即可生成 Claude Code / Codex CLI / OpenCode 三个 `ccswitch://` 导入深链；默认模型下拉与 Playground 同源（`/api/playground/models`），按渠道分组。粘贴的 Key 只留在对话框内存中，关闭即清除。创建 Key 成功后的对话框内也提供同样的导入按钮（那里直接用刚生成的明文 Key）。
 
@@ -394,6 +411,8 @@ Playground 与 `GET /v1/models` 走 **stale-while-revalidate**：有缓存立刻
 
 OpenRouter 收录数百条，其中多数本服务没接。每行带 `available` 布尔（该模型是否**当前渠道真能提供**，口径与 `/v1/models` 一致），页面提供**默认关闭**的「只看当前渠道」开关，勾选后本地收窄到当前渠道获取到的模型（不重新请求）。
 
+**疑似下线视图**：同页可切到「疑似下线」筛选——`GET /api/models/availability`（operator）把最近 N 天（默认 7、可调 1–30）`usage_events` 里 `error_type` 为 `upstream_blocked` / `invalid_request` 的失败按 `(渠道, 模型)` 聚合，给出失败次数、最近失败时刻与「是否已在黑名单」。行内「加入黑名单」把该模型**追加**到现行 `model_blocklist`（读现值再写，不覆盖既有项；已命中的行按钮置灰），写入走既有设置接口并落审计 `settings.update`，下一次 `/v1/models` 即生效。这里**只读聚合、不做主动探活**——真发请求会耗额度，且必须与生产冷却 / 统计隔离，留作独立立项。
+
 「能力分」列头可点排序，按**综合智能指数**（智）排；无分数的行排末尾（不冒充 0 分）。只给这一个分项排序入口——表头一列对应一个入口，三项各排会把表头挤成一排按钮。
 
 ### 管理台「上游状态」页
@@ -459,11 +478,13 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ### 分组维度与重新汇总
 
-**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（渠道 / 请求（请求数 · 成功率，悬停看成功数）/ Credit / 成本 / Token（输入 ÷ 输出 · 命中率，悬停看命中 token）/ 平均延迟（耗时 ÷ 首字）/ P95 延迟（耗时 ÷ 首字）），共 7 列。对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序；请求 / Token / 平均延迟 / P95 延迟四个合并列点列头弹菜单选子列再排序（`sort=requests|ok_count|input_tokens|output_tokens|cached_tokens|avg_latency_ms|avg_ttfb_ms|p95_latency_ms|p95_ttfb_ms`），成功率与命中率是派生只读值不参与排序。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
+**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（渠道 / 请求（请求数 · 成功率，悬停看成功数）/ Credit / 成本 / Token（输入 ÷ 输出 · 命中率，悬停看命中 token）/ 平均延迟（耗时 ÷ 首字）/ P95 延迟（耗时 ÷ 首字）），共 7 列。对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序；请求 / Token / 平均延迟 / P95 延迟四个合并列点列头弹菜单选子列再排序（`sort=requests|ok_count|input_tokens|output_tokens|cached_tokens|avg_latency_ms|avg_ttfb_ms|p50_latency_ms|p90_latency_ms|p95_latency_ms|p99_latency_ms|p50_ttfb_ms|p90_ttfb_ms|p95_ttfb_ms|p99_ttfb_ms`），成功率与命中率是派生只读值不参与排序。**延迟分位可切换**：P95 列的表头有 P50 / P90 / P95 / P99 四档切换（默认 P95，不铺开四列以免表头拥挤）；四档由同一次窗口函数子查询算出，取整口径一致（nearest-rank，n 为**有值**样本数）。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
 
-**延迟两类口径**：**只统计成功请求**（失败请求的耗时会拉偏「典型耗时」）。**平均延迟列** = 平均耗时 / 平均首字 = `latency_sum ÷ 成功数`（读小时汇总，与总览卡片、图表同口径，永久保留）；**P95 延迟列** = P95 耗时 / P95 首字 = 第 95 百分位，按 **nearest-rank**（第 `⌈0.95·n⌉` 小的值，n = 该组有值样本数）从**逐请求明细**算出——小时汇总只有和与计数，数学上还原不出分布，故分位列只覆盖**最近 90 天**。`ttfb_ms` 对非流式 / 未产出首字的成功请求为 `NULL`，两列各自独立排名（只数有值样本）。无成功样本 / 未上报延迟时显示 `—`（不拿 0 冒充）。
+**延迟两类口径**：**只统计成功请求**（失败请求的耗时会拉偏「典型耗时」）。**平均延迟列** = 平均耗时 / 平均首字 = `latency_sum ÷ 成功数`（读小时汇总，与总览卡片、图表同口径，永久保留）；**P95 延迟列** = P95 耗时 / P95 首字 = 第 95 百分位，按 **nearest-rank**（第 `⌈0.95·n⌉` 小的值，n = 该组有值样本数）从**逐请求明细**算出——小时汇总只有和与计数，数学上还原不出分布，故分位列只覆盖**最近 90 天**。P50 / P90 / P99 与 P95 同一套 SQL（一次子查询算完四档），口径完全一致，只是百分位参数不同。`ttfb_ms` 对非流式 / 未产出首字的成功请求为 `NULL`，两列各自独立排名（只数有值样本）。无成功样本 / 未上报延迟时显示 `—`（不拿 0 冒充）。
 
-**点行钻取**：点分组表任意一行，下方「请求明细」即按该行钻取（渠道 / 模型 / 凭证按同名列过滤，用户维度走作用域参数），条件叠加、可多个维度层层收窄，面板上方显示当前过滤标签并可一键清除。`GET /api/stats/events` 因此接受 `provider` / `model` / `credential_id` 三个过滤参数（`AND` 语义）。
+**失败归因**：分组表下方另有「失败归因」面板，`GET /api/stats/errors`（operator+）按 `(渠道, 模型, 错误类型)` 聚合窗口内 `ok=0` 的明细，给出失败次数与最近失败时刻（按失败数降序，`limit` ≤ 5000）。点任意一行即**钻取**到下方明细并自动加上「只看失败」（`GET /api/stats/events?ok=0`，与 `provider`/`model`/`credential_id` 叠加）；键盘 Enter / Space 同样触发。该面板只在 admin/operator 下渲染与请求。`/metrics` 的 `upstream_errors_total` 仍取进程内计数（重启归零），与这里的 90 天明细口径不同，两者不合并。
+
+**点行钻取**：点分组表任意一行，下方「请求明细」即按该行钻取（渠道 / 模型 / 凭证按同名列过滤，用户维度走作用域参数），条件叠加、可多个维度层层收窄，面板上方显示当前过滤标签并可一键清除。`GET /api/stats/events` 因此接受 `provider` / `model` / `credential_id` 三个过滤参数（`AND` 语义），另有 `ok=0` 只看失败。
 
 **明细表列合并**：请求明细把同类列并成一列，默认值一眼可读、悬停展开全部子项：**Token**（默认「输入 / 输出 · 命中率」，悬停含命中 token）、**延迟**（默认「耗时 / 首字」）。列数从 14 压到约 10，窄屏卡片也少一半字段。排序能力不丢：点合并列头弹出下拉选子列（Token → 输入 / 输出 / 命中 / 命中率，延迟 → 耗时 / 首字），选中即按该子列排序；**命中率**子列走后端 `sort=cache_rate`（命中 ÷ 输入，输入为 0 或未上报时为 `NULL`，与其它可空列同排序语义）。
 
@@ -633,6 +654,10 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `CONTEXT_COMPRESS_MIN_KEEP_MESSAGES` | `4` | 无论多长都保留的最近消息条数 |
 | `CONTEXT_COMPRESS_SAFETY_RATIO` | `0.95` | 按模型上限的百分比计算压缩预算，给 token 估算误差留余量 |
 | `UPSTREAM_COMPLETE_TIMEOUT_SECONDS` | `600` | 非流式聚合整体超时（秒）：超时按瞬态错误换号重试；`≤0` 关闭 |
+| `STREAM_FIRST_EVENT_TIMEOUT_SECONDS` | `0` | 流式**首事件**超时（秒）：上游接了连接却长时间不吐第一个数据帧时，在**出帧前**换号重试（此时切换安全，客户端没收到任何内容）。注释帧 / 心跳不重置该计时。`0` = 关闭。**默认必须保持关闭**——实测慢上下文首字可达 40–71s，默认值会误杀正常请求；要用请按部署实际填（推荐 `60`）。可热更 |
+| `STREAM_IDLE_TIMEOUT_SECONDS` | `0` | 流式**空闲**超时（秒）：**已出帧**后上游长时间不再吐数据时断流，只发一帧错误收尾——半截输出不可回滚，换号会把两个账号的内容拼给客户端。`0` = 关闭（推荐 `300`）。可热更 |
+| `SHORT_COOLDOWN_WAIT_SECONDS` | `0` | 短冷却「等待续上」（秒）：全池都在短冷却、没有任何立即可用候选时，最短剩余冷却不超过该值则等待后重取一次，而不是直接 503。等待期间不占在途租约、不计入轮换预算。`0` = 关闭（快速失败，旧行为）。可热更 |
+| `MODEL_ALIASES` | `""` | 自定义模型别名：`对外名=模型@渠道;对外名2=模型`，`@渠道` 省略则自动选。列表与请求解析用同一份；与真实 id / 自动别名撞车、目标不存在、渠道不持有该模型时该段跳过并记 ERROR。留空 = 不启用。可热更 |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | 单账号在途请求上限（跨渠道全局）：并发占满的号不再参与选号；`0` = 不限。租约请求结束释放，另有 600s TTL 兜底漏释放 |
 | `METRICS_ENABLED` | `true` | 是否暴露 `GET /metrics`（Prometheus text 格式，**不鉴权**，与 `/healthz` 同口径）；`false` 关闭（返回 404）。可热更 |
 | `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 `event=request request_id=… method=… route=… status=… duration_ms=…`。路由用模板（`/api/credentials/{credential_id}`）不用实际 ID；**不写 query string、请求体、用户名**，靠 `request_id` 关联 `usage_events`。5xx 记 WARNING、其余 INFO；静态资源与探针不记。`false` 回到只有 uvicorn 裸 access log。可热更 |
@@ -642,9 +667,9 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 
 ### 管理台热更（「任务与配置」页）
 
-上表中带「可热更」语义的 **51 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
+上表中带「可热更」语义的 **55 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
 
-`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`。
+`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`MODEL_ALIASES`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`、`STREAM_IDLE_TIMEOUT_SECONDS`、`SHORT_COOLDOWN_WAIT_SECONDS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`。
 
 要点：**优先级 `DB 覆盖值 > .env`**——改过后 .env 对该项不再生效，页面标「DB 覆盖」，点「恢复默认」删掉覆盖行才回落 .env。值存 `runtime_settings` 表（纯 key/value），新增可热更项无需迁移；白名单外的 key、非法类型 / 越界值写入前即拒。启动期项（`APP_SECRET` / `PORT` / `DATA_DIR` / `USERS_FILE` / `OPENROUTER_MODELS_URL` / 上游端点白名单）**不在**白名单。接口 `GET /api/settings` 读快照、`PUT /api/settings` 写（admin + CSRF），传 `null` 恢复默认。该页同时展示**后台任务运行态**，页面按 tab 组织；运行态是**进程内**的（`GET /api/tasks`，admin，页面每 30 秒刷新），重启归零。
 
