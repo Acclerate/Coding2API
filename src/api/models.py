@@ -35,6 +35,9 @@ from fastapi.responses import JSONResponse
 
 from ..benchmarks import BenchmarkTable
 from ..compat.openai.errors import error_payload
+from ..engine.reasoning import parse_effort_map
+from ..model_alias import parse_model_aliases
+from ..pricing import PriceTable
 from .deps import ApiKeyPrincipal, Services, api_key_user
 from .model_catalog import load_catalog, save_catalog
 from .model_merge import (
@@ -95,8 +98,13 @@ def _publish(services: Services, entries: list[dict[str, Any]]) -> None:
     先算好再 clear+update：`_build_aliases` 若抛错，不能让别名表停在「已清空、
     未写入」的中间态（那会让所有扁平名请求失去候选收窄）。对象身份必须保留，
     故不能整体替换 dict。
+
+    自定义别名（`MODEL_ALIASES`）**每次现读**运行态覆盖层再解析：这是热更
+    项，改完下一次列表 / 单查就生效，不需要重启或等 TTL。解析结果同时进
+    「条目表」（列表侧）与「别名表」（执行侧），两者天然是同一份。
     """
-    aliases = _build_aliases(entries)
+    custom = parse_model_aliases(str(getattr(services.settings, "model_aliases", "")))
+    aliases = _build_aliases(entries, custom)
     services.model_aliases.clear()
     services.model_aliases.update(aliases)
 
@@ -263,15 +271,20 @@ def _served_entries(services: Services, connected: set[str],
 
 def _build_response(services: Services, connected: set[str],
                     allowed_models: str = "",
-                    benchmarks: BenchmarkTable | None = None) -> dict:
+                    benchmarks: BenchmarkTable | None = None,
+                    prices: PriceTable | None = None,
+                    efforts: dict[str, dict[str, str]] | None = None) -> dict:
     """按当前缓存合并出响应（不碰上游），并就地 publish 别名表。
 
     `benchmarks` 为能力分表（`app.state.model_benchmarks`）；None/空表时条目
-    不带 `benchmarks` 字段，与加该字段前的行为一致。
+    不带 `benchmarks` 字段，与加该字段前的行为一致。`prices`（刊例价）与
+    `efforts`（生效中的档位映射）同理：缺省时条目不带 `cost` /
+    `reasoning_efforts`。
     """
     entries = _served_entries(services, connected, allowed_models)
-    return {"object": "list", "data": [_entry_response(entry, benchmarks)
-                                       for entry in entries]}
+    return {"object": "list",
+            "data": [_entry_response(entry, benchmarks, prices, efforts)
+                     for entry in entries]}
 
 
 def _match_entry(entries: list[dict[str, Any]],
@@ -318,6 +331,16 @@ def _benchmarks_of(request: Request | None) -> BenchmarkTable | None:
     return getattr(request.app.state, "model_benchmarks", None) if request else None
 
 
+def _prices_of(request: Request | None) -> PriceTable | None:
+    """刊例价表（`app.state.price_table`）：与能力分同一次抓取、同一形态。"""
+    return getattr(request.app.state, "price_table", None) if request else None
+
+
+def _efforts_of(services: Services) -> dict[str, dict[str, str]] | None:
+    """生效中的档位映射（热更）：每请求现读并解析，改完下一次请求即生效。"""
+    return parse_effort_map(str(getattr(services.settings, "reasoning_effort_map", "")))
+
+
 async def serve_models(services: Services, allowed_models: str = "",
                        request: Request | None = None) -> dict:
     """HTTP 出口（`/v1/models`、Playground）：先回旧列表，过期渠道后台刷。
@@ -334,9 +357,12 @@ async def serve_models(services: Services, allowed_models: str = "",
     `request` 非空时从 `request.app.state.model_benchmarks` 现读能力分表并随
     条目透出（与 `models_dev_catalog` 同一形态：运行数据挂 app.state，不是
     Services 依赖）。不传（测试 / 内部调用）时条目不带 `benchmarks` 字段。
+    刊例价（`cost`）走同一条 `app.state.price_table` 取法。
     """
     connected = await _revalidated_providers(services)
-    return _build_response(services, connected, allowed_models, _benchmarks_of(request))
+    return _build_response(services, connected, allowed_models,
+                           _benchmarks_of(request), _prices_of(request),
+                           _efforts_of(services))
 
 
 async def serve_model(services: Services, model_id: str, allowed_models: str = "",
@@ -354,7 +380,8 @@ async def serve_model(services: Services, model_id: str, allowed_models: str = "
     entry = _match_entry(_served_entries(services, connected, allowed_models), model_id)
     if entry is None:
         return None
-    return _entry_response(entry, _benchmarks_of(request))
+    return _entry_response(entry, _benchmarks_of(request), _prices_of(request),
+                           _efforts_of(services))
 
 
 async def list_models(services: Services,

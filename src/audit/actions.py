@@ -26,6 +26,7 @@ ACTION_CREDENTIAL_LIMITS = "credential.limits"
 ACTION_CREDENTIAL_TAGS = "credential.tags"
 ACTION_API_KEY_QUOTA = "api_key.quota"
 ACTION_ALERT_RESOLVE = "alert.resolve"
+ACTION_SETTINGS_UPDATE = "settings.update"
 
 ACTIONS: tuple[str, ...] = (
     ACTION_LOGIN_SUCCESS, ACTION_LOGIN_FAILURE,
@@ -37,6 +38,7 @@ ACTIONS: tuple[str, ...] = (
     ACTION_CREDENTIAL_LIMITS, ACTION_CREDENTIAL_TAGS,
     ACTION_API_KEY_QUOTA,
     ACTION_ALERT_RESOLVE,
+    ACTION_SETTINGS_UPDATE,
 )
 
 # 界面上的中文标签（审计页筛选下拉用）
@@ -61,4 +63,5 @@ ACTION_LABELS: dict[str, str] = {
     ACTION_CREDENTIAL_TAGS: "设置标签",
     ACTION_API_KEY_QUOTA: "设置 Key 配额",
     ACTION_ALERT_RESOLVE: "标记告警恢复",
+    ACTION_SETTINGS_UPDATE: "修改运行时配置",
 }

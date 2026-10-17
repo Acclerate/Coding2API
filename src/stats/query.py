@@ -356,6 +356,30 @@ class StatsQuery:
                  int(row["reasoning_tokens"]), int(row["cached_tokens"]))
                 for row in rows]
 
+    def model_failures(self, *, since: int, limit: int = 200) -> list[dict[str, Any]]:
+        """按 (provider, model) 聚合窗口内的模型级失败（可用性视图的数据源）。
+
+        只认两类错误：`invalid_request`（当前 executor 把上游「无此模型」的
+        `ErrKind.BLOCKED` 也归到这一类）与 `upstream_blocked`（协议预留值，
+        未来 provider 直接上报时自动纳入）。窗口由调用方给绝对时刻 `since`，
+        SQL 走 `idx_usage_ts`；`limit` 由调用方收敛，多取一条供判断截断。
+
+        `last_failed_at` 取该组内最大 `ts`；排序按失败次数降序，同次数按
+        (provider, model) 升序，保证分页 / 快照稳定。
+        """
+        rows = self._db.connect().execute(
+            """
+            SELECT provider, model, COUNT(*) AS failures, MAX(ts) AS last_failed_at
+            FROM usage_events
+            WHERE ts >= ? AND error_type IN ('upstream_blocked', 'invalid_request')
+            GROUP BY provider, model
+            ORDER BY failures DESC, provider ASC, model ASC
+            LIMIT ?
+            """, (since, max(1, limit))).fetchall()
+        return [{"provider": row["provider"], "model": row["model"],
+                 "failures": int(row["failures"]),
+                 "last_failed_at": int(row["last_failed_at"])} for row in rows]
+
     @staticmethod
     def _group_row(row: Any, key: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:
         """把一行聚合结果转成 {分组键: ...} + 公共指标的 dict（各分组维度共用）。

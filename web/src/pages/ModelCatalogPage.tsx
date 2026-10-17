@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
-import { Boxes, CircleDollarSign, RefreshCw, Search, Trophy } from "lucide-react";
+import {
+  Ban,
+  Boxes,
+  CircleDollarSign,
+  RefreshCw,
+  Search,
+  Trophy,
+} from "lucide-react";
 import { useSessionContext } from "../Layout";
-import { useModelCatalog } from "../api/hooks";
+import { useModelCatalogPage, useBlockModel } from "../api/modelExtrasHooks";
+import type { ModelCatalogRow } from "../api/modelExtras";
 import {
   formatAgo,
   formatCompact,
@@ -13,9 +21,12 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
 import { ColumnHint } from "../components/Tip";
+import { ToastViewport, useToasts } from "../components/Toast";
 import { useSort } from "../hooks/useSort";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
+  Badge,
+  Button,
   Checkbox,
   Empty,
   Input,
@@ -106,6 +117,54 @@ function benchmarkLine(row: ModelCatalogEntry) {
 }
 
 /**
+ * 可用性单元格：窗口内失败次数 + 最后失败时刻 + 「加入黑名单」按钮。
+ *
+ * 没有失败记录时显示 —（「没数据」不等于「确认健康」，与后端 `suspected`
+ * 字段同口径）。已命中当前黑名单的行只显示「已屏蔽」，按钮置灰——重复点击
+ * 不会产生新的审计记录，只会让用户误以为操作没生效。
+ */
+function AvailabilityCell({
+  row,
+  windowDays,
+  busy,
+  onBlock,
+}: {
+  row: ModelCatalogRow;
+  windowDays: number;
+  busy: boolean;
+  onBlock: () => void;
+}) {
+  const suspected = row.suspected;
+  if (!suspected) return <span className="text-muted-foreground">—</span>;
+  return (
+    <div className="space-y-1" data-testid={`model-availability-${row.id}`}>
+      <div className="flex flex-wrap items-center gap-1">
+        <Badge tone="warn" dot>
+          近 {windowDays} 天失败 {suspected.failures} 次
+        </Badge>
+        {suspected.blocked && <Badge tone="muted">已屏蔽</Badge>}
+      </div>
+      <div className="text-muted-foreground" title="最后一次失败的请求时刻">
+        {suspected.provider} · {formatTime(suspected.last_failed_at)}
+      </div>
+      <Button
+        variant="default"
+        size="sm"
+        data-testid={`model-block-${row.id}`}
+        disabled={busy || suspected.blocked}
+        title={suspected.blocked
+          ? "该模型已命中当前黑名单"
+          : `把 ${suspected.model} 追加进 MODEL_BLOCKLIST（走设置写接口，记审计）`}
+        onClick={onBlock}
+      >
+        <Ban className="size-3" />
+        加入黑名单
+      </Button>
+    </div>
+  );
+}
+
+/**
  * 模型列表页（管理）：只读展示 OpenRouter 的模型目录。
  *
  * 这份目录既是统计页「成本（估算）」的价格来源（输入 / 输出 / 缓存读，USD /
@@ -127,25 +186,37 @@ export function ModelCatalogPage() {
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   // 只看「当前渠道获取到的模型」：默认关闭（OpenRouter 收录全量，用户按需收窄）。
   const [onlyAvailable, setOnlyAvailable] = useState(false);
+  // 只看「疑似下线」：最近 N 天有模型级失败（口径见后端 /api/models/availability）。
+  const [onlySuspected, setOnlySuspected] = useState(false);
+  const { toasts, push, dismiss } = useToasts();
+  const block = useBlockModel(session.username);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 250);
     return () => clearTimeout(timer);
   }, [query]);
 
-  const { data, isLoading, isError, isFetching } = useModelCatalog(
-    session.username, sort, order, debouncedQuery || undefined, onlyAvailable,
-    pageSize, page * pageSize);
+  const { data, isLoading, isError, isFetching } = useModelCatalogPage(
+    session.username,
+    {
+      sort, order,
+      q: debouncedQuery || undefined,
+      onlyAvailable,
+      onlySuspected,
+      limit: pageSize,
+      offset: page * pageSize,
+    });
 
   const rate = data?.usd_cny_rate ?? 1;
   const models = data?.models ?? [];
   const catalogCount = data?.count ?? 0;
   const total = data?.total ?? 0;
+  const windowDays = data?.availability_days ?? 7;
 
-  // 搜索 / 改每页条数 / 换排序 / 切渠道过滤后回到第一页：否则会停在一个已不存在的页码上（空白）
+  // 搜索 / 改每页条数 / 换排序 / 切过滤后回到第一页：否则会停在一个已不存在的页码上（空白）
   useEffect(() => {
     setPage(0);
-  }, [debouncedQuery, pageSize, sort, order, onlyAvailable]);
+  }, [debouncedQuery, pageSize, sort, order, onlyAvailable, onlySuspected]);
 
   if (isLoading) {
     return (
@@ -154,6 +225,24 @@ export function ModelCatalogPage() {
       </div>
     );
   }
+
+  const addToBlocklist = async (row: ModelCatalogRow) => {
+    const pattern = row.id;
+    try {
+      await block.mutateAsync(pattern);
+      push({
+        tone: "ok",
+        testId: "model-blocklist-toast",
+        content: `已把 ${pattern} 加入黑名单，下一次 /v1/models 起不再下发。`,
+      });
+    } catch (caught) {
+      push({
+        tone: "danger",
+        testId: "model-blocklist-toast",
+        content: `加入黑名单失败：${caught instanceof Error ? caught.message : String(caught)}`,
+      });
+    }
+  };
 
   const priceUnit = `${currency === "CNY" ? "¥" : "$"} / 百万 token`;
 
@@ -183,11 +272,20 @@ export function ModelCatalogPage() {
         />
         只看当前渠道
       </Label>
+      <Label className="w-fit cursor-pointer gap-1.5 text-xs font-normal text-muted-foreground">
+        <Checkbox
+          checked={onlySuspected}
+          data-testid="model-suspected-toggle"
+          onCheckedChange={(value) => setOnlySuspected(value === true)}
+        />
+        只看疑似下线
+      </Label>
     </div>
   );
 
   return (
     <div className="space-y-6" data-testid="model-catalog-page">
+      <ToastViewport toasts={toasts} onDismiss={dismiss} />
       <PageHeader
         eyebrow="管理"
         title="模型列表"
@@ -241,7 +339,9 @@ export function ModelCatalogPage() {
             <Empty data-testid="no-model-match">
               {query.trim()
                 ? `没有匹配「${query}」的模型`
-                : "当前渠道没有可用模型（未接入或全部暂停）"}
+                : onlySuspected
+                  ? `最近 ${windowDays} 天没有模型级失败（疑似下线为空）`
+                  : "当前渠道没有可用模型（未接入或全部暂停）"}
             </Empty>
           ) : (
             <div className="mt-3">
@@ -271,6 +371,7 @@ export function ModelCatalogPage() {
                     <SortableHead label="知识截止" columnKey="knowledge"
                                   active={sort === "knowledge"} direction={order}
                                   onToggle={toggle} testId="sort-knowledge" />
+                    <TableHead>可用性</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -316,6 +417,14 @@ export function ModelCatalogPage() {
                         </TableCell>
                         <TableCell label="知识截止" className="text-xs">
                           {row.knowledge ?? "—"}
+                        </TableCell>
+                        <TableCell label="可用性" className="text-xs">
+                          <AvailabilityCell
+                            row={row}
+                            windowDays={windowDays}
+                            busy={block.isPending}
+                            onBlock={() => void addToBlocklist(row)}
+                          />
                         </TableCell>
                       </TableRow>
                     );
