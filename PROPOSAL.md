@@ -126,6 +126,8 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 上游 SSE 解析到「中立事件」（`EventKind`：`content` / `reasoning` / `tool_calls` / `usage` / `finish` / `error`）独立成层。出口协议适配器（OpenAI / Responses / Anthropic）只消费中立事件，不动上游逻辑。
 
+**入口语义收口**（不静默降级，也不把畸形请求打到上游把凭证打凉）：chat 入站的 `response_format` 只放行 `text` / `json_object` / `json_schema`（后者要求非空 `name` 与 `schema`，未知字段丢弃），Responses 的 `text.format` 复用**同一个**校验函数（`compat/openai/request.py: normalize_response_format`，`prefix` 只改报错路径）。Anthropic 的 `cache_control` **默认原样透传**（落点：`system` 块、user/assistant 块、`tool_result` 挂 tool 消息顶层、`tool_calls` 元素顶层、`tools` 元素顶层），只校验结构（对象 + 非空字符串 `type`，`ttl` 若给必须字符串），取值交给上游裁决；无标记时映射结果逐字节不变，会话粘性指纹与上游前缀缓存不受影响。
+
 ### 3.7 账号与权限面
 
 管理面身份来自 SQLite `users` 表。三角色：`admin`（用户管理、运行时配置、凭证写操作、全量统计、审计、运维告警、`require_admin`）、`operator`（凭证写操作：导入 / 删除 / 启停 / pin / 切换账号 / 签到 / 成长，全量统计，上游状态、模型列表，`require_operator`）、`viewer`（只读：仪表盘、凭证列表、Playground、统计；审计为 admin-only，登录即可）。
@@ -161,7 +163,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 
 ## 5. API 契约
 
-**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate, benefit}` + 可选 `benchmarks`；`benefit` 标福利模型，单渠道在顶层）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
+**外部（API Key 鉴权）**：`POST /v1/chat/completions`（流式 + 非流式）；`POST /v1/responses`（Responses 子集，Codex CLI）；`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（Anthropic Messages 子集，`count_tokens` 本地估算不转发上游）——三者共用同一调度链路；`GET /v1/models`（对外 `id` 为归一键 + `name` + `providers` + `by_provider.{渠道}.{raw_id, credit_rate, benefit}` + 可选 `benchmarks`；`benefit` 标福利模型，单渠道在顶层）；`GET /v1/models/{id}`（单模型查询，`:path` 容纳带命名空间的渠道原代号；对外 id / 展示名 / 任一渠道原 id 三种写法、大小写不敏感；不存在**或不在该 Key 模型白名单内**一律 404 + `model_not_found`，不泄露池中模型）；`GET /v1/user/balance`（DeepSeek 兼容余额，读探测缓存聚合，不实时打上游）；`GET /health`（纯存活）、`GET /healthz`（存活 + 凭证池五类计数，无鉴权）、`GET /metrics`（Prometheus text 格式指标，默认开、无鉴权，`METRICS_ENABLED=false` 关闭）。
 
 **管理台（会话 Cookie + RBAC）**：凭证管理、API Key 管理、用量统计（`/api/stats/*`）、Playground、模型列表（operator）、用户管理（admin-only）、审计日志（admin-only）、运维告警（admin-only）、上游状态（operator）、任务与配置（admin-only）。
 
@@ -171,6 +173,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 - 运行时配置与任务运行态：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`（手动跑一轮）。列表端点接受统一 `sort`（白名单键）+ `order`（`asc`/`desc`）；未知键 / 非法值回落到默认，不报错。回调（无鉴权）：`GET /authorize`。
 - 运维告警：`GET /api/alerts`（倒序回看，分页）+ `POST /api/alerts/{id}/resolve`（人工标记一条已恢复，admin + CSRF + 审计；用于规则已下线 / 误报等状态机无法自动判定的情况）。后台正常路径会在规则不再命中时自动写 `resolved_at`，且 `AlertTask` 启动时从库里未恢复的行重建「告警中」集合，重启后仍能自愈。
 - 上游状态聚合：`GET /api/upstream-status`（operator）返回后台任务抓取的内存快照（`summary` + `sources`）与任务的当前 `enabled` / `interval_seconds` / `server_time`；**不落盘**，重启后为「尚未抓取」。四种解析器（Statuspage v2 / OpenCode / Better Stack / Atom）归一化到六档，加源只需在 `SOURCE_SPECS` 加一行。
+- 用量统计：`GET /api/stats/{overview,by-provider,by-model,by-user,by-credential,timeline,model-timeline}`、`GET /api/stats/events`（rowid 游标 / LIMIT-OFFSET 双模式，`provider`/`model`/`credential_id` 钻取过滤，`?format=csv` 导出）、`GET /api/stats/events/stream`（**SSE 实时明细**：`StatsCollector.record` 事务提交后由进程内 `LiveEventHub` 广播刚写入的行，不轮询数据库；每订阅者有界缓冲 200 条、并发上限 8 超出回 429 + `Retry-After`；15s 注释帧保活，`Cache-Control: no-store` + `X-Accel-Buffering: no`；作用域/过滤在订阅者侧逐条判定，与 `/api/stats/events` 同口径）。
 - 侧栏数据提醒：`GET /api/nav-badges` 一次返回侧栏各项的待办计数（凭证需重登/耗尽、未恢复告警、上次失败任务、异常上游源、待激活账号、本人将到期 Key、模型目录陈旧）。**按角色裁剪 payload**——缺失的键 = 无权看（admin-only 的告警/任务/用户不下发给 operator/viewer，operator 的上游/目录不下发给 viewer）；这是聚合端点，**不做整体 403**（viewer 也要看自己的 API Key）。各计数与对应页面数据**不是同一口径**：只数「待办」（如告警只数 `resolved_at IS NULL`、任务用「上次失败」而非「连续失败达阈值」）。
 
 实现以代码为准，使用说明见 [README.md](README.md)。
@@ -185,7 +188,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 - **错误响应不回流上游正文**：`/v1` 与外层的错误文案只带受控标识（HTTP 状态码 / 上游业务码 / 异常类名），上游错误体摘要只进服务端日志；未匹配的 `/api`、`/v1` 路径返回 JSON 404（不落到 SPA 的 200 + HTML）。**日志脱敏**：不打印 Token、完整请求体；审计写 INFO（含操作人），**绝不记密码/令牌明文**。
 - **请求 ID 是客户端可写输入**：入站 `X-Request-ID` 按白名单字符集与长度（`[A-Za-z0-9._:-]{1,128}`）校验后才采信与回显，不合法一律丢弃改用自生成——否则日志与统计列会被人塞进换行/超长串。响应头回显最终 ID（含自生成值），不伪装成上游追踪。
 - **请求级结构化日志**（`src/webapp/access_log.py`，`REQUEST_LOG_ENABLED` 可热更）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 logfmt，含 `request_id` / 路由**模板** / 状态码 / 耗时。**不写 query string**（可能被客户端塞 token）、**不写请求体 / 请求头 / 用户名**（身份靠 `request_id` 关联 `usage_events`）；未匹配路由时回落为清洗并截断的原始路径，防换行注入。静态资源与探针不记（uvicorn 已覆盖）。
-- **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。`/api/stats/events?format=csv`（整份明细导出）同样仅 admin/operator。
+- **租户隔离**：`/api/stats/events` 与 `/api/stats/by-credential` 的**凭证昵称**取自全局共享池（常含邮箱/手机），仅 admin/operator 可见；viewer 即便只看自己的记录也不下发该字段。`/api/stats/events?format=csv`（整份明细导出）同样仅 admin/operator；`/api/stats/events/stream` 的广播 payload 不含昵称，仅 admin/operator 的连接由服务端逐条补 `credential_name`。
 - **热更配置写入即校验**：float 拒 NaN/±inf；字符串类有长度上限；告警 webhook 只接受 `http(s)` 并做 **SSRF 校验**（写入期拒字面量内网 / 回环 / 链路本地 / 保留 / 多播 / 未指定地址，**投递前再按 DNS 解析结果复核一次**、解析失败即阻断），外发载荷对 `nickname` 打码，多地址并发投递并加总预算。告警出站 client `trust_env=False`，不吃宿主代理环境变量。
 - **上游流解析有界**：SSE 单行与单帧缓冲设上限，非 2xx 错误体有界读取；OAuth state store 的 owner/consume 有 TTL 判定。**入站解析把关**：三个出站协议在入口拒绝越界数值字段（`max_tokens` ≤0 或超上限、`temperature`/`top_p` 为 NaN/Inf）与 JSON 里的 `NaN`/`Infinity`。
 - **OAuth 登录弹窗**只允许 `http(s)` scheme，弹窗 `opener` 置空。**库版本守卫**：`user_version` 高于本程序时 `apply_schema` 拒绝执行。`scripts/hash_password` / `create_user` 支持 `--password-stdin`；拒绝含 `:` / 换行的用户名。

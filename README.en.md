@@ -11,14 +11,14 @@ upstreams, with a shared credential pool, unified scheduling, and per-user usage
 
 ## Features
 
-- **OpenAI-compatible surface**: `/v1/chat/completions` (streaming + non-streaming), `/v1/responses` (for the Codex CLI), `/v1/messages` (Anthropic Messages / Claude Code), `/v1/models`, `/v1/user/balance` (DeepSeek-compatible).
+- **OpenAI-compatible surface**: `/v1/chat/completions` (streaming + non-streaming), `/v1/responses` (for the Codex CLI), `/v1/messages` (Anthropic Messages / Claude Code), `/v1/models` plus `/v1/models/{id}` (single-model lookup), `/v1/user/balance` (DeepSeek-compatible).
 - **Unified scheduling**: bare model names auto-route by health, `model@provider` pins an upstream. When free channels are candidates, **free wins**; then **least in-flight first** (concurrent requests spread across idle credentials), then expiring credits, then three-state health with tiered cooldowns, ties broken by **largest balance first**. A model-scoped limit sidelines only that model (the same account's other models stay available); a model held by a single cooling channel returns "model temporarily unavailable" instead of fanning out. A multi-turn conversation keeps one credential and rotates only on error.
 - **Expiry-aware burn**: credits expiring within the main window (default 36h) burn largest-first (near-expiry quota not wasted), ties fall to a 7-day window. Units unify to credits.
 - **Credential-gated model list**: only channels with a currently usable credential are fetched and shown, so a never-connected channel never shows phantom models; pausing or losing credentials hides a channel's models until it recovers.
 - **Shared credential pool**: admins maintain credentials, everyone shares them, encrypted at rest (`APP_SECRET`); device-code login, account switching, quota probing, daily check-in, token pre-refresh.
 - **Three-role accounts**: `admin` / `operator` / `viewer` in SQLite; one-time activation links (no shared initial secret), forced password change on first login, changing a role or disabling an account revokes its sessions immediately; logins and writes are audited.
 - **Growth center** (CodeBuddy only): travel gifts, Buddy dispatch, task rewards, streak repair, streak redemption, blind boxes; irreversible steps off via `GROWTH_IRREVERSIBLE_ACTIONS=false`; runnable from the admin UI.
-- **Privacy-preserving stats**: no conversation content stored; 90-day request detail, permanent hourly rollups; per user / channel / model / credential views; cost estimated from OpenRouter list prices (CNY primary).
+- **Privacy-preserving stats**: no conversation content stored; 90-day request detail, permanent hourly rollups; per user / channel / model / credential views; cost estimated from OpenRouter list prices (CNY primary); a **Live** toggle in the request-detail panel streams just-committed requests over SSE.
 - **Sidebar to-dos**: count badges on sidebar entries for things you would otherwise only notice by visiting the page (credentials needing re-login or out of quota, unresolved alerts, failed background tasks, abnormal upstream sources, pending activations, your own expiring API keys, stale model catalog). One aggregate endpoint, role-filtered, counts only outstanding items.
 - **Admin security**: login rate limiting, CSRF checks, body limits, Host allowlist.
 - **Responsive tables**: wide tables (credentials, request detail, model list, …) turn into one card per row below 768px — column names collapse into a row of tappable sort chips and each cell shows its field name inline. The DOM is unchanged, so screen-reader semantics match the wide layout.
@@ -125,6 +125,8 @@ Every model on the seven channels is unified into three fields:
 
 Every `id` in `GET /v1/models` is the canonical key; requests are translated back to the channel's raw id (`by_provider.{channel}.raw_id`). **All three spellings are directly requestable** (`kmodel_latest`, `Kimi K3`, `kimi-k3` all resolve to the same model). **`benefit` marker**: CodeArts models that draw on the daily free token pool get no rate from upstream, so their entries carry `benefit: true` (top level for single-channel, `by_provider.{channel}` for multi-channel); the Playground uses it to show a「福」badge on the channel pill, distinguishing them from the credit-billed built-in models.
 
+**`GET /v1/models/{id}` single-model lookup** (same shape as OpenAI): all three spellings resolve, case-insensitively. The route uses `:path`, so namespaced raw ids (`dots-studio/dots-3-note-preview:free`) work too. A model that does not exist **or is outside the calling key's model allowlist** returns the same 404 with an OpenAI error body (`code=model_not_found`) — allowlisted-out and missing look identical, so a client cannot probe "what else is in the pool". Benchmarks and refresh timing come from the same merged snapshot as the list, so a model shown in the list never 404s on lookup.
+
 ### Streaming usage and reasoning tokens
 
 - **Streaming usage frame**: after the finish chunk and before `data: [DONE]`, a `choices: []` usage frame (standard OpenAI shape) lets stream-reading clients show tok/s, context occupancy and session totals; nothing is sent when the upstream reported no usage (never a fake `0`), and unreported fields are `null`.
@@ -216,6 +218,16 @@ codex -c "model_providers.coding2api={ name='coding2api', base_url='http://127.0
 
 Supports streaming text, reasoning summaries, function tool calls and `finish_reason=length` → `response.incomplete`. `text.format` maps to chat's `response_format` (`text` / `json_object` pass through; `json_schema` is expanded). Content parts map as `input_text`/`text`/`output_text` → chat text and `input_image` → chat `image_url` (the URL is passed through as-is). **Not supported**: `store=true`, `previous_response_id` (stateless server, not faked), `input_file` (needs server-side file storage), Responses-only tools — explicit 400, never silently degraded. `include=["reasoning.encrypted_content"]` is accepted and ignored.
 
+### chat `response_format` validation
+
+`POST /v1/chat/completions` no longer forwards `response_format` verbatim: only the three OpenAI-defined shapes pass, and malformed or unknown shapes are an **explicit 400** (never silently degraded, and never sent upstream where a 4xx would cool the credential):
+
+- `{"type": "text"}`
+- `{"type": "json_object"}`
+- `{"type": "json_schema", "json_schema": {"name": <non-empty string>, "schema": <any JSON Schema>, "description"?: <string>, "strict"?: <bool>}}` — unknown keys inside `json_schema` are dropped (not part of the chat spec, not honored upstream); a missing `name`, a missing `schema` and an unknown `type` each get their own 400 message.
+
+The Responses `text.format` → `response_format` mapping shares **the same validator** (`normalize_response_format` in `src/compat/openai/request.py`), so the two inbound protocols cannot drift; the `prefix` argument only changes the field path in error messages (Responses passes `text.format`).
+
 ### Anthropic Messages API (Claude Code)
 
 `POST /v1/messages` serves an Anthropic Messages subset for [Claude Code](https://docs.anthropic.com/en/docs/claude-code):
@@ -227,6 +239,8 @@ claude
 ```
 
 **Auth**: both `x-api-key` and `Authorization: Bearer` are accepted. **Streaming**: `message_start` → `content_block_start/delta/stop` → `message_delta` (with `stop_reason` and usage) → `message_stop`; no `[DONE]` sentinel, and thinking blocks get a `signature_delta` before `content_block_stop`. **Cache hit**: usage is split Anthropic-style — `input_tokens` counts only misses, hits are reported separately as `cache_read_input_tokens` (the internal `input_tokens` is OpenAI's `prompt_tokens`, which includes hits), so Claude Code shows cached tokens instead of always 0. **`count_tokens`**: `POST /v1/messages/count_tokens` estimates input tokens locally. **Images**: `image` blocks (`source.type=base64` becomes a `data:` URL, `source.type=url` passes through) are normalized to chat `image_url` parts, and images inside `tool_result.content` are kept too — pure-text content is still folded into a string, so image-free requests map byte-for-byte as before. **Not supported**: `document` blocks (PDF, no chat equivalent), `source.type=file` and Anthropic-only server tools — explicit 400.
+
+**`cache_control` pass-through** (always on, no flag): inbound cache markers are forwarded verbatim, at the same places Anthropic accepts them — `system` content blocks, user/assistant content blocks, `tool_result` (attached to the **tool message top level**, avoiding a synthetic empty text block), `tool_calls` elements, and `tools` elements. Only **structure** is validated (must be an object with a non-empty string `type`; `ttl`, if present, must be a string); values are not interpreted (an unknown `type` still passes through — a gateway should not gatekeep cache types upstream may add later). Malformed markers are an explicit 400 rather than a silent drop. **Without markers the mapping is byte-for-byte unchanged** (pure text still folds into a string), so session-affinity fingerprints and upstream prefix caching are unaffected. Six of the seven channels accept the markers in testing (codebuddy / codebuddy_intl / trae / qoder / codearts / kilo); **zen is unverified** (its upstream returns `FreeTierError` 403 even with `--plain`, unrelated to the markers). Probe script: `scripts/probe_cache_control.py`.
 
 ### CC Switch one-click import
 
@@ -350,6 +364,13 @@ The **Grouped stats** panel tabs four dimensions (channel / model / user / crede
 **Merged columns**: the Request detail table merges same-kind columns into one, showing a readable default and the full breakdown on hover: **Token** (defaults to "input / output · hit rate", hover adds cached tokens) and **Latency** (defaults to "duration / TTFB"). Column count drops from 14 to about 10, and the narrow-screen cards carry half as many fields. Sorting is preserved: clicking a merged header opens a dropdown to pick the sub-column (Token → input / output / cached / hit rate; Latency → duration / TTFB), and selecting one sorts by it. The **hit rate** sub-column uses backend `sort=cache_rate` (cached ÷ input; `NULL` when input is 0 or never reported, matching the sort semantics of other nullable columns).
 
 **CSV export**: the **Export CSV** button (admin/operator only) exports request detail for the **current time range and drill filters**, via `GET /api/stats/events?format=csv`. The file carries a UTF-8 BOM (so Excel detects the encoding), `\r\n` line endings, ISO 8601 (UTC) timestamps, and prefixes a leading apostrophe on **text** cells starting with `= + - @` (or tab/CR) to block spreadsheet formula injection (numbers, negatives included, are left as-is). Export is capped at 10000 rows; beyond that it truncates and flags `X-Export-Truncated: 1` in the response headers, and the page tells the user to narrow the conditions.
+
+**Live stream (SSE)**: the **Live** toggle in the request-detail panel subscribes with `EventSource` to `GET /api/stats/events/stream` and shows requests **just committed** within the current filter range. Live rows render in their own panel above the paginated history, so the table you are paging through never jumps. Events are broadcast after the `StatsCollector.record` transaction commits via an in-process `LiveEventHub` (no DB polling); the client keeps the newest 50, newest first, and closing the toggle closes the connection.
+
+- **Scope and filters**: identical to `/api/stats/events` — admin/operator may pass `username` (omitted = everything), viewers are pinned to themselves; `provider` / `model` / `credential_id` stack. Changing a filter reopens the connection (`EventSource` cannot change its query string).
+- **Credential names**: the broadcast payload carries no nickname (same redacted field set as the detail endpoint, plus `rowid`); only admin/operator connections get `credential_name` filled in per event **server-side**, so viewers never see pool nicknames.
+- **Backpressure and limits**: each subscriber gets a **bounded** buffer (200 events); when full the **oldest** is dropped (a live view cares about now). At most 8 concurrent subscribers; beyond that the endpoint answers 429 with `Retry-After` instead of queueing or quietly degrading the service.
+- **Keep-alive and caching**: a comment frame (`:`) every 15s keeps proxies from dropping an idle connection; the response sets `Cache-Control: no-store` and `X-Accel-Buffering: no` so no middle layer caches or fully buffers the stream. Browsers auto-reconnect; the page reports a disconnect once the browser gives up (401 / 429).
 
 If history looks light (pre-upgrade detail not covered, or detail backfilled without re-rolling), run `python3 scripts/rollup_hourly.py --apply` (preview by default, backs up before writing, idempotent). It reports gaps and warns about intervals whose detail has passed the 90-day retention and cannot be restored.
 

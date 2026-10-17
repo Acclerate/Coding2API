@@ -7,14 +7,14 @@
 
 ## 特性
 
-- **OpenAI 兼容出口**：`/v1/chat/completions`（流式 + 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Anthropic / Claude Code）、`/v1/models`、`/v1/user/balance`（DeepSeek 兼容余额）。
+- **OpenAI 兼容出口**：`/v1/chat/completions`（流式 + 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Anthropic / Claude Code）、`/v1/models` 与 `/v1/models/{id}`（单模型查询）、`/v1/user/balance`（DeepSeek 兼容余额）。
 - **统一调度**：扁平模型名按健康度自动选号，`模型@渠道` 强制指定。候选含免费渠道时**免费优先**，之后**在途最少优先**（并发摊到空闲号），再按到期额度、三态健康度 + 分级冷却避开坏号，打平则**余额多者优先**。模型级限流只避让该模型（同账号其他模型立即可用）；某模型只有一个渠道持有且它在模型级冷却时，直接回「该模型暂不可用」。同一对话多轮粘住同一凭证，出错才轮换。
 - **到期额度优先消化**：主窗口（默认 36h）内将过期的额度多者先用，避免过期浪费；打平再比 7 天窗口。额度单位统一为积分。
 - **模型列表按渠道凭证加载**：只展示**当前有可用凭证**的渠道，未接入不出现幽灵模型；暂停或凭证失效时其模型暂时消失，恢复即回来。
 - **公共凭证池**：admin 集中维护、全员共享、加密入库（`APP_SECRET`）；设备码登录、多账号切换、额度探测、每日签到、token 预刷新。
 - **三角色账号体系**：`admin` / `operator` / `viewer`，用户存 SQLite；一次性激活链接自设密码、首登强制改密、改角色/停用即时吊销会话；登录与写操作留审计。
 - **成长中心**（仅 CodeBuddy）：自动领 Buddy 旅行礼物、派 Buddy、领任务奖、断登补登、连登兑换、开盲盒；不可逆动作可用 `GROWTH_IRREVERSIBLE_ACTIONS=false` 关停；管理台可手动执行。
-- **脱敏统计**：不存对话内容；明细 90 天、小时汇总永久；按人/渠道/模型/凭证可视化；按 OpenRouter 刊例价估算成本（人民币为主）。
+- **脱敏统计**：不存对话内容；明细 90 天、小时汇总永久；按人/渠道/模型/凭证可视化；按 OpenRouter 刊例价估算成本（人民币为主）；明细面板带「实时」开关（SSE 推送刚落库的请求）。
 - **上游状态聚合**：把各模型 / 网关提供方的官方状态页（OpenCode Zen、Kilo、DeepSeek、Together、Moonshot、MiniMax、OpenAI、Anthropic）归一化后并排展示，用于区分「上游整体故障」与「本服务凭证 / 额度问题」。只做解释、不参与选号 / 熔断；快照只存内存、重启归零。
 - **侧栏数据提醒**：侧栏对应项上显示待办计数角标（凭证需重登/耗尽、未恢复告警、上次失败任务、异常上游源、待激活账号、本人将到期 Key、模型目录陈旧），不点进去也能看到；只数「待办」、按角色裁剪，见[下文](#侧栏数据提醒导航角标)。
 - **管理台安全加固**：登录限流、CSRF 校验、请求体上限、Host 白名单。
@@ -128,6 +128,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 `GET /v1/models` 里**所有条目的 `id` 都是归一键**，转发到某渠道时自动换回该渠道原代号，`by_provider.{渠道}.raw_id` 可见。**原代号、展示名、归一键三种写法都能直接请求**（`kmodel_latest`、`Kimi K3`、`kimi-k3` 指向同一模型）。同渠道内归一键重复时退回原代号，避免撞名误并。**福利模型标记 `benefit`**：CodeArts 走每日免费 token 池的模型上游不给倍率，条目会带 `benefit: true`（单渠道在顶层、多渠道在 `by_provider.{渠道}`），Playground 据此在渠道徽章上打「福」标，与按积分计费的内置模型区分。
 
+**`GET /v1/models/{id}` 单模型查询**（OpenAI 同形）：上面三种写法都认，大小写不敏感，路径参数用 `:path` 故带命名空间的原代号（`dots-studio/dots-3-note-preview:free`）也能查。找不到、或该模型**不在当前 Key 的模型白名单内**，一律 404 + OpenAI 错误形状（`code=model_not_found`）——白名单外与不存在同形，客户端无法用单查探测「池子里还有哪些模型」。能力分与列表条目同源（同一份合并结果），刷新时机也一致（列表有、单查不会 404）。
+
 ### 流式 usage 与思考 token
 
 - **流式带 usage 帧**：收尾时在 finish chunk 之后、`data: [DONE]` 之前补一帧 `choices: []` 的 usage（OpenAI 标准形态），只从流里读用量的客户端据此显示 tok/s、上下文占用率与会话 token 统计；上游没上报时不补（不发 0 占位），非流式出口的 `usage` 同理，未上报字段一律为 `null`。
@@ -227,6 +229,16 @@ codex -c "model_providers.coding2api={ name='coding2api', base_url='http://127.0
 
 支持文本、流式正文、思考摘要（`reasoning` item）、函数工具调用与 `finish_reason=length` → `response.incomplete`。`text.format` 映射到 chat 的 `response_format`（`text` / `json_object` 直通，`json_schema` 展开成 `{type, json_schema:{name, description?, schema, strict?}}`）。内容 part 映射为：`input_text` / `text` / `output_text` → chat text，`input_image` → chat `image_url`（URL 原样透传，含 `detail` 时一并带上）。**不支持** `store=true`、`previous_response_id`（服务端无状态，不假装支持）、`input_file`（需服务端文件存储）、Responses 私有工具——一律显式 400，不静默降级。`include=["reasoning.encrypted_content"]`（Codex 每轮必带）接受但忽略。
 
+### chat `response_format` 收口
+
+`POST /v1/chat/completions` 的 `response_format` 不再整包透传，只放行 OpenAI 定义的三种形状，畸形或未知形状**显式 400**（不静默降级、也不打到上游把凭证打凉）：
+
+- `{"type": "text"}`
+- `{"type": "json_object"}`
+- `{"type": "json_schema", "json_schema": {"name": <非空字符串>, "schema": <任意 JSON Schema>, "description"?: <字符串>, "strict"?: <布尔>}}` —— `json_schema` 内的未知字段丢弃（既非 chat 规范、上游也不认），`name` 缺失 / `schema` 缺失 / `type` 未知分别回对应的 400 文案。
+
+Responses 出口的 `text.format` → `response_format` 映射与 chat 入站**共用同一段校验**（`src/compat/openai/request.py: normalize_response_format`），两条入站协议不会各写一份而漂移；`prefix` 参数只改报错里的字段路径（Responses 侧是 `text.format`）。
+
 ### Anthropic Messages API（Claude Code）
 
 `POST /v1/messages` 提供 Anthropic Messages 子集，供 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 接入。与其它出口共用同一套选号 / 冷却 / 轮换 / 统计与会话粘性：
@@ -238,6 +250,8 @@ claude
 ```
 
 **鉴权**：`x-api-key` 与 `Authorization: Bearer` 都接受。**流式**：`message_start` → `content_block_start/delta/stop` → `message_delta`（含 `stop_reason` 与 usage）→ `message_stop`；无 `[DONE]` 哨兵，thinking 块在 `content_block_stop` 前补 `signature_delta`。**缓存命中**：出口 usage 按 Anthropic 语义拆两笔——`input_tokens` 只计未命中，命中另记 `cache_read_input_tokens`（内部 `input_tokens` 是 OpenAI 口径的 `prompt_tokens`，含命中），Claude Code 据此显示缓存读 token。**`count_tokens`**：`POST /v1/messages/count_tokens` 本地估算输入 token（不转发上游）。**图片**：`image` 块（`source.type=base64` 拼成 `data:` URL、`source.type=url` 直传）归一为 chat 的 `image_url` 内容块，`tool_result.content` 内的图片同样保留——纯文本内容仍折成字符串，故无图请求的映射结果与旧版逐字节一致。**不支持**：`document` 块（PDF，chat 上游无对应表达）、`source.type=file`、Anthropic 服务端工具一律显式 400。
+
+**`cache_control` 透传**（默认开启，无开关）：入站的缓存提示标记原样带给上游，落点与 Anthropic 一致——`system` 内容块、user/assistant 消息内容块、`tool_result`（挂 tool 消息**顶层**，不造空 text 块）、assistant `tool_calls` 元素顶层、`tools` 元素顶层。只做**结构**校验（必须是对象、必须有非空字符串 `type`、`ttl` 若给必须是字符串），取值不解释（未知 `type` 也透传，上游将来新增的缓存类型不该被本网关挡掉）；结构不合法显式 400 而不是静默丢弃。**不带标记时映射结果与旧版逐字节一致**（纯文本仍折成字符串），故会话粘性指纹与上游前缀缓存不受影响。七渠道实测 6 个接受（codebuddy / codebuddy_intl / trae / qoder / codearts / kilo），**zen 未验证**（该渠道上游返 `FreeTierError` 403，`--plain` 对照同样失败，与标记无关）；实测脚本 `scripts/probe_cache_control.py`。
 
 ### CC Switch 一键导入
 
@@ -445,7 +459,7 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 
 ### 分组维度与重新汇总
 
-**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（渠道 / 请求数 / 成功数 / 成功率 / Credit / 成本 / Token（输入 ÷ 输出 · 命中率，悬停看命中 token）/ 平均延迟（耗时 ÷ 首字）/ P95 延迟（耗时 ÷ 首字）），对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序；Token / 平均延迟 / P95 延迟三个合并列点列头弹菜单选子列再排序（`sort=input_tokens|output_tokens|cached_tokens|avg_latency_ms|avg_ttfb_ms|p95_latency_ms|p95_ttfb_ms`），命中率与成功率是派生只读列不参与排序。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
+**分组统计**面板用 tabs 切四个维度（按渠道 / 按模型 / 按用户 / 按凭证），共用同一张表（渠道 / 请求（请求数 · 成功率，悬停看成功数）/ Credit / 成本 / Token（输入 ÷ 输出 · 命中率，悬停看命中 token）/ 平均延迟（耗时 ÷ 首字）/ P95 延迟（耗时 ÷ 首字）），共 7 列。对应端点 `GET /api/stats/by-provider|by-model|by-user|by-credential`。默认按请求数降序，点列头可切换排序；请求 / Token / 平均延迟 / P95 延迟四个合并列点列头弹菜单选子列再排序（`sort=requests|ok_count|input_tokens|output_tokens|cached_tokens|avg_latency_ms|avg_ttfb_ms|p95_latency_ms|p95_ttfb_ms`），成功率与命中率是派生只读值不参与排序。**按用户 / 按凭证**只对 admin 与 operator 展示。**口径差异**：渠道 / 模型 / 用户三维读**小时汇总**（永久保留，最近 5 分钟内的请求尚未计入）；**凭证维度读明细表**（小时汇总主键里没有 `credential_id`），故只覆盖**最近 90 天**。
 
 **延迟两类口径**：**只统计成功请求**（失败请求的耗时会拉偏「典型耗时」）。**平均延迟列** = 平均耗时 / 平均首字 = `latency_sum ÷ 成功数`（读小时汇总，与总览卡片、图表同口径，永久保留）；**P95 延迟列** = P95 耗时 / P95 首字 = 第 95 百分位，按 **nearest-rank**（第 `⌈0.95·n⌉` 小的值，n = 该组有值样本数）从**逐请求明细**算出——小时汇总只有和与计数，数学上还原不出分布，故分位列只覆盖**最近 90 天**。`ttfb_ms` 对非流式 / 未产出首字的成功请求为 `NULL`，两列各自独立排名（只数有值样本）。无成功样本 / 未上报延迟时显示 `—`（不拿 0 冒充）。
 
@@ -454,6 +468,13 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 **明细表列合并**：请求明细把同类列并成一列，默认值一眼可读、悬停展开全部子项：**Token**（默认「输入 / 输出 · 命中率」，悬停含命中 token）、**延迟**（默认「耗时 / 首字」）。列数从 14 压到约 10，窄屏卡片也少一半字段。排序能力不丢：点合并列头弹出下拉选子列（Token → 输入 / 输出 / 命中 / 命中率，延迟 → 耗时 / 首字），选中即按该子列排序；**命中率**子列走后端 `sort=cache_rate`（命中 ÷ 输入，输入为 0 或未上报时为 `NULL`，与其它可空列同排序语义）。
 
 **导出 CSV**：明细面板右上「导出 CSV」（仅 admin / operator）按**当前时间范围 + 当前钻取过滤**导出逐请求明细，`GET /api/stats/events?format=csv`。文件带 UTF-8 BOM（Excel 认编码）、`\r\n` 换行、时间列 ISO 8601（UTC），并对以 `= + - @`（及制表符/回车）开头的**文本**单元格加前导单引号防公式注入（数值含负数原样）。单次导出上限 10000 行，超出截断并在响应头 `X-Export-Truncated: 1` 标出，页面提示收窄条件。
+
+**实时流（SSE）**：明细面板右上「实时」开关打开后，`EventSource` 订阅 `GET /api/stats/events/stream`，展示**当前筛选范围内刚落库**的请求（与下方翻页的历史明细分开展示，避免混成一张会跳动的表）。事件在 `StatsCollector.record` **事务提交后**由进程内 `LiveEventHub` 广播（不轮询数据库），前端只保留最近 50 条、新→旧排列；关闭开关即断开连接。
+
+- **作用域与过滤**：与 `/api/stats/events` 同口径——admin/operator 可传 `username`（不传 = 全量），viewer 恒回落到本人；`provider` / `model` / `credential_id` 三个过滤可叠加。换过滤会重建连接（`EventSource` 无法改查询串）。
+- **凭证昵称**：广播 payload 不含昵称（与明细端点一致，只给已脱敏字段 + `rowid`）；仅 admin/operator 的连接在**服务端逐条按需补** `credential_name`，viewer 拿不到池里他人凭证的昵称。
+- **背压与上限**：每个订阅者一个**有界**缓冲（200 条），满了丢**最旧**的一条（实时流看的是「现在」）；并发订阅上限 8，超出回 429 + `Retry-After`，不排队、不静默拖垮服务。
+- **保活与缓存**：15 秒一条 SSE 注释帧（`:` 开头，`EventSource` 忽略）防止反向代理断掉静默连接；响应带 `Cache-Control: no-store` 与 `X-Accel-Buffering: no`，避免中间层缓存或整段缓冲把「实时」变成批量。断线由浏览器自动重连，页面在浏览器放弃重连（如 401 / 429）时提示断开。
 
 若历史数据偏小（老库升级前落的明细没被覆盖、或补过明细后没重算），用 `python3 scripts/rollup_hourly.py --apply` 一次性重算（默认预览、**写库前自动备份**、幂等）。脚本先报告缺口与两侧时间跨度，并提示**明细已过保留期无法还原**的区间。
 
