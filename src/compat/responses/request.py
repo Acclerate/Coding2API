@@ -34,6 +34,7 @@ from ..openai.request import (
     MAX_TEMPERATURE,
     ChatRequest,
     InvalidRequest,
+    normalize_response_format,
     require_finite_number,
     require_positive_int,
 )
@@ -249,6 +250,10 @@ def _map_response_format(text_config: dict[str, Any]) -> dict[str, Any] | None:
     `{type, json_schema: {name, description?, schema, strict?}}` 嵌套结构。
     只有 verbosity、没有 format 时返回 None（不产生 response_format）。
     无法无损表达的形状显式 400（与模块「不静默降级」一致）。
+
+    校验与归一委托给 `normalize_response_format`（chat 入站用的是同一个）：
+    两条入站协议对 json_schema 的判定必须一致，否则同一个 schema 走
+    `/v1/chat/completions` 被拒、走 `/v1/responses` 放行，纯属口径分叉。
     """
     format = text_config.get("format")
     if format is None:
@@ -261,17 +266,15 @@ def _map_response_format(text_config: dict[str, Any]) -> dict[str, Any] | None:
     if kind != "json_schema":
         raise InvalidRequest(
             f"text.format.type {kind!r} is not supported by this gateway")
-    name = format.get("name")
-    if not isinstance(name, str) or not name:
-        raise InvalidRequest("text.format.name must be a non-empty string")
-    if "schema" not in format:
-        raise InvalidRequest("text.format.schema is required for json_schema")
-    json_schema: dict[str, Any] = {"name": name, "schema": format["schema"]}
+    nested: dict[str, Any] = {"name": format.get("name")}
+    if "schema" in format:
+        nested["schema"] = format["schema"]
     if isinstance(format.get("description"), str):
-        json_schema["description"] = format["description"]
+        nested["description"] = format["description"]
     if isinstance(format.get("strict"), bool):
-        json_schema["strict"] = format["strict"]
-    return {"type": "json_schema", "json_schema": json_schema}
+        nested["strict"] = format["strict"]
+    return normalize_response_format(
+        {"type": "json_schema", "json_schema": nested}, prefix="text.format")
 
 
 def _map_tool_choice(value: Any) -> Any:

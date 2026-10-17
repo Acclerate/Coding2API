@@ -109,6 +109,54 @@ def validate_content_parts(messages: list[Any]) -> None:
                     "must be a non-empty string")
 
 
+def normalize_response_format(value: Any, *,
+                              prefix: str = "response_format") -> dict[str, Any]:
+    """`response_format` 语义收口：只放行 OpenAI 定义的三种形状。
+
+    此前 chat 入站 `raw=dict(body)` 整包透传，`response_format` 既不校验也不
+    归一：畸形的 json_schema（缺 name/schema）会一路打到上游、按 4xx 冷却凭证，
+    未知 type（`{"type": "audio"}` 之类）则被静默当成「上游会懂」。这里在入口
+    显式收口；Responses 出口（`text.format` → 同一形状）复用本函数，两条入站
+    协议不会各写一份而漂移。
+
+    归一后的形状（与官方 openai-python 3.x 的 chat 类型一致）：
+
+    - `{"type": "text"}`
+    - `{"type": "json_object"}`
+    - `{"type": "json_schema", "json_schema": {"name": str, "schema": Any,
+      "description"?: str, "strict"?: bool}}`
+
+    未知 type 显式 400（不静默降级）；`json_schema` 内的未知字段丢弃——
+    它们既非 chat 规范、也无上游认，留着只是把客户端笔误透传出去。
+
+    `prefix` 只影响报错文案里的字段路径（Responses 侧传 `text.format`），
+    校验与输出形状完全一致。
+    """
+    if not isinstance(value, dict):
+        raise InvalidRequest(f"{prefix} must be an object")
+    kind = value.get("type")
+    if kind in ("text", "json_object"):
+        return {"type": kind}
+    if kind != "json_schema":
+        raise InvalidRequest(
+            f"{prefix}.type {kind!r} is not supported by this gateway")
+    schema = value.get("json_schema")
+    if not isinstance(schema, dict):
+        raise InvalidRequest(
+            f"{prefix}.json_schema must be an object for json_schema")
+    name = schema.get("name")
+    if not isinstance(name, str) or not name:
+        raise InvalidRequest(f"{prefix}.name must be a non-empty string")
+    if "schema" not in schema:
+        raise InvalidRequest(f"{prefix}.schema is required for json_schema")
+    normalized: dict[str, Any] = {"name": name, "schema": schema["schema"]}
+    if isinstance(schema.get("description"), str):
+        normalized["description"] = schema["description"]
+    if isinstance(schema.get("strict"), bool):
+        normalized["strict"] = schema["strict"]
+    return {"type": "json_schema", "json_schema": normalized}
+
+
 @dataclass(slots=True)
 class ChatRequest:
     model: str
@@ -143,4 +191,7 @@ def parse_chat_request(body: Any) -> ChatRequest:
     for key in ("max_tokens", "max_completion_tokens"):
         if key in raw and raw[key] is not None:
             require_positive_int(raw[key], key, maximum=MAX_OUTPUT_TOKENS)
+    if raw.get("response_format") is not None:
+        # 收口而非整包透传：畸形/未知形状在这里 400，别让它打到上游把凭证打凉
+        raw["response_format"] = normalize_response_format(raw["response_format"])
     return ChatRequest(model=model or "", messages=messages, stream=stream, raw=raw)
