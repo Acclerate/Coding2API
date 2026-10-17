@@ -136,6 +136,17 @@ class Settings(BaseSettings):
     # 篡改活动数据（处罚为取消资格并追回礼品），开启前请评估账号风险；上游改版即失效。
     activity_report_enabled: bool = False
     activity_report_hour: int = 10          # 本地（北京）时间整点窗口内执行一次
+    # 每日签到的执行时点（本地时间，HH:MM，逗号分隔；留空 = 全天每 10 分钟
+    # 检查一次的旧行为）。命中时点才跑一轮：上游签到本身幂等（回 ALREADY），
+    # 但每次都要打 status+claim+回查三次，全天轮询纯属白打。抖动见下一项。
+    checkin_times: str = ""
+    # 签到抖动（分钟，0 = 不抖）：在时点**之前**提前一个随机偏移执行，避免
+    # 一堆部署在同一分钟齐刷刷打上游。按「日期 + 时点」记去重键，抖动只改
+    # 执行时刻、不改归属，不会让同一时点跑两次。
+    checkin_jitter_minutes: int = 0
+    # 服务端日志页（「任务与配置」→ 日志）：进程内环形缓冲的保留行数，
+    # 0 = 关闭该页（端点返回 404）。只收本进程 logging 记录，不读文件。
+    log_buffer_lines: int = 500
     # 运维告警：周期评估四类风险，命中即落 alert_events 并可选推送
     # webhook。webhook 留空 = 只留站内记录、不外推。
     alert_enabled: bool = True

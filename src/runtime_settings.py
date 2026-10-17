@@ -208,6 +208,19 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("activity_report_hour", int, "活跃上报时点（0-23）",
                "本地（北京）时间整点窗口；该小时内每 10 分钟检查一次，每号每天"
                "最多补发一条。", minimum=0, maximum=23, task="activity"),
+    HotSetting("checkin_times", str, "签到时点",
+               "本地时间 HH:MM，逗号分隔（如 `09:37,21:10`）。命中时点才跑一轮"
+               "签到；留空 = 全天每 10 分钟检查一次（旧行为）。上游签到幂等，"
+               "多设几个时点只是多几次重试机会。", task="checkin"),
+    HotSetting("checkin_jitter_minutes", int, "签到抖动（分钟）",
+               "在时点**之前**提前一个 0..N 分钟的随机偏移执行，避免多部署"
+               "同一分钟齐打上游。按「日期 + 时点」去重，抖动不会让同一时点"
+               "跑两次。0 = 不抖。", minimum=0, maximum=1440, task="checkin"),
+    HotSetting("log_buffer_lines", int, "日志页保留行数",
+               "「任务与配置」→ 日志页的进程内环形缓冲行数（只收本进程日志，"
+               "不读文件）。0 = 关闭该页（端点返回 404）。日志行发出前经脱敏"
+               "白名单过滤，含 token / secret / authorization / cookie 的行整行丢弃。",
+               minimum=0, group="observability"),
     # 运维告警：全部归到「运维告警」任务卡片下——改阈值时人就在看
     # 这个任务最近报了什么。webhook 留空 = 只留站内记录、不外推。
     HotSetting("alert_enabled", bool, "运维告警开关",
@@ -742,6 +755,18 @@ class RuntimeSettings:
     @property
     def activity_report_hour(self) -> int:
         return int(self.get("activity_report_hour"))
+
+    @property
+    def checkin_times(self) -> str:
+        return str(self.get("checkin_times"))
+
+    @property
+    def checkin_jitter_minutes(self) -> int:
+        return int(self.get("checkin_jitter_minutes"))
+
+    @property
+    def log_buffer_lines(self) -> int:
+        return int(self.get("log_buffer_lines"))
 
     # ---------------------------------------------------------- 运维告警
 

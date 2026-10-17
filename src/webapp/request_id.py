@@ -15,8 +15,10 @@ from __future__ import annotations
 from ..request_context import (
     REQUEST_ID_HEADER,
     resolve_request_id,
+    session_id_from_headers,
     set_api_key_id,
     set_request_id,
+    set_session_id,
 )
 
 
@@ -39,6 +41,9 @@ class RequestIdMiddleware:
             return
         request_id = resolve_request_id(_header(scope, b"x-request-id"))
         set_request_id(request_id)
+        # 会话标识（E1）：与请求 ID 同一中间件设置即可——它只被会话粘性读，
+        # 且必须在校验之前落进上下文（executor 早于任何业务层）。
+        set_session_id(session_id_from_headers(scope.get("headers", ())))
         header = (REQUEST_ID_HEADER.lower().encode("latin-1"),
                   request_id.encode("latin-1"))
 
@@ -51,7 +56,9 @@ class RequestIdMiddleware:
         try:
             await self.app(scope, receive, send_with_header)
         finally:
-            # 复原 Key 归属：contextvar 由鉴权依赖设置，而流式响应体在依赖
-            # 的 finally **之后**才发送，只靠依赖复原会让「响应体期间」的
-            # 后台写入串到下一个请求。中间件包住整个 ASGI 调用，最可靠。
+            # 复原 Key 归属与会话标识：contextvar 由鉴权依赖/本中间件设置，而
+            # 流式响应体在依赖的 finally **之后**才发送，只靠依赖复原会让
+            # 「响应体期间」的后台写入串到下一个请求。中间件包住整个 ASGI
+            # 调用，最可靠。
             set_api_key_id(None)
+            set_session_id(None)
