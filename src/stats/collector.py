@@ -78,14 +78,21 @@ class UsageEvent:
 class StatsCollector:
     def __init__(self, db, *,
                  prices: Callable[[], Mapping[str, tuple[float, float, float]]] | None = None,
-                 usd_cny_rate: Callable[[], float] | None = None) -> None:
+                 usd_cny_rate: Callable[[], float] | None = None,
+                 on_record: Callable[[dict[str, Any]], None] | None = None) -> None:
         """`prices` / `usd_cny_rate` 是零参取值器（热更：每写一条现读当前价表
         与汇率）。两者都缺省为 None = 不估算成本（既有测试与老装配保持原行为，
         cost 两列恒为 NULL）。
+
+        `on_record` 是「明细落库后」的回调（装配时接 `LiveEventHub.publish`，
+        供 `GET /api/stats/events/stream` 的 SSE 实时流）。回调拿到的是**已脱敏**
+        的行字典（与 `/api/stats/events` 同一字段集，另带 rowid），且异常被吞
+        ——统计写入绝不能因为一个订阅者出问题而失败。
         """
         self._db = db
         self._prices = prices
         self._usd_cny_rate = usd_cny_rate
+        self._on_record = on_record
         # 进程内「失败请求 × 原因」计数（供 /metrics 的 errors_total）。
         # 为什么不落库、不读明细表：① usage_hourly 没有 error_type 维度；
         # ② usage_events 只留 90 天，用它算 `_total` 会让计数器随裁剪**下降**
@@ -169,7 +176,7 @@ class StatsCollector:
             key = (event.provider, event.error_type)
             self._error_totals[key] = self._error_totals.get(key, 0) + 1
         with self._db.transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO usage_events (id, ts, username, provider, credential_id, model, "
                 "ok, error_type, input_tokens, output_tokens, reasoning_tokens, cached_tokens, "
                 "credit, credit_estimated, cost_usd, cost_cny, latency_ms, ttfb_ms, "
@@ -185,6 +192,46 @@ class StatsCollector:
             # retention rollup 才可见（否则刚发生的请求统计页面显示 0）。
             # 增量累加与全量重算等价：rollup 后续会把这一小时算成同样的值。
             self._bump_hourly(conn, event)
+            # 事务内拿 rowid，提交后再广播：订阅者拿到的是「已落库」的行，
+            # 与随后刷新 `/api/stats/events` 看到的是同一条（含 rowid 游标）。
+            rowid = cursor.lastrowid
+        self._notify(rowid, event)
+
+    def _notify(self, rowid: int | None, event: UsageEvent) -> None:
+        """把刚写入的明细推给实时流订阅者（未装配 / 出问题都不影响写入）。
+
+        广播在**事务提交之后**：订阅者收到就能立刻用 rowid 接着翻页，不会
+        看到一条回滚掉的记录。回调异常一律吞掉——统计是旁路，绝不能让它
+        把聊天响应搞失败。
+        """
+        if self._on_record is None:
+            return
+        payload = {
+            "rowid": rowid,
+            "id": event.id,
+            "ts": event.ts,
+            "username": event.username,
+            "provider": event.provider,
+            "model": event.model,
+            "credential_id": event.credential_id,
+            "ok": int(event.ok),
+            "error_type": event.error_type,
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+            "reasoning_tokens": event.reasoning_tokens,
+            "cached_tokens": event.cached_tokens,
+            "credit": event.credit,
+            "credit_estimated": int(event.credit_estimated),
+            "cost_usd": event.cost_usd,
+            "cost_cny": event.cost_cny,
+            "latency_ms": event.latency_ms,
+            "ttfb_ms": event.ttfb_ms,
+            "request_id": event.request_id,
+        }
+        try:
+            self._on_record(payload)
+        except Exception as error:  # noqa: BLE001 - 实时流失败不影响统计写入
+            logger.warning("实时事件广播失败: %s", error)
 
     @staticmethod
     def _bump_hourly(conn, event: UsageEvent) -> None:

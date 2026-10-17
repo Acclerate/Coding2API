@@ -194,3 +194,60 @@ def test_error_totals_counts_only_controlled_types(stats):
     # 稳定排序：按 (provider, kind)
     assert collector.error_totals() == [("codebuddy", "upstream_error", 1),
                                         ("trae", "rate_limit", 1)]
+
+
+# ------------------------------------------------------------ 实时流回调
+
+
+def test_record_publishes_redacted_row_after_commit(stats):
+    """落库后广播：拿到 rowid 与已脱敏字段（不含提示词/请求头）。"""
+    _collector, _query = stats
+    from src.stats.collector import StatsCollector
+
+    published: list[dict] = []
+    collector = StatsCollector(stats[0]._db, on_record=published.append)
+    collector.record(username="alice", provider="trae", model="glm-5.2", ok=True,
+                     credential_id="cred-1", input_tokens=10, output_tokens=20,
+                     latency_ms=100, now=1234)
+    assert len(published) == 1
+    row = published[0]
+    assert row["rowid"] > 0
+    assert row["ts"] == 1234 and row["username"] == "alice"
+    assert row["provider"] == "trae" and row["model"] == "glm-5.2"
+    assert row["credential_id"] == "cred-1" and row["ok"] == 1
+    assert row["input_tokens"] == 10 and row["output_tokens"] == 20
+    assert row["latency_ms"] == 100
+    # 广播的字段集与 /api/stats/events 一致：不含 credential_name（端点按角色补）
+    assert "credential_name" not in row
+    assert "prompt" not in row and "headers" not in row
+
+
+def test_record_without_callback_is_silent(stats):
+    """未装配实时流（脚本 / 老装配）：写入照常，不报错。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert query.overview(username="u")["requests"] == 1
+
+
+def test_record_swallows_publish_failure(stats):
+    """订阅者出问题不能让统计写入（进而让聊天响应）失败。"""
+    from src.stats.collector import StatsCollector
+
+    def boom(_row):
+        raise RuntimeError("subscriber exploded")
+
+    collector = StatsCollector(stats[0]._db, on_record=boom)
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert stats[1].overview(username="u")["requests"] == 1
+
+
+def test_record_publishes_normalized_model_and_error_type(stats):
+    """广播的是**归一后**的值（与明细表一致），不是调用方原始入参。"""
+    from src.stats.collector import StatsCollector
+
+    published: list[dict] = []
+    collector = StatsCollector(stats[0]._db, on_record=published.append)
+    collector.record(username="u", provider="trae", model="x" * 100, ok=False,
+                     error_type="not-controlled")
+    assert published[0]["model"] == "unknown"
+    assert published[0]["error_type"] is None

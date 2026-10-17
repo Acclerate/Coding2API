@@ -569,6 +569,19 @@ class CredentialRepository:
         plaintext = self._cipher.decrypt(row["data_enc"])
         return json.loads(plaintext.decode("utf-8"))
 
+    def nickname_of(self, credential_id: str) -> str | None:
+        """单条凭证昵称（供实时流按需补名字，避免每事件拉整份列表）。
+
+        昵称来自全局共享池（常含邮箱/手机），调用方必须自己保证「只对
+        admin/operator 解析」，与 `/api/stats/events` 同口径。凭证已删除 /
+        无昵称时返回 None（前端回落到 ID 前缀）。
+        """
+        row = self._db.connect().execute(
+            "SELECT nickname FROM credentials WHERE id = ?", (credential_id,)).fetchone()
+        if row is None or not row["nickname"]:
+            return None
+        return str(row["nickname"])
+
     def list_all(
         self, *, expiring_window: int = 0, expiring_secondary_window: int = 0,
         now: int | None = None, sort: str | None = None, order: str | None = None,

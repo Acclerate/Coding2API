@@ -42,6 +42,7 @@ from ..db.repo import (
 from ..engine.executor import Executor
 from ..engine.limits import LimitGuard
 from ..runtime_settings import RuntimeSettings
+from ..stats.live import LiveEventHub
 from ..stats.query import StatsQuery
 
 # 首登强制改密（must_change_password=1）时放行的端点，精确白名单。
@@ -75,6 +76,9 @@ class Services:
     users: Any                                  # DbUserStore
     stats_query: StatsQuery
     login_throttle: LoginThrottle
+    # 逐请求事件广播（SSE 实时流）：`GET /api/stats/events/stream` 订阅它，
+    # `StatsCollector.record` 落库后 publish。进程内、单进程部署。
+    live_events: LiveEventHub
     upstream_auth: dict[str, Any]
     model_aliases: dict[str, dict[str, str]]
     schedule_probe: Callable[[str], None]

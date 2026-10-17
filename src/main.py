@@ -98,6 +98,7 @@ from .provider.trae.client import TraeClient, TraeProvider
 from .provider.zen.client import ZenClient, ZenProvider
 from .runtime_settings import load_runtime_settings
 from .stats.collector import StatsCollector
+from .stats.live import LiveEventHub
 from .stats.query import StatsQuery
 from .tasks.backup import BackupTask
 from .tasks.pacer import Pacer
@@ -427,6 +428,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # provider → {小写模型名: 上游原始 id}；api/models.list_models 拉取后就地更新，
     # executor 发请求前把归一名映射回各上游的原始大小写
     model_aliases: dict[str, dict[str, str]] = {}
+    # 逐请求事件广播：StatsCollector 写入明细后 publish，SSE 实时流订阅。
+    # 进程内即可——明细写入与订阅都在同一个进程（单进程 SQLite 部署）。
+    live_events = LiveEventHub()
     # 模型目录原始表的**同一引用**交给 executor（credit_rate 查询）与 Services
     # （list_models 缓存）——这里先建空 dict，Services 装配时直接挂它
     model_cache: dict[str, dict[str, Any]] = {}
@@ -451,7 +455,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     except Exception as error:  # noqa: BLE001 - 价表是加速手段，失败不阻断服务
         logger.warning("恢复落盘模型目录失败: %s", error)
     stats_collector = StatsCollector(
-        db, prices=lambda: price_table, usd_cny_rate=lambda: runtime.usd_cny_rate)
+        db, prices=lambda: price_table, usd_cny_rate=lambda: runtime.usd_cny_rate,
+        on_record=live_events.publish)
     # 凭证级限额护栏：配置表 + 当日用量聚合注入 LimitGuard（快照缓存），
     # executor 选号前用它过滤触顶候选；管理台改完 invalidate() 立即生效。
     limits_repo = LimitsRepository(db)
@@ -644,6 +649,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.state.stats_collector = stats_collector
     app.state.growth_events = growth_events
     app.state.stats_query = StatsQuery(db)
+    # SSE 实时流的订阅中心（与 StatsCollector 的 on_record 同源）
+    app.state.live_events = live_events
     app.state.upstream_auth = _upstream_auth(registry, config)
     app.state.pending_probes = []
     app.state.model_aliases = model_aliases
@@ -705,6 +712,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         limit_guard=limit_guard,
         stats_query=app.state.stats_query,
         login_throttle=app.state.login_throttle,
+        live_events=live_events,
         upstream_auth=app.state.upstream_auth,
         model_aliases=model_aliases,
         # executor 拿的就是这一份引用：目录恢复 / 拉取 / TTL 刷新写进来后，

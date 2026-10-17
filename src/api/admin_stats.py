@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+import json
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
+from typing import Any
 
-from fastapi import APIRouter, Depends
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..auth.rbac import Principal, require_operator
+from ..compat.openai.errors import error_payload
 from ..stats.csv import CSV_BOM, EXPORT_HEADERS, csv_line, event_cells
+from ..stats.live import LiveEventHub, Subscription, TooManySubscribers
 from ..stats.query import EXPORT_MAX_ROWS
 from .deps import Services, principal_from_request
+
+# 心跳间隔：代理/浏览器对「长时间没数据」的连接会主动断（nginx 默认 60s）。
+# 15s 一条注释帧，既保活又不至于把流量抬起来。
+HEARTBEAT_SECONDS = 15.0
 
 
 def _scope(principal: Principal, username: str | None) -> str | None:
@@ -33,6 +42,70 @@ def _csv_stream(rows: list[dict]) -> Iterator[str]:
     yield CSV_BOM + csv_line(list(EXPORT_HEADERS))
     for row in rows:
         yield csv_line(event_cells(row))
+
+
+def _event_matches(event: dict[str, Any], *, username: str | None,
+                   provider: str | None, model: str | None,
+                   credential_id: str | None) -> bool:
+    """实时行是否属于该订阅者的过滤条件（与 `/api/stats/events` 同口径）。
+
+    过滤放在**订阅者侧**而不是发布侧：一条事件可能同时被多个订阅者看到，
+    各自的条件不同（一人看全量、一人钻取某渠道）。`None` = 不限制。
+    """
+    if username is not None and event.get("username") != username:
+        return False
+    if provider is not None and event.get("provider") != provider:
+        return False
+    if model is not None and event.get("model") != model:
+        return False
+    return not (credential_id is not None and event.get("credential_id") != credential_id)
+
+
+def _sse_frame(event: dict[str, Any]) -> str:
+    """一帧 SSE：`data: <json>` + 空行。
+
+    不加 `event:` 名，前端用 `onmessage` 统一处理；JSON 不转义非 ASCII，
+    与其它统计端点（`JSONResponse`）保持同一可读性。
+    """
+    return f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+async def _stream_events(request: Request, hub: LiveEventHub,
+                         subscription: Subscription, *,
+                         username: str | None, provider: str | None,
+                         model: str | None, credential_id: str | None,
+                         resolve_name: Callable[[str], str | None] | None,
+                         heartbeat: float = HEARTBEAT_SECONDS) -> AsyncIterator[str]:
+    """SSE 主体：订阅 → 逐条下发 → 心跳 → 断开即注销。
+
+    `finally` 里注销是硬要求：客户端关标签页时生成器被取消，不注销的话
+    订阅槽位会泄漏，8 次之后所有人 429。
+    """
+    try:
+        # 先发一条注释帧：浏览器 EventSource 收到任何字节才进入 OPEN，
+        # 否则打开面板后要等到第一条真实事件才算「已连接」。
+        yield ": connected\n\n"
+        while True:
+            if await request.is_disconnected():
+                return
+            batch = subscription.drain()
+            if batch:
+                for event in batch:
+                    if not _event_matches(event, username=username, provider=provider,
+                                          model=model, credential_id=credential_id):
+                        continue
+                    if resolve_name is not None and event.get("credential_id"):
+                        event = {**event,
+                                 "credential_name": resolve_name(event["credential_id"])}
+                    yield _sse_frame(event)
+                continue
+            try:
+                await asyncio.wait_for(subscription.wakeup.wait(), timeout=heartbeat)
+            except TimeoutError:
+                # 注释帧（以 `:` 开头）被 EventSource 忽略，只用于保活
+                yield ": heartbeat\n\n"
+    finally:
+        hub.unsubscribe(subscription)
 
 
 def create_router(services: Services) -> APIRouter:
@@ -139,5 +212,42 @@ def create_router(services: Services) -> APIRouter:
                                   provider=provider, model=model,
                                   credential_id=credential_id,
                                   include_credential_name=names)
+
+    @router.get("/api/stats/events/stream")
+    async def stats_events_stream(request: Request,
+                                  principal=Depends(principal_from_request),
+                                  username: str | None = None,
+                                  provider: str | None = None,
+                                  model: str | None = None,
+                                  credential_id: str | None = None):
+        """明细实时流（SSE）：`StatsCollector.record` 落库后逐条推送。
+
+        与 `/api/stats/events` 同一套作用域与过滤（`username` / `provider` /
+        `model` / `credential_id`），只是「新记录主动推」而不是翻页拉。凭证昵称
+        仅 admin/operator 解析（与明细端点同口径）；`since`/`until` 不参与——
+        实时流没有时间窗语义，客户端自己按需丢弃。
+
+        订阅数超上限回 429（不排队）：每个订阅者占一条长连接，静默接受会
+        把内存和连接数拖到不可控。`Cache-Control: no-store` + `X-Accel-Buffering:
+        no` 防止中间层缓存或整段缓冲（否则「实时」变成批量）。
+        """
+        try:
+            subscription = services.live_events.subscribe()
+        except TooManySubscribers:
+            return JSONResponse(
+                status_code=429,
+                content=error_payload("too many live subscribers",
+                                      "rate_limit_exceeded", 429),
+                headers={"Retry-After": "10"})
+        scope = _scope(principal, username)
+        resolve_name = services.credentials.nickname_of if principal.is_operator else None
+        return StreamingResponse(
+            _stream_events(request, services.live_events, subscription,
+                           username=scope, provider=provider, model=model,
+                           credential_id=credential_id, resolve_name=resolve_name),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
+                     "Connection": "keep-alive"},
+        )
 
     return router
