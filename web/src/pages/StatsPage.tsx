@@ -7,6 +7,7 @@ import {
   useStatsByModel,
   useStatsByUser,
   useStatsByCredential,
+  useStatsEventStream,
   useStatsEvents,
   useStatsModelTimeline,
   useStatsOverview,
@@ -28,9 +29,11 @@ import { buildCustomRange, toLocalInput } from "../lib/customRange";
 import type { GroupStats, StatsDrill, UsageEventRow } from "../api/types";
 import {
   Button,
+  Checkbox,
   Empty,
   Field,
   Input,
+  Label,
   Metric,
   Notice,
   Panel,
@@ -42,6 +45,9 @@ import {
   TableRow,
   Tabs,
 } from "../ui";
+
+/** 实时流前端缓冲上限：只保留最近 50 条（新→旧），页面长开也不会无限增长。 */
+const LIVE_MAX_ROWS = 50;
 
 const RANGES = [
   { value: "24h", label: "最近 24 小时", seconds: 86400 },
@@ -77,6 +83,15 @@ const TOKEN_COLUMNS = [
 const LATENCY_COLUMNS = [
   { key: "latency_ms", label: "耗时" },
   { key: "ttfb_ms", label: "首字" },
+] as const;
+
+/**
+ * 分组表请求合并列的子列：请求数 / 成功数（成功率是派生只读值，不可排序）。
+ * 与 Token 列同例：默认只显示请求数，悬停补全成功数与成功率。
+ */
+const GROUP_REQUEST_COLUMNS = [
+  { key: "requests", label: "请求数" },
+  { key: "ok_count", label: "成功数" },
 ] as const;
 
 /**
@@ -194,6 +209,10 @@ export function StatsPage() {
   // 导出反馈（行数/截断/失败），一次性展示，再次导出即覆盖
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  // 实时流：开关打开后用 SSE 订阅「刚落库」的明细（与翻页结果分开展示，
+  // 避免把「实时行」和「历史分页」混成一张会跳动的表）。
+  const [live, setLive] = useState(false);
+  const [liveRows, setLiveRows] = useState<UsageEventRow[]>([]);
   // 游标分页只在「按 rowid 降序」时成立：换列即改用 offset 分页
   const cursorMode = eventSort.sort === "time" && eventSort.order === "desc";
   const eventBefore = cursorMode
@@ -227,6 +246,22 @@ export function StatsPage() {
     { provider: drill.provider, model: drill.model,
       credential_id: drill.credential_id });
   const eventRows = events.data?.events ?? [];
+  // 实时流：只保留最近 50 条（新→旧）。缓冲由前端自己管：页面长时间开着时
+  // 不无限增长，且「刚发生的」永远在最上面。
+  const liveStatus = useStatsEventStream({
+    enabled: live,
+    username: drill.username,
+    filters: { provider: drill.provider, model: drill.model,
+               credential_id: drill.credential_id },
+    onEvent: (row) => {
+      setLiveRows((prev) => [row, ...prev].slice(0, LIVE_MAX_ROWS));
+    },
+  });
+  const toggleLive = (value: boolean) => {
+    setLive(value);
+    // 关掉再打开 = 重新开始看「现在」：清空旧行，避免混进上一段的记录
+    if (!value) setLiveRows([]);
+  };
   // 游标模式看 next_before；offset 模式看 total（还有下一页 = 已加载 < 总数）
   const hasNextPage = cursorMode
     ? events.data
@@ -520,13 +555,9 @@ export function StatsPage() {
                               columnKey="group" active={groupSort.sort === "group"}
                               direction={groupSort.order} onToggle={groupSort.toggle}
                               testId="sort-group" />
-                <SortableHead label="请求数" columnKey="requests"
-                              active={groupSort.sort === "requests"} direction={groupSort.order}
-                              onToggle={groupSort.toggle} align="right" testId="sort-requests" />
-                <SortableHead label="成功数" columnKey="ok_count"
-                              active={groupSort.sort === "ok_count"} direction={groupSort.order}
-                              onToggle={groupSort.toggle} align="right" testId="sort-ok_count" />
-                <TableHead className="text-right">成功率</TableHead>
+                <SortMenuHead label="请求" options={[...GROUP_REQUEST_COLUMNS]}
+                              activeKey={groupSort.sort} direction={groupSort.order}
+                              onToggle={groupSort.toggle} testId="group-sort-requests" />
                 <SortableHead label="Credit" columnKey="credit"
                               active={groupSort.sort === "credit"} direction={groupSort.order}
                               onToggle={groupSort.toggle} align="right" testId="sort-credit" />
@@ -592,17 +623,23 @@ export function StatsPage() {
                       keyValue
                     )}
                   </TableCell>
-                  <TableCell label="请求数" className="text-right tabular-nums">
-                    {formatNumber(row.requests)}
-                  </TableCell>
-                  <TableCell label="成功数" className="text-right tabular-nums">
-                    {formatNumber(row.ok_count)}
-                  </TableCell>
-                  {/* 成功率：请求数为 0 无意义（不渲染 0% 冒充数据） */}
-                  <TableCell label="成功率" className="text-right tabular-nums" data-testid="group-success-rate">
-                    {row.requests > 0
-                      ? `${((row.ok_count / row.requests) * 100).toFixed(1)}%`
-                      : "—"}
+                  {/* 请求合并列：默认「请求数 · 成功率」，悬停补成功数。
+                      成功率 = 成功 ÷ 请求，请求数为 0 时给 —（不渲染 0% 冒充数据）。 */}
+                  <TableCell label="请求" className="text-right">
+                    <Tip content={`请求 ${formatNumber(row.requests)}`
+                      + ` · 成功 ${formatNumber(row.ok_count)}`
+                      + ` · 成功率 ${row.requests > 0
+                        ? `${((row.ok_count / row.requests) * 100).toFixed(1)}%`
+                        : "—"}`}>
+                      <span className="tabular-nums">
+                        {formatNumber(row.requests)}
+                        <span className="text-muted-foreground" data-testid="group-success-rate">
+                          {" · "}{row.requests > 0
+                            ? `${((row.ok_count / row.requests) * 100).toFixed(1)}%`
+                            : "—"}
+                        </span>
+                      </span>
+                    </Tip>
                   </TableCell>
                   <TableCell label="Credit" className="text-right tabular-nums">
                     {formatCredit(row.credit, row.credit_estimated)}
@@ -674,6 +711,12 @@ export function StatsPage() {
       <Panel data-testid="events-panel" title="请求明细" action={
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>共 {formatNumber(overview.data?.requests)} 条 · 保留 90 天</span>
+          {/* 实时流：默认关闭（翻页看历史是常态），打开后追加「刚落库」的行 */}
+          <Label className="w-fit cursor-pointer gap-1.5 text-xs font-normal text-muted-foreground">
+            <Checkbox checked={live} data-testid="events-live-toggle"
+                      onCheckedChange={(value) => toggleLive(value === true)} />
+            实时
+          </Label>
           {/* 导出限 admin/operator：整份明细落盘比翻页浏览的暴露面大 */}
           {session.is_operator && (
             <Button size="sm" variant="ghost" data-testid="events-export"
@@ -703,6 +746,79 @@ export function StatsPage() {
         {exportNotice && (
           <div data-testid="export-notice">
             <Notice tone="muted" className="mb-3 text-xs">{exportNotice}</Notice>
+          </div>
+        )}
+        {live && (
+          <div className="mb-4 rounded-md border border-border/70" data-testid="events-live">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/70 px-3 py-2 text-xs text-muted-foreground">
+              <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+                <span aria-hidden
+                      className={liveStatus === "live"
+                        ? "size-1.5 rounded-full bg-ok" : "size-1.5 rounded-full bg-muted-foreground"} />
+                实时明细
+              </span>
+              <span role="status">
+                {liveStatus === "error"
+                  ? "实时连接已断开（可能订阅数已满或会话过期），请刷新重试。"
+                  : liveRows.length === 0
+                    ? "已连接，等待新的请求…"
+                    : `已收到 ${liveRows.length} 条（最多保留 ${LIVE_MAX_ROWS} 条）`}
+              </span>
+              <span className="ml-auto">仅推送本页当前筛选范围内的新请求</span>
+            </div>
+            {liveRows.length > 0 && (
+              <Table data-testid="events-live-table" cards>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>时间</TableHead>
+                    {session.is_operator && <TableHead>用户</TableHead>}
+                    <TableHead>渠道</TableHead>
+                    <TableHead>凭证</TableHead>
+                    <TableHead>模型</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead className="text-right">Token</TableHead>
+                    <TableHead className="text-right">Credit</TableHead>
+                    <TableHead className="text-right">成本</TableHead>
+                    <TableHead className="text-right">延迟</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {liveRows.map((row) => (
+                    <TableRow key={`live-${row.rowid}`} data-testid="live-row">
+                      <TableCell label="时间" className="whitespace-nowrap tabular-nums">
+                        {formatTime(row.ts)}
+                      </TableCell>
+                      {session.is_operator && (
+                        <TableCell label="用户">{row.username}</TableCell>
+                      )}
+                      <TableCell label="渠道">
+                        <span className="inline-flex items-center gap-1.5">
+                          <ProviderIcon provider={row.provider} size={13} />
+                          {providerLabel(row.provider)}
+                        </span>
+                      </TableCell>
+                      <TableCell label="凭证" className="max-w-40 truncate">
+                        {credentialCellLabel(row.credential_name, row.credential_id)}
+                      </TableCell>
+                      <TableCell label="模型" className="max-w-48 truncate">
+                        {row.model}
+                      </TableCell>
+                      <TableCell label="状态">{statusCell(row)}</TableCell>
+                      <TableCell label="Token" className="text-right">{tokenCell(row)}</TableCell>
+                      <TableCell label="Credit" className="text-right tabular-nums">
+                        {formatCredit(row.credit, row.credit_estimated)}
+                      </TableCell>
+                      <TableCell label="成本" className="text-right tabular-nums">
+                        {formatMoney(row.cost_cny, "CNY")}
+                      </TableCell>
+                      <TableCell label="延迟" className="text-right">
+                        {latencyCell(row)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
           </div>
         )}
         {events.isError ? (

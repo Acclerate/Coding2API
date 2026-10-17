@@ -285,6 +285,12 @@ export const api = {
     request<StatsEventsResponse>(
       `/api/stats/events${query({ username, since, until, before, limit, sort, order,
                                   offset, ...filters })}`),
+  /** 明细实时流（SSE）地址：交给 `EventSource` 订阅，页面不自己拼查询串。
+   *
+   * `EventSource` 自动带同源 Cookie、断线重连，但不支持自定义头（CSRF 只对
+   * 写请求要求，GET 不受影响）。`username` 是作用域收窄，其余是明细过滤。 */
+  statsEventsStreamUrl: (username?: string, filters?: StatsEventFilters) =>
+    `/api/stats/events/stream${query({ username, ...filters })}`,
   /** 明细 CSV 导出：返回文件内容与截断标记（响应头），由页面触发下载。 */
   statsEventsCsv: async (username?: string, since?: number, until?: number,
                          filters?: StatsEventFilters): Promise<CsvExport> => {

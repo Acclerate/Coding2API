@@ -106,6 +106,17 @@ describe("StatsPage 分组与明细", () => {
         .at(-1)!;
       expect(last).toContain("sort=group");
     });
+
+    // 请求合并列下拉选「成功数」→ 后端 sort=ok_count
+    await userEvent.click(screen.getByTestId("group-sort-requests"));
+    await userEvent.click(screen.getByTestId("group-sort-requests-ok_count"));
+    await waitFor(() => {
+      const last = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((url) => url.includes("/api/stats/by-provider"))
+        .at(-1)!;
+      expect(last).toContain("sort=ok_count");
+    });
   });
 
   it("分组统计排序：点延迟列头按均值/P95 重新取数", async () => {

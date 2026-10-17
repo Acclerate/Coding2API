@@ -156,3 +156,54 @@ export async function expandCredentialGroups() {
 }
 
 export { userEvent };
+
+/** `EventSource` 替身：测试里手动触发 `message` / `error`，并记录 close 调用。
+ *
+ * jsdom 没有 EventSource，SSE 相关用例需要它。`instances` 让用例断言「打开
+ * 开关才建连、关闭即 close、换过滤重建」。
+ */
+export class MockEventSource {
+  static CLOSED = 2;
+  static instances: MockEventSource[] = [];
+
+  readonly url: string;
+  readyState = 0;
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  closed = false;
+
+  constructor(url: string) {
+    this.url = url;
+    MockEventSource.instances.push(this);
+  }
+
+  /** 推一条事件（等价于服务端发一帧 `data: {...}`）。 */
+  emit(row: unknown) {
+    this.onmessage?.({ data: JSON.stringify(row) } as MessageEvent<string>);
+  }
+
+  /** 推一帧坏数据（半截 JSON），验证页面丢弃而不崩。 */
+  emitRaw(data: string) {
+    this.onmessage?.({ data } as MessageEvent<string>);
+  }
+
+  fail(readyState = 1) {
+    this.readyState = readyState;
+    this.onerror?.(new Event("error"));
+  }
+
+  close() {
+    this.closed = true;
+    this.readyState = MockEventSource.CLOSED;
+  }
+
+  static reset() {
+    MockEventSource.instances = [];
+    vi.unstubAllGlobals();
+    vi.stubGlobal("EventSource", MockEventSource);
+  }
+
+  static last() {
+    return MockEventSource.instances[MockEventSource.instances.length - 1];
+  }
+}

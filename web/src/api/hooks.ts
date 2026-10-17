@@ -1,10 +1,12 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type {
   CredentialsResponse,
   NavBadges,
   StatsEventFilters,
   StatsMetric,
+  UsageEventRow,
 } from "../api/types";
 /** Query key 约定：所有管理数据以 ["admin", username, ...] 开头。 */
 export function adminKey(username: string | undefined, ...rest: unknown[]) {
@@ -283,8 +285,64 @@ export function useStatsEvents(username?: string, since?: number, until?: number
   });
 }
 
-/** 凭证相关写操作：成功后统一失效凭证与统计查询。 */
-export function useCredentialMutation<TArgs, TResult>(
+/** 明细实时流（SSE）：`enabled` 为真时建连，关闭即断开。
+ *
+ * 为什么不用 react-query 轮询：后端在写入事务提交后**主动推**，轮询要么太密
+ * （每秒一次查询）要么不够「实时」。这里只管连接生命周期，收到的行由调用方
+ * 决定怎么展示（页面把它与翻页结果合并）。
+ *
+ * 依赖变化（钻取过滤/作用域）会重建连接：`EventSource` 无法改查询串，只能重开。
+ * 断线由浏览器自动重连，这里只在 `error` 时把状态标成「重连中」，不主动 close。
+ */
+export function useStatsEventStream(options: {
+  enabled: boolean;
+  username?: string;
+  filters?: StatsEventFilters;
+  onEvent: (row: UsageEventRow) => void;
+}) {
+  const { enabled, username, filters, onEvent } = options;
+  const provider = filters?.provider;
+  const model = filters?.model;
+  const credentialId = filters?.credential_id;
+  // 回调放 ref：调用方每次渲染都可能传新函数，不应触发重连
+  const handler = useRef(onEvent);
+  handler.current = onEvent;
+  const [status, setStatus] = useState<"idle" | "live" | "error">("idle");
+
+  useEffect(() => {
+    if (!enabled) {
+      setStatus("idle");
+      return;
+    }
+    if (typeof EventSource === "undefined") {
+      // 老浏览器 / 测试环境未提供：不假装已连上，页面按「不支持」提示
+      setStatus("error");
+      return;
+    }
+    const url = api.statsEventsStreamUrl(username,
+      { provider, model, credential_id: credentialId });
+    const source = new EventSource(url);
+    setStatus("live");
+    source.onmessage = (event: MessageEvent<string>) => {
+      try {
+        handler.current(JSON.parse(event.data) as UsageEventRow);
+      } catch {
+        // 半截帧 / 非 JSON：丢弃这一条，连接继续（不能因一条坏数据断开实时流）
+      }
+    };
+    source.onerror = () => {
+      // readyState=CLOSED 说明浏览器放弃重连（如 401/429）：标成错误
+      setStatus(source.readyState === EventSource.CLOSED ? "error" : "live");
+    };
+    return () => {
+      source.close();
+    };
+  }, [enabled, username, provider, model, credentialId]);
+
+  return status;
+}
+
+/** 凭证相关写操作：成功后统一失效凭证与统计查询。 */export function useCredentialMutation<TArgs, TResult>(
   mutationFn: (args: TArgs) => Promise<TResult>,
   username?: string,
 ) {
