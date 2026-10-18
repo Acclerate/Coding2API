@@ -256,6 +256,39 @@ def test_context_window_ignores_unknown_and_invalid_values():
     assert context_window_for(cache, aliases, "codebuddy", "") is None
 
 
+def test_context_window_raises_trae_to_measured_floor():
+    """TRAE 声明值严重低估（200K/232K，实测约 1M），压缩预算按实测下限抬。
+
+    回归场景：用户发 30 万 token 上下文，上游本可处理，但按声明值算的压缩
+    预算只有 217K → 本地静默压掉真实内容。
+    """
+    cache = {"trae": {"seed-code-pro-0430": Model(id="x", max_input_tokens=232768),
+                      "glm-5.2": Model(id="y", max_input_tokens=200000)}}
+    aliases = {"trae": {"seed-code-pro-0430": "seed-code-pro-0430",
+                        "glm-5.2": "glm-5.2"}}
+    assert context_window_for(cache, aliases, "trae", "seed-code-pro-0430") == 1_048_576
+    assert context_window_for(cache, aliases, "trae", "glm-5.2") == 1_048_576
+
+
+def test_context_window_floor_never_lowers_a_larger_declared_value():
+    """下限只抬不压：声明值本来就比实测下限大时，保留声明值。"""
+    cache = {"trae": {"big": Model(id="b", max_input_tokens=2_000_000)}}
+    assert context_window_for(cache, {"trae": {"big": "big"}}, "trae", "big") == 2_000_000
+
+
+def test_context_window_floor_is_channel_scoped():
+    """抬升只对登记过的渠道生效，不污染其它渠道的预算。"""
+    cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=232768)}}
+    assert context_window_for(cache, {"codebuddy": {"m": "m"}},
+                              "codebuddy", "m") == 232768
+
+
+def test_context_window_floor_still_requires_known_model():
+    """未知模型不因下限表而被凭空赋予窗口（否则会对未知模型乱压）。"""
+    assert context_window_for({"trae": {}}, {"trae": {}}, "trae", "glm-5.2") is None
+    assert context_window_for({}, {}, "trae", "glm-5.2") is None
+
+
 def test_compressor_disabled_is_noop():
     cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=1)}}
     compress = build_context_compressor(

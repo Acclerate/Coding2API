@@ -194,6 +194,7 @@ def health_score(q: Quota | None) -> int | None:
 - **预算**：`模型上限 × safety_ratio − reserve_for_output`。
 - **裁剪**：`system` 永久保留（丢了会改变模型行为）；`assistant.tool_calls` 与其后连续的 `tool` 结果**同组同生共死**（只删一半会让上游报 tool_call_id 找不到）；至少保留最近 `min_keep_messages` 条；其外从最新往最老贪心回填。裁剪后仍超限则截断最长的**非 system** 消息内容（留头尾 + 标记）。
 - **未知上限不压缩**：模型目录里查不到 `max_input_tokens` 时直接跳过——宁可不裁剪，也不拿一个猜的数字去砍用户上下文。故本功能对未知模型**零副作用**。
+- **声明值 ≠ 实际可用量**：目录里的 `max_input_tokens` 是模型自报的声明值，个别渠道严重低估。TRAE 声明 200000/232768，实测 1,450,000 字符（约 1,035,544 token）仍能正确读到开头，1,470,000 字符才报 `4022`/`4026`（针在开头、问题在结尾、中间填随机 ASCII，答对暗号即证明窗口横跨整段）。按声明值算压缩预算只有 217K，用户发 30 万 token 时上游明明能吃却被本地静默压掉。故 `api/context.py` 的 `_CHANNEL_WINDOW_FLOOR` 把压缩预算按渠道抬到实测下限（TRAE `1_048_576`），**只抬不压**（声明值更大时保留声明值），且**只影响压缩预算**——`/v1/models` 对外宣告仍用声明值，客户端保持保守认知，不会主动发超限请求。
 - **多渠道按实际渠道取值**：同名模型可能挂多个渠道、各自上限不同（qoder 180K vs codebuddy 1M）。压缩从 API 入口移到 **executor 选号之后**（`ExecutorDeps.context_compress`），按实际服务渠道的上限裁剪——路由前只能取 min 的口径会把大窗口渠道的会话反复误裁，前缀不稳定击穿上游前缀缓存。压缩实现无副作用：每轮从原文重压（换号/回退可能落到不同窗口的渠道），affinity 指纹读未压缩原文。
 
 热更项 `context_compress_enabled`（默认 true）/ `context_compress_reserve_tokens`（4096）/ `context_compress_min_keep_messages`（4）/ `context_compress_safety_ratio`（0.95）。
@@ -559,7 +560,7 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 
 ```json
 {
-  "status": "ok", "service": "coding2api", "version": "0.7.0",
+  "status": "ok", "service": "coding2api", "version": "0.7.1",
   "credentials": {"total": 5, "ready": 4, "cooling": 1, "paused": 0, "disabled": 0}
 }
 ```
