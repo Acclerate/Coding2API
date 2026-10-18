@@ -73,6 +73,10 @@ class CheckinTask:
         self._slot_offsets: dict[str, int] = {}   # 当日该时点抽到的抖动偏移（分钟）
         self._fired_slots: set[str] = set()       # 当日已放行的时点
 
+    def has_times(self) -> bool:
+        """是否配置了签到时点（决定 runner 的醒转周期：配了就要 1 分钟精度）。"""
+        return bool(parse_checkin_times(self._times()))
+
     def due(self, *, now: time.struct_time | None = None) -> bool:
         """是否该跑一轮签到。
 
@@ -84,10 +88,9 @@ class CheckinTask:
         - 放行一次即记 `日期 + 时点` 键（不是实际执行时刻），同一时点当天
           不再放行；跨天记录由 `_prune_slots` 清掉。
 
-        注意窗口宽度与 runner 的醒转周期：循环是每 10 分钟醒一次，`抖动=0`
-        时窗口只有一个分钟，醒来时刻未必落在那一分钟。所以要**稳定命中**，
-        `checkin_jitter_minutes` 应不小于醒转周期（≥10 分钟）；抖动本就是
-        用来摊开同一分钟的多部署，代价可接受。
+        注意窗口宽度与 runner 的醒转周期：配了时点时 runner 改为 **每 60 秒**
+        醒一次（见 `TaskRunner._checkin_interval`），故抖动=0 也能稳定命中那
+        一分钟；留空时仍是 10 分钟一轮的旧节奏。抖动继续用于把多部署摊开。
         """
         times = parse_checkin_times(self._times())
         if not times:

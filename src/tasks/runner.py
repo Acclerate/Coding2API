@@ -181,6 +181,17 @@ class TaskRunner:
         # 抓得比它更新只是白打别人的接口。
         return max(60, int(self._upstream_status_minutes()) * 60)
 
+    @property
+    def _checkin_interval(self) -> float:
+        """签到循环的醒转周期：留空（旧行为）10 分钟，配了时点则 1 分钟。
+
+        为什么必须短：`due()` 的窗口是 `[时点-抖动, 时点]`，抖动=0 时只有
+        「恰好那一分钟」。10 分钟周期下，醒来时刻与配置时点几乎必然错开，
+        结果是**一天一次都不签**——比旧的全天轮询更糟。1 分钟是 60 秒精度
+        与「醒来仅比较几个整数」之间的折中。
+        """
+        return 60.0 if self._checkin.has_times() else 600.0
+
     async def start(self) -> None:
         """启动所有周期任务；首轮额度探测与 token 预刷新都立即执行（不节流）。
 
@@ -447,8 +458,10 @@ class TaskRunner:
         if key == "refresh":
             return self._refresh_interval
         if key == "checkin":
-            # 固定 10 分钟醒一次（时点由 due() 判定），不是热更项
-            return 600.0
+            # 留空（旧行为）= 10 分钟醒一次即可；配了时点则必须 1 分钟醒一次——
+            # 抖动=0 时窗口只有「恰好那一分钟」，10 分钟周期会大概率整天落空。
+            # 醒来只是读一次配置 + 比较几个整数，代价可忽略。
+            return self._checkin_interval
         if key == "growth":
             return self._growth_interval
         if key == "activity":

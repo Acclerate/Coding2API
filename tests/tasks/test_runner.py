@@ -725,3 +725,63 @@ async def test_sync_helpers_raise_when_optional_tasks_unwired(repo):
     for sync in (runner._sync_growth, runner._sync_activity, runner._sync_alert):
         with pytest.raises(RuntimeError, match="not configured"):
             await sync()
+
+
+class _Store:
+    """最小 SettingsStore：只实现读写，避免测试依赖数据库。"""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, str] = {}
+
+    def load(self) -> dict[str, str]:
+        return dict(self.rows)
+
+    def set(self, key: str, value: str, now: int | None = None) -> None:
+        self.rows[key] = value
+
+    def delete(self, key: str) -> None:
+        self.rows.pop(key, None)
+
+
+def _runtime(**overrides):
+    from src.runtime_settings import RuntimeSettings
+
+    base = Settings(_env_file=None, APP_SECRET=SECRET, **overrides)
+    store = _Store()
+    return RuntimeSettings(base, store), store
+
+
+def test_checkin_interval_follows_schedule_config(repo):
+    """签到时点是否配置决定醒转周期：留空 10 分钟，配了则 1 分钟。
+
+    抖动=0 时 due() 窗口只有「恰好那一分钟」，10 分钟周期下醒来时刻几乎必然
+    错开，结果是一天一次都不签——比旧的全天轮询更糟。
+    """
+    credentials, db = repo
+    config, store = _runtime()
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+    assert runner._interval_seconds("checkin") == 600.0
+
+    store.set("checkin_times", "09:37")
+    config.reload()
+    assert runner._checkin.has_times() is True
+    assert runner._interval_seconds("checkin") == 60.0
+
+    # 全是坏段等同留空：退回旧行为，不让一条笔误锁死签到
+    store.set("checkin_times", "25:00,bad")
+    config.reload()
+    assert runner._checkin.has_times() is False
+    assert runner._interval_seconds("checkin") == 600.0
+
+
+def test_build_runner_wires_checkin_schedule(repo):
+    """时点与抖动从热更项接线（零参 callable，改动立刻生效）。"""
+    credentials, db = repo
+    config, store = _runtime(CHECKIN_TIMES="09:37,21:10", CHECKIN_JITTER_MINUTES=5)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._checkin._times() == "09:37,21:10"
+    assert runner._checkin._jitter() == 5
+    store.set("checkin_times", "")
+    config.reload()
+    assert runner._checkin._times() == ""
