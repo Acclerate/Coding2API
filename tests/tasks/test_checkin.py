@@ -127,9 +127,8 @@ async def test_checkin_error_is_isolated(repo):
     assert report.failed == 1
 
 async def test_checkin_due_is_always_true():
-    """签到全天每 10 分钟一轮，不再受时刻限制（due 恒 True）。"""
-    task = CheckinTask.__new__(CheckinTask)
-    task._done_scopes = set()
+    """未配置时点（留空）时保持旧行为：全天每 10 分钟一轮，due 恒 True。"""
+    task = CheckinTask(None, {})  # type: ignore[arg-type]
     midnight = time.struct_time((2026, 9, 11, 0, 30, 0, 3, 254, 0))
     late = time.struct_time((2026, 9, 11, 23, 59, 0, 3, 254, 0))
     assert task.due(now=midnight) is True
