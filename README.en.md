@@ -58,7 +58,7 @@ Pull the GHCR image instead of building:
 
 ```bash
 docker compose pull
-# or pin a version: docker pull ghcr.io/robbsluo/coding2api:v0.6.0
+# or pin a version: docker pull ghcr.io/robbsluo/coding2api:v0.7.0
 ```
 
 Pushing a `v*` tag to main triggers the publish workflow (`.github/workflows/publish.yml`), tagging both `<tag>` and `:latest` on GHCR.
@@ -95,6 +95,15 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
 ## Audit log
 
 The *Audit log* page (admins only) records logins and writes, filterable by actor/action and paginated: **logins** (success and failure), **account changes** (create, activate, role change, enable/disable, password change/reset, hard delete), **credential writes** (import, delete, pause, pin, revive, account switch) and **manual alert resolution**. Each row has time, actor, action, target, detail and source IP. **No passwords or token plaintext** (the one-time activation token appears once in the create response; only its SHA-256 digest is stored). Retention matches request detail (90 days), trimmed by the background cleanup task.
+
+## Server logs
+
+The *Server logs* page (`/logs`, admins only) is a **read-only** live view of this process's own logging: `GET /api/logs?limit=` returns recent lines, `GET /api/logs/stream` is SSE (buffer replay, then live). The page offers level filtering, keyword search, follow-latest, pause and clear — **no write or execute entry point**, subscribers can only read.
+
+- **This process only**: it attaches a `logging.Handler`, it never tails a file. Under multiple processes or containers each one sees its own slice; that is deliberate, since log rotation and permissions make a file view lie.
+- **Redaction is a hard precondition**: every line passes an allow-list before leaving the process. Anything matching `token` / `secret` / `authorization` / `cookie` / `password` / `api_key` (including `X-Api-Key:`, `client_secret=` and JSON key forms), an `sk-…` shape or `Bearer <value>` is **dropped whole**. Losing a log line beats pushing a credential into a browser.
+- **Bounded buffer**: size is `LOG_BUFFER_LINES` (default 500, hot-reloadable), oldest overwritten first; lowering it trims immediately. `0` disables the page (both endpoints 404 and the handler is detached), matching how `/metrics` turns off.
+- Each line is capped at 4000 chars and carries `seq` (replay/live dedupe), timestamp, level, logger and `request_id` when available. Subscriber limit is 4; beyond that 429 + `Retry-After`.
 
 ## Usage
 
@@ -431,6 +440,9 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `GROWTH_IRREVERSIBLE_ACTIONS` | `true` | Allow lottery, streak redemption, blind boxes, repair cards |
 | `ACTIVITY_REPORT_ENABLED` | `false` | Post one chat event per account per day. **Off by default** — terms forbid tampering |
 | `ACTIVITY_REPORT_HOUR` | `10` | Activity hour (local Beijing time) |
+| `CHECKIN_TIMES` | `""` | Daily check-in times: local `HH:MM`, comma separated (e.g. `09:37,21:10`). A round runs only at those times; **empty = every 10 minutes all day** (the old behaviour, unchanged after upgrade). Bad segments are ignored with a warning; all-bad is treated as empty. Check-in is idempotent upstream, so extra times only add retry opportunities. Once times are set the loop wakes **every 60 seconds** — otherwise a zero-jitter window lasts one minute and the day is silently missed. Hot-reloadable |
+| `CHECKIN_JITTER_MINUTES` | `0` | Check-in jitter (minutes): run a random `0..N` minutes **before** the configured time so multiple deployments do not hit upstream in the same minute. Deduplication keys on *date + time*, so jitter never makes the same slot run twice. `0` = off. Hot-reloadable |
+| `LOG_BUFFER_LINES` | `500` | In-process ring-buffer size for the admin *Server logs* page (collects this process's `logging` records only, never tails a file). `0` disables the page (both `GET /api/logs` and `/api/logs/stream` return 404). Every line passes a redaction allow-list first: anything matching `token` / `secret` / `authorization` / `cookie` / `password` / `api_key`, an `sk-…` shape or `Bearer <value>` is **dropped entirely**. Hot-reloadable |
 | `ALERT_ENABLED` | `true` | Operations-alert evaluation (pool exhausted / repeated task failures / token near expiry / error-rate spike), persisted to `alert_events` |
 | `ALERT_WEBHOOK_URL` | empty | Webhook POST (JSON, body carries `status`: `firing` / `resolved`), comma-separated (≤16, `http(s)` only, private/loopback/link-local blocked against SSRF, re-checked against DNS resolution right before delivery and skipped if it fails to resolve), concurrent delivery, all must succeed (15s budget); requests always carry `X-Coding2API-Signature: sha256=<HMAC-SHA256(APP_SECRET, body)>`; empty = in-app records only |
 | `ALERT_INTERVAL_MINUTES` | `5` | Alert evaluation cycle (floor 1) |
@@ -445,7 +457,7 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `ALERT_ERROR_RATE_WINDOW_MINUTES` | `15` | Error-rate window (from `usage_events` detail) |
 | `QUOTA_EXPIRY_WINDOW_SECONDS` | `129600` | Main expiry window: credits expiring within it burn account-first; `≤0` disables expiry sorting |
 | `QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS` | `604800` | Tie-breaking window; `≤0` disables |
-| `CONVERSATION_STICKY_SECONDS` | `3600` | Session-affinity TTL (explicit id, else prefix fingerprint; pin wins); `≤0` disables |
+| `CONVERSATION_STICKY_SECONDS` | `3600` | Session-affinity TTL. Precedence: **explicit request-body session id** (`conversation_id` / `prompt_cache_key`, `metadata` first) > **session header** (`x-session-id` / `x-opencode-session` / `x-session-affinity` / `conversation-id`) > **message-prefix fingerprint** fallback; a manual pin beats all. Header and fingerprint values are salted with `username` before hashing, so two users sending the same value never share an account; headers must match `[A-Za-z0-9._:-]{1,128}` or they are dropped. `user_id` still suppresses the prefix fallback (headers keep working); `≤0` disables |
 | `MODEL_BLOCKLIST` | `custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,hunyuan-image-*,hy4-preview-x,qwen3.8-flash,glyph-cluster` | Model-list blocklist (fnmatch, display only), matched on the outward spellings |
 | `MODEL_FALLBACK_GROUPS` | `""` | Cross-channel fallback groups: `name=m1,m2;name2=m3`; members may carry `@channel`; switches only **before any frame is emitted** |
 | `ALLOWED_HOSTS` | empty | Host allowlist (DNS rebinding) |
@@ -492,7 +504,7 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 
 ### Runtime settings (*Tasks & settings* page)
 
-**49 settings** apply immediately without editing `.env` or restarting: default model, blocklist, context-compression knobs, fallback groups, both expiry windows, sticky TTL, the per-credential in-flight cap, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour, all alerting rules, `METRICS_ENABLED`, `REQUEST_LOG_ENABLED` and the three reasoning knobs (`FORCE_DISABLE_THINKING` / `REASONING_EFFORT_MAP` / `ANTHROPIC_THINKING_EFFORTS`).
+**58 settings** apply immediately without editing `.env` or restarting: default model, blocklist, model aliases, context-compression knobs, fallback groups, both expiry windows, sticky TTL, stream timeouts, short-cooldown wait, the per-credential in-flight cap, growth toggles/interval, refresh/probe/catalog intervals, `USD_CNY_RATE`, every per-channel chat interval, CodeArts concurrency/window, pacer bounds, activity toggle/hour, check-in times/jitter, all alerting rules, `METRICS_ENABLED`, `REQUEST_LOG_ENABLED`, `LOG_BUFFER_LINES` and the three reasoning knobs (`FORCE_DISABLE_THINKING` / `REASONING_EFFORT_MAP` / `ANTHROPIC_THINKING_EFFORTS`).
 
 **DB overrides beat `.env`**: once changed, `.env` no longer applies to that key; the row is marked "DB override" and *Reset* removes the override. Values live in the `runtime_settings` table (plain key/value), so adding a hot-updatable key needs no migration; unknown keys and invalid/out-of-range values are rejected on write. Startup-only knobs (`APP_SECRET`, `PORT`, `DATA_DIR`, `USERS_FILE`, `OPENROUTER_MODELS_URL`, endpoint allowlists) are **excluded**. API: `GET /api/settings`, `PUT /api/settings` (admin + CSRF; `null` resets). The page also shows the 10 tasks' state (`GET /api/tasks`, admin, 30s refresh), in-process only. Each task card has a **Run now** button (`POST /api/tasks/{key}/run`, admin + CSRF): it bypasses the due-time window but **not** the enable switch — a disabled task honestly returns `ran=false` instead of pretending it ran; if the same task is already running it returns `busy=true` immediately (no queueing, no concurrent upstream calls); the response is the finished round.
 

@@ -60,7 +60,7 @@ docker compose exec coding2api python scripts/create_user.py admin --role admin
 
 ```bash
 docker compose pull
-# 或指定版本：docker pull ghcr.io/robbsluo/coding2api:v0.6.0
+# 或指定版本：docker pull ghcr.io/robbsluo/coding2api:v0.7.0
 ```
 
 推送新版本：打 tag `v*` 推到 main 即触发 publish workflow（`.github/workflows/publish.yml`），同时打 `<tag>` 与 `:latest` 到 GHCR；也可在 Actions 页面手动触发。
@@ -98,6 +98,15 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
 ## 审计
 
 「审计日志」页（仅管理员可见）记录登录与写操作，可按操作者/动作筛选、分页查看：**登录**（成败都记）、**账号变动**（新建、激活、改角色、禁用/启用、改密、重置密码、硬删）、**凭证写操作**（导入、删除、启停、指定 pin、复活、切换账号）与**告警人工处置**（标记恢复）。每条含时间、操作者、动作、对象、说明与来源 IP。**绝不包含密码或令牌明文**（一次性激活令牌明文只在创建响应出现一次，库里只有 SHA-256 摘要）。保留期与请求明细一致（默认 90 天），由后台清理任务裁剪。
+
+## 服务端日志
+
+「服务端日志」页（`/logs`，仅管理员可见）是**只读**的进程内实时日志视图：`GET /api/logs?limit=` 取最近若干行，`GET /api/logs/stream` 走 SSE 先回放缓冲、再推新行。页面上可做级别筛选、关键字过滤、跟随最新、暂停与清空——**没有任何写入或执行入口**，订阅者只能读。
+
+- **只收本进程 `logging` 记录**，不读文件、不 tail：多进程 / 容器下各进程只看得见自己那份，这是刻意的（日志文件轮转与权限差异会让「看文件」变成一个会骗人的视图）。
+- **脱敏是硬前提**：每行发出前过白名单，命中 `token` / `secret` / `authorization` / `cookie` / `password` / `api_key`（含 `X-Api-Key:`、`client_secret=`、JSON 键形态）、`sk-…` 形状或 `Bearer <值>` 的**整行丢弃**。宁可漏一条日志，也不把凭证推进浏览器。
+- **缓冲有界**：容量是 `LOG_BUFFER_LINES`（默认 500，可热更），环形覆盖最旧；调小立即裁掉多余行。`0` 关闭整页（两个端点都 404，handler 也摘下），与 `/metrics` 关闭同口径。
+- 单行上限 4000 字符；每行带 `seq`（回放与实时去重）、时间、级别、logger、`request_id`（有则带上）。订阅者上限 4，超限 429 + `Retry-After`。
 
 ## 使用
 
@@ -295,7 +304,7 @@ claude
 
 ```json
 {
-  "status": "ok", "service": "coding2api", "version": "0.6.0",
+  "status": "ok", "service": "coding2api", "version": "0.7.0",
   "credentials": {"total": 5, "ready": 4, "cooling": 1, "paused": 0, "disabled": 0}
 }
 ```
@@ -592,6 +601,9 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `GROWTH_IRREVERSIBLE_ACTIONS` | `true` | 是否允许成长中心的不可逆动作：抽奖、连登兑换、开盲盒、消耗补登卡 |
 | `ACTIVITY_REPORT_ENABLED` | `false` | 活跃上报（CodeBuddy 与国际版）：每天为账号补发一条对话事件续连登。**默认关闭**——条款禁止篡改活动数据，上游改版即失效 |
 | `ACTIVITY_REPORT_HOUR` | `10` | 活跃上报的本地（北京）时间整点窗口；仅在开关开启时生效 |
+| `CHECKIN_TIMES` | `""` | 每日签到执行时点：本地时间 `HH:MM`，逗号分隔（如 `09:37,21:10`）。命中时点才跑一轮；**留空 = 全天每 10 分钟检查一次**（旧行为，升级后不做任何配置也不变节奏）。坏段忽略并记 warning，全是坏段等同留空。上游签到幂等，多设几个时点只是多几次重试机会。配了时点后循环改为**每 60 秒**醒一次（否则抖动=0 时窗只有一分钟，必然整天漏签）。可热更 |
+| `CHECKIN_JITTER_MINUTES` | `0` | 签到抖动（分钟）：在时点**之前**提前一个 `0..N` 的随机偏移执行，把多部署摊开、避免同一分钟齐打上游。按「日期 + 时点」记去重键，抖动只改执行时刻，不会让同一时点跑两次。`0` = 不抖。可热更 |
+| `LOG_BUFFER_LINES` | `500` | 管理台「服务端日志」页的进程内环形缓冲行数（只收本进程 `logging` 记录，不读文件）。`0` = 关闭该页（`GET /api/logs` 与 `/api/logs/stream` 均 404）。每行发出前过脱敏白名单，命中 `token` / `secret` / `authorization` / `cookie` / `password` / `api_key` 或 `sk-…` 形状的**整行丢弃**。可热更 |
 | `ALERT_ENABLED` | `true` | 运维告警开关：后台周期评估四类风险（池耗尽 / 任务连续失败 / token 临近到期 / 上游错误率骤升），命中落 `alert_events` |
 | `ALERT_WEBHOOK_URL` | 空 | 告警 Webhook：命中时 POST JSON（body 带 `status`：`firing` / `resolved`），多个用逗号分隔（≤16 个，仅 `http(s)`，拒内网/回环/链路本地/保留地址防 SSRF，投递前再按 DNS 解析复核一次、解析失败即跳过），并发投递、全部成功才算成功（总预算 15s）；请求恒带 `X-Coding2API-Signature: sha256=<HMAC-SHA256(APP_SECRET, body)>` 供收端验真；留空 = 只留站内记录 |
 | `ALERT_INTERVAL_MINUTES` | `5` | 运维告警评估周期（下限 1 分钟） |
@@ -611,7 +623,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `UPSTREAM_STATUS_TIMEOUT_SECONDS` | `10.0` | 单源 HTTP 超时（秒）：8 个源并发抓，慢的那个不该拖住整轮 |
 | `QUOTA_EXPIRY_WINDOW_SECONDS` | `129600` | 主到期排序窗口：把距到期 ≤ 该秒数的积分加总，多的账号先用；CodeBuddy 与 TRAE 都按包独立到期、都参与；`≤0` 关闭整套到期排序 |
 | `QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS` | `604800` | 次到期排序窗口：主窗口打平时才比较；`≤0` 关闭该级 |
-| `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL：优先按请求体显式会话标识，无则回落消息前缀指纹；手动 pin 优先；带 `user_id` 时不派生前缀兜底键；`≤0` 关闭 |
+| `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL：优先级 **请求体显式会话标识**（`conversation_id` / `prompt_cache_key`，`metadata` 优先）> **请求头会话标识**（`x-session-id` / `x-opencode-session` / `x-session-affinity` / `conversation-id`）> **消息前缀指纹**兜底；手动 pin 优先于全部。头与指纹值都掺 `username` 再哈希，两用户同值不串号；头必须过字符白名单（`[A-Za-z0-9._:-]`，≤128），非法则丢弃退回兜底。带 `user_id` 时不派生前缀兜底键（头照常生效）；`≤0` 关闭 |
 | `MODEL_BLOCKLIST` | `custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,hunyuan-image-*,hy4-preview-x,qwen3.8-flash,glyph-cluster` | 模型列表黑名单（fnmatch，仅影响列表展示）；按**归一后的对外写法**匹配（原代号、归一键、展示名、展示名归一键四种任一命中即滤） |
 | `MODEL_FALLBACK_GROUPS` | `""` | 跨渠道 fallback 兼容组：格式 `组名=成员1,成员2;组名2=成员3`；成员可带 `@渠道`。请求任一成员时该成员置首、组内其余依次回退；主渠道全不可用才回退，**仅在本次尝试尚未产出任何响应帧前**切换。留空 = 不启用 |
 | `ALLOWED_HOSTS` | 空 | Host 白名单，防 DNS rebinding |
@@ -667,9 +679,9 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 
 ### 管理台热更（「任务与配置」页）
 
-上表中带「可热更」语义的 **55 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
+上表中带「可热更」语义的 **58 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
 
-`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`MODEL_ALIASES`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`、`STREAM_IDLE_TIMEOUT_SECONDS`、`SHORT_COOLDOWN_WAIT_SECONDS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`。
+`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`MODEL_ALIASES`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`、`STREAM_IDLE_TIMEOUT_SECONDS`、`SHORT_COOLDOWN_WAIT_SECONDS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`、`CHECKIN_TIMES`、`CHECKIN_JITTER_MINUTES`、`LOG_BUFFER_LINES`。
 
 要点：**优先级 `DB 覆盖值 > .env`**——改过后 .env 对该项不再生效，页面标「DB 覆盖」，点「恢复默认」删掉覆盖行才回落 .env。值存 `runtime_settings` 表（纯 key/value），新增可热更项无需迁移；白名单外的 key、非法类型 / 越界值写入前即拒。启动期项（`APP_SECRET` / `PORT` / `DATA_DIR` / `USERS_FILE` / `OPENROUTER_MODELS_URL` / 上游端点白名单）**不在**白名单。接口 `GET /api/settings` 读快照、`PUT /api/settings` 写（admin + CSRF），传 `null` 恢复默认。该页同时展示**后台任务运行态**，页面按 tab 组织；运行态是**进程内**的（`GET /api/tasks`，admin，页面每 30 秒刷新），重启归零。
 
