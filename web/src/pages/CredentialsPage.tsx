@@ -1244,7 +1244,11 @@ function PackageLadder({ credential }: { credential: Credential }) {
       content={
         <div
           data-testid={`packages-${credential.id}`}
-          className="max-h-[70vh] max-w-full overflow-x-auto overflow-y-auto pr-1"
+          // 高度只能按「弹层实际可用的空间」封顶，不能只写 70vh：弹层贴着视口
+          // 上/下缘弹出时（几十个包必然超出），radix 的 flip 挪不动就只能把
+          // 上半截顶到视口外。available-height 是 radix 算好的可用高度，
+          // 再减掉弹层自身的内边距（py-1.5 上下共 0.75rem），否则仍差这几像素。
+          className="max-h-[min(70vh,calc(var(--radix-tooltip-content-available-height)-0.75rem))] max-w-full overflow-x-auto overflow-y-auto pr-1"
         >
           <div className="mb-1 font-medium">
             额度包 {packages.length} 个（按到期先后）

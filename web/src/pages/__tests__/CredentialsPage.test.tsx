@@ -290,6 +290,11 @@ describe("CredentialsPage", () => {
     // 明细行很长：弹层要放宽且不折行（默认 max-w-sm + 换行会把每行挤成两三行）
     expect(tip.className).toContain("max-w-[90vw]");
     expect(tip.className).toContain("whitespace-nowrap");
+    // 几十个包必然超出视口：高度要按 radix 给的可用高度封顶再内滚，
+    // 只写 70vh 时贴边弹出会被顶出视口（上半截看不见）
+    const body = screen.getByTestId("packages-cb");
+    expect(body.className).toContain("--radix-tooltip-content-available-height");
+    expect(body.className).toContain("overflow-y-auto");
     await userEvent.unhover(toggle);
   });
 
