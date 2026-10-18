@@ -73,6 +73,10 @@ export interface Credential {
   quota_credits_expiring: number | null;
   /** 积分账自己的次窗口内到期积分（仅 CodeArts 有） */
   quota_credits_expiring_secondary: number | null;
+  /** 积分账派生的健康度（仅 CodeArts 有，其余渠道 null）。
+   *  **不参与调度**：调度只用 `health`（每日池）；本字段只让「内置」展示组
+   *  的健康度与该组额度列讲同一本账，避免「积分还剩 99%、健康度却 0%」。 */
+  quota_credits_health: Health;
   /** 套餐到期阶梯 [[到期 epoch, 该套餐剩余积分]]，仅 CodeBuddy；TRAE 为 null */
   quota_expiry_ladder: [number, number][] | null;
   /** 积分账那一段到期阶梯（仅 CodeArts）；其余渠道 null */

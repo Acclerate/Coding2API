@@ -16,6 +16,7 @@ import {
   activeModelCooldowns,
   CREDITS_QUOTA_SEMANTICS,
   credentialState,
+  credentialHealth,
   formatDuration,
   formatNumber,
   formatTime,
@@ -368,7 +369,7 @@ describe("display helpers", () => {
     // 口径文案必须点明「与每日额度池并行的独立账本」，否则会被读成同一本账
     expect(CREDITS_QUOTA_SEMANTICS).toContain("独立账本");
     expect(CREDITS_QUOTA_SEMANTICS).toContain("内置模型");
-    expect(CREDITS_QUOTA_SEMANTICS).toContain("不参与健康度");
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("调度口径不变");
   });
 
   it("凭证状态机覆盖全部状态", () => {
@@ -379,6 +380,28 @@ describe("display helpers", () => {
     expect(credentialState(makeCredential({ health: -1 }) as never, 0)).toBe("exhausted");
     // 冷却已过期 → 不再是 cooling
     expect(credentialState(makeCredential({ cooling_until: 50 }) as never, 100)).toBe("ready");
+  });
+
+  it("CodeArts 两本账各读各的健康度（内置组不与额度列自相矛盾）", () => {
+    // 主账（每日池）已耗尽、积分账几乎满：库里 health=-1，积分派生值 100
+    const codearts = makeCredential({
+      provider: "codearts", health: -1,
+      quota_credits_remaining: 13498.72, quota_credits_total: 13500,
+      quota_credits_health: 100,
+    }) as never;
+    // 福利组（每日池）读主账 → 已耗尽
+    expect(credentialHealth(codearts, "pool")).toBe(-1);
+    expect(credentialState(codearts, 0, credentialHealth(codearts, "pool"))).toBe("exhausted");
+    // 内置组（积分账）读派生值 → 100%，状态不能是「额度耗尽」
+    expect(credentialHealth(codearts, "credits")).toBe(100);
+    expect(healthView(credentialHealth(codearts, "credits"), "codearts"))
+      .toMatchObject({ kind: "known", percent: 100, tone: "ok" });
+    expect(credentialState(codearts, 0, credentialHealth(codearts, "credits"))).toBe("ready");
+    // 缺省账本＝主账，与调度口径一致
+    expect(credentialHealth(codearts)).toBe(-1);
+    // 非 CodeArts 渠道积分账恒 null → 内置组也只会读到 null（此时按「未探测」）
+    const trae = makeCredential({ provider: "trae", quota_credits_health: null }) as never;
+    expect(credentialHealth(trae, "credits")).toBeNull();
   });
 
   it("时长格式化覆盖秒/分/时/天与零值", () => {

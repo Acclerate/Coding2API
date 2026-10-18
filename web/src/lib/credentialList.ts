@@ -11,9 +11,13 @@
  *
  * 状态判定复用 `credentialState`（与表格里那个 Badge 同一口径），
  * 不在这里另起一套「可用」定义，否则筛选结果会和徽章自相矛盾。
+ *
+ * 唯一的例外是 CodeArts 的虚拟渠道：状态筛选与池概况仍按**主账**（真实调度口径
+ * `health`）判，因为一条凭证是否被选中跟展示分组无关；而组头的状态分布按本组
+ * 那本账算（见 `groupByProvider`），与组内额度列同源。
  */
 
-import { credentialState, STATE_LABEL } from "../api/display";
+import { credentialHealth, credentialState, STATE_LABEL } from "../api/display";
 import type { CredentialState } from "../api/display";
 import { providerLabel, providerRank } from "../api/providers";
 import type { Credential } from "../api/types";
@@ -197,11 +201,13 @@ export function groupByProvider(
   return [...buckets.values()]
     .map(({ channel, items }) => {
       const states: Partial<Record<CredentialState, number>> = {};
+      const credits = channel.ledger === "credits";
       for (const item of items) {
-        const state = credentialState(item, now);
+        // 状态按**本组那本账**的健康度算：内置组讲积分账，若仍读主账，会出现
+        // 「额度还剩一大截却记在『额度耗尽』」的组头分布。
+        const state = credentialState(item, now, credentialHealth(item, channel.ledger));
         states[state] = (states[state] ?? 0) + 1;
       }
-      const credits = channel.ledger === "credits";
       return {
         key: channel.key,
         provider: channel.provider,

@@ -43,6 +43,23 @@ export function healthView(health: Health, provider?: string): HealthView {
 }
 
 /**
+ * 一条凭证在**某个展示组**里的健康度。
+ *
+ * CodeArts 在凭证页拆成两组、每组只讲一本账，健康度也必须跟着账本走：
+ * 后端 `health` 只按主账（每日 token 池）算，积分账另有派生的
+ * `quota_credits_health`。若内置组仍读 `health`，就会出现「额度列显示
+ * 积分还剩 99%、健康度却 0%」的自相矛盾。
+ *
+ * 其余渠道与福利组都读主账；调度口径始终只有 `health` 一个（派生值不改选号）。
+ */
+export function credentialHealth(
+  credential: Credential,
+  ledger: "pool" | "credits" = "pool",
+): Health {
+  return ledger === "credits" ? credential.quota_credits_health : credential.health;
+}
+
+/**
  * 周期语义：CodeBuddy 的额度随周期重置，TRAE 是单调递减的账户余额，
  * Zen / Kilo 走免费层、上游没有额度接口（探测恒为「未知」），
  * CodeArts 是**每日积分池**（上游 1000 万 token 折 1000 积分，当日 0 点清零、不累计）。
@@ -87,7 +104,8 @@ export function quotaSemantics(credential: Credential): string {
  */
 export const CREDITS_QUOTA_SEMANTICS =
   "内置模型积分（GLM-5.2 / OpenPangu 等）：与每日额度池并行的独立账本，" +
-  "按积分计费，套餐到期日作废。不参与健康度，但到期日计入「快过期先用」。";
+  "按积分计费，套餐到期日作废。选号仍按每日池额度算（调度口径不变），" +
+  "但本组健康度按积分账算，与本组额度同源；到期日计入「快过期先用」。";
 
 /**
  * 额度单位统一为「积分」：CodeArts 上游的 token 已在后端折成积分
@@ -179,11 +197,17 @@ export type CredentialState =
   | "off"
   | "exhausted";
 
-export function credentialState(credential: Credential, now = Date.now() / 1000): CredentialState {
+export function credentialState(
+  credential: Credential,
+  now = Date.now() / 1000,
+  /** 本组讲的那本账的健康度；缺省＝主账（`credential.health`）。
+   *  CodeArts 内置组传积分账派生的健康度，否则会出现「额度 99% + 额度耗尽」。 */
+  health: Health = credential.health,
+): CredentialState {
   if (credential.disabled) return "disabled";
   if (!credential.enabled) return "off";
   if (cooldownRemaining(credential.cooling_until, now) > 0) return "cooling";
-  if (credential.health !== null && credential.health < 0) return "exhausted";
+  if (health !== null && health < 0) return "exhausted";
   return "ready";
 }
 

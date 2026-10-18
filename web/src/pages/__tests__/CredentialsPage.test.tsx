@@ -120,6 +120,34 @@ describe("CredentialsPage", () => {
     expect(shown[0]).toHaveTextContent("100 积分将在");
   });
 
+  it("CodeArts 两组的健康度各读各的账本，不与额度列矛盾", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({
+          id: "ca", provider: "codearts",
+          // 每日池已耗尽（主账 health=-1、额度 0），积分账几乎满
+          health: -1, quota_remaining: 0, quota_total: 1000,
+          quota_credits_remaining: 13498.72, quota_credits_total: 13500,
+          quota_credits_health: 100,
+        }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    // 福利组（每日池）：额度 0 + 健康度「已耗尽」，两者一致
+    const benefitRow = screen.getByTestId("row-ca-benefit");
+    expect(within(benefitRow).getByText("已耗尽")).toBeInTheDocument();
+    expect(within(benefitRow).getByText("0 / 1,000")).toBeInTheDocument();
+    // 内置组（积分账）：额度近满 + 健康度 100%，不能出现「积分近满却额度耗尽」
+    const internalRow = screen.getByTestId("row-ca");
+    expect(within(internalRow).getByText("100%")).toBeInTheDocument();
+    expect(within(internalRow).getByText("13,498.72 / 13,500")).toBeInTheDocument();
+    expect(within(internalRow).queryByText("已耗尽")).not.toBeInTheDocument();
+    expect(within(internalRow).queryByText("额度耗尽")).not.toBeInTheDocument();
+  });
+
   it("CodeArts 两组各显各的到期积分：福利组读每日池、内置组读积分账", async () => {
     mockFetch({
       "/api/credentials": listBody([

@@ -352,8 +352,9 @@ class Quota:
     packages: list[dict[str, Any]] | None = None
     # 第二本账：积分（CodeArts 内置模型的计费单位，与每日 token 池并行）。
     # 只有双账本渠道（当前仅 CodeArts）填，其余渠道恒 None——`remaining`/`total`
-    # 仍是各渠道的主账（CodeArts 为每日 token 池），**健康度只看主账**；
-    # 积分到期日由渠道并入 `expiry_ladder` 参与到期排序（见 codearts/client）。
+    # 仍是各渠道的主账（CodeArts 为每日 token 池），**调度健康度只看主账**；
+    # 管理台内置组另用 `credits_health_score` 派生一个积分账健康度（只展示，
+    # 不改选号）；积分到期日由渠道并入 `expiry_ladder` 参与到期排序（见 codearts/client）。
     credits_remaining: float | None = None
     credits_total: float | None = None
     # 积分账自己的到期阶梯（仅 CodeArts）：与并入主账 `expiry_ladder` 的那一段
@@ -369,14 +370,33 @@ EXHAUSTED = -1
 """HealthScore：0-100 已知；None 未知；-1 已耗尽。"""
 
 
+def _ratio_health(remaining: float | None, total: float | None) -> int:
+    """剩余/总量 → 0-100 百分比（夹紧）；总量缺失或 ≤0 判为「已耗尽」。"""
+    if total is None or total <= 0:
+        return EXHAUSTED
+    return max(0, min(100, round((remaining or 0.0) / total * 100)))
+
+
 def health_score(quota: Quota | None) -> int | None:
     """三态健康度：known(0-100) / unknown(None) / exhausted(-1)。"""
     if quota is None or quota.probe_failed:
         return UNKNOWN
-    if quota.total is None or quota.total <= 0:
-        return EXHAUSTED
-    remaining = quota.remaining or 0.0
-    return max(0, min(100, round(remaining / quota.total * 100)))
+    return _ratio_health(quota.remaining, quota.total)
+
+
+def credits_health_score(remaining: float | None, total: float | None) -> int | None:
+    """第二本账（CodeArts 积分）的派生健康度，供管理台内置组展示。
+
+    **不参与调度**：调度器只用 `health`（主账＝每日 token 池），选号口径不变。
+    积分账只在列表层给一个与额度列同源的百分比——否则内置组会出现
+    「额度列显示积分 x / y，健康度却是每日池的 0%」，两个数字自相矛盾。
+
+    两字段同时为 None = 积分接口未探测（best-effort 失败或从未探到），与主账
+    `probe_failed` 同语义：回「未探测」而不是「已耗尽」。
+    """
+    if remaining is None and total is None:
+        return UNKNOWN
+    return _ratio_health(remaining, total)
 
 
 @dataclass(slots=True)

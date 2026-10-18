@@ -68,6 +68,7 @@ import {
   CREDIT_SOURCE_LABEL,
   creditEventLabel,
   credentialState,
+  credentialHealth,
   CREDITS_QUOTA_SEMANTICS,
   cooldownRemaining,
   expiringQuotaLabel,
@@ -1434,6 +1435,8 @@ function ColumnHeaderRow({
   // 其余按每日池排。两把键都在后端白名单里，未知键会被后端回落默认键。
   const creditsLedger = ledger === "credits";
   const quotaColumnKey = creditsLedger ? "quota_credits_remaining" : "quota_remaining";
+  // 健康度列同样按本组那本账排：内置组用积分账派生的健康度
+  const healthColumnKey = creditsLedger ? "quota_credits_health" : "health";
   return (
     <TableRow
       data-testid={`column-header-${groupKey}`}
@@ -1445,9 +1448,9 @@ function ColumnHeaderRow({
       <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
                     direction={order} onToggle={toggle} testId={`sort-${groupKey}-nickname`}
                     hint={<ColumnHint text="昵称；「已指定」＝调度器优先用该凭证（全局唯一）。渠道名与数量在分组标题行。" />} />
-      <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
+      <SortableHead label="状态 / 健康度" columnKey={healthColumnKey} active={sort === healthColumnKey}
                     direction={order} onToggle={toggle} testId={`sort-${groupKey}-health`}
-                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。" />} />
+                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。CodeArts 内置组按**积分账**算，福利组按每日池算，各与本组额度列同源。" />} />
       <SortableHead label="额度" columnKey={quotaColumnKey}
                     active={sort === quotaColumnKey} direction={order}
                     onToggle={toggle} testId={`sort-${groupKey}-quota_remaining`}
@@ -1550,8 +1553,10 @@ function Row({
         QUOTA_UNIT,
       )
     : null;
-  const health = healthView(credential.health, credential.provider);
-  const state = credentialState(credential, now);
+  // 健康度也按本行那本账取：内置组（积分账）读后端派生的 `quota_credits_health`，
+  // 其余读主账 `health`。两列必须同源，否则会出现「额度积分 99% + 健康度 0%」。
+  const health = healthView(credentialHealth(credential, ledger), credential.provider);
+  const state = credentialState(credential, now, credentialHealth(credential, ledger));
   const cooldown = cooldownRemaining(credential.cooling_until, now);
   const tokenExpiry = tokenExpiryView(
     credential.token_expires_at, tokenWarning, now, credential.token_issued_at);

@@ -432,7 +432,7 @@ class CodeArtsClient:
         额度是**每日 token 池**（当日 0 点清零）；另有独立的积分余额走
         `/snap-manager/v1/statistics/plugin`，两者是并行的两套账，**不要混**。
         积分账（内置模型计费）在这里顺带探测并挂在 `credits_*` 上——它是
-        第二本账，**不参与 health**，但到期日会并入 `expiry_ladder` 参与
+        第二本账，**不参与调度口径的 health**（选号仍按主账），但到期日会并入 `expiry_ladder` 参与
         「快过期先用」的选号排序（见 `Quota.credits_remaining`）。
         临时凭证的续期**不在**这里做：refresh_token 是一次性的，必须由
         `tasks.refresh.RefreshTask`（先落库再同步）独占轮转。若此处顺手刷新，

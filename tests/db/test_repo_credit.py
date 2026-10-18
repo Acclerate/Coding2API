@@ -128,6 +128,11 @@ def test_list_all_splits_expiring_credits_by_ledger(tmp_path):
     assert row["quota_credits_expiring"] == 0.0
     assert row["quota_credits_expiring_secondary"] == pytest.approx(13498.72)
     assert row["quota_credits_expiry_ladder"] == [(credits_end, 13498.72)]
+    # 积分账派生的健康度：按积分账算（13498.72 / 13500 ≈ 100%），而主账 health
+    # 是每日池（900 / 1000 = 90%）。两者必须各自独立——内置组的额度列与健康度
+    # 徽章读同一本账，才不会出现「积分还剩 99%、健康度却 0%」。
+    assert row["health"] == 90
+    assert row["quota_credits_health"] == 100
 
     # 非 CodeArts：无积分阶梯 → 主账字段＝合并阶梯求和，积分账字段恒 None
     other = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"},
@@ -141,6 +146,8 @@ def test_list_all_splits_expiring_credits_by_ledger(tmp_path):
     assert other_row["quota_credits_expiring"] is None
     assert other_row["quota_credits_expiring_secondary"] is None
     assert other_row["quota_credits_expiry_ladder"] is None
+    # 无积分账的渠道：派生健康度恒 None（而不是 0 / 耗尽），前端内置组根本不会读它
+    assert other_row["quota_credits_health"] is None
     db.close()
 
 

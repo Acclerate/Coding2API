@@ -21,7 +21,15 @@ from src.engine.scheduler import (
     Scheduler,
     next_credit_reset,
 )
-from src.provider.base import EXHAUSTED, ErrKind, Event, EventKind, Quota, health_score
+from src.provider.base import (
+    EXHAUSTED,
+    ErrKind,
+    Event,
+    EventKind,
+    Quota,
+    credits_health_score,
+    health_score,
+)
 
 NOW = 1_000_000
 
@@ -41,6 +49,17 @@ def test_health_three_states():
     assert health_score(Quota(remaining=0.0, total=0.0)) == EXHAUSTED
     assert health_score(Quota(remaining=50.0, total=100.0)) == 50
     assert health_score(Quota(remaining=150.0, total=100.0)) == 100     # 夹紧
+
+
+def test_credits_health_from_second_ledger():
+    """积分账派生的健康度只服务展示：两字段全缺＝未探测，不判耗尽。"""
+    assert credits_health_score(None, None) is None                     # 积分接口没探到
+    assert credits_health_score(0.0, None) == EXHAUSTED                 # 有余额无数额 → 夹到耗尽
+    assert credits_health_score(13498.72, 13500.0) == 100
+    assert credits_health_score(6750.0, 13500.0) == 50
+    assert credits_health_score(None, 100.0) == 0
+    assert credits_health_score(50.0, 100.0) == 50
+    assert credits_health_score(150.0, 100.0) == 100                    # 夹紧
 
 def test_event_defaults():
     e = Event(kind=EventKind.CONTENT, content="hi")
