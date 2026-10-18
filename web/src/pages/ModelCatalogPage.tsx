@@ -8,8 +8,14 @@ import {
   Trophy,
 } from "lucide-react";
 import { useSessionContext } from "../Layout";
-import { useModelCatalogPage, useBlockModel } from "../api/modelExtrasHooks";
-import type { ModelCatalogRow } from "../api/modelExtras";
+import {
+  useBlockModel,
+  useModelCatalogPage,
+  useModelProbes,
+  useProbeModel,
+  useSetProbeManual,
+} from "../api/modelExtrasHooks";
+import { probeStateLabel, type ModelCatalogRow, type ModelProbeRow } from "../api/modelExtras";
 import {
   formatAgo,
   formatCompact,
@@ -165,6 +171,157 @@ function AvailabilityCell({
 }
 
 /**
+ * 探活面板：只有「仍被 blocked 负缓存锁住」或「探过」的 (渠道, 模型) 才出现。
+ *
+ * 独立成块而不并进目录行：目录是 OpenRouter 的模型 id（`z-ai/glm-5.3`），
+ * 负缓存与探活是网关侧名（`glm-5.3`），两边要靠后端的 `model_match` 才能对上。
+ * 前端自己复刻那套规则（同义词、尾缀、版本号点/连字符互换）必然会漂移，
+ * 与其显示错行，不如各列各的——探活表的行本来就是可直接操作的对象。
+ *
+ * 三态措辞刻意区分「确认不可用」与「无法判定」：后者（额度 / 限流 / 超时）
+ * 不构成下线证据，页面不能让用户误读成「这个模型坏了」。
+ */
+function ProbePanel({
+  rows,
+  loading,
+  error,
+  busy,
+  onProbe,
+  onManual,
+}: {
+  rows: ModelProbeRow[];
+  loading: boolean;
+  error: boolean;
+  busy: boolean;
+  onProbe: (row: ModelProbeRow) => void;
+  onManual: (row: ModelProbeRow) => void;
+}) {
+  const locked = rows.filter((row) => row.credentials > 0).length;
+  return (
+    <Panel title="主动探活">
+      <p className="text-xs text-muted-foreground">
+        只探仍被「该后端无此模型」负缓存锁住的 (渠道, 模型)：成功即清负缓存、
+        模型立刻回到池子；上游明确说没这个模型才算失败；额度 / 限流 / 网络一律
+        「无法判定」，不禁用。
+      </p>
+      {error ? (
+        <div data-testid="model-probe-error">
+          <Notice tone="danger">探活记录加载失败，请刷新重试。</Notice>
+        </div>
+      ) : loading ? (
+        <Empty data-testid="model-probe-loading">正在读取探活记录…</Empty>
+      ) : rows.length === 0 ? (
+        <Empty data-testid="model-probe-empty">
+          当前没有被负缓存锁住的模型，也没有探活记录
+        </Empty>
+      ) : (
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground" data-testid="model-probe-summary">
+            共 {rows.length} 个 · 仍被负缓存 {locked} 个
+          </div>
+          <Table cards>
+            <TableHeader>
+              <TableRow>
+                <TableHead>渠道 / 模型</TableHead>
+                <TableHead>探活结论</TableHead>
+                <TableHead>负缓存</TableHead>
+                <TableHead>最近探活</TableHead>
+                <TableHead>操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => {
+                const key = `${row.provider}-${row.model}`;
+                const manual = row.manual !== "";
+                return (
+                  <TableRow key={key} data-testid={`probe-row-${key}`}>
+                    <TableCell label="渠道 / 模型" className="text-xs">
+                      <div className="font-mono break-all">{row.model}</div>
+                      <div className="text-muted-foreground">{row.provider}</div>
+                    </TableCell>
+                    <TableCell label="探活结论" className="text-xs">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <Badge tone={row.state === "ok" ? "ok"
+                          : row.state === "failed" ? "danger" : "muted"}
+                          dot>
+                          探活 · {probeStateLabel(row.state)}
+                        </Badge>
+                        {manual && <Badge tone="muted">人工接管</Badge>}
+                      </div>
+                      {row.state === "failed" && row.failures > 0 && (
+                        <div className="text-muted-foreground">连续失败 {row.failures} 次</div>
+                      )}
+                    </TableCell>
+                    <TableCell label="负缓存" className="text-xs">
+                      {row.credentials > 0 ? (
+                        <span title="仍被 blocked 负缓存避让的号数 · 最晚到期时刻">
+                          {row.credentials} 号 · 至 {formatTime(row.until)}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">无</span>
+                      )}
+                    </TableCell>
+                    <TableCell label="最近探活" className="text-xs">
+                      {row.last_probe_at ? (
+                        <>
+                          <div title={formatTime(row.last_probe_at)}>
+                            {formatAgo(row.last_probe_at)}
+                          </div>
+                          {row.last_ok_at > 0 && (
+                            <div className="text-muted-foreground">
+                              上次成功 {formatAgo(row.last_ok_at)}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-muted-foreground">未探过</span>
+                      )}
+                      {row.last_error && (
+                        <div className="max-w-[16rem] text-muted-foreground break-words"
+                             title="最近一次探活的错误摘要（未脱敏前的上游原文已截断）">
+                          {row.last_error}
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell label="操作" className="text-xs">
+                      <div className="flex flex-wrap gap-1">
+                        <Button
+                          variant="default"
+                          size="sm"
+                          data-testid={`probe-now-${key}`}
+                          disabled={busy}
+                          title={`立即探活 ${row.provider}/${row.model}：成功即清该渠道的 blocked 负缓存（记审计）`}
+                          onClick={() => onProbe(row)}
+                        >
+                          <RefreshCw className="size-3" />
+                          立即探活
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          data-testid={`probe-manual-${key}`}
+                          disabled={busy}
+                          title={manual
+                            ? "交还自动探活：后台将重新按周期探这个模型"
+                            : "人工接管：后台不再自动探这个模型（不改变当前负缓存）"}
+                          onClick={() => onManual(row)}
+                        >
+                          {manual ? "交还自动探活" : "人工接管"}
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+/**
  * 模型列表页（管理）：只读展示 OpenRouter 的模型目录。
  *
  * 这份目录既是统计页「成本（估算）」的价格来源（输入 / 输出 / 缓存读，USD /
@@ -190,6 +347,9 @@ export function ModelCatalogPage() {
   const [onlySuspected, setOnlySuspected] = useState(false);
   const { toasts, push, dismiss } = useToasts();
   const block = useBlockModel(session.username);
+  const probes = useModelProbes(session.username);
+  const probeNow = useProbeModel(session.username);
+  const probeManual = useSetProbeManual(session.username);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 250);
@@ -240,6 +400,53 @@ export function ModelCatalogPage() {
         tone: "danger",
         testId: "model-blocklist-toast",
         content: `加入黑名单失败：${caught instanceof Error ? caught.message : String(caught)}`,
+      });
+    }
+  };
+
+  const runProbe = async (row: ModelProbeRow) => {
+    try {
+      const result = await probeNow.mutateAsync({
+        provider: row.provider, model: row.model,
+      });
+      // 三态文案不合并：inconclusive 若被写成「探活失败」，用户会以为模型坏了。
+      push({
+        tone: result.state === "ok" ? "ok"
+          : result.state === "failed" ? "danger" : "warn",
+        testId: "model-probe-toast",
+        content: result.state === "ok"
+          ? `${row.model} 探活成功，已清除该渠道的负缓存，模型立即回到池子。`
+          : result.state === "failed"
+            ? `${row.model} 确认不可用：${result.error || "上游无此模型"}`
+            : `${row.model} 无法判定（不构成下线证据，未做任何禁用）：${result.error || "上游无内容"}`,
+      });
+    } catch (caught) {
+      push({
+        tone: "danger",
+        testId: "model-probe-toast",
+        content: `探活失败：${caught instanceof Error ? caught.message : String(caught)}`,
+      });
+    }
+  };
+
+  const toggleManual = async (row: ModelProbeRow) => {
+    const manual = row.manual === "";
+    try {
+      await probeManual.mutateAsync({
+        provider: row.provider, model: row.model, on: manual,
+      });
+      push({
+        tone: "ok",
+        testId: "model-probe-toast",
+        content: manual
+          ? `${row.model} 已人工接管：自动探活跳过它，直到你交还。`
+          : `${row.model} 已交还自动探活：后台将按周期重新探它。`,
+      });
+    } catch (caught) {
+      push({
+        tone: "danger",
+        testId: "model-probe-toast",
+        content: `切换接管失败：${caught instanceof Error ? caught.message : String(caught)}`,
       });
     }
   };
@@ -315,6 +522,15 @@ export function ModelCatalogPage() {
           icon={<CircleDollarSign className="size-4" />}
         />
       </section>
+
+      <ProbePanel
+        rows={probes.data?.rows ?? []}
+        loading={probes.isLoading}
+        error={probes.isError}
+        busy={probeNow.isPending || probeManual.isPending}
+        onProbe={(row) => void runProbe(row)}
+        onManual={(row) => void toggleManual(row)}
+      />
 
       {isError ? (
         <div data-testid="model-catalog-error">

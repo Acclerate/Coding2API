@@ -3,6 +3,9 @@ import { api } from "./client";
 import {
   fetchModelAvailability,
   fetchModelCatalog,
+  fetchModelProbes,
+  probeModel,
+  setModelProbeManual,
   withBlocklistPattern,
   type ModelCatalogParams,
 } from "./modelExtras";
@@ -53,6 +56,49 @@ export function useBlockModel(username?: string) {
       void client.invalidateQueries({ queryKey: adminKey(username, "model-availability") });
       void client.invalidateQueries({ queryKey: adminKey(username, "settings") });
       void client.invalidateQueries({ queryKey: ["playground-models"] });
+    },
+  });
+}
+
+/**
+ * 探活结论 + 当前负缓存。60 秒自动刷新：后台探活周期以小时计，但「人工点了
+ * 探活之后结论什么时候回来」要能自己冒出来（一次探活最长 60 秒超时）。
+ */
+export function useModelProbes(username?: string, enabled = true) {
+  return useQuery({
+    queryKey: adminKey(username, "model-probes"),
+    queryFn: fetchModelProbes,
+    enabled,
+    refetchInterval: 60_000,
+  });
+}
+
+/**
+ * 立即探活：成功即清负缓存。写完失效探活表、可用性视图、目录页与 Playground
+ * 列表——负缓存一清，模型立刻回到池子，这几处的数据都会变。
+ */
+export function useProbeModel(username?: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ provider, model }: { provider: string; model: string }) =>
+      probeModel(provider, model),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: adminKey(username, "model-probes") });
+      void client.invalidateQueries({ queryKey: adminKey(username, "model-availability") });
+      void client.invalidateQueries({ queryKey: adminKey(username, "model-catalog-page") });
+      void client.invalidateQueries({ queryKey: ["playground-models"] });
+    },
+  });
+}
+
+/** 人工接管 / 交还自动探活（不改负缓存，只改「后台要不要继续探」）。 */
+export function useSetProbeManual(username?: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ provider, model, on }: { provider: string; model: string; on: boolean }) =>
+      setModelProbeManual(provider, model, on),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: adminKey(username, "model-probes") });
     },
   });
 }

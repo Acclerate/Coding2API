@@ -216,6 +216,30 @@ CREATE TABLE IF NOT EXISTS credential_model_cooldowns (
 CREATE INDEX IF NOT EXISTS idx_model_cooling_until
     ON credential_model_cooldowns(cooling_until);
 
+-- 主动探活结论：(渠道, 模型) 级，与生产冷却/统计**完全隔离**。
+--
+-- 为什么单独建表：`credential_model_cooldowns` 是「调度要不要避开」的权威
+-- 状态，由真实请求的失败驱动；探活只是「再试一次看恢复没有」的观测。把
+-- 探活结论写进冷却表会让一次探测直接改变选号结果（探测失败 ≠ 上游拒绝），
+-- 而写进 usage_events 会污染用量与成本统计。故独立成表，只供管理台展示 +
+-- 「探活成功就清负缓存」这一个动作。
+--
+-- `state`：ok（探活成功）/ failed（上游明确不认这个模型）/ inconclusive
+-- （额度、限流、网络等与模型无关的失败——**绝不能**据此禁用）。
+-- `manual`：人工接管标记（非空 = 跳过自动探活），见 src/api/admin_model_availability.py。
+CREATE TABLE IF NOT EXISTS model_probes (
+    provider      TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT '',
+    failures      INTEGER NOT NULL DEFAULT 0,
+    last_probe_at INTEGER NOT NULL DEFAULT 0,
+    last_ok_at    INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    manual        TEXT NOT NULL DEFAULT '',
+    updated_at    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, model)
+);
+
 -- 运行时配置覆盖：只存「管理台改过」的 key，未出现的 key 回落 env。
 --
 -- 为什么单独建表而不是加列到别的表：键集合随版本演进（新增可热更项不

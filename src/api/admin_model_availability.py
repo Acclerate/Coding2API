@@ -1,4 +1,4 @@
-"""模型可用性只读视图：`GET /api/models/availability`。
+"""模型可用性视图与主动探活：`GET /api/models/availability` + 探活/接管端点。
 **回答的问题**：「最近 N 天哪些 (渠道, 模型) 在真实请求里被判成『上游不认这个
 模型』？」——此前只有首次请求才学到的 BLOCKED 负缓存（
 `credential_model_cooldowns.reason='blocked'`），没有汇总视图，也就没有
@@ -17,8 +17,18 @@
 * `blocked` 是**现算**的：拿 `MODEL_BLOCKLIST`（热更）与记录里的模型名
   做 glob 匹配，与 `/v1/models` 的过滤同口径（归一键 / 展示名任一命中即算）。
   不在服务端缓存，改完黑名单下一次请求立即反映。
-* **不做主动探活**：真发请求耗额度，且必须与生产冷却 / 统计隔离，留作后续
-  独立立项。
+
+主动探活（`model_probes` 表 + `ModelProbeTask`）：
+
+* 真实请求的失败只能「证明我这次没打通」，不能区分「上游真没有这个模型」与
+  「额度耗尽 / 限流 / 网络抖动」。探活用一条最小对话把这两类分开，因此三态
+  判定里 `inconclusive` **绝不**触发禁用。
+* 探活与生产完全隔离：直连 provider，不写 `usage_events`、不动冷却、不影响
+  任何出口判断，结论只进独立的 `model_probes` 表。
+* 探活**成功**才是恢复入口：它清掉该 (渠道, 模型) 的 blocked 负缓存，模型
+  立即回到池子，不必等 6–24h 的 TTL 走完。
+* 人工接管（`manual != ''`）优先于自动探活：管理员点过「恢复」之后不希望
+  后台又把同一结论纠回去。
 
 目录页（`admin_model_catalog`）复用同一份聚合结果给每行补 `suspected`
 字段：两边都用 `model_match.match_keys` 的候选键求交集，OpenRouter 的
@@ -31,12 +41,15 @@ import time
 from fnmatch import fnmatch
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from ..audit.actions import ACTION_MODEL_PROBE, ACTION_MODEL_PROBE_MANUAL
 from ..auth.rbac import require_operator
+from ..compat.openai.request import InvalidRequest
 from ..model_match import match_keys
 from ..provider.naming import normalize_model_key
-from .deps import Services, principal_from_request
+from ..tasks.model_probe import ModelProbeTask
+from .deps import Services, csrf_protected, principal_from_request
 
 # 窗口：默认 7 天、上限 30 天（`usage_events` 只保留 90 天，30 天足够判断
 # 「最近是不是坏了」，再宽只是把早已恢复的历史失败翻出来）。
@@ -133,4 +146,103 @@ def create_router(services: Services) -> APIRouter:
             "error_types": list(FAILURE_ERROR_TYPES),
         }
 
+    @router.get("/api/models/probes")
+    async def list_model_probes(principal=Depends(principal_from_request)):
+        """探活结论 + 当前仍生效的 blocked 负缓存（operator 门槛）。
+
+        一次返回两份数据是为了让页面不必自己拼：`probes` 回答「上次探活什么
+        时候、结论如何」，`blocked` 回答「现在还被避让的是哪些」——只看前者
+        会漏掉「从未探过但正被负缓存锁着」的模型（那才是该点探活的）。
+        `blocked` 按 (渠道, 模型) 聚合，`credentials` 是该结论涉及的号数
+        （负缓存是逐号的，结论是模型级的）。
+        """
+        require_operator(principal)
+        rows = services.credentials.blocked_cooldowns()
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["provider"], row["model"])
+            item = grouped.setdefault(key, {
+                "provider": row["provider"], "model": row["model"],
+                "credentials": 0, "until": 0, "hits": 0,
+            })
+            item["credentials"] += 1
+            item["until"] = max(item["until"], row["cooling_until"])
+            item["hits"] = max(item["hits"], row["hits"])
+        probes = services.model_probes.all()
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, item in grouped.items():
+            merged[key] = {**item, **(probes.get(key) or {"state": "", "failures": 0,
+                                                          "last_probe_at": 0,
+                                                          "last_ok_at": 0,
+                                                          "last_error": "", "manual": ""})}
+        # 有人工接管标记但负缓存已被清掉的行也要露出（否则「恢复」之后那一行
+        # 就从页面上消失了，用户无法把它交还给自动探活）。
+        for key, probe in probes.items():
+            if key in merged:
+                continue
+            merged[key] = {"provider": key[0], "model": key[1], "credentials": 0,
+                           "until": 0, "hits": 0, **probe}
+        items = sorted(merged.values(), key=lambda item: (
+            item["state"] != "failed", -int(item.get("until") or 0),
+            item["provider"], item["model"]))
+        return {"rows": items}
+
+    @router.post("/api/models/probes/probe")
+    async def probe_model(payload: dict, request: Request,
+                          _csrf: None = Depends(csrf_protected),
+                          principal=Depends(principal_from_request)):
+        """立即探活一个 (渠道, 模型)（operator + CSRF + 审计）。
+
+        真发一次最小对话，成功即清该渠道的 blocked 负缓存。这是「人工恢复」
+        的显式入口：模型已恢复但 TTL 还没到（最长 24h）时，用户不必干等。
+        """
+        require_operator(principal)
+        provider, model = _probe_target(payload)
+        task = _probe_task(request)
+        state, error = await task.probe_now(provider, model)
+        services.audit.record(
+            actor=principal.username, action=ACTION_MODEL_PROBE,
+            target=f"{provider}/{model}", detail=f"state={state} {error}".strip())
+        return {"provider": provider, "model": model, "state": state, "error": error}
+
+    @router.post("/api/models/probes/manual")
+    async def take_over(payload: dict, request: Request,
+                        _csrf: None = Depends(csrf_protected),
+                        principal=Depends(principal_from_request)):
+        """人工接管一个 (渠道, 模型)（operator + CSRF + 审计）。
+
+        `manual` 取值：`on`（接管，自动探活永久跳过）或 `off`（交还自动探活）。
+        接管**不**改负缓存：用户可能只是不想让后台反复探这个模型（比如它是
+        确认下线的），而不是要立刻用它。要立刻恢复请走 `/probe`。
+        """
+        require_operator(principal)
+        provider, model = _probe_target(payload)
+        manual = str(payload.get("manual") or "").strip()
+        if manual not in ("on", "off"):
+            raise InvalidRequest("manual must be 'on' or 'off'")
+        _probe_task(request)  # 装配校验：探活任务不存在时早失败
+        services.model_probes.set_manual(provider=provider, model=model,
+                                         manual="manual" if manual == "on" else "")
+        services.audit.record(actor=principal.username,
+                              action=ACTION_MODEL_PROBE_MANUAL,
+                              target=f"{provider}/{model}", detail=f"manual={manual}")
+        return {"provider": provider, "model": model, "manual": manual == "on"}
+
     return router
+
+
+def _probe_target(payload: dict) -> tuple[str, str]:
+    """从请求体取 (渠道, 模型)；两者都是必填字符串。"""
+    provider = str(payload.get("provider") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if not provider or not model:
+        raise InvalidRequest("provider and model are required")
+    return provider, model
+
+
+def _probe_task(request: Request) -> ModelProbeTask:
+    """取装配好的探活任务（与后台循环同一个实例，共用 provider 与仓储）。"""
+    task = getattr(request.app.state, "model_probe_task", None)
+    if task is None:  # pragma: no cover - 生产路径恒装配；测试注入空 registry 时才有
+        raise InvalidRequest("model probe task not configured")
+    return task

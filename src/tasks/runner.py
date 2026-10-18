@@ -21,6 +21,7 @@ from .alerting import AlertTask
 from .backup import BackupTask
 from .checkin import CheckinTask
 from .growth import GrowthTask
+from .model_probe import ModelProbeTask
 from .pacer import Pacer
 from .quota_probe import QuotaProbeTask
 from .refresh import RefreshTask
@@ -77,11 +78,15 @@ class TaskRunner:
     backup: BackupTask | None = None,
     # 上游状态页聚合：None 表示不装配该循环（老调用方/测试保持原行为）。
     upstream_status: UpstreamStatusTask | None = None,
+    # 模型可用性探活：None 表示不装配该循环。即使装配了，周期为 0（默认）
+    # 时也由 `_sync_model_probe` 每轮判成 no-op——探活会真发上游请求。
+    model_probe: ModelProbeTask | None = None,
     quota_probe_minutes: int | Callable[[], int] = 60,
     growth_interval_minutes: int | Callable[[], int] = 60,
     refresh_interval_minutes: int | Callable[[], int] = 60,
     retention_interval_minutes: int | Callable[[], int] = 5,
     model_catalog_minutes: int | Callable[[], int] = 30,
+    model_probe_minutes: int | Callable[[], int] = 0,
     openrouter_catalog_minutes: int | Callable[[], int] = 1440,
     alert_interval_minutes: int | Callable[[], int] = 5,
     backup_interval_minutes: int | Callable[[], int] = 1440,
@@ -98,6 +103,7 @@ class TaskRunner:
         self._refresh = refresh
         self._retention = retention
         self._model_catalog = model_catalog
+        self._model_probe = model_probe
         self._openrouter_catalog = openrouter_catalog
         self._alert = alert
         self._backup = backup
@@ -109,6 +115,7 @@ class TaskRunner:
         self._refresh_minutes = live(refresh_interval_minutes)
         self._retention_minutes = live(retention_interval_minutes)
         self._model_catalog_minutes = live(model_catalog_minutes)
+        self._model_probe_minutes = live(model_probe_minutes)
         self._openrouter_catalog_minutes = live(openrouter_catalog_minutes)
         self._alert_minutes = live(alert_interval_minutes)
         self._backup_minutes = live(backup_interval_minutes)
@@ -163,6 +170,13 @@ class TaskRunner:
         # 下限 60 分钟与热更项 minimum 对齐：价格与能力指数变动都很少，更密只是
         # 白拉一遍（一次抓取同时供三处用）。
         return max(3600, int(self._openrouter_catalog_minutes()) * 60)
+
+    @property
+    def _model_probe_interval(self) -> float:
+        # 周期 0 = 关闭，故下限与热更项 minimum 对齐到 1 分钟（不再按 60 分钟
+        # 兜底，否则「填 1」会静默变成 60）。负缓存本身 6h 起步，实际部署建议
+        # ≥60 分钟——这条只防手滑填成 0 以外的小值。
+        return max(60, int(self._model_probe_minutes()) * 60)
 
     @property
     def _alert_interval(self) -> float:
@@ -248,6 +262,9 @@ class TaskRunner:
         if self._model_catalog is not None:
             specs.append(_LoopSpec("model_catalog", self._model_catalog,
                                    lambda: self._interval_seconds("model_catalog")))
+        if self._model_probe is not None:
+            specs.append(_LoopSpec("model_probe", self._sync_model_probe,
+                                   lambda: self._interval_seconds("model_probe")))
         if self._openrouter_catalog is not None:
             specs.append(_LoopSpec("openrouter_catalog", self._openrouter_catalog,
                                    lambda: self._interval_seconds("openrouter_catalog")))
@@ -319,6 +336,19 @@ class TaskRunner:
         `context_compress_min_keep_messages` 调大后可达秒级）。
         """
         return await asyncio.to_thread(self._retention.run_once)
+
+    async def _sync_model_probe(self) -> object:
+        """模型可用性探活一轮：周期 0（默认）时是 no-op。
+
+        是否开启每轮现读：探活要真发上游请求、消耗额度，默认关闭；管理台把
+        「模型探活周期」填上即生效，不必重启。关着时返回 None，`_guarded`
+        不记运行态——页面显示「未运行」，而不是「刚跑过」。
+        """
+        if self._model_probe is None:
+            raise RuntimeError("model probe task not configured")
+        if int(self._model_probe_minutes()) <= 0:
+            return None
+        return await self._model_probe.run_once()
 
     async def _sync_alert(self) -> object:
         """运维告警一轮：评估四类规则、静默去重后落库 + 推送。
@@ -468,6 +498,8 @@ class TaskRunner:
             return float(self._activity_interval)
         if key == "model_catalog":
             return self._model_catalog_interval
+        if key == "model_probe":
+            return self._model_probe_interval
         if key == "openrouter_catalog":
             return self._openrouter_catalog_interval
         if key == "alert":
@@ -520,6 +552,8 @@ def build_runner(credentials, providers: dict, stats_collector, config,
                  alerts=None,
                  backup: BackupTask | None = None,
                  upstream_status: UpstreamStatusTask | None = None,
+                 model_probe: ModelProbeTask | None = None,
+                 model_probe_minutes: int | Callable[[], int] = 0,
                  status: TaskStatusStore | None = None) -> TaskRunner:
     """按配置装配后台任务（Pacer 由两个 provider 共享）。
 
@@ -547,6 +581,10 @@ def build_runner(credentials, providers: dict, stats_collector, config,
 
     upstream_status 同理：None 时不装配上游状态页抓取循环（老调用方与测试保持
     原行为）；生产路径传入 UpstreamStatusTask（快照挂在 app.state 供路由读取）。
+
+    model_probe 同理：None 时不装配模型探活循环。周期默认 0（关闭）——探活
+    会真发上游请求、消耗额度，开不开由部署者按余量决定；管理台把「模型探活
+    周期」填上即生效（热更，不必重启）。
 
     热更：`config` 既可以是启动期快照 `Settings`，也可以是
     `RuntimeSettings` 覆盖层。装配时所有「可热更项」必须传**零参 lambda**，
@@ -609,6 +647,8 @@ def build_runner(credentials, providers: dict, stats_collector, config,
         backup_interval_minutes=lambda: config.backup_interval_minutes,
         upstream_status=upstream_status,
         upstream_status_minutes=lambda: config.upstream_status_minutes,
+        model_probe=model_probe,
+        model_probe_minutes=lambda: config.model_probe_minutes,
         activity_enabled=lambda: config.activity_report_enabled,
         alert_enabled=lambda: config.alert_enabled,
         upstream_status_enabled=lambda: config.upstream_status_enabled,

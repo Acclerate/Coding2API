@@ -153,6 +153,12 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "/v1/models 或 Playground 时才刷新，纯 API 用法的部署会让"
                "「模型→渠道」归属表与落盘快照一起变陈旧。下限 5 分钟。",
                minimum=5, task="model_catalog", floor=5),
+    HotSetting("model_probe_minutes", int, "模型探活周期（分钟）",
+               "对仍被负缓存（上游「无此模型」）的 (渠道, 模型) 发一次最小对话的"
+               "间隔：探活成功立即解除避让，额度/限流类失败只记「不确定」不禁用。"
+               "0 = 关闭（默认）：探活会真发上游请求、消耗额度，是否开启按余量"
+               "决定；负缓存本身 6 小时起步，开启后建议 ≥60 分钟。",
+               minimum=0, task="model_probe"),
     HotSetting("openrouter_catalog_minutes", int, "模型目录刷新周期（分钟）",
                "后台拉取 OpenRouter 公开模型列表的间隔：一次抓取代刊例价（成本"
                "估算）、明细元数据（「模型列表」页）与 Artificial Analysis 能力"
@@ -699,6 +705,10 @@ class RuntimeSettings:
     @property
     def model_catalog_minutes(self) -> int:
         return int(self.get("model_catalog_minutes"))
+
+    @property
+    def model_probe_minutes(self) -> int:
+        return int(self.get("model_probe_minutes"))
 
     @property
     def openrouter_catalog_minutes(self) -> int:

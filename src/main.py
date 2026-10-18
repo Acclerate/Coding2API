@@ -77,6 +77,7 @@ from .db.repo import (
     CredentialRepository,
     CreditEventRepository,
     GrowthRepository,
+    ModelProbeRepository,
     RuntimeSettingsRepository,
     UserRepository,
 )
@@ -106,6 +107,7 @@ from .stats.collector import StatsCollector
 from .stats.live import LiveEventHub
 from .stats.query import StatsQuery
 from .tasks.backup import BackupTask
+from .tasks.model_probe import ModelProbeTask
 from .tasks.pacer import Pacer
 from .tasks.runner import build_runner
 from .tasks.upstream_status import UpstreamStatusTask
@@ -470,6 +472,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 凭证级限额护栏：配置表 + 当日用量聚合注入 LimitGuard（快照缓存），
     # executor 选号前用它过滤触顶候选；管理台改完 invalidate() 立即生效。
     limits_repo = LimitsRepository(db)
+    # 主动探活结论表（只供管理台展示 + 探活成功清负缓存）：与调度状态严格分开，
+    # 见 src/tasks/model_probe.py 的模块 docstring。
+    model_probes = ModelProbeRepository(db)
     limit_guard = LimitGuard(limits_repo,
                              lambda since: day_usage(db, since=since))
     # Key 级配额：当日用量按 api_key_id 聚合（明细表），RPM/TPM/并发走进程内
@@ -582,6 +587,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             upstream_status_store,
             timeout=config.upstream_status_timeout_seconds,
             enabled=lambda: runtime.upstream_status_enabled)
+        model_probe_task = ModelProbeTask(
+            credentials, registry, model_probes,
+            upstream_model=lambda provider_id, name: (
+                model_aliases.get(provider_id, {}).get(name.lower(), name)))
+        app_.state.model_probe_task = model_probe_task
         runner = build_runner(credentials, registry, app_.state.stats_collector, runtime,
                               growth_events=app_.state.growth_events,
                               credit_events=credit_events,
@@ -590,6 +600,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               backup=BackupTask(config.db_path,
                                                 keep=lambda: runtime.backup_keep),
                               upstream_status=upstream_status_task,
+                              model_probe=model_probe_task,
+                              model_probe_minutes=lambda: runtime.model_probe_minutes,
                               model_catalog=_refresh_channel_models,
                               openrouter_catalog=_refresh_model_catalog,
                               openrouter_catalog_minutes=(
@@ -737,6 +749,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         audit=audit,
         alerts=alerts,
         limits=limits_repo,
+        model_probes=model_probes,
         limit_guard=limit_guard,
         key_quota=key_quota,
         key_usage=key_usage,

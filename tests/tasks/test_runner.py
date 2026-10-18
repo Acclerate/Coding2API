@@ -785,3 +785,97 @@ def test_build_runner_wires_checkin_schedule(repo):
     store.set("checkin_times", "")
     config.reload()
     assert runner._checkin._times() == ""
+
+
+def test_build_runner_wires_model_probe(repo):
+    """model_probe 传入时接线：周期从配置读，循环与间隔都挂上。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, MODEL_PROBE_MINUTES=90)
+    task = ModelProbeTask(credentials, {}, ModelProbeRepository(db))
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          model_probe=task,
+                          model_probe_minutes=lambda: config.model_probe_minutes)
+
+    assert runner._model_probe is task
+    assert runner._model_probe_interval == 90 * 60
+    assert "model_probe" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("model_probe") == 90 * 60
+    assert "model_probe" in {item["key"] for item in runner.task_status()}
+
+
+def test_model_probe_interval_floor(repo):
+    """周期下限 1 分钟：填 0（关闭）时循环仍在，只是每轮判成 no-op。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET,
+                                   MODEL_PROBE_MINUTES=0))
+
+    assert runner._model_probe_interval == 60
+
+
+def test_model_probe_not_assembled_by_default(repo):
+    """老调用方不传 model_probe 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._model_probe is None
+    assert "model_probe" not in {spec.key for spec in runner._loop_specs()}
+    assert "model_probe" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_model_probe_without_task_raises(repo):
+    """未装配时 _sync_model_probe 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="model probe task not configured"):
+        await runner._sync_model_probe()
+
+
+async def test_runner_model_probe_disabled_is_noop(repo):
+    """周期 0（默认）= 关闭：返回 None 且不记运行态（页面显示「未运行」）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 0,
+    )
+
+    assert await runner._sync_model_probe() is None
+    assert runner.status.runs("model_probe") == 0
+
+
+async def test_runner_model_probe_runs_task_when_enabled(repo):
+    """周期 > 0 时委托给任务对象（无负缓存行 → 空报告也算跑过一轮）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 60,
+    )
+
+    ok = await runner._guarded(runner._sync_model_probe(), "模型探活",
+                               key="model_probe")
+
+    assert ok is True
+    assert runner.status.runs("model_probe") == 1
+    assert runner.status.get("model_probe").report == {
+        "attempted": 0, "succeeded": 0, "failed": 0, "skipped": 0}

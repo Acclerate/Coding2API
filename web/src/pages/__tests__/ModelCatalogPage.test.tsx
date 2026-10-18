@@ -346,18 +346,19 @@ describe("ModelCatalogPage（模型列表）", () => {
     await settle();
 
     const urls = () => spy.mock.calls.map((call) => String(call[0]));
+    const catalogUrls = () => urls().filter((url) => url.includes("/api/model-catalog"));
     // 默认按 id 升序，不带 intelligence
-    expect(urls()[0]).toContain("sort=id");
+    expect(catalogUrls()[0]).toContain("sort=id");
 
     await userEvent.click(screen.getByTestId("sort-intelligence"));
     await settle();
-    expect(urls().at(-1)!).toContain("sort=intelligence");
-    expect(urls().at(-1)!).toContain("order=desc");   // 分数类列首点降序（先看最高）
+    expect(catalogUrls().at(-1)!).toContain("sort=intelligence");
+    expect(catalogUrls().at(-1)!).toContain("order=desc");   // 分数类列首点降序（先看最高）
 
     // 再点同列：升序
     await userEvent.click(screen.getByTestId("sort-intelligence"));
     await settle();
-    expect(urls().at(-1)!).toContain("order=asc");
+    expect(catalogUrls().at(-1)!).toContain("order=asc");
   });
 
   // ------------------------------------------------ 疑似下线 / 一键黑名单
@@ -471,5 +472,217 @@ describe("ModelCatalogPage（模型列表）", () => {
     fireEvent.click(screen.getByTestId("model-block-glm-5.2"));
     await waitFor(() => expect(screen.getByTestId("model-blocklist-toast"))
       .toHaveTextContent("加入黑名单失败"));
+  });
+
+  // ------------------------------------------------------ 主动探活 / 人工接管
+
+  const PROBES = {
+    rows: [
+      {
+        provider: "trae", model: "glm-5.2", credentials: 2, until: 1_700_003_600,
+        hits: 4, state: "failed", failures: 2, last_probe_at: 1_700_000_000,
+        last_ok_at: 0, last_error: "HTTP 404: model not found", manual: "",
+      },
+      {
+        provider: "trae", model: "kimi-k3", credentials: 0, until: 0, hits: 0,
+        state: "ok", failures: 0, last_probe_at: 1_700_000_000,
+        last_ok_at: 1_700_000_000, last_error: "", manual: "",
+      },
+      {
+        provider: "codebuddy", model: "seed-2.1", credentials: 1, until: 1_700_003_600,
+        hits: 1, state: "inconclusive", failures: 0, last_probe_at: 1_700_000_000,
+        last_ok_at: 0, last_error: "上游未返回任何内容", manual: "manual",
+      },
+      {
+        provider: "trae", model: "never-probed", credentials: 1, until: 1_700_003_600,
+        hits: 1, state: "", failures: 0, last_probe_at: 0,
+        last_ok_at: 0, last_error: "", manual: "",
+      },
+    ],
+  };
+
+  /** 目录 + 探活三类端点一起 mock（探活写接口按 body 记录调用）。 */
+  function stubProbePage(
+    probes: unknown = PROBES,
+    handler?: (url: string, init?: RequestInit) => Response | undefined,
+  ) {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      const custom = handler?.(url, init);
+      if (custom) return custom;
+      return new Response(JSON.stringify({
+        models: MODELS, count: 2, total: 2, currency: "USD",
+        usd_cny_rate: 7, saved_at: 1_700_000_000, availability_days: 7,
+        ...(url.includes("/api/models/probes") ? (probes as object) : {}),
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", spy);
+    return calls;
+  }
+
+  it("探活面板：三态结论 / 负缓存 / 接管标记 / 未探过都各有措辞", async () => {
+    stubProbePage();
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    expect(screen.getByTestId("model-probe-summary")).toHaveTextContent(
+      "共 4 个 · 仍被负缓存 3 个");
+
+    const failed = screen.getByTestId("probe-row-trae-glm-5.2");
+    expect(failed).toHaveTextContent("探活 · 确认不可用");
+    expect(failed).toHaveTextContent("连续失败 2 次");
+    expect(failed).toHaveTextContent("HTTP 404: model not found");
+    expect(failed).toHaveTextContent("2 号 · 至");
+
+    const recovered = screen.getByTestId("probe-row-trae-kimi-k3");
+    expect(recovered).toHaveTextContent("探活 · 已恢复");
+    expect(recovered).toHaveTextContent("无");
+
+    // 「无法判定」不能被写成「失败」或「坏了」——那是额度 / 限流的措辞
+    const inconclusive = screen.getByTestId("probe-row-codebuddy-seed-2.1");
+    expect(inconclusive).toHaveTextContent("探活 · 无法判定");
+    expect(inconclusive).not.toHaveTextContent("确认不可用");
+    expect(inconclusive).toHaveTextContent("人工接管");
+    expect(inconclusive).toHaveTextContent("交还自动探活");
+
+    const never = screen.getByTestId("probe-row-trae-never-probed");
+    expect(never).toHaveTextContent("探活 · 未探活");
+    expect(never).toHaveTextContent("未探过");
+  });
+
+  it("探活面板：无记录时给出空态", async () => {
+    stubProbePage({ rows: [] });
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    expect(screen.getByTestId("model-probe-empty")).toHaveTextContent(
+      "当前没有被负缓存锁住的模型");
+  });
+
+  it("探活面板：接口失败时给专属错误提示（不影响目录表）", async () => {
+    stubProbePage(undefined, (url) => {
+      if (url.includes("/api/models/probes")) {
+        return new Response(JSON.stringify({
+          error: { code: "forbidden", message: "operator only" },
+        }), { status: 403, headers: { "Content-Type": "application/json" } });
+      }
+      return undefined;
+    });
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    expect(screen.getByTestId("model-probe-error")).toHaveTextContent(
+      "探活记录加载失败");
+    expect(screen.getByTestId("model-catalog-table")).toBeInTheDocument();
+  });
+
+  it("「立即探活」成功时提示已清负缓存（POST provider/model）", async () => {
+    const calls = stubProbePage(undefined, (url) =>
+      url.includes("/probes/probe")
+        ? new Response(JSON.stringify({
+            provider: "trae", model: "glm-5.2", state: "ok", error: "",
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-now-trae-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("探活成功，已清除该渠道的负缓存"));
+
+    const post = calls.find((call) => call.url.includes("/probes/probe"));
+    expect(post?.init?.method).toBe("POST");
+    expect(JSON.parse(String(post!.init!.body))).toEqual({
+      provider: "trae", model: "glm-5.2",
+    });
+  });
+
+  it("「立即探活」无法判定时明确说未做禁用（不写成探活失败）", async () => {
+    stubProbePage(undefined, (url) =>
+      url.includes("/probes/probe")
+        ? new Response(JSON.stringify({
+            provider: "codebuddy", model: "seed-2.1",
+            state: "inconclusive", error: "上游未返回任何内容",
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-now-codebuddy-seed-2.1"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("无法判定（不构成下线证据，未做任何禁用）"));
+  });
+
+  it("「立即探活」上游确认不可用时提示结论", async () => {
+    stubProbePage(undefined, (url) =>
+      url.includes("/probes/probe")
+        ? new Response(JSON.stringify({
+            provider: "trae", model: "glm-5.2",
+            state: "failed", error: "HTTP 404: model not found",
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-now-trae-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("确认不可用：HTTP 404: model not found"));
+  });
+
+  it("探活请求本身失败时给出错误提示", async () => {
+    stubProbePage(undefined, (url) =>
+      url.includes("/probes/probe")
+        ? new Response(JSON.stringify({
+            error: { code: "forbidden", message: "operator only" },
+          }), { status: 403, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-now-trae-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("探活失败：operator only"));
+  });
+
+  it("「人工接管」写 manual=on，已接管的行写 manual=off（交还）", async () => {
+    const calls = stubProbePage(undefined, (url) =>
+      url.includes("/probes/manual")
+        ? new Response(JSON.stringify({
+            provider: "trae", model: "glm-5.2", manual: true,
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-manual-trae-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("已人工接管：自动探活跳过它"));
+    expect(JSON.parse(String(
+      calls.find((call) => call.url.includes("/probes/manual"))!.init!.body,
+    ))).toEqual({ provider: "trae", model: "glm-5.2", manual: "on" });
+
+    fireEvent.click(screen.getByTestId("probe-manual-codebuddy-seed-2.1"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("已交还自动探活"));
+    expect(JSON.parse(String(
+      calls.filter((call) => call.url.includes("/probes/manual")).at(-1)!.init!.body,
+    ))).toEqual({ provider: "codebuddy", model: "seed-2.1", manual: "off" });
+  });
+
+  it("切换接管失败时给出错误提示", async () => {
+    stubProbePage(undefined, (url) =>
+      url.includes("/probes/manual")
+        ? new Response(JSON.stringify({
+            error: { code: "forbidden", message: "operator only" },
+          }), { status: 403, headers: { "Content-Type": "application/json" } })
+        : undefined);
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    fireEvent.click(screen.getByTestId("probe-manual-trae-glm-5.2"));
+    await waitFor(() => expect(screen.getByTestId("model-probe-toast"))
+      .toHaveTextContent("切换接管失败：operator only"));
   });
 });

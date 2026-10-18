@@ -21,7 +21,7 @@ from ..engine.scheduler import (
     expiring_credits,
     expiry_windows,
 )
-from ..provider.base import Quota, health_score
+from ..provider.base import Quota, credits_health_score, health_score
 from ..provider.token_expiry import credential_token_times
 from ..sorting import sort_rows, sql_order
 from ..tags import tags_text, tags_value
@@ -104,6 +104,9 @@ CREDENTIAL_SORT_KEYS: dict[str, Callable[[dict[str, Any]], Any]] = {
     # ——否则点列头会按每日池排、却显示积分，数字看着不成序。其余渠道恒 None，
     # 排在末尾（`sort_rows` 的 null 语义），组内保持原顺序。
     "quota_credits_remaining": lambda row: row["quota_credits_remaining"],
+    # 积分账派生的健康度：内置组点「状态 / 健康度」列头时按它排——与列里显示的
+    # 那本账同源（否则列里显示积分 99%，排序却按每日池的 0%）。其余渠道恒 None。
+    "quota_credits_health": lambda row: row["quota_credits_health"],
     "quota_expiring_credits": lambda row: row["quota_expiring_credits"],
     # 0 = 上游未给到期信息，视为缺失（排最后），不当成「最早过期」
     "token_expires_at": lambda row: row["token_expires_at"] or None,
@@ -341,6 +344,35 @@ class CredentialRepository:
             "WHERE credential_id = ? AND cooling_until > ?",
             (credential_id, int(now if now is not None else time.time()))).fetchall()
         return {row["model"]: row["cooling_until"] for row in rows}
+
+    def blocked_cooldowns(self, now: int | None = None) -> list[dict[str, Any]]:
+        """仍在生效的 `reason='blocked'` 负缓存行（附渠道），供主动探活。
+
+        只取 blocked：`model`（6004 模型限流）有自己的重置墙钟，探活成功一次
+        不代表限流解除——那是调度器与上游时钟的事，不该被探测提前解除。
+        """
+        rows = self._db.connect().execute(
+            "SELECT c.credential_id, c.model, c.cooling_until, c.hits, "
+            "       cred.provider AS provider "
+            "FROM credential_model_cooldowns c "
+            "JOIN credentials cred ON cred.id = c.credential_id "
+            "WHERE c.reason = 'blocked' AND c.cooling_until > ? "
+            "ORDER BY c.cooling_until", (int(now if now is not None else time.time()),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_blocked(self, *, provider: str, model: str) -> int:
+        """清掉某 (渠道, 模型) 的全部 blocked 负缓存行（人工恢复 / 探活成功）。
+
+        按渠道而不是按凭证清：11102「该后端无此模型」通常随上游模型表变化，
+        只清探活用的那一个号，其余号会各等一个 6h 起步的 TTL 才恢复。
+        """
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM credential_model_cooldowns WHERE model = ? "
+                "AND reason = 'blocked' AND credential_id IN "
+                "(SELECT id FROM credentials WHERE provider = ?)", (model, provider))
+        return cursor.rowcount
 
     def save_credential_data(self, credential_id: str, credential_data: dict) -> None:
         """写回凭证 JSON，并同步 access token 的签发/到期时间。
@@ -601,6 +633,8 @@ class CredentialRepository:
         附 `quota_expiring_credits_secondary`（主账次窗口，主窗口打平时才参与排序的第二级）；
         附 `quota_credits_expiring` / `quota_credits_expiring_secondary`（**积分账**
         自己的窗口内到期积分，仅 CodeArts 有；其余渠道为 None）；
+        附 `quota_credits_health`（**积分账**派生的健康度，仅 CodeArts 有值；只供
+        内置组展示，调度口径仍读 `health`）；
         附 `quota_expiry_ladder`（两本账合并的套餐到期阶梯，[[epoch, 剩余积分]]，按包
         独立到期的渠道）、`quota_credits_expiry_ladder`（仅积分账那一段，仅 CodeArts）；
         渠道无到期信息时前两者为 None，展示层据此隐藏。
@@ -668,6 +702,11 @@ class CredentialRepository:
                 None if credits_ladder is None else credits_primary)
             rec["quota_credits_expiring_secondary"] = (
                 None if credits_ladder is None else credits_secondary)
+            # 积分账的派生健康度（仅展示，调度口径仍是 `health`）。内置组的
+            # 额度列讲积分账，健康度也必须讲同一本账，否则两列自相矛盾：
+            # 库里 `health` 只按主账（每日池）算，积分还剩 99% 的号也会显示 0%。
+            rec["quota_credits_health"] = credits_health_score(
+                row["quota_credits_remaining"], row["quota_credits_total"])
             rec["model_cooldowns"] = cooling.get(row["id"], [])
             out.append(rec)
         # 排序在组装后做：额度占比 / 到期额度是派生字段，SQL 排不了。
@@ -1309,3 +1348,78 @@ class AuditRepository:
         with self._db.transaction() as conn:
             cursor = conn.execute("DELETE FROM audit_events WHERE ts < ?", (cutoff,))
         return cursor.rowcount
+
+class ModelProbeRepository:
+    """主动探活结论（`model_probes`）：只供管理台展示 + 「探活成功清负缓存」。
+
+    与 `credential_model_cooldowns` 严格分工：那张表是调度**权威**状态（真实
+    请求的失败驱动，直接决定选号），本表只是观测记录，不参与任何出口判断。
+    把探测结论写进冷却表会让一次探测直接改变选号结果，而「探测失败」未必是
+    模型本身的问题（额度耗尽、限流、网络抖动都会失败）。
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    _COLUMNS = ("provider, model, state, failures, last_probe_at, last_ok_at, "
+                "last_error, manual, updated_at")
+    # `record` 不写 manual（接管标记只由 set_manual 改）：INSERT 的列必须与
+    # 占位符一一对应，否则会撞「Incorrect number of bindings」。
+    _RECORD_COLUMNS = ("provider, model, state, failures, last_probe_at, last_ok_at, "
+                       "last_error, updated_at")
+
+    def all(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """整表读回 `{(渠道, 模型): 行}`：表很小，只在探过的模型上才有行。"""
+        rows = self._db.connect().execute(
+            f"SELECT {self._COLUMNS} FROM model_probes").fetchall()
+        return {(row["provider"], row["model"]): dict(row) for row in rows}
+
+    def get(self, provider: str, model: str) -> dict[str, Any] | None:
+        row = self._db.connect().execute(
+            f"SELECT {self._COLUMNS} FROM model_probes "
+            "WHERE provider = ? AND model = ?", (provider, model)).fetchone()
+        return dict(row) if row is not None else None
+
+    def record(self, *, provider: str, model: str, state: str,
+               error: str = "", now: int | None = None) -> None:
+        """落一条探活结论。
+
+        `failures` 只在 `failed` 时累加、`ok`/`inconclusive` 时归零。归零是
+        刻意的：额度耗尽、限流、网络抖动都不构成「模型本身有问题」的连续
+        证据，继续累计会让一串无关故障凑成「连续失败」，把好模型判死。
+        `last_ok_at` 只在 `ok` 时前移，其余状态保留上一次成功时刻。
+        """
+        stamp = int(now if now is not None else time.time())
+        with self._db.transaction() as conn:
+            conn.execute(
+                f"INSERT INTO model_probes ({self._RECORD_COLUMNS}) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(provider, model) DO UPDATE SET "
+                "state = excluded.state, "
+                "failures = CASE WHEN excluded.state = 'failed' "
+                "                THEN model_probes.failures + 1 ELSE 0 END, "
+                "last_probe_at = excluded.last_probe_at, "
+                "last_ok_at = CASE WHEN excluded.state = 'ok' "
+                "                  THEN excluded.last_probe_at "
+                "                  ELSE model_probes.last_ok_at END, "
+                "last_error = excluded.last_error, "
+                "updated_at = excluded.updated_at",
+                (provider, model, state, 1 if state == "failed" else 0,
+                 stamp, stamp if state == "ok" else 0, error, stamp))
+
+    def set_manual(self, *, provider: str, model: str, manual: str,
+                   now: int | None = None) -> None:
+        """人工接管标记（`''` = 交还自动探活）。行不存在时先建一条空结论行。"""
+        stamp = int(now if now is not None else time.time())
+        with self._db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO model_probes (provider, model, manual, updated_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(provider, model) DO UPDATE SET "
+                "manual = excluded.manual, updated_at = excluded.updated_at",
+                (provider, model, manual, stamp))
+
+    def manual_marked(self) -> set[tuple[str, str]]:
+        """被人工接管的 (渠道, 模型)：自动探活整行跳过。"""
+        rows = self._db.connect().execute(
+            "SELECT provider, model FROM model_probes WHERE manual != ''").fetchall()
+        return {(row["provider"], row["model"]) for row in rows}

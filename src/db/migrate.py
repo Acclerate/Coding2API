@@ -60,7 +60,10 @@ SCHEMA_NAME = "schema.sql"
 # 27：api_keys 新增 quota（Key 级配额 JSON 文本：当日请求/当日 token/当日成本/
 # RPM/TPM/并发，''=不限制）。老库补列后为 '' ＝「所有 Key 不受配额约束」，
 # 出口行为与补列前完全一致。
-SCHEMA_VERSION = 27
+# 28：新增 model_probes 表（主动探活结论 + 人工接管标记）。新增表只需进
+# schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作；
+# 老库升级后表为空 ＝「从未探活」，管理台显示「—」，行为与补表前一致。
+SCHEMA_VERSION = 28
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (

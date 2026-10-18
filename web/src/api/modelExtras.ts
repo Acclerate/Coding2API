@@ -101,9 +101,14 @@ export interface ModelCatalogParams {
   offset?: number;
 }
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
-    headers: { "X-Requested-With": "XMLHttpRequest" },
+    ...init,
+    headers: {
+      "X-Requested-With": "XMLHttpRequest",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
     credentials: "same-origin",
   });
   const text = await response.text();
@@ -169,4 +174,80 @@ export function withBlocklistPattern(raw: string, pattern: string): string {
     return patterns.join(",");
   }
   return [...patterns, target].join(",");
+}
+
+// ------------------------------------------------- 主动探活 + 人工接管
+
+/** 探活三态：`ok` 恢复、`failed` 上游明确说没这个模型、其余一律 `inconclusive`。 */
+export type ProbeState = "ok" | "failed" | "inconclusive";
+
+/** `GET /api/models/probes` 的一行：探活结论 + 当前负缓存（两者按 (渠道, 模型) 合并）。 */
+export interface ModelProbeRow {
+  provider: string;
+  model: string;
+  /** 仍被 blocked 负缓存锁住的号数（0 = 已无负缓存，但可能有人工接管标记） */
+  credentials: number;
+  /** 负缓存最晚到期时刻（epoch 秒），0 表示当前无负缓存 */
+  until: number;
+  /** 负缓存命中次数（多号取最大） */
+  hits: number;
+  /** 最近一次探活结论；从未探过为空串 */
+  state: ProbeState | "";
+  /** 连续 `failed` 次数（`ok` / `inconclusive` 会归零） */
+  failures: number;
+  last_probe_at: number;
+  last_ok_at: number;
+  last_error: string;
+  /** `manual` = 人工接管中，自动探活跳过；空串 = 自动 */
+  manual: string;
+}
+
+export interface ModelProbeResponse {
+  rows: ModelProbeRow[];
+}
+
+export interface ProbeResult {
+  provider: string;
+  model: string;
+  state: ProbeState;
+  error: string;
+}
+
+/** 探活结论 + 当前负缓存（operator）。 */
+export function fetchModelProbes(): Promise<ModelProbeResponse> {
+  return request<ModelProbeResponse>("/api/models/probes");
+}
+
+/** 立即探活一个 (渠道, 模型)：成功即清该渠道的 blocked 负缓存（operator + CSRF）。 */
+export function probeModel(provider: string, model: string): Promise<ProbeResult> {
+  return request<ProbeResult>("/api/models/probes/probe", {
+    method: "POST",
+    body: JSON.stringify({ provider, model }),
+  });
+}
+
+/**
+ * 人工接管 / 交还自动探活（operator + CSRF）。
+ *
+ * 接管不改负缓存：要立刻恢复请用「立即探活」。接管只是让后台别再反复探它。
+ */
+export function setModelProbeManual(
+  provider: string,
+  model: string,
+  on: boolean,
+): Promise<{ provider: string; model: string; manual: boolean }> {
+  return request("/api/models/probes/manual", {
+    method: "POST",
+    body: JSON.stringify({ provider, model, manual: on ? "on" : "off" }),
+  });
+}
+
+/** 探活状态的中文标签（页面与 toast 共用一套措辞）。 */
+export function probeStateLabel(state: ProbeState | ""): string {
+  switch (state) {
+    case "ok": return "已恢复";
+    case "failed": return "确认不可用";
+    case "inconclusive": return "无法判定";
+    default: return "未探活";
+  }
 }

@@ -26,6 +26,8 @@ ACTION_CREDENTIAL_LIMITS = "credential.limits"
 ACTION_CREDENTIAL_TAGS = "credential.tags"
 ACTION_API_KEY_QUOTA = "api_key.quota"
 ACTION_ALERT_RESOLVE = "alert.resolve"
+ACTION_MODEL_PROBE = "model.probe"
+ACTION_MODEL_PROBE_MANUAL = "model.probe_manual"
 ACTION_SETTINGS_UPDATE = "settings.update"
 
 ACTIONS: tuple[str, ...] = (
@@ -38,6 +40,7 @@ ACTIONS: tuple[str, ...] = (
     ACTION_CREDENTIAL_LIMITS, ACTION_CREDENTIAL_TAGS,
     ACTION_API_KEY_QUOTA,
     ACTION_ALERT_RESOLVE,
+    ACTION_MODEL_PROBE, ACTION_MODEL_PROBE_MANUAL,
     ACTION_SETTINGS_UPDATE,
 )
 
@@ -63,5 +66,7 @@ ACTION_LABELS: dict[str, str] = {
     ACTION_CREDENTIAL_TAGS: "设置标签",
     ACTION_API_KEY_QUOTA: "设置 Key 配额",
     ACTION_ALERT_RESOLVE: "标记告警恢复",
+    ACTION_MODEL_PROBE: "探活模型",
+    ACTION_MODEL_PROBE_MANUAL: "接管模型探活",
     ACTION_SETTINGS_UPDATE: "修改运行时配置",
 }
