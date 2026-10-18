@@ -69,7 +69,7 @@ Accounts live in SQLite's `users` table; the *Users* page (admins only) handles 
 
 | Role | Can do |
 |---|---|
-| `admin` | User management, tasks & settings, credential read/write, all stats, audit log, upstream status, model list |
+| `admin` | User management, tasks & settings, credential read/write, all stats, audit log, server logs, upstream status, model list |
 | `operator` | Credential read/write (import / delete / pause / check-in / growth / account switch), all stats, upstream status, model list |
 | `viewer` | Read-only: dashboard, credential list, stats, Playground |
 
