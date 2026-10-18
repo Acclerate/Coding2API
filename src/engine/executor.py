@@ -10,6 +10,8 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+import httpx
+
 from ..compat.openai.errors import UpstreamStreamError, stream_error_frame
 from ..compat.openai.request import ChatRequest, InvalidRequest
 from ..compat.openai.response import (
@@ -1365,10 +1367,27 @@ def _event_kind(event: Event) -> ErrKind:
 
 
 def _classify(error: Exception) -> ErrKind | None:
-    """上游 HTTP 错误 → ErrKind；不认识的原样上抛。"""
+    """上游错误 → ErrKind；不认识的原样上抛。
+
+    `kind()` 优先（provider 自己按上游错误码语义分类）。之后兜住
+    `httpx.TransportError`：连接超时 / DNS 失败 / 写请求体超时 / 读超时
+    都是链路瞬态，与具体账号无关，按 SOFT 短冷却换号重试。
+
+    **为什么统一放在这里，而不是让每个 provider 各自包装**：httpx 的传输
+    异常会从 `client.stream()` 的 `__aenter__`、`aiter_bytes()`、写请求体
+    等多个位置抛出，逐点 `try/except` 必然漏掉其中某个；而且 6 个渠道各写
+    一遍，新增渠道还会再漏一次。分类是「传输层失败」这一件事的公共语义，
+    放在唯一的错误出口最省也最不容易漏。
+
+    刻意**不**泛化到 `OSError` / `ConnectionError`：文件系统类错误（磁盘满、
+    句柄耗尽）也是它们的子类，误判成上游故障会去冷却一个完全健康的凭证。
+    `UpstreamTransportError` 自带 `kind()`，已被上面第一段覆盖。
+    """
     kind_method = getattr(error, "kind", None)
     if callable(kind_method):
         return kind_method()
+    if isinstance(error, httpx.TransportError):
+        return ErrKind.SOFT
     return None
 
 

@@ -296,7 +296,14 @@ class UpstreamTransportError(ConnectionError):
     只承载**原始传输异常**（`httpx.TransportError` 等），由各渠道客户端在
     请求处捕获后 `raise ... from error` 抛出，好让上层按类型翻译成可操作
     的原因（network_unreachable），而不是让 `httpx` 私有异常泄漏到翻译层。
+
+    分类固定为 SOFT：传输层失败（连不上 / 写请求体超时 / 读超时）是**链路
+    瞬态**，与具体账号无关，按 SOFT 短冷却、可换号重试，且不累计错误数——
+    累计到阈值会把健康凭证踢出池子，反而放大了网络抖动的影响。
     """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.SOFT
 
 
 @dataclass(slots=True)

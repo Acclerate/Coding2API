@@ -66,6 +66,15 @@ def test_error_fixtures_classify_plan_and_other():
     assert other.error_code == 4001 and trae_events.classify_error_code(4001) is ErrKind.INVALID
     assert trae_events.classify_error_code(None) is ErrKind.OTHER
 
+def test_error_frame_4008_quota_exhausted_is_credit():
+    """4008 = "Your requests have exceeded the quota."：按配额耗尽处理（等签到恢复）。"""
+    frame = trae_events.SSEFrame(
+        event="error",
+        data='{"code":4008,"message":"Your requests have exceeded the quota."}')
+    event = trae_events.parse_frame(frame)
+    assert event.error_code == 4008
+    assert event.error_kind is ErrKind.CREDIT
+
 @pytest.mark.parametrize(("status", "expected"), [
     (401, ErrKind.DEAD), (404, ErrKind.SOFT), (429, ErrKind.SOFT),
     (500, ErrKind.OTHER), (400, ErrKind.INVALID), (402, ErrKind.CREDIT),
@@ -84,13 +93,16 @@ def test_classify_status_detects_1005_in_body():
     (429, b'{"code": 6004}', ErrKind.MODEL),
     (429, b'{"code": 500}', ErrKind.SOFT),
     (500, b'{"code": 14018}', ErrKind.CREDIT),      # 业务码优先于状态码
+    (403, b'{"code": 4008, "message": "Your requests have exceeded the quota."}',
+     ErrKind.CREDIT),                                # 配额耗尽：HTTP 形态同样判 CREDIT
 ])
 def test_classify_status_business_codes(status, body, expected):
     assert trae_events.classify_status(status, body) is expected
 
 @pytest.mark.parametrize(("code", "expected"), [
-    (1005, ErrKind.PLAN), (14018, ErrKind.CREDIT), (6004, ErrKind.MODEL),
-    (4001, ErrKind.INVALID), (None, ErrKind.OTHER),
+    (1005, ErrKind.PLAN), (14018, ErrKind.CREDIT), (4008, ErrKind.CREDIT),
+    (6004, ErrKind.MODEL), (4001, ErrKind.INVALID),
+    (None, ErrKind.OTHER), (9999, ErrKind.OTHER),      # 未知码仍走 OTHER 兜底
 ])
 def test_classify_error_code_mapping(code, expected):
     assert trae_events.classify_error_code(code) is expected

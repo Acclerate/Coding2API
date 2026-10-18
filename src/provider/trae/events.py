@@ -214,12 +214,17 @@ def classify_error_code(code: int | None) -> ErrKind:
     TRAE 侧未观测到 6004/11102，但两侧共用同一套 ErrKind 语义；
     这里只把「明确等价」的码映射过去，不臆造未观测的码。
 
-    4001 = 参数/模型不可用（实测原文 "the param is invalid"）：换凭证没用，
-    跳过该上游 —— 与 classify_status 的 400 分支同一结论。
+    1005  = 权益不足（PLAN）
+    14018 = 余额不足（CREDIT）
+    4008  = 请求额度/配额耗尽（实测原文 "Your requests have exceeded the quota."）：
+            与 14018 同为「等恢复」语义，冷却到次日签到，避免继续选号失败
+    6004  = 模型不可用（MODEL）
+    4001  = 参数/模型不可用（实测原文 "the param is invalid"）：换凭证没用，
+            跳过该上游 —— 与 classify_status 的 400 分支同一结论。
     """
     if code == 1005:
         return ErrKind.PLAN
-    if code == 14018:
+    if code in (14018, 4008):
         return ErrKind.CREDIT
     if code == 6004:
         return ErrKind.MODEL
@@ -229,9 +234,13 @@ def classify_error_code(code: int | None) -> ErrKind:
 
 
 def classify_status(status: int, body: bytes = b"") -> ErrKind:
-    """HTTP 状态码分类（与 CodeBuddy 侧同序，见其 classify_status 的说明）。"""
+    """HTTP 状态码分类（与 CodeBuddy 侧同序，见其 classify_status 的说明）。
+
+    body 里的业务码经 business_codes() 提取，与流内 classify_error_code 对齐：
+    14018/4008 都是配额耗尽 → CREDIT（等签到恢复）。
+    """
     codes = business_codes(body.decode("utf-8", errors="replace"))
-    if status == 402 or 14018 in codes:
+    if status == 402 or 14018 in codes or 4008 in codes:
         return ErrKind.CREDIT
     if 1005 in codes:
         return ErrKind.PLAN

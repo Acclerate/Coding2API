@@ -6,9 +6,11 @@ import json
 
 import pytest
 
-from src.provider.base import EventKind
+from src.provider.base import ErrKind, EventKind
 from src.provider.codebuddy import events as cb_events
+from src.provider.codebuddy.client import CodeBuddyProvider
 from src.provider.codebuddy.events import UpstreamProtocolViolation
+from src.provider.codebuddy.intl import CodeBuddyIntlProvider
 from tests.helpers.paths import provider_fixture
 from tests.helpers.sse import parse_frames
 
@@ -266,3 +268,31 @@ def test_clean_history_tool_calls_removes_dirty_and_orphans(tmp_path):
     assert body4["messages"][0]["role"] == "assistant"
     assert body4["messages"][0]["content"] == "文本"
     assert "tool_calls" not in body4["messages"][0]
+
+def test_classify_429_model_saturated_code_is_model_level():
+    """429 + 14003「模型饱和」→ 模型级，不能落账号级 SOFT。
+
+    国际版实测原文：displayMsg「Model busy. Please switch models or retry
+    later」、displayTips「This model is currently saturated」。上游要求换模型，
+    说明同凭证其他模型可用；落 SOFT 会让整张凭证 60s 全部模型一起不可用。
+    """
+    body = (b'{"code":14003,"msg":"too many requests",'
+            b'"displayMsg":{"en":"Model busy. Please switch models or retry later"},'
+            b'"displayTips":{"en":"This model is currently saturated"}}')
+    assert cb_events.classify_status(429, body) is ErrKind.MODEL
+
+def test_classify_429_model_rate_limit_code_still_model_level():
+    """回归保护：6004「该模型用量超限」仍是模型级。"""
+    assert cb_events.classify_status(429, b'{"code":6004}') is ErrKind.MODEL
+
+def test_classify_429_unknown_code_stays_soft():
+    """回归保护：429 里认不出的业务码仍按账号级软限流。"""
+    assert cb_events.classify_status(429, b'{"code":9999}') is ErrKind.SOFT
+    assert cb_events.classify_status(429, b"") is ErrKind.SOFT
+
+def test_provider_classify_routes_14003_to_model():
+    """国际版复用同一分类：provider 入口（含 intl 子类）同样是模型级。"""
+    body = b'{"code":14003,"msg":"too many requests"}'
+    assert CodeBuddyProvider().classify(429, body) is ErrKind.MODEL
+    assert CodeBuddyIntlProvider().classify(429, body) is ErrKind.MODEL
+    assert CodeBuddyIntlProvider().classify(429, b'{"code":9999}') is ErrKind.SOFT

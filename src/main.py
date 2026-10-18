@@ -775,11 +775,18 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
 
     # ------------------------------------------------------------- 对外端点
 
+    # 同时接受 GET 与 HEAD：FastAPI 的 APIRoute 不像 Starlette 那样自动给 GET
+    # 补 HEAD，只注册 GET 时监控发 `curl -I /health` 会一直吃 405。HEAD 用单独
+    # 装饰器挂同一个处理函数并排除出 schema——若写成 api_route(methods=[...])，
+    # OpenAPI 里 GET/HEAD 会撞出重复 operationId。HEAD 的 body 由 ASGI 层按
+    # 协议丢弃，处理函数照常返回同一份内容即可。
     @app.get("/health")
+    @app.head("/health", include_in_schema=False)
     async def health():
         return {"status": "ok"}
 
     @app.get("/healthz")
+    @app.head("/healthz", include_in_schema=False)
     async def healthz():
         """就绪探针：可用凭证数为 0 时回 503（ready>0 回 200）。
 
@@ -913,6 +920,11 @@ def run() -> None:
     uvicorn.run(
         build_app(config), host=config.host, port=config.port,
         log_level=config.log_level.lower(),
+        # 关掉 uvicorn 自带 access log：请求级留痕已由 RequestLogMiddleware
+        # 覆盖（logfmt，带时间戳与 request_id，可与 usage_events 关联），而
+        # uvicorn 的裸行无时间戳、含完整 query string，只是把同样的请求再写满
+        # 另一个轮转文件。
+        access_log=False,
         # 收到 SIGTERM 后先停止接受新连接，给在途请求（含长流）最多
         # GRACEFUL_SHUTDOWN_SECONDS 秒收尾，再强关。默认 None 是无限等，
         # 配合容器/launchd 的停机超时会变成「卡住直到被 SIGKILL」。

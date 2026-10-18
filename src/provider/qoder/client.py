@@ -66,7 +66,10 @@ from .events import (
 logger = logging.getLogger(__name__)
 
 # 流式无总超时防长流截断；短请求 30s 防悬挂（与其余渠道同策略）
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+# 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
+# 经代理链路 10s 会稳定超时；首字等待由 read=None +
+# stream_first_event_timeout_seconds 负责，两者不要混为一谈。
+STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 SHORT_TIMEOUT = httpx.Timeout(30.0)
 
 # 本区域无签到接口的 HTTP 状态（国际版实测 404；405/410 同义）。活动制与旧接口
@@ -125,6 +128,51 @@ def _openapi_request_id(uid: str) -> str:
     return derive_request_id(uid)
 
 
+def _drop_orphan_tool_messages(
+        messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """丢弃没有对应 `assistant.tool_calls` 的 `role:"tool"` 消息。
+
+    OpenAI 兼容协议要求 `role:"tool"` 紧跟声明了该 `tool_call_id` 的 assistant，
+    否则上游以 400「Messages with role 'tool' must be a response to a preceding
+    message with 'tool_calls'」拒绝。孤立 tool 有两种来源：客户端本身发来的非法
+    历史，以及压缩（`engine.compress`）按组删除时留下的残骸。这里只丢弃、不重排、
+    不合并、不改 content。
+
+    连续多条 tool 共用同一份「上一条 assistant 的声明集合」——并行 `tool_calls`
+    的结果本就是多条 tool 依次跟在同一个 assistant 后面。连续多条 assistant 的
+    声明取并集：`/v1/responses` 的并行 `function_call` 会被拆成多条 assistant
+    消息（见 `compat/responses/request.py`），只看最后一条会把前一条的 tool
+    结果误判成孤立而丢掉。
+    """
+    kept: list[dict[str, Any]] = []
+    declared: set[str] = set()   # 上一条 assistant 声明的 tool_call_ids
+    previous: str | None = None
+    dropped = 0
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            # 非字符串（缺失/畸形）必然匹配不上；也避免 unhashable 值抛 TypeError
+            if not isinstance(call_id, str) or call_id not in declared:
+                dropped += 1
+                continue
+            kept.append(message)
+            previous = role
+            continue
+        if role == "assistant":
+            ids = {call["id"] for call in message.get("tool_calls") or []
+                   if isinstance(call, dict) and isinstance(call.get("id"), str)
+                   and call["id"]}
+            # 连续的 assistant 且都声明了调用时取并集（见 docstring）；不带
+            # tool_calls 的 assistant 视为新一轮，清空声明集合
+            declared = (declared | ids if previous == "assistant" and ids else ids)
+        else:
+            declared = set()
+        previous = role
+        kept.append(message)
+    return kept, dropped
+
+
 def build_chat_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
     """下游 chat 请求体 → Qoder `agent_chat_generation` 请求体。
 
@@ -132,10 +180,20 @@ def build_chat_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
     `baseprompt.json` 模板与 `chat_context` / `business` 卡片只在桌面端上下文
     里被验证过，凭空补一套没验证过的默认值会把「上游改版」伪装成「我们发对了」。
     这里保留 messages/tools/参数，加官方客户端要求的会话字段（只支持流式）。
+    转发前清理孤立 tool 消息（见 `_drop_orphan_tool_messages`）。
     """
-    messages = payload.get("messages")
+    raw_messages = payload.get("messages")
+    messages = json.loads(json.dumps(raw_messages)) if raw_messages is not None else []
+    # 非 list 形状（畸形请求）交给上游裁决，不做结构假设
+    dropped = 0
+    if isinstance(messages, list):
+        messages, dropped = _drop_orphan_tool_messages(messages)
+    if dropped:
+        # 只记条数：正文里可能有用户数据，日志不落消息内容
+        logger.warning("Qoder 请求含 %d 条孤立 tool 消息，已丢弃（上游会以 400 拒绝）",
+                       dropped)
     body: dict[str, Any] = {
-        "messages": json.loads(json.dumps(messages)) if messages is not None else [],
+        "messages": messages,
         "model": model,
         "stream": True,
         "agent_id": "agent_common",
@@ -267,8 +325,11 @@ class QoderClient:
             return []
         if envelope.status != 200:
             kind = qoder_events.classify_error_code(envelope.status, envelope.body)
+            # 200 字符只够看到外层 `"details":"{\"error\":{\"message\":...`——上游把
+            # 真实原因嵌在转义的 details 里，截断后根因（如缺哪个 tool_call_id）
+            # 永久丢失，排障时等于没打。放宽到 2000。
             return [Event(kind=EventKind.ERROR, error_code=envelope.status,
-                          error_message=envelope.body[:200], error_kind=kind)]
+                          error_message=envelope.body[:2000], error_kind=kind)]
         if envelope.body == "[DONE]":
             return []
         return qoder_events.parse_inner_chunk(envelope.body)

@@ -525,6 +525,9 @@ def test_run_entry_point_starts_uvicorn(monkeypatch, tmp_path):
     assert captured["port"] == 9123
     assert captured["log_level"] == "warning"
     assert captured["app"] is not None
+    # uvicorn 自带 access log 与 RequestLogMiddleware 重复（且无时间戳 /
+    # request_id），必须关掉
+    assert captured["access_log"] is False
     # 停机排空：不给 timeout_graceful_shutdown 就是无限等（长流卡住直到 SIGKILL）
     assert captured["timeout_graceful_shutdown"] == main.GRACEFUL_SHUTDOWN_SECONDS
 

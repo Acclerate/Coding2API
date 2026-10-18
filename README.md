@@ -300,7 +300,7 @@ claude
 
 ### 池健康检查
 
-`GET /health` 只回 `{"status":"ok"}`（进程存活，适合容器存活探针）；`GET /healthz` 额外给出凭证池计数，**并在 `ready == 0` 时回 HTTP 503**（就绪探针）——那是「进程活着但没有可用凭证」的状态，对话请求必然 503，负载均衡/外部监控应据此摘流量。计数在两种状态下都返回，监控可读到「为什么不可用」。两个端点都不鉴权。
+`GET /health` 只回 `{"status":"ok"}`（进程存活，适合容器存活探针）；`GET /healthz` 额外给出凭证池计数，**并在 `ready == 0` 时回 HTTP 503**（就绪探针）——那是「进程活着但没有可用凭证」的状态，对话请求必然 503，负载均衡/外部监控应据此摘流量。计数在两种状态下都返回，监控可读到「为什么不可用」。两个端点都不鉴权。**两者同时接受 `HEAD`**（`curl -I` / 多数监控默认发 HEAD）：FastAPI 的 `APIRoute` 不像 Starlette 那样自动给 GET 补 HEAD，只注册 GET 时探针会一直吃 405，表现为「服务正常但监控永远红灯」。
 
 ```json
 {
@@ -683,7 +683,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `MODEL_ALIASES` | `""` | 自定义模型别名：`对外名=模型@渠道;对外名2=模型`，`@渠道` 省略则自动选。列表与请求解析用同一份；与真实 id / 自动别名撞车、目标不存在、渠道不持有该模型时该段跳过并记 ERROR。留空 = 不启用。可热更 |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | 单账号在途请求上限（跨渠道全局）：并发占满的号不再参与选号；`0` = 不限。租约请求结束释放，另有 600s TTL 兜底漏释放 |
 | `METRICS_ENABLED` | `true` | 是否暴露 `GET /metrics`（Prometheus text 格式，**不鉴权**，与 `/healthz` 同口径）；`false` 关闭（返回 404）。可热更 |
-| `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 `event=request request_id=… method=… route=… status=… duration_ms=…`。路由用模板（`/api/credentials/{credential_id}`）不用实际 ID；**不写 query string、请求体、用户名**，靠 `request_id` 关联 `usage_events`。5xx 记 WARNING、其余 INFO；静态资源与探针不记。`false` 回到只有 uvicorn 裸 access log。可热更 |
+| `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 `event=request request_id=… method=… route=… status=… duration_ms=…`。路由用模板（`/api/credentials/{credential_id}`）不用实际 ID；**不写 query string、请求体、用户名**，靠 `request_id` 关联 `usage_events`。5xx 记 WARNING、其余 INFO；静态资源与探针不记（uvicorn 自带 access log 已关闭）。`false` 关闭请求级日志。可热更 |
 | `FORCE_DISABLE_THINKING` | `false` | 出站剥离思考内容：开启后响应里不再有 `reasoning_content` / Anthropic `thinking` 块 / Responses reasoning item，**只过滤响应、不改请求体**（上游仍照常思考）。三个出口、流式与非流式一致生效。可热更 |
 | `REASONING_EFFORT_MAP` | `""` | 出站 `reasoning_effort` 档位映射：格式 `渠道=from:to,from:to;*=from:to`（渠道取 `KNOWN_PROVIDERS`，`*` 兜底）；目标写 `none` = 删除该键、走渠道默认。只改写客户端**显式**给的档位，渠道自身 `setdefault` 补的默认档不受影响。留空 = 原样透传。可热更 |
 | `ANTHROPIC_THINKING_EFFORTS` | `""` | Anthropic 入站 `thinking.budget_tokens` → 上游 `reasoning_effort`：格式 `预算:档位,预算:档位,disabled:档位`（`disabled` 匹配 `thinking.type=="disabled"`；其余取「阈值 ≤ budget_tokens 中最大的那一档」，低于最小阈值不映射）。留空 = 完全不映射（`thinking` 照旧忽略）。可热更 |
@@ -842,8 +842,9 @@ event=request request_id=9f2c… method=POST route=/v1/chat/completions status=2
 - **不写 query string、请求体、响应体、请求头、用户名**。query 里可能被客户端塞 token；身份靠 `request_id` 去 `usage_events.request_id` 关联（那里已有 `username` 列），日志系统保留更久、权限更宽，能少放就少放。
 - `request_id` 与响应头 `X-Request-ID` 同值，可双向对照。
 - **级别**：`5xx` 记 WARNING（服务端自己的问题，值得抓），`4xx` 与成功记 INFO（否则 401 探测、拼错路径会把告警日志淹没）。
-- **不记**静态资源（`assets/*.js`）与探针（`/health`、`/healthz`、`/metrics`）——它们由 uvicorn access log 覆盖，重复记录只会把业务行挤出视野。
-- 开关 `REQUEST_LOG_ENABLED`（默认 `true`，可热更），关掉后回到只有 uvicorn 的裸 access log。
+- **不记**静态资源（`assets/*.js`）与探针（`/health`、`/healthz`、`/metrics`）：探针已有 `/healthz` 计数与 metrics 覆盖，静态资源量级大且无排障价值，记下来只会把业务行挤出视野。
+- **uvicorn 自带 access log 已关闭**（`run()` 传 `access_log=False`）：它没有时间戳、没有 request_id、带完整 query string，与上面这层完全重复，只是把同样的请求再写满另一个轮转文件。排查探针/静态资源请用 `/healthz` 计数与 metrics。
+- 开关 `REQUEST_LOG_ENABLED`（默认 `true`，可热更），关掉后不再有请求级日志。
 
 > 容器里的 `data/dumps/`（诊断开关 `DUMP_REQUEST_BODIES=true` 写入）不在 docker 日志体系内，由应用自行保持最多 200 份。
 

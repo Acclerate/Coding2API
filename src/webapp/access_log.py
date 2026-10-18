@@ -22,9 +22,10 @@
   ID 无限分叉。未匹配到路由（404 / 被安全中间件拒掉）时回落为清洗过的
   原始路径：只保留 `[A-Za-z0-9._~/%:@-]`、截断 120 字符，防换行注入。
 
-**只记业务请求**：`/api/*`、`/v1/*`、`/authorize`。静态资源（每次打开管理台
-都会拉一堆 `assets/*.js`）与探针（`/health`、`/healthz`、`/metrics`）不记——
-它们由 uvicorn access log 覆盖，重复记录只会把业务行挤出视野。
+**只记业务请求**：`/api/*`、`/v1/*`、`/authorize`。探针与静态资源不记结构化
+日志：探针（`/health`、`/healthz`、`/metrics`）已有 `/healthz` 计数与 metrics
+覆盖，静态资源（每次打开管理台都会拉一堆 `assets/*.js`）量级大且无排障价值，
+记下来只会把业务行挤出视野。
 
 注册顺序：必须在 `RequestIdMiddleware` **内侧**（后者的 ID 要先生成）、在
 `BodySizeLimitMiddleware` **外侧**（413 也是请求结果，要能记到）。
