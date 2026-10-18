@@ -16,6 +16,7 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage").then(m => ({ defa
 const UsersPage = lazy(() => import("./pages/UsersPage").then(m => ({ default: m.UsersPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then(m => ({ default: m.AuditPage })));
 const AlertsPage = lazy(() => import("./pages/AlertsPage").then(m => ({ default: m.AlertsPage })));
+const LogsPage = lazy(() => import("./pages/LogsPage").then(m => ({ default: m.LogsPage })));
 const UpstreamStatusPage = lazy(() => import("./pages/UpstreamStatusPage").then(m => ({ default: m.UpstreamStatusPage })));
 
 const LOADING = (
@@ -78,6 +79,7 @@ export function App() {
           <Route path="/playground" element={<PlaygroundPage />} />
           <Route path="/users" element={<RequireAdmin isAdmin={session.data.is_admin}><UsersPage /></RequireAdmin>} />
           <Route path="/audit" element={<RequireAdmin isAdmin={session.data.is_admin}><AuditPage /></RequireAdmin>} />
+          <Route path="/logs" element={<RequireAdmin isAdmin={session.data.is_admin}><LogsPage /></RequireAdmin>} />
           <Route path="/alerts" element={<RequireAdmin isAdmin={session.data.is_admin}><AlertsPage /></RequireAdmin>} />
           <Route path="/upstream" element={<RequireOperator isOperator={session.data.is_operator}><UpstreamStatusPage /></RequireOperator>} />
           <Route path="/models" element={<RequireOperator isOperator={session.data.is_operator}><ModelCatalogPage /></RequireOperator>} />

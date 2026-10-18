@@ -47,6 +47,7 @@ from ..request_context import set_api_key_id
 from ..runtime_settings import RuntimeSettings
 from ..stats.live import LiveEventHub
 from ..stats.query import StatsQuery
+from ..webapp.log_buffer import LogBuffer
 
 # 首登强制改密（must_change_password=1）时放行的端点，精确白名单。
 #
@@ -82,6 +83,9 @@ class Services:
     # 逐请求事件广播（SSE 实时流）：`GET /api/stats/events/stream` 订阅它，
     # `StatsCollector.record` 落库后 publish。进程内、单进程部署。
     live_events: LiveEventHub
+    # 进程内日志环形缓冲（E3）：`GET /api/logs[/stream]` 的只读数据源。
+    # 与 root logger 上的 handler 共用同一实例；`log_buffer_lines=0` 即关闭。
+    log_buffer: LogBuffer
     upstream_auth: dict[str, Any]
     model_aliases: dict[str, dict[str, str]]
     schedule_probe: Callable[[str], None]
