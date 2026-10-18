@@ -219,7 +219,10 @@ class TaskRunner:
                       lambda: self._interval_seconds("refresh")),
             _LoopSpec("retention", self._sync_retention,
                       lambda: self._interval_seconds("retention")),
-            # 全天每 10 分钟签到一次（周期固定，不可热更）
+            # 签到：留空时点 = 全天每 10 分钟一轮；有配置时点时仍按 10 分钟醒
+            # 一次，由 `due()` 自己判定是否落在抖动窗口内。**不能**把周期改成
+            # 「按最大时点间隔算」——服务恰在两个时点之间重启会直接漏签，而
+            # 10 分钟空转的代价只是读一次配置（与 activity 的取舍同理）。
             _LoopSpec("checkin", self._sync_checkin,
                       lambda: self._interval_seconds("checkin")),
         ]
@@ -290,7 +293,10 @@ class TaskRunner:
         return await self._activity.run_once()
 
     async def _sync_checkin(self) -> object:
-        """全天每 10 分钟一轮；成功凭证当日封账（run_once 内跳过），失败凭证持续重试。"""
+        """签到一轮：有配置时点时只在窗口内跑，留空则全天每 10 分钟一轮。
+
+        成功凭证当日封账（run_once 内跳过），失败凭证继续重试。
+        """
         if not self._checkin.due():
             return None
         return await self._checkin.run_once()
@@ -441,7 +447,8 @@ class TaskRunner:
         if key == "refresh":
             return self._refresh_interval
         if key == "checkin":
-            return 600.0            # 全天每 10 分钟检查一次，与 _loop 装配一致
+            # 固定 10 分钟醒一次（时点由 due() 判定），不是热更项
+            return 600.0
         if key == "growth":
             return self._growth_interval
         if key == "activity":
@@ -566,7 +573,9 @@ def build_runner(credentials, providers: dict, stats_collector, config,
                           app_secret=lambda: config.app_secret)
     return TaskRunner(
         quota_probe=QuotaProbeTask(credentials, providers, pacer),
-        checkin=CheckinTask(credentials, providers, pacer=pacer),
+        checkin=CheckinTask(credentials, providers, pacer=pacer,
+                            times=lambda: config.checkin_times,
+                            jitter_minutes=lambda: config.checkin_jitter_minutes),
         growth=growth,
         activity=activity,
         refresh=RefreshTask(credentials, providers, skew_seconds=config.refresh_skew_hours * 3600,
