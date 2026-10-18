@@ -35,6 +35,7 @@ from .api import (
     authorize,
     balance,
     chat,
+    logs,
     messages,
     metrics,
     models,
@@ -115,6 +116,7 @@ from .webapp import static as _static
 from .webapp.access_log import RequestLogMiddleware
 from .webapp.handlers import register_exception_handlers
 from .webapp.limits import BodySizeLimitMiddleware
+from .webapp.log_buffer import LogBuffer, detach_root_handler, sync_root_handler
 from .webapp.logging import configure_logging
 from .webapp.request_id import RequestIdMiddleware
 from .webapp.security import host_allowed, security_middleware
@@ -435,6 +437,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 逐请求事件广播：StatsCollector 写入明细后 publish，SSE 实时流订阅。
     # 进程内即可——明细写入与订阅都在同一个进程（单进程 SQLite 部署）。
     live_events = LiveEventHub()
+    # 日志环形缓冲（E3）：容量现读热更项 `log_buffer_lines`（0 = 关闭整页）。
+    # 这里只建对象；handler 在 lifespan 里按当前值挂/摘，避免每个 build_app
+    # 都往 root 上叠一个（测试会反复建 app）。
+    log_buffer = LogBuffer(capacity=lambda: runtime.log_buffer_lines)
     # 模型目录原始表的**同一引用**交给 executor（credit_rate 查询）与 Services
     # （list_models 缓存）——这里先建空 dict，Services 装配时直接挂它
     model_cache: dict[str, dict[str, Any]] = {}
@@ -644,6 +650,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                 closer = getattr(oauth, "aclose", None)
                 if callable(closer):
                     await closer()
+            # 摘掉日志缓冲处理器：否则已关闭的 app 实例仍被 root 引用，
+            # 反复建 app 的测试里每条日志会写进多个死实例。
+            detach_root_handler(log_buffer)
             db.close()
 
     app = FastAPI(title="Coding2API", version=app_version(), lifespan=lifespan,
@@ -669,6 +678,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.state.stats_query = StatsQuery(db)
     # SSE 实时流的订阅中心（与 StatsCollector 的 on_record 同源）
     app.state.live_events = live_events
+    app.state.log_buffer = log_buffer
     app.state.upstream_auth = _upstream_auth(registry, config)
     app.state.pending_probes = []
     app.state.model_aliases = model_aliases
@@ -733,6 +743,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         stats_query=app.state.stats_query,
         login_throttle=app.state.login_throttle,
         live_events=live_events,
+        log_buffer=log_buffer,
         upstream_auth=app.state.upstream_auth,
         model_aliases=model_aliases,
         # executor 拿的就是这一份引用：目录恢复 / 拉取 / TTL 刷新写进来后，
@@ -788,6 +799,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(admin_stats.create_router(services))
     app.include_router(admin_users.create_router(services))
     app.include_router(admin_audit.create_router(services))
+    # 服务端日志页（E3）：admin-only 只读视图；`log_buffer_lines=0` 时回 404。
+    app.include_router(logs.create_router(services))
     app.include_router(activate.create_router(services))
     app.include_router(chat.create_router(services))
     app.include_router(responses.create_router(services))
@@ -813,6 +826,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 413 响应（不经过更内层的 security），只有最外层才能保证**任何**响应
     # （含 413 / Host 校验 400）都带上 X-Request-ID。
     app.add_middleware(RequestIdMiddleware)
+    # 日志缓冲挂到 root（幂等）：只在 `log_buffer_lines > 0` 时挂，关闭时摘掉；
+    # 与 `_RootHandler`（stdout/stderr）并存，不改变既有落盘行为。放在最后
+    # 是为了让上面所有装配期的日志也能进缓冲（首个快照更有用）。
+    sync_root_handler(log_buffer)
     return app
 
 

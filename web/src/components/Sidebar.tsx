@@ -4,6 +4,7 @@ import {
   BellRing,
   Boxes,
   Database,
+  FileTerminal,
   KeyRound,
   RadioTower,
   ScrollText,
@@ -48,6 +49,7 @@ export const NAV: NavItem[] = [
 export const ADMIN_NAV: NavItem[] = [
   { to: "/users", label: "用户管理", icon: UsersRound, badgeKey: "users" },
   { to: "/audit", label: "审计日志", icon: ScrollText },
+  { to: "/logs", label: "服务端日志", icon: FileTerminal },
   { to: "/alerts", label: "运维告警", icon: BellRing, badgeKey: "alerts" },
   { to: "/upstream", label: "上游状态", icon: RadioTower, operator: true, badgeKey: "upstream" },
   { to: "/models", label: "模型列表", icon: Boxes, operator: true,
