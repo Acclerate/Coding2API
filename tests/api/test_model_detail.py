@@ -33,7 +33,7 @@ def _app(tmp_path, providers: dict | None = None):
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
     app = build_app(settings, providers=providers or {
-        "trae": _Stub("trae", [("glm-5.2", "GLM 5.2"), ("kimi-k3-1", "Kimi-K3")]),
+        "trae": _Stub("trae", [("glm-5.3", "GLM 5.3"), ("kimi-k3-1", "Kimi-K3")]),
         "kilo": _Stub("kilo", [("dots-studio/dots-3-note-preview:free",
                                 "Dots 3 Note Preview")]),
     })
@@ -51,18 +51,18 @@ def _key(app, allowed_models: str = "") -> dict[str, str]:
 def test_single_model_by_public_id(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
-        response = client.get("/v1/models/glm-5.2", headers=_key(app))
+        response = client.get("/v1/models/glm-5.3", headers=_key(app))
     assert response.status_code == 200
     item = response.json()
-    assert item["id"] == "glm-5.2" and item["object"] == "model"
+    assert item["id"] == "glm-5.3" and item["object"] == "model"
     assert item["providers"] == ["trae"]
 
 def test_single_model_accepts_display_name_and_case_insensitive(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
         headers = _key(app)
-        assert client.get("/v1/models/GLM%205.2", headers=headers).json()["id"] == "glm-5.2"
-        assert client.get("/v1/models/Glm-5.2", headers=headers).json()["id"] == "glm-5.2"
+        assert client.get("/v1/models/GLM%205.3", headers=headers).json()["id"] == "glm-5.3"
+        assert client.get("/v1/models/Glm-5.3", headers=headers).json()["id"] == "glm-5.3"
 
 def test_single_model_accepts_raw_upstream_id_with_namespace(tmp_path):
     """`:path` 路由：带斜杠的原代号（kilo）也要能单查，否则列表有、单查 404。"""
@@ -86,8 +86,8 @@ def test_single_model_outside_key_allowlist_is_404(tmp_path):
     """白名单外与不存在同形 404：不能让单查成为「池里有什么」的探测口。"""
     app = _app(tmp_path)
     with TestClient(app) as client:
-        headers = _key(app, allowed_models="glm-5.2")
-        assert client.get("/v1/models/glm-5.2", headers=headers).status_code == 200
+        headers = _key(app, allowed_models="glm-5.3")
+        assert client.get("/v1/models/glm-5.3", headers=headers).status_code == 200
         hidden = client.get("/v1/models/kimi-k3", headers=headers)
     assert hidden.status_code == 404
     assert hidden.json()["error"]["code"] == "model_not_found"
@@ -95,13 +95,13 @@ def test_single_model_outside_key_allowlist_is_404(tmp_path):
 def test_single_model_requires_api_key(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
-        assert client.get("/v1/models/glm-5.2").status_code == 401
+        assert client.get("/v1/models/glm-5.3").status_code == 401
 
 def test_single_model_carries_benchmarks_when_available(tmp_path):
     app = _app(tmp_path)
-    app.state.model_benchmarks.update({"glm-5.2": {"intelligence": 42}})
+    app.state.model_benchmarks.update({"glm-5.3": {"intelligence": 42}})
     with TestClient(app) as client:
-        item = client.get("/v1/models/glm-5.2", headers=_key(app)).json()
+        item = client.get("/v1/models/glm-5.3", headers=_key(app)).json()
     assert item["benchmarks"]["intelligence"] == 42
 
 def test_single_model_blank_id_is_404(tmp_path):

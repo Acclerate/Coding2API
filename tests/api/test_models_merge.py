@@ -395,8 +395,12 @@ def test_models_sentinel_names_not_merged_across_channels(tmp_path):
     kilo 的 `kilo-auto/free`（上游名 `Auto Free`）与 Qoder 的 `auto` 都归一成
     `auto`，但一个是 kilo 的自动路由、一个是 Qoder 的默认模型，语义只在本渠道
     内成立。若合并，调度会把请求错误地路由到另一个上游。
+
+    这两个哨兵名在默认黑名单里（列表不展示占位模型），本用例只验证合并规则，
+    故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -431,9 +435,11 @@ def test_models_outward_id_disambiguated_on_collision(tmp_path):
     （这里 TRAE 的 `glm-5` 归一键 `glm-5`，而 kilo 有个原 id 就叫 `glm-5` 的
     模型）。撞车时两条 entry 会共用一个 id，前端选择器的 key 与别名表都会
     互相覆盖，故后来的那条退回自己的原 id。保留谁按渠道优先级：TRAE 优先于
-    未排名的 kilo。
+    未排名的 kilo。`glm-5` 是默认黑名单里的老模型，本用例只验证撞车消歧，
+    故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):

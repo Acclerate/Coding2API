@@ -33,7 +33,7 @@ class _PlaygroundProvider:
     async def list_models(self, _data):
         from src.provider.base import Model
 
-        return [Model(id="glm-5.2"), Model(id="trae-only")]
+        return [Model(id="glm-5.3"), Model(id="trae-only")]
 
     def import_credential(self, raw):  # pragma: no cover - 非本测试路径
         return raw
@@ -51,7 +51,7 @@ def test_playground_models_uses_session(tmp_path):
         assert client.get("/api/playground/models").status_code == 401
         client.cookies.set("coding2api_session", create_session_token("root", SECRET))
         body = client.get("/api/playground/models").json()
-    assert [m["id"] for m in body["data"]] == ["glm-5.2", "trae-only"]
+    assert [m["id"] for m in body["data"]] == ["glm-5.3", "trae-only"]
     assert body["data"][0]["providers"] == ["trae"]
 
 def test_playground_chat_requires_session(tmp_path):

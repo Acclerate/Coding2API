@@ -21,7 +21,7 @@ def test_models_by_provider_rates_when_dual_upstream(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2", credit_rate=self._rate)]
+            return [Model(id="glm-5.3", credit_rate=self._rate)]
 
         def import_credential(self, raw):
             return raw
@@ -34,13 +34,13 @@ def test_models_by_provider_rates_when_dual_upstream(tmp_path):
     with TestClient(app) as client:
         item = next(m for m in client.get("/v1/models", headers={
             "Authorization": f"Bearer {key}"}).json()["data"]
-            if m["id"] == "glm-5.2")
+            if m["id"] == "glm-5.3")
     assert item["providers"] == ["codebuddy", "trae"]
     assert item["credit_rate"] == 0.29          # 合并值：先到先填
     # by_provider 同时给出各渠道的 raw_id（渠道请求 key）与倍率
     assert item["by_provider"] == {
-        "codebuddy": {"raw_id": "glm-5.2", "credit_rate": 0.29},
-        "trae": {"raw_id": "glm-5.2", "credit_rate": 0.17}}
+        "codebuddy": {"raw_id": "glm-5.3", "credit_rate": 0.29},
+        "trae": {"raw_id": "glm-5.3", "credit_rate": 0.17}}
 
 def test_models_list_orders_cb_then_trae_first(tmp_path):
     """展示顺序：CB → TR → 其余渠道，组内按模型名字典序。

@@ -237,23 +237,33 @@ class Settings(BaseSettings):
     # 原代号的归一键、展示名、展示名的归一键四种写法任一命中即滤——用户照列表
     # 里看到的 `kimi-k3` / `Kimi K3` 写就能生效，老规则按原代号写也仍生效。
     # 覆盖此值时为完全替换（含默认噪音规则），增删请重写全量。
-    # 实测（2026-09-21，两边上游真实清单）补入的内部/不可用模型：
-    #   custom_model_* / *sub*agent* / summary / browser_use_* / file_search_agent
-    #   为上游内部或代理模型（chat 报 3003 / 非用户模型）
-    #   default 实测 HTTP 200 但零内容（不可用于 chat）
-    #   hunyuan-image-* 实测 HTTP 400 11103「backend is not supported」
-    # 2026-10-10 复测七渠道全量清单后补入三条「上游已下架」：
-    #   hy4-preview-x（CB 400 11102 service info not found；同名的 hy4-preview
-    #     仍可用，故写全名不用 glob）
-    #   qwen3.8-flash（Qoder qfmodel 400「Execution failed: null」；CB/TRAE 的
-    #     qwen3.8-max 正常，不受影响）
-    #   glyph-cluster（Kilo stealth/glyph-cluster 两次 121s 后 408；Kilo 其余正常）
-    # 刻意不加的：*-volc（deepseek-v3-2-volc 实测正常 chat）、aquila/sagitta/
-    #   seed-code-pro-0430（TRAE 实测均正常 chat）、glm-5.0-turbo/glm-5v-turbo/
-    #   hunyuan-chat/hy3/auto（2026-10-10 复测均正常 chat）
+    # 默认口径（2026-10-19 与线上生效值对齐）：**只展示当前在售的新模型**，
+    # 三类一律滤掉——
+    #   1. 上游内部/代理模型：custom_model_* / *sub*agent* / summary /
+    #      browser_use_* / file_search_agent（chat 报 3003 / 非用户模型）；
+    #      default 与 codebuddy_intl 的 default-model/fast-model/balanced-model/
+    #      primary-model/deep-model、Qoder 的 auto 是各上游的「自动路由」占位。
+    #   2. 已停售/被新一代取代的老模型：glm-4.* / glm-5 / glm-5.0* / glm-5.1 /
+    #      glm-5.2* / glm-5v-* / glm-5-turbo、kimi-k2.*（含 k2.5/2.6/k2-thinking）、
+    #      minimax-m2.5/m2.7/m3、deepseek-v3-* / deepseek-v4-*（v4.1 不受影响）、
+    #      qwen3.7-*、gpt-5.4/5.5、hy3* / hy4-preview、hunyuan-*、
+    #      seed-2.1* / seed-code-pro-* / seed-evolving、qwen3-vl-235b、
+    #      openpangu 之外的开源小模型（nemotron-3* / lfm2* / laguna* /
+    #      north-mini-code / inkling-small / xing4.0-29b-a4 / openrouter-models-router）。
+    #   3. 实测不可用的噪音：glyph-cluster（Kilo 两次 121s 后 408）、
+    #      hunyuan-*（含 hunyuan-image-* 的 400 11103 backend not supported）。
+    # 刻意不加的：deepseek-v4.1-flash / kimi-k3 / glm-5.3* / mimo-v2.6* /
+    #   qwen3.8-max / openpangu-2.0-*（在售主力，2026-10-19 实测正常 chat）。
     model_blocklist: str = (
         "custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,"
-        "default,hunyuan-image-*,hy4-preview-x,qwen3.8-flash,glyph-cluster"
+        "default,seed-code-pro-*,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,"
+        "glm-5.0*,glm-5.1,glm-5v-*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,"
+        "minimax-m2.5,deepseek-v3-*,hunyuan-*,hy3*,deepseek-v4-*,qwen3.7-*,auto,"
+        "nemotron-3-*,glm-5.2*,nemotron-3*,lfm2*,north-mini-code,"
+        "openrouter-models-router,fast,balanced,deep,primary,hy4-preview,"
+        "inkling-small,minimax-m2.7,kimi-k2.*,minimax-m3,gpt-5.4,gpt-5.5,"
+        "laguna*,qwen3-vl-235b,seed-2.1*,xing4.0-29b-a4,glyph-cluster,"
+        "qwen3.8-flash,seed-evolving"
     )
     # 诊断：把 /v1 入口的原始请求体落到 data/dumps/（排查客户端差异用）
     dump_request_bodies: bool = False

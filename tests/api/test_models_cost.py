@@ -39,7 +39,7 @@ def _app(tmp_path):
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
     app = build_app(settings, providers={
-        "trae": _Stub("trae", [("glm-5.2", "GLM 5.2"), ("shared", "Shared")]),
+        "trae": _Stub("trae", [("glm-5.3", "GLM 5.3"), ("shared", "Shared")]),
         "kilo": _Stub("kilo", [("shared", "Shared")]),
     })
     for provider in ("trae", "kilo"):
@@ -62,10 +62,10 @@ def _ids(client, app) -> dict[str, dict]:
 
 def test_cost_listed_and_single_lookup_are_identical(tmp_path):
     app = _app(tmp_path)
-    app.state.price_table["glm-5.2"] = (3.0, 15.0, 0.3)
+    app.state.price_table["glm-5.3"] = (3.0, 15.0, 0.3)
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
-        single = client.get("/v1/models/glm-5.2", headers=_key(app)).json()
+        item = _ids(client, app)["glm-5.3"]
+        single = client.get("/v1/models/glm-5.3", headers=_key(app)).json()
     assert item["cost"] == {"input": 3.0, "output": 15.0, "cache_read": 0.3}
     assert single["cost"] == item["cost"]
     # 我们只有三项价：上游的 cache_write 本服务不采集，不编
@@ -76,9 +76,9 @@ def test_cost_matches_by_display_name(tmp_path):
     """价表键与对外 id 对不上时按展示名兜底（与能力分同一口径）。"""
     app = _app(tmp_path)
     # 价表键是展示名清洗后的形态，条目对外 id 是另一个写法
-    app.state.price_table["glm-5-2"] = (1.0, 2.0, 0.1)
+    app.state.price_table["glm-5-3"] = (1.0, 2.0, 0.1)
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
+        item = _ids(client, app)["glm-5.3"]
     assert item["cost"] == {"input": 1.0, "output": 2.0, "cache_read": 0.1}
 
 
@@ -86,17 +86,17 @@ def test_no_cost_field_without_price(tmp_path):
     """缺价不带字段：`cost: 0` 会被读成「免费」，比没有字段更误导。"""
     app = _app(tmp_path)
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
-        single = client.get("/v1/models/glm-5.2", headers=_key(app)).json()
+        item = _ids(client, app)["glm-5.3"]
+        single = client.get("/v1/models/glm-5.3", headers=_key(app)).json()
     assert "cost" not in item and "cost" not in single
 
 
 def test_malformed_price_record_is_ignored(tmp_path):
     """价表记录不是三元组（上游结构变了 / 手改快照）时按缺价处理，不抛。"""
     app = _app(tmp_path)
-    app.state.price_table["glm-5.2"] = (1.0, 2.0)  # type: ignore[assignment]
+    app.state.price_table["glm-5.3"] = (1.0, 2.0)  # type: ignore[assignment]
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
+        item = _ids(client, app)["glm-5.3"]
     assert "cost" not in item
 
 
@@ -107,8 +107,8 @@ def test_reasoning_efforts_prefers_provider_entry_and_drops_none(tmp_path):
     app.state.runtime_settings.set(
         "reasoning_effort_map", "trae=low:low,high:high,none:none;*=medium:medium")
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
-        single = client.get("/v1/models/glm-5.2", headers=_key(app)).json()
+        item = _ids(client, app)["glm-5.3"]
+        single = client.get("/v1/models/glm-5.3", headers=_key(app)).json()
     # 渠道项优先于 `*`；`none` 是「删除该键」不是档位，不进候选
     assert item["reasoning_efforts"] == ["high", "low"]
     assert single["reasoning_efforts"] == item["reasoning_efforts"]
@@ -126,7 +126,7 @@ def test_reasoning_efforts_falls_back_to_wildcard(tmp_path):
 def test_reasoning_efforts_absent_when_unconfigured(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
+        item = _ids(client, app)["glm-5.3"]
     assert "reasoning_efforts" not in item
 
 
@@ -135,7 +135,7 @@ def test_reasoning_efforts_absent_when_every_target_is_none(tmp_path):
     app = _app(tmp_path)
     app.state.runtime_settings.set("reasoning_effort_map", "trae=high:none")
     with TestClient(app) as client:
-        item = _ids(client, app)["glm-5.2"]
+        item = _ids(client, app)["glm-5.3"]
     assert "reasoning_efforts" not in item
 
 
@@ -143,6 +143,6 @@ def test_reasoning_efforts_hot_reload(tmp_path):
     """档位映射是热更项：改完下一次请求即生效，不需要重启。"""
     app = _app(tmp_path)
     with TestClient(app) as client:
-        assert "reasoning_efforts" not in _ids(client, app)["glm-5.2"]
+        assert "reasoning_efforts" not in _ids(client, app)["glm-5.3"]
         app.state.runtime_settings.set("reasoning_effort_map", "trae=high:high")
-        assert _ids(client, app)["glm-5.2"]["reasoning_efforts"] == ["high"]
+        assert _ids(client, app)["glm-5.3"]["reasoning_efforts"] == ["high"]

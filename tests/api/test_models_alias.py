@@ -46,7 +46,7 @@ def _app(tmp_path, aliases: str = ""):
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root", MODEL_ALIASES=aliases)
     app = build_app(settings, providers={
-        "trae": _Stub("trae", [("glm-5.2", "GLM 5.2"), ("kimi-k3-1", "Kimi-K3")]),
+        "trae": _Stub("trae", [("glm-5.3", "GLM 5.3"), ("kimi-k3-1", "Kimi-K3")]),
         "kilo": _Stub("kilo", [("stealth/space-bunny-alpha", "Space Bunny")]),
     })
     for provider in ("trae", "kilo"):
@@ -68,17 +68,17 @@ def _ids(client, app) -> dict[str, dict]:
 # ------------------------------------------------------------- 列表 / 单查
 
 def test_alias_appears_in_list_and_single_lookup(tmp_path):
-    app = _app(tmp_path, "team-fast=glm-5.2@trae")
+    app = _app(tmp_path, "team-fast=glm-5.3@trae")
     with TestClient(app) as client:
         items = _ids(client, app)
         assert "team-fast" in items
         entry = items["team-fast"]
         assert entry["custom_alias"] is True
-        assert entry["alias_target"] == "glm-5.2"
+        assert entry["alias_target"] == "glm-5.3"
         assert entry["providers"] == ["trae"]
         assert entry["name"] == "team-fast"
         # 别名条目必须带目标条目的能力元数据（前端选择器要用）
-        assert entry["max_input_tokens"] == items["glm-5.2"].get("max_input_tokens")
+        assert entry["max_input_tokens"] == items["glm-5.3"].get("max_input_tokens")
 
         single = client.get("/v1/models/team-fast", headers=_key(app))
         assert single.status_code == 200
@@ -89,11 +89,11 @@ def test_alias_appears_in_list_and_single_lookup(tmp_path):
 
 
 def test_real_entries_do_not_carry_custom_alias_flag(tmp_path):
-    app = _app(tmp_path, "team-fast=glm-5.2")
+    app = _app(tmp_path, "team-fast=glm-5.3")
     with TestClient(app) as client:
         items = _ids(client, app)
-    assert "custom_alias" not in items["glm-5.2"]
-    assert "alias_target" not in items["glm-5.2"]
+    assert "custom_alias" not in items["glm-5.3"]
+    assert "alias_target" not in items["glm-5.3"]
 
 
 def test_alias_without_provider_keeps_all_target_channels(tmp_path):
@@ -126,7 +126,7 @@ def test_alias_routes_chat_to_pinned_provider(tmp_path):
     app.state.runtime_settings.set("model_aliases",
                                    "team-bunny=space-bunny-alpha@kilo")
     services = app.state.services
-    services.model_list_cache["trae"] = {"glm-5.2": Model(id="glm-5.2")}
+    services.model_list_cache["trae"] = {"glm-5.3": Model(id="glm-5.3")}
     services.model_list_cache["kilo"] = {
         "stealth/space-bunny-alpha": Model(id="stealth/space-bunny-alpha")}
     app.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
@@ -177,28 +177,28 @@ async def test_executor_maps_alias_to_target_raw_id(dual_repo):
 
 def test_alias_colliding_with_real_id_is_skipped(tmp_path, caplog):
     """与真实对外 id 撞车：跳过该段、记错误，**不覆盖**真实条目。"""
-    app = _app(tmp_path, "glm-5.2=kimi-k3;good=glm-5.2@trae")
+    app = _app(tmp_path, "glm-5.3=kimi-k3;good=glm-5.3@trae")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
-    assert "custom_alias" not in items["glm-5.2"]     # 真实条目未被别名覆盖
-    assert items["glm-5.2"]["providers"] == ["trae"]
+    assert "custom_alias" not in items["glm-5.3"]     # 真实条目未被别名覆盖
+    assert items["glm-5.3"]["providers"] == ["trae"]
     assert "good" in items                              # 其它段照常生效
     assert any("撞车" in record.getMessage() for record in caplog.records)
 
 
 def test_alias_colliding_with_auto_alias_is_skipped(tmp_path, caplog):
     """与已存在的自动别名撞车（这里是展示名键）同样跳过并记错误。"""
-    app = _app(tmp_path, "GLM 5.2=kimi-k3;good=glm-5.2@trae")
+    app = _app(tmp_path, "GLM 5.3=kimi-k3;good=glm-5.3@trae")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
-    assert "GLM 5.2" not in items
+    assert "GLM 5.3" not in items
     assert "good" in items
     assert any("自动别名" in record.getMessage() for record in caplog.records)
 
 
 def test_alias_name_with_at_is_rejected(tmp_path, caplog):
     """对外名含 `@` 与 `@渠道` 语法冲突，无法从请求里无歧义地还原。"""
-    app = _app(tmp_path, "weird@name=glm-5.2;good=glm-5.2@trae")
+    app = _app(tmp_path, "weird@name=glm-5.3;good=glm-5.3@trae")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
     assert "weird@name" not in items
@@ -207,7 +207,7 @@ def test_alias_name_with_at_is_rejected(tmp_path, caplog):
 
 
 def test_alias_with_unknown_target_is_skipped(tmp_path, caplog):
-    app = _app(tmp_path, "ghost=no-such-model;good=glm-5.2@trae")
+    app = _app(tmp_path, "ghost=no-such-model;good=glm-5.3@trae")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
     assert "ghost" not in items
@@ -217,7 +217,7 @@ def test_alias_with_unknown_target_is_skipped(tmp_path, caplog):
 
 def test_alias_pinned_to_wrong_provider_is_skipped(tmp_path, caplog):
     """目标模型不在该渠道上（钉错渠道）：跳过而不是让请求打到不认它的上游。"""
-    app = _app(tmp_path, "wrong=glm-5.2@kilo;good=glm-5.2@trae")
+    app = _app(tmp_path, "wrong=glm-5.3@kilo;good=glm-5.3@trae")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
     assert "wrong" not in items
@@ -227,7 +227,7 @@ def test_alias_pinned_to_wrong_provider_is_skipped(tmp_path, caplog):
 
 def test_alias_cannot_chain_to_another_alias(tmp_path, caplog):
     """别名目标只认真实条目：A→B 时若 B 本身是别名，A 被跳过（不形成链）。"""
-    app = _app(tmp_path, "first=glm-5.2@trae;second=first")
+    app = _app(tmp_path, "first=glm-5.3@trae;second=first")
     with caplog.at_level(logging.ERROR), TestClient(app) as client:
         items = _ids(client, app)
     assert "first" in items
@@ -237,13 +237,13 @@ def test_alias_cannot_chain_to_another_alias(tmp_path, caplog):
 
 def test_broken_segment_does_not_break_other_aliases(tmp_path, caplog):
     """坏配置段（缺 `=`、未知渠道）不影响其它段——这是「宽容解析」的意义。"""
-    app = _app(tmp_path, "garbage;bad=glm-5.2@nope;good=glm-5.2@trae")
+    app = _app(tmp_path, "garbage;bad=glm-5.3@nope;good=glm-5.3@trae")
     with caplog.at_level(logging.WARNING), TestClient(app) as client:
         items = _ids(client, app)
     assert "good" in items
     assert "bad" not in items
     # 整个列表仍然完整（真实模型一条不少）
-    assert {"glm-5.2", "kimi-k3", "space-bunny"} <= set(items)
+    assert {"glm-5.3", "kimi-k3", "space-bunny"} <= set(items)
 
 
 # ------------------------------------------------------------------ 热更
@@ -266,14 +266,14 @@ def test_find_target_entry_blank_target_is_none():
     """空白目标不参与匹配（配置层已拦，这里守住「直接调用」也不乱命中）。"""
     from src.api.model_merge import _find_target_entry
 
-    entries = [{"id": "glm-5.2", "meta": {"name": "GLM 5.2"}, "raw_ids": {}}]
+    entries = [{"id": "glm-5.3", "meta": {"name": "GLM 5.3"}, "raw_ids": {}}]
     assert _find_target_entry(entries, "   ") is None
-    assert _find_target_entry(entries, "glm-5.2") is entries[0]
+    assert _find_target_entry(entries, "glm-5.3") is entries[0]
 
 
 def test_alias_listed_for_key_allowlist(tmp_path):
     """Key 白名单按对外名过滤：别名与真实条目同一条规则（别名不绕过白名单）。"""
-    app = _app(tmp_path, "team-fast=glm-5.2@trae")
+    app = _app(tmp_path, "team-fast=glm-5.3@trae")
     with TestClient(app) as client:
         allowed = app.state.api_keys.create("root", allowed_models="team-fast")
         headers = {"Authorization": f"Bearer {allowed['api_key']}"}
@@ -282,5 +282,5 @@ def test_alias_listed_for_key_allowlist(tmp_path):
         # 白名单外的真实模型单查 404（不能拿单查探测池子）
         assert client.get("/v1/models/kimi-k3", headers=headers).status_code == 404
         # 用目标渠道原 id 单查：命中的是白名单内的别名条目（与列表同一份）
-        by_raw = client.get("/v1/models/glm-5.2", headers=headers)
+        by_raw = client.get("/v1/models/glm-5.3", headers=headers)
         assert by_raw.status_code == 200 and by_raw.json()["id"] == "team-fast"

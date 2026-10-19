@@ -29,7 +29,7 @@ def test_default_registry_contains_both_providers(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -47,7 +47,7 @@ def test_default_registry_contains_both_providers(tmp_path):
                           headers={"Authorization": f"Bearer {key}"}).json()["data"]
     by_id = {item["id"]: item["providers"] for item in data}
     # CB 的 list_models 抛错 → 该上游被跳过（不拖垮整个列表），TRAE 正常返回
-    assert by_id["glm-5.2"] == ["trae"]
+    assert by_id["glm-5.3"] == ["trae"]
 
 def test_models_endpoint_skips_providers_without_credentials(tmp_path):
     """模型列表按渠道凭证加载——没凭证的渠道既不拉取也不展示。
@@ -129,7 +129,7 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
 
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2"), Model(id="DeepSeek-V4-Flash")]
+            return [Model(id="glm-5.3"), Model(id="DeepSeek-V4.1-Flash")]
 
         def import_credential(self, raw):
             return raw
@@ -144,25 +144,25 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
     with TestClient(app) as client:
         # 第一次：拉取成功，缓存写入
         first = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in first} == {"glm-5.2", "deepseek-v4-flash"}
+        assert {item["id"] for item in first} == {"glm-5.3", "deepseek-v4.1-flash"}
         cached_keys = app.state.services.model_list_cache["trae"].keys()
-        assert cached_keys == {"glm-5.2", "deepseek-v4-flash"}
+        assert cached_keys == {"glm-5.3", "deepseek-v4.1-flash"}
 
         # 第二次：拉取失败 → 用缓存兜底，列表不缺模型
         trae.fail = True
         second = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in second} == {"glm-5.2", "deepseek-v4-flash"}
+        assert {item["id"] for item in second} == {"glm-5.3", "deepseek-v4.1-flash"}
         assert {item["id"] for item in second} and all(
             item["providers"] == ["trae"] for item in second)
 
         # 恢复后重新拉取成功，缓存刷新
         trae.fail = False
         third = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in third} == {"glm-5.2", "deepseek-v4-flash"}
+        assert {item["id"] for item in third} == {"glm-5.3", "deepseek-v4.1-flash"}
 
 def test_models_blocklist_filters_noise_and_old(tmp_path):
     """默认黑名单滤非用户模型（custom_model_*/subagent/summary/file_search_agent/
-    default/hunyuan-image-*），MODEL_BLOCKLIST 覆盖后可再滤老模型；
+    default/hunyuan-*），MODEL_BLOCKLIST 覆盖后可再滤在售模型；
     直连指定不受列表过滤影响。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
 
@@ -172,7 +172,7 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2"), Model(id="kimi-k2.6"),
+            return [Model(id="glm-5.3"), Model(id="kimi-k3"),
                     Model(id="custom_model_claude"),
                     Model(id="explore_sub_agent_v13"), Model(id="summary"),
                     Model(id="file_search_agent"), Model(id="default"),
@@ -187,31 +187,31 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
     with TestClient(app) as client:
         ids = {item["id"] for item in client.get(
             "/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]}
-    # 默认黑名单：噪音全滤（实测内部/不可用模型），老模型默认保留（是否滤由配置决定）
+    # 默认黑名单：噪音全滤（实测内部/不可用模型），在售主力默认保留
     assert "custom_model_claude" not in ids
     assert "explore_sub_agent_v13" not in ids
     assert "summary" not in ids
     assert "file_search_agent" not in ids
     assert "default" not in ids
     assert "hunyuan-image-alpha" not in ids
-    assert {"glm-5.2", "kimi-k2.6"} <= ids
+    assert {"glm-5.3", "kimi-k3"} <= ids
 
-    # 覆盖黑名单：额外滤老模型（完全替换语义，需重写噪音规则）
+    # 覆盖黑名单：额外滤在售模型（完全替换语义，需重写噪音规则）
     settings2 = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
-                         MODEL_BLOCKLIST="custom_model_*,*sub*agent*,summary,kimi-k2.6")
+                         MODEL_BLOCKLIST="custom_model_*,*sub*agent*,summary,kimi-k3")
     app2 = build_app(settings2, providers={"trae": NoisyProvider()})
     app2.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
     key2 = app2.state.api_keys.create("root")["api_key"]
     with TestClient(app2) as client:
         ids2 = {item["id"] for item in client.get(
             "/v1/models", headers={"Authorization": f"Bearer {key2}"}).json()["data"]}
-    assert "kimi-k2.6" not in ids2 and "glm-5.2" in ids2
+    assert "kimi-k3" not in ids2 and "glm-5.3" in ids2
 
 def test_models_blocklist_default_covers_retired_upstream_models(tmp_path):
     """默认黑名单含 2026-10-10 复测补入的三条「上游已下架」。
 
-    `hy4-preview-x`（CB 400 11102）与同名的 `hy4-preview` 只差后缀，故必须
-    写全名而不是 `hy4-preview*`；`qwen3.8-flash` 只命中 Qoder 的 qfmodel，
+    `hy4-preview-x`（CB 400 11102）与 `hy4-preview` 只差后缀，默认两条都滤
+    （`hy4-preview` 已停售）；`qwen3.8-flash` 只命中 Qoder 的 qfmodel，
     CB/TRAE 的 `qwen3.8-max` 不受影响；`glyph-cluster` 按 kilo 展示名清洗出的
     归一键命中，不误伤同渠道其它模型。
     """
@@ -247,10 +247,11 @@ def test_models_blocklist_default_covers_retired_upstream_models(tmp_path):
             "/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]}
 
     assert "hy4-preview-x" not in ids
+    assert "hy4-preview" not in ids          # 已停售，默认一并滤掉
     assert "qwen3.8-flash" not in ids
     assert "glyph-cluster" not in ids
-    # 近邻模型不受牵连：同名不同 id 的 hy4-preview、qwen3.8-max、kilo-auto 都在
-    assert {"hy4-preview", "qwen3.8-max", "kilo-auto"} <= ids
+    # 近邻模型不受牵连：qwen3.8-max 仍在售，`auto` 只命中占位符本身
+    assert "qwen3.8-max" in ids
 
 def test_models_blocklist_matches_normalized_id_and_display_name(tmp_path):
     """黑名单按**归一后的对外写法**匹配，且两边忽略大小写。
@@ -314,7 +315,7 @@ def test_models_blocklist_hot_reload_applies_without_waiting_for_ttl(tmp_path):
 
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2"), Model(id="kimi-k2.6")]
+            return [Model(id="glm-5.3"), Model(id="kimi-k3")]
 
         def import_credential(self, raw):
             return raw
@@ -327,26 +328,26 @@ def test_models_blocklist_hot_reload_applies_without_waiting_for_ttl(tmp_path):
     with TestClient(app) as client:
         client.cookies.set("coding2api_session", create_session_token("root", SECRET))
         first = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in first} == {"glm-5.2", "kimi-k2.6"}
+        assert {item["id"] for item in first} == {"glm-5.3", "kimi-k3"}
         # 缓存存的是**未过滤**表（两条都在），否则热更在 TTL 内无法生效
-        assert set(app.state.services.model_list_cache["trae"]) == {"glm-5.2", "kimi-k2.6"}
+        assert set(app.state.services.model_list_cache["trae"]) == {"glm-5.3", "kimi-k3"}
 
         # TTL 未过（刚拉过），此时改黑名单
-        client.put("/api/settings", json={"values": {"model_blocklist": "kimi-k2.6"}},
+        client.put("/api/settings", json={"values": {"model_blocklist": "kimi-k3"}},
                    headers={"Referer": "http://testserver/"})
         second = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in second} == {"glm-5.2"}   # 立即生效
+        assert {item["id"] for item in second} == {"glm-5.3"}   # 立即生效
 
         # 上游随后失败：兜底缓存也不能让被滤模型复活
         provider.fail = True
         third = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in third} == {"glm-5.2"}
+        assert {item["id"] for item in third} == {"glm-5.3"}
 
         # 清空黑名单（'' 与 null 等价 = 恢复默认）：被滤模型立刻回来
         client.put("/api/settings", json={"values": {"model_blocklist": ""}},
                    headers={"Referer": "http://testserver/"})
         fourth = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in fourth} == {"glm-5.2", "kimi-k2.6"}
+        assert {item["id"] for item in fourth} == {"glm-5.3", "kimi-k3"}
 
 def test_codebuddy_import_via_api(tmp_path):
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),

@@ -87,14 +87,14 @@ def test_aggregates_by_provider_and_model(admin_client):
     app, client = admin_client
     now = int(time.time())
     for offset in (10, 20, 30):
-        _insert(app, provider="trae", model="glm-5.2", error_type="invalid_request",
+        _insert(app, provider="trae", model="glm-5.3", error_type="invalid_request",
                 ts=now - offset)
     _insert(app, provider="kilo", model="space-bunny", error_type="upstream_blocked",
             ts=now - 5)
     rows = _rows(client)["rows"]
     assert [row["provider"] for row in rows] == ["trae", "kilo"]  # 失败次数降序
     first = rows[0]
-    assert first["model"] == "glm-5.2"
+    assert first["model"] == "glm-5.3"
     assert first["failures"] == 3
     assert first["last_failed_at"] == now - 10
     assert rows[1]["failures"] == 1
@@ -105,12 +105,12 @@ def test_ignores_other_error_types_and_successes(admin_client):
     app, client = admin_client
     for error_type in ("rate_limit", "credential_unavailable",
                        "upstream_error", "model_unavailable", None):
-        _insert(app, provider="trae", model="glm-5.2", error_type=error_type)
+        _insert(app, provider="trae", model="glm-5.3", error_type=error_type)
     with app.state.stats_collector._db.transaction() as conn:
         conn.execute(
             "INSERT INTO usage_events (id, ts, username, provider, model, ok)"
             " VALUES (?,?,?,?,?,?)",
-            ("evt_ok", int(time.time()), "root", "trae", "glm-5.2", 1))
+            ("evt_ok", int(time.time()), "root", "trae", "glm-5.3", 1))
     assert _rows(client)["rows"] == []
 
 
@@ -176,14 +176,14 @@ def test_limit_is_clamped(admin_client):
 
 def test_blocked_reflects_current_blocklist(admin_client):
     app, client = admin_client
-    _insert(app, provider="trae", model="glm-5.2", error_type="invalid_request")
+    _insert(app, provider="trae", model="glm-5.3", error_type="invalid_request")
     _insert(app, provider="kilo", model="space-bunny", error_type="invalid_request")
     rows = {row["model"]: row for row in _rows(client)["rows"]}
-    assert rows["glm-5.2"]["blocked"] is False
+    assert rows["glm-5.3"]["blocked"] is False
 
     app.state.runtime_settings.set("model_blocklist", "glm-*")
     rows = {row["model"]: row for row in _rows(client)["rows"]}
-    assert rows["glm-5.2"]["blocked"] is True
+    assert rows["glm-5.3"]["blocked"] is True
     assert rows["space-bunny"]["blocked"] is False
 
 
@@ -255,11 +255,11 @@ def test_probes_lists_blocked_rows(tmp_path):
     """仍被负缓存的 (渠道, 模型) 出现在列表里，带号数与最晚解除时刻。"""
     app, client = _operator_client(tmp_path)
     with client:
-        _block(app, provider="trae", model="glm-5.2")
+        _block(app, provider="trae", model="glm-5.3")
         body = client.get(PROBES).json()
     assert len(body["rows"]) == 1
     row = body["rows"][0]
-    assert (row["provider"], row["model"]) == ("trae", "glm-5.2")
+    assert (row["provider"], row["model"]) == ("trae", "glm-5.3")
     assert row["credentials"] == 1
     assert row["state"] == ""          # 从未探过：没有结论，不是「健康」
     assert row["manual"] == ""
@@ -269,11 +269,11 @@ def test_probes_aggregates_credentials_and_ignores_other_reasons(tmp_path):
     """同模型多号合并成一行；`reason='model'`（限流）不进这张表。"""
     app, client = _operator_client(tmp_path)
     with client:
-        _block(app, provider="trae", model="glm-5.2")
-        _block(app, provider="trae", model="glm-5.2")
+        _block(app, provider="trae", model="glm-5.3")
+        _block(app, provider="trae", model="glm-5.3")
         _block(app, provider="trae", model="limited", reason="model")
         rows = client.get(PROBES).json()["rows"]
-    assert [row["model"] for row in rows] == ["glm-5.2"]
+    assert [row["model"] for row in rows] == ["glm-5.3"]
     assert rows[0]["credentials"] == 2
 
 
@@ -281,7 +281,7 @@ def test_probes_ignores_expired_rows(tmp_path):
     """已过期的负缓存不在列表里（调度侧本来就会重试）。"""
     app, client = _operator_client(tmp_path)
     with client:
-        _block(app, provider="trae", model="glm-5.2", until=1)
+        _block(app, provider="trae", model="glm-5.3", until=1)
         assert client.get(PROBES).json()["rows"] == []
 
 
@@ -290,7 +290,7 @@ def test_probes_shows_manual_row_without_blocked(tmp_path):
     app, client = _operator_client(tmp_path)
     with client:
         app.state.services.model_probes.set_manual(
-            provider="trae", model="glm-5.2", manual="manual")
+            provider="trae", model="glm-5.3", manual="manual")
         rows = client.get(PROBES).json()["rows"]
     assert len(rows) == 1
     assert rows[0]["credentials"] == 0
@@ -331,11 +331,11 @@ def test_probe_now_clears_blocked_on_success(tmp_path):
     with client:
         # 探活任务在 lifespan 里装配，必须先进入上下文才能替换 provider。
         app.state.model_probe_task._providers["trae"] = Provider()
-        _block(app, provider="trae", model="glm-5.2")
+        _block(app, provider="trae", model="glm-5.3")
         body = client.post(f"{PROBES}/probe",
-                           json={"provider": "trae", "model": "glm-5.2"}).json()
+                           json={"provider": "trae", "model": "glm-5.3"}).json()
         rows = client.get(PROBES).json()["rows"]
-    assert body == {"provider": "trae", "model": "glm-5.2",
+    assert body == {"provider": "trae", "model": "glm-5.3",
                     "state": "ok", "error": ""}
     # 负缓存已清（`credentials`/`until` 归零），但结论行保留：页面要能显示
     # 「探过、已恢复」，而不是整行凭空消失。
@@ -362,9 +362,9 @@ def test_probe_now_records_failure_without_clearing(tmp_path):
     app, client = _operator_client(tmp_path)
     with client:
         app.state.model_probe_task._providers["trae"] = Provider()
-        _block(app, provider="trae", model="glm-5.2")
+        _block(app, provider="trae", model="glm-5.3")
         body = client.post(f"{PROBES}/probe",
-                           json={"provider": "trae", "model": "glm-5.2"}).json()
+                           json={"provider": "trae", "model": "glm-5.3"}).json()
     assert body["state"] == "inconclusive"
     assert body["error"] == "rate limited"
     assert len(app.state.services.credentials.blocked_cooldowns()) == 1
@@ -375,12 +375,12 @@ def test_manual_takeover_toggles(tmp_path):
     app, client = _operator_client(tmp_path)
     with client:
         first = client.post(f"{PROBES}/manual",
-                            json={"provider": "trae", "model": "glm-5.2",
+                            json={"provider": "trae", "model": "glm-5.3",
                                   "manual": "on"}).json()
-        assert first == {"provider": "trae", "model": "glm-5.2", "manual": True}
-        assert app.state.services.model_probes.manual_marked() == {("trae", "glm-5.2")}
+        assert first == {"provider": "trae", "model": "glm-5.3", "manual": True}
+        assert app.state.services.model_probes.manual_marked() == {("trae", "glm-5.3")}
         second = client.post(f"{PROBES}/manual",
-                             json={"provider": "trae", "model": "glm-5.2",
+                             json={"provider": "trae", "model": "glm-5.3",
                                    "manual": "off"}).json()
     assert second["manual"] is False
     assert app.state.services.model_probes.manual_marked() == set()
