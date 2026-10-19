@@ -429,7 +429,7 @@ Key variables below; the full list is in `src/config.py` (authoritative), and **
 | `USERS_FILE` | `secrets/users.txt` | **Bootstrap-only**: legacy user file imported once (idempotent) |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | Browser-reachable address; TRAE login callback depends on it |
 | `DATA_DIR` | `./data` | SQLite and runtime data directory |
-| `DEFAULT_MODEL` | `glm-5.2` | Model when empty/`auto` |
+| `DEFAULT_MODEL` | `deepseek-v4.1-flash` | Model when empty/`auto` |
 | `QUOTA_PROBE_MINUTES` | `60` | Quota probe interval (floor 1) |
 | `REFRESH_INTERVAL_MINUTES` | `30` | Token pre-refresh polling interval (floor 5); short-lived channels cap their window wider than this |
 | `MODEL_CATALOG_MINUTES` | `30` | Channel catalog fallback refresh (floor 5) |

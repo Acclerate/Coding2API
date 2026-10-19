@@ -602,7 +602,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `USERS_FILE` | `secrets/users.txt` | **仅引导期**：老式用户文件路径，启动时一次性导入 SQLite（幂等）。账号唯一源是 `users` 表 |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | 浏览器可达地址；TRAE 登录回调（`+/authorize`）依赖它，scheme 为 https 时额外下发 HSTS。**不决定会话 Cookie 的 `Secure`**——那按请求实际协议动态判定（`X-Forwarded-Proto` 优先，无该头则看 Host），同一实例 LAN(http) 与隧道(https) 双入口才能都登录 |
 | `DATA_DIR` | `./data` | SQLite 与运行数据目录 |
-| `DEFAULT_MODEL` | `glm-5.2` | 模型为空/`auto` 时的默认 |
+| `DEFAULT_MODEL` | `deepseek-v4.1-flash` | 模型为空/`auto` 时的默认 |
 | `QUOTA_PROBE_MINUTES` | `60` | 额度探测周期（下限 1 分钟） |
 | `REFRESH_INTERVAL_MINUTES` | `30` | token 预刷新轮询周期（下限 5 分钟）；短寿命渠道的预刷新窗口封顶必须**宽于**它 |
 | `MODEL_CATALOG_MINUTES` | `30` | 渠道模型列表兜底刷新周期（下限 5 分钟） |

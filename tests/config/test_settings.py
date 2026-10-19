@@ -12,7 +12,7 @@ from tests.helpers.constants import SECRET
 def test_settings_defaults_and_admin_set():
     s = Settings(_env_file=None, APP_SECRET=SECRET, ADMIN_USERNAMES="alice, bob ,")
     assert s.admin_set == frozenset({"alice", "bob"})
-    assert s.default_model == "glm-5.2"
+    assert s.default_model == "deepseek-v4.1-flash"
     assert s.quota_expiry_window_seconds == EXPIRY_WINDOW_SECONDS
     assert s.quota_expiry_secondary_window_seconds == SECONDARY_EXPIRY_WINDOW_SECONDS
     assert s.is_admin("alice") and not s.is_admin("carol")

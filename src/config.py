@@ -89,7 +89,9 @@ class Settings(BaseSettings):
     provider_proxies: str = ""
 
     # 路由与调度
-    default_model: str = "glm-5.2"
+    # 默认模型：六条渠道都已上架 `deepseek-v4.1-flash`（CB / TRAE / CodeArts /
+    # codebuddy_intl 同名，Qoder 走别名 `dfmodel`），故默认值取它而不是老模型
+    default_model: str = "deepseek-v4.1-flash"
     # token 预刷新的提前量（小时）：距 access token 到期 ≤ 该值就提前换新。
     # 注意它对**短寿命渠道**会被自行封顶（CodeArts STS 只有 2h，见
     # `CodeArtsCredential.refresh_skew_cap_seconds`），所以调大它不会让短寿命

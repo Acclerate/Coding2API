@@ -18,7 +18,7 @@ services:
       # 远程部署时必须设为浏览器可达的地址，TRAE 登录回调依赖它
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8000}
       CODEBUDDY_API_ENDPOINT: ${CODEBUDDY_API_ENDPOINT:-https://copilot.tencent.com}
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-glm-5.2}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-deepseek-v4.1-flash}
       # 模型列表黑名单（fnmatch glob，逗号分隔，完全替换语义）
       MODEL_BLOCKLIST: ${MODEL_BLOCKLIST:-custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,seed-code-pro-*,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,glm-5.0*,glm-5.1,glm-5v-*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,minimax-m2.5,deepseek-v3-*,hunyuan-*,hy3*,deepseek-v4-*,qwen3.7-*,auto,nemotron-3-*,glm-5.2*,nemotron-3*,lfm2*,north-mini-code,openrouter-models-router,fast,balanced,deep,primary,hy4-preview,inkling-small,minimax-m2.7,kimi-k2.*,minimax-m3,gpt-5.4,gpt-5.5,laguna*,qwen3-vl-235b,seed-2.1*,xing4.0-29b-a4,glyph-cluster,qwen3.8-flash,seed-evolving}
       QUOTA_PROBE_MINUTES: ${QUOTA_PROBE_MINUTES:-60}
