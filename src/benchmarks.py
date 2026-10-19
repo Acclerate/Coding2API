@@ -75,6 +75,18 @@ ModelCatalog = dict[str, dict[str, Any]]
 
 _INDEX_FIELDS = ("intelligence_index", "coding_index", "agentic_index")
 
+# 快照日期戳识别（2026-10-19 起）：OpenRouter 对同一个模型会同时挂多条记录——
+# **浮动别名**（`deepseek/deepseek-v4.1-flash`）与**带日期快照**
+# （`deepseek/deepseek-v4.1-flash-1017`）。上游把浮动别名钉在旧快照上、还换了
+# 评测变体（实测 2026-10-19：浮动别名标 `Non-reasoning` 24.7，`-1017` 标
+# `Max` 39.5），于是能力分看着「掉」了 15 分，其实只是取了另一个变体。
+#
+# 本项目转发时推理默认开着（渠道 `default_effort` 多为 high），与 Max 变体
+# 同口径，故**浮动别名取同族最新快照的分**；显式带日期戳的 id
+# （`deepseek-v4-pro-0813`）仍用自己的分——那才是用户点名要的那个快照。
+_SNAPSHOT_DATE = re.compile(r"-\d{8}$")                 # canonical 尾部 YYYYMMDD
+_ID_DATE_STAMP = re.compile(r"[-_](?:\d{8}|\d{4})$")    # id 尾部快照日期戳
+
 
 def _as_number(value: Any) -> float | None:
     """数值字段 → 有限非负 float；缺失 / 非数值 / 负数 / NaN / inf 一律 None。
@@ -208,6 +220,29 @@ def build_price_table(raw: Any) -> PriceTable:
     return build_table(entries)
 
 
+def _snapshot_info(item: Mapping[str, Any]) -> tuple[str | None, str, bool]:
+    """一条上游记录 → `(家族基键, 快照日期, 是否浮动别名)`。
+
+    `canonical_slug` 是上游自己的「这条属于哪个发布」声明：带 `-YYYYMMDD`
+    尾缀的才是**同一发布的快照序列**（`deepseek/deepseek-v4.1-flash-20260910`
+    与 `...-20261017`）。家族基键只从这种带日期的 canonical 派生——像
+    `mistralai/mistral-large`（Feb '24）与 `mistralai/mistral-large-2512`
+    （Mistral Large 3）削完日期虽然同基，却是两个模型，上游没给前者日期戳
+    就是在说「它不是谁的快照」，故**不入家族**。
+
+    「浮动别名」只按**上游 id** 判定：`deepseek/deepseek-v4.1-flash`（浮动，
+    跟随上游漂移）vs `deepseek/deepseek-v4.1-flash-1017`（点名要的快照）。
+    不看展示名——`DeepSeek: DeepSeek V4 Pro 0423` 这类名字带日期、id 却不带，
+    恰恰就是「浮动别名被钉在旧快照上」的典型形态。
+    """
+    canonical = _as_str(item.get("canonical_slug")) or ""
+    match = _SNAPSHOT_DATE.search(canonical)
+    family = canonical[:match.start()] if match else None
+    date = match.group(0)[1:] if match else ""
+    raw_id = _as_str(item.get("id")) or ""
+    return family, date, not _ID_DATE_STAMP.search(raw_id)
+
+
 def build_benchmark_table(raw: Any) -> BenchmarkTable:
     """OpenRouter 原始 JSON → `{候选键: 能力记录}`。
 
@@ -217,8 +252,16 @@ def build_benchmark_table(raw: Any) -> BenchmarkTable:
     结构异常（顶层非 dict、`data` 非 list、单条非 dict）逐条跳过，不让一个坏
     条目拖垮整张表。完全没有指数时**不入表**：空记录只会让前端多渲染一个
     「无分」徽章，不如没有条目。
+
+    **浮动别名取同族最新快照的分**（2026-10-19，见 `_SNAPSHOT_DATE` 注释）：
+    OpenRouter 会把浮动别名钉在旧快照上、并且对同一快照只发布一个评测变体
+    （实测 `deepseek/deepseek-v4.1-flash` 标 `Non-reasoning` 24.7，而
+    `-1017` 标 `Max` 39.5）。本项目转发时推理默认开着，与 Max 同口径，故按
+    `canonical_slug` 的日期取同族最新一条；显式带日期戳的 id 仍用自己的分。
+    `source_model` 一律指向真正提供分数的上游 id，溯源不失真。
     """
-    entries: list[tuple[list[str], BenchmarkRecord]] = []
+    scored: list[tuple[Mapping[str, Any], BenchmarkRecord,
+                       str | None, str, bool]] = []
     for item in _select_entries(raw):
         indices = item.get("benchmarks")
         # `benchmarks` 缺失 / 非 dict（上游结构变了）时整条跳过。注意不能写
@@ -234,9 +277,27 @@ def build_benchmark_table(raw: Any) -> BenchmarkTable:
                   if (number := _as_number(indices.get(field))) is not None}
         if not scores:
             continue
-        entries.append((_match_names(item), {"source": SOURCE,
-                                             "source_model": item.get("id", ""),
-                                             **scores}))
+        record: BenchmarkRecord = {"source": SOURCE,
+                                   "source_model": item.get("id", ""),
+                                   **scores}
+        scored.append((item, record, *_snapshot_info(item)))
+
+    # 每个家族的最新快照（按 canonical 日期；同日期时先到先得，保持确定性）。
+    newest: dict[str, tuple[str, BenchmarkRecord]] = {}
+    for _item, record, family, date, _floating in scored:
+        if not family:
+            continue
+        current = newest.get(family)
+        if current is None or date > current[0]:
+            newest[family] = (date, record)
+
+    entries: list[tuple[list[str], BenchmarkRecord]] = []
+    for item, record, family, date, floating in scored:
+        if floating and family:
+            latest_date, latest_record = newest[family]
+            if latest_date > date:
+                record = latest_record
+        entries.append((_match_names(item), record))
     return build_table(entries)
 
 

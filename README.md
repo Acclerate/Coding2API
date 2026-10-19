@@ -60,7 +60,7 @@ docker compose exec coding2api python scripts/create_user.py admin --role admin
 
 ```bash
 docker compose pull
-# 或指定版本：docker pull ghcr.io/robbsluo/coding2api:v0.8.0
+# 或指定版本：docker pull ghcr.io/robbsluo/coding2api:v0.8.1
 ```
 
 推送新版本：打 tag `v*` 推到 main 即触发 publish workflow（`.github/workflows/publish.yml`），同时打 `<tag>` 与 `:latest` 到 GHCR；也可在 Actions 页面手动触发。
@@ -304,7 +304,7 @@ claude
 
 ```json
 {
-  "status": "ok", "service": "coding2api", "version": "0.8.0",
+  "status": "ok", "service": "coding2api", "version": "0.8.1",
   "credentials": {"total": 5, "ready": 4, "cooling": 1, "paused": 0, "disabled": 0}
 }
 ```
@@ -423,6 +423,8 @@ OpenRouter 收录数百条，其中多数本服务没接。每行带 `available`
 **疑似下线视图**：同页可切到「疑似下线」筛选——`GET /api/models/availability`（operator）把最近 N 天（默认 7、可调 1–30）`usage_events` 里 `error_type` 为 `upstream_blocked` / `invalid_request` 的失败按 `(渠道, 模型)` 聚合，给出失败次数、最近失败时刻与「是否已在黑名单」。行内「加入黑名单」把该模型**追加**到现行 `model_blocklist`（读现值再写，不覆盖既有项；已命中的行按钮置灰），写入走既有设置接口并落审计 `settings.update`，下一次 `/v1/models` 即生效。这个视图本身**只读聚合**（真发请求的那部分见下节「主动探活与人工接管」）。
 
 「能力分」列头可点排序，按**综合智能指数**（智）排；无分数的行排末尾（不冒充 0 分）。只给这一个分项排序入口——表头一列对应一个入口，三项各排会把表头挤成一排按钮。
+
+**浮动别名取同族最新快照的分**：OpenRouter 对同一个模型会同时挂**浮动别名**（`deepseek/deepseek-v4.1-flash`）与**带日期快照**（`deepseek/deepseek-v4.1-flash-1017`），并用 `canonical_slug` 声明同属一次发布。上游会把浮动别名钉在旧快照上、并对同一快照只发布一个评测变体（2026-10-19 实测：浮动别名标 `Non-reasoning` 24.7，`-1017` 标 `Max` 39.5）——分数看着「掉」了 15 分，其实只是换了变体。本项目转发时推理默认开着（渠道 `default_effort` 多为 `high`），与 Max 变体同口径，故按 `canonical_slug` 的日期取同族最新快照的分；显式带日期戳的 id（`deepseek-v4-pro-0813`）仍用自己的分。`source_model` 一律指向真正提供分数的上游 id。家族只从**带 `-YYYYMMDD` 的 canonical** 派生：`mistralai/mistral-large`（Feb '24）与 `mistralai/mistral-large-2512`（Mistral Large 3）削完日期同基却是两个模型，不互相借分。
 
 ### 主动探活与人工接管
 

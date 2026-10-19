@@ -144,6 +144,133 @@ def test_build_benchmark_table_rejects_nan_and_infinite():
     assert table == {"b": {"source": "openrouter", "source_model": "b",
                            "intelligence_index": 0}}
 
+# ------------------------------------- 浮动别名取同族最新快照（2026-10-19）
+
+def _snapshot_entry(model_id, *, canonical, score, name=None, created=None):
+    """一条带快照声明的上游记录（只填能力分需要的字段）。"""
+    return {"id": model_id,
+            "canonical_slug": canonical,
+            "name": name or model_id,
+            "created": created,
+            "benchmarks": {"artificial_analysis": {"intelligence_index": score}}}
+
+def test_benchmark_table_floating_alias_takes_newest_snapshot():
+    """浮动别名跟随上游漂移：取同族最新快照的分（复现 24.7 → 39.5 事故）。
+
+    上游把浮动别名钉在旧快照上并换了评测变体（Non-reasoning 24.7），同族
+    新快照是 Max 39.5。本项目转发默认开推理，故浮动别名应采用 39.5，且
+    `source_model` 指向真正提供分数的 `-1017`。
+    """
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("deepseek/deepseek-v4.1-flash",
+                        canonical="deepseek/deepseek-v4.1-flash-20260910",
+                        score=24.7, name="DeepSeek: DeepSeek V4.1 Flash"),
+        _snapshot_entry("deepseek/deepseek-v4.1-flash-1017",
+                        canonical="deepseek/deepseek-v4.1-flash-20261017",
+                        score=39.5, name="DeepSeek: DeepSeek V4.1 Flash 1017"),
+    ]})
+    floating = table["deepseek-v4.1-flash"]
+    assert floating["intelligence_index"] == 39.5
+    assert floating["source_model"] == "deepseek/deepseek-v4.1-flash-1017"
+    # 显式快照 id 仍用自己的分（用户点名要的就是它）
+    explicit = table["deepseek-v4.1-flash-1017"]
+    assert explicit["intelligence_index"] == 39.5
+    assert explicit["source_model"] == "deepseek/deepseek-v4.1-flash-1017"
+
+def test_benchmark_table_floating_alias_keeps_newest_regardless_of_order():
+    """最新快照先出现时结果不变（不依赖上游数组顺序）。"""
+    newest = _snapshot_entry("deepseek/deepseek-v4-pro-0813",
+                             canonical="deepseek/deepseek-v4-pro-20260813",
+                             score=36.0)
+    older = _snapshot_entry("deepseek/deepseek-v4-pro",
+                            canonical="deepseek/deepseek-v4-pro-20260423",
+                            score=30.4, name="DeepSeek: DeepSeek V4 Pro 0423")
+    forward = build_benchmark_table({"data": [newest, older]})
+    backward = build_benchmark_table({"data": [older, newest]})
+    assert forward["deepseek-v4-pro"]["intelligence_index"] == 36.0
+    assert backward["deepseek-v4-pro"]["intelligence_index"] == 36.0
+    assert backward["deepseek-v4-pro"]["source_model"] == "deepseek/deepseek-v4-pro-0813"
+
+def test_benchmark_table_floating_alias_without_newer_sibling_keeps_own():
+    """没有同族更新快照时，浮动别名用自己的分（不跨家族借分）。"""
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("deepseek/deepseek-r1",
+                        canonical="deepseek/deepseek-r1", score=11.4),
+    ]})
+    assert table["deepseek-r1"]["intelligence_index"] == 11.4
+    assert table["deepseek-r1"]["source_model"] == "deepseek/deepseek-r1"
+
+def test_benchmark_table_does_not_merge_same_base_different_model():
+    """只有带日期 canonical 的才算快照序列：无日期的不入家族，不互相借分。
+
+    `mistralai/mistral-large`（Feb '24）与 `mistralai/mistral-large-2512`
+    （Mistral Large 3）削完日期同基，却是两个模型——上游没给前者日期戳，
+    就是在声明「它不是谁的快照」。
+    """
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("mistralai/mistral-large",
+                        canonical="mistralai/mistral-large", score=5.8),
+        _snapshot_entry("mistralai/mistral-large-2512",
+                        canonical="mistralai/mistral-large-2512", score=9.3),
+    ]})
+    assert table["mistral-large"]["intelligence_index"] == 5.8
+    assert table["mistral-large-2512"]["intelligence_index"] == 9.3
+
+def test_benchmark_table_route_suffix_is_not_a_snapshot_id():
+    """`(...)` 分发口径（batch / free）不是快照日期：仍按浮动别名取最新。
+
+    浮动的 `:batch` 与浮动的基名同属一个快照，取最新时同样受益——
+    否则会出现「普通别名 39.5、batch 别名 24.7」的自相矛盾。
+    """
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("deepseek/deepseek-v4.1-flash",
+                        canonical="deepseek/deepseek-v4.1-flash-20260910",
+                        score=24.7),
+        _snapshot_entry("deepseek/deepseek-v4.1-flash:batch",
+                        canonical="deepseek/deepseek-v4.1-flash-20260910",
+                        score=24.7),
+        _snapshot_entry("deepseek/deepseek-v4.1-flash-1017",
+                        canonical="deepseek/deepseek-v4.1-flash-20261017",
+                        score=39.5),
+    ]})
+    assert table["deepseek-v4.1-flash"]["intelligence_index"] == 39.5
+    assert table["deepseek-v4.1-flash-batch"]["intelligence_index"] == 39.5
+
+def test_benchmark_table_floating_alias_keeps_own_when_it_is_newest():
+    """浮动别名自己就是最新快照时用自己的分（上游已把别名切到新快照）。"""
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("deepseek/deepseek-v4.1-flash",
+                        canonical="deepseek/deepseek-v4.1-flash-20261017",
+                        score=39.5),
+    ]})
+    assert table["deepseek-v4.1-flash"]["intelligence_index"] == 39.5
+    assert table["deepseek-v4.1-flash"]["source_model"] == "deepseek/deepseek-v4.1-flash"
+
+def test_benchmark_table_ignores_snapshot_entries_without_scores():
+    """同族最新快照没分数时不参与「最新」判定（避免把空记录当最新）。"""
+    table = build_benchmark_table({"data": [
+        _snapshot_entry("m-0910", canonical="deepseek/m-20260910", score=24.7),
+        {"id": "m-1017", "canonical_slug": "deepseek/m-20261017",
+         "benchmarks": {"artificial_analysis": {"intelligence_index": None}}},
+    ]})
+    assert table["m-0910"]["intelligence_index"] == 24.7
+
+@pytest.mark.parametrize("model_id,canonical,expected", [
+    ("a/b", "a/b-20261017", ("a/b", "20261017", True)),         # 浮动别名
+    ("a/b-1017", "a/b-20261017", ("a/b", "20261017", False)),   # 显式快照
+    ("a/b_1017", "a/b-20261017", ("a/b", "20261017", False)),   # 下划线也认
+    ("a/b", "a/b", (None, "", True)),                           # 无日期 canonical
+    ("a/b", None, (None, "", True)),                            # 缺字段
+    ("a/b-1017", "a/b-20261017:batch", (None, "", False)),      # 尾缀非日期 → 不入家族
+    (None, "a/b-20261017", ("a/b", "20261017", True)),          # 缺 id
+])
+def test_snapshot_info_shapes(model_id, canonical, expected):
+    """快照识别：只认 canonical 尾部 8 位日期；浮动与否只看上游 id。"""
+    from src.benchmarks import _snapshot_info
+
+    item = {"id": model_id, "canonical_slug": canonical}
+    assert _snapshot_info(item) == expected
+
 # --------------------------------------------------------------- 网络拉取
 
 async def test_fetch_openrouter_models_parses_and_raises():
