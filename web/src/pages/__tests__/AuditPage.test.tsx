@@ -5,8 +5,8 @@ import { jsonResponse, renderPage, settle, userEvent } from "@/test-utils";
 
 const LABELS = { login_success: "登录成功", user_disable: "禁用用户" };
 
-function auditPayload(events: unknown[]) {
-  return { events, actions: ["login_success", "user_disable"], labels: LABELS };
+function auditPayload(events: unknown[], total = events.length) {
+  return { events, total, actions: ["login_success", "user_disable"], labels: LABELS };
 }
 
 function stubFetch(body: unknown, status = 200) {
@@ -43,6 +43,16 @@ describe("AuditPage", () => {
     expect(first).toHaveTextContent("—");
     // 失败记录（ok=0）同样展示
     expect(screen.getByTestId("audit-row-audit_2")).toHaveTextContent("禁用用户");
+  });
+
+  it("筛选字段的 label 与控件关联（读屏能拿到字段名）", async () => {
+    stubFetch(auditPayload([EVENT]));
+    renderPage(<AuditPage />, { username: "root", is_admin: true });
+    await settle();
+
+    // label 与控件必须真的绑上：getByLabelText 找不到就说明只是视觉上摆在一起
+    expect(screen.getByLabelText("操作者")).toBe(screen.getByTestId("audit-actor"));
+    expect(screen.getByLabelText("动作")).toBe(screen.getByTestId("audit-action"));
   });
 
   it("无记录时显示占位", async () => {
@@ -96,7 +106,8 @@ describe("AuditPage", () => {
     const full = Array.from({ length: 50 }, (_, index) => ({
       ...EVENT, id: `audit_${index}`,
     }));
-    const spy = stubFetch(auditPayload(full));
+    // total > 本页条数 → 还有下一页（页数由后端 total 算出）
+    const spy = stubFetch(auditPayload(full, 120));
     renderPage(<AuditPage />, { username: "root", is_admin: true });
     await settle();
 
@@ -106,10 +117,11 @@ describe("AuditPage", () => {
       const urls = spy.mock.calls.map(([url]) => String(url));
       expect(urls.some((url) => url.includes("offset=50"))).toBe(true);
     });
-    expect(screen.getByText(/第 2 页/)).toBeInTheDocument();
+    expect(screen.getByTestId("audit-page-info")).toHaveTextContent("第 2 / 3 页");
 
     await userEvent.click(screen.getByTestId("audit-prev"));
-    await waitFor(() => expect(screen.getByText(/第 1 页/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("audit-page-info")).toHaveTextContent("第 1 / 3 页"));
   });
 
   it("不满一页时下一页禁用", async () => {

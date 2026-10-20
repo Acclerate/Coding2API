@@ -425,7 +425,11 @@ def test_models_sentinel_names_scoped_per_channel(tmp_path):
     内成立——对外 id 退回原代号归一键（`kilo-auto-kilo` / `auto-qoder`），
     且歧义的展示名不入别名。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    # 默认黑名单含 `auto`（会滤掉这两个哨兵条目），本用例测合并语义而非默认
+    # 黑名单内容，显式置空隔离默认值漂移
+    settings = Settings(
+        _env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path), MODEL_BLOCKLIST=""
+    )
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -474,7 +478,10 @@ def test_models_outward_id_falls_back_to_raw_key_on_collision(tmp_path):
     entry 共用一个 id 会让前端选择器的 `key` 与该渠道的别名表互相覆盖，故
     后来的那条退回自己的原代号归一键。保留谁按 `_sort_key` 序（先定稿优先）。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    # 默认黑名单含 `glm-5`（夹具主体正是它），显式置空隔离默认值漂移
+    settings = Settings(
+        _env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path), MODEL_BLOCKLIST=""
+    )
 
     class Stub:
         def __init__(self, pid: str, models):

@@ -124,6 +124,12 @@ def _usage(raw: dict[str, Any]) -> Usage:
 
 
 _MODEL_RATE_LIMIT_CODE = 6004       # 该模型用量超限 → 模型级软冷却
+# 该模型当前饱和 → 模型级软冷却（与 6004 同类，同样只罚 (凭证, 模型)）。
+# 国际版实测原文：displayMsg「Model busy. Please switch models or retry later」
+# （zh「模型繁忙，请换模型或稍后重试」）、displayTips「This model is currently
+# saturated」。上游明确要求「switch models」，说明同凭证其他模型可用，
+# 落账号级 SOFT 会让整张凭证 60s 内全部模型一起不可用。
+_MODEL_SATURATED_CODE = 14003
 _MODEL_BLOCKED_CODE = 11102         # 该后端无此模型 → (账号, 模型) 负缓存
 _CREDITS_EXHAUSTED_CODE = 14018     # 积分耗尽 → 冷却到次日签到
 _PLAN_EXHAUSTED_CODE = 1005         # 权益/套餐耗尽
@@ -147,7 +153,7 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
     * 11102「该后端无此模型」→ (账号, 模型) 负缓存（400/404 形态）
     * 401/403 → session 失效（硬禁用）
     * 404 → 软冷却，不累计错误数
-    * 429 + 6004 → 模型级限流；429 其他 → 账号级软限流
+    * 429 + 6004/14003 → 模型级限流（用量超限 / 模型饱和）；429 其他 → 账号级软限流
     * 400 + 11101/11115/11128/11135 → 请求级错误：不罚号，但仍换号
     * 400 其他 → 请求无效（模型不存在等），不冷却凭证
     """
@@ -163,7 +169,9 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
     if status == 404:
         return ErrKind.SOFT
     if status == 429:
-        return ErrKind.MODEL if _MODEL_RATE_LIMIT_CODE in codes else ErrKind.SOFT
+        return (ErrKind.MODEL
+                if _MODEL_RATE_LIMIT_CODE in codes or _MODEL_SATURATED_CODE in codes
+                else ErrKind.SOFT)
     if status == 400:
         if (codes & _REQUEST_LEVEL_CODES
                 or _BAD_PARAMS_PHRASE in body_hint(body).lower()):

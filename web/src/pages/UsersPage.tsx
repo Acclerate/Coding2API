@@ -10,7 +10,9 @@ import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
 import {
   Badge,
   Button,
@@ -71,7 +73,10 @@ export function UsersPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("username", "asc",
     { created_at: "desc", enabled: "desc" });
-  const { data, isLoading } = useUsers(session.username, sort, order);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const { data, isLoading, isFetching } = useUsers(session.username, sort, order,
+                                                   pageSize, page * pageSize);
   const [username, setUsername] = useState("");
   const [role, setRole] = useState<Role>("viewer");
   const [issued, setIssued] = useState<ActivationIssued | null>(null);
@@ -104,12 +109,21 @@ export function UsersPage() {
 
   const users = data?.users ?? [];
 
+  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
+  const toggleSort = (columnKey: string) => {
+    toggle(columnKey);
+    setPage(0);
+  };
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+  };
   const report = (caught: unknown, fallback: string) => {
     const message = caught instanceof ApiError ? caught.message : "";
     if (message.includes("last active admin")) {
-      setError("不能移除最后一个活跃管理员，否则将无人能管理此系统。");
+      setError("不能移除最后一个活跃管理员，否则无人能管理系统。");
     } else if (/your own|yourself/.test(message)) {
-      setError("不能对自己执行此操作，请让另一位管理员处理。");
+      setError("不能对自己执行此操作，请让另一位管理员处理");
     } else {
       setError(fallback);
     }
@@ -172,7 +186,7 @@ export function UsersPage() {
       <PageHeader
         eyebrow="管理"
         title="用户管理"
-        description="创建账号、分配角色、停用或重置密码。新建账号会得到一次性激活链接，由本人自设密码——系统里不存在管理员已知的共享密码。"
+        description="创建账号、分配角色、停用或重置密码。新建账号得到一次性激活链接、由本人自设密码——没有管理员已知的共享密码。"
         icon={<KeyRound className="size-5" />}
       />
 
@@ -211,36 +225,37 @@ export function UsersPage() {
           <EmptyState
             icon={<KeyRound className="size-5" />}
             title="还没有用户"
-            description="点右上角「新建用户」创建账号，系统会生成一次性激活链接由本人自设密码。"
+            description="点右上角「新建用户」创建账号，系统生成一次性激活链接由本人自设密码。"
             data-testid="no-users"
           />
         ) : (
-          <Table data-testid="users-table">
+          <>
+          <Table data-testid="users-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="用户名" columnKey="username" active={sort === "username"}
-                              direction={order} onToggle={toggle} testId="sort-username" />
+                              direction={order} onToggle={toggleSort} testId="sort-username" />
                 <SortableHead label="角色" columnKey="role" active={sort === "role"}
-                              direction={order} onToggle={toggle} testId="sort-role" />
+                              direction={order} onToggle={toggleSort} testId="sort-role" />
                 <SortableHead label="状态" columnKey="enabled" active={sort === "enabled"}
-                              direction={order} onToggle={toggle} testId="sort-enabled" />
+                              direction={order} onToggle={toggleSort} testId="sort-enabled" />
                 <SortableHead label="创建者" columnKey="created_by" active={sort === "created_by"}
-                              direction={order} onToggle={toggle} testId="sort-created_by" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_by" />
                 <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
-                              direction={order} onToggle={toggle} testId="sort-created_at" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {users.map((user) => (
                 <TableRow key={user.username} data-testid={`user-row-${user.username}`}>
-                  <TableCell className="font-medium">
+                  <TableCell label="用户名" className="font-medium">
                     {user.username}
                     {user.username === session.username && (
                       <span className="ml-1.5 text-xs text-muted-foreground">（我）</span>
                     )}
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="角色">
                     <Select
                       value={user.role}
                       disabled={busy === user.username}
@@ -255,7 +270,7 @@ export function UsersPage() {
                       ))}
                     </Select>
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="状态">
                     {user.enabled ? (
                       <Badge tone="ok">启用</Badge>
                     ) : (
@@ -272,11 +287,13 @@ export function UsersPage() {
                       </span>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
+                  <TableCell label="创建者" className="text-xs text-muted-foreground">
                     {user.created_by ?? "引导导入"}
                   </TableCell>
-                  <TableCell className="text-xs">{formatTime(user.created_at)}</TableCell>
-                  <TableCell className="text-right">
+                  <TableCell label="创建时间" className="text-xs">
+                    {formatTime(user.created_at)}
+                  </TableCell>
+                  <TableCell label="操作" className="text-right">
                     <span className="inline-flex gap-1.5">
                       <Button
                         size="sm"
@@ -313,12 +330,22 @@ export function UsersPage() {
               ))}
             </TableBody>
           </Table>
+          <Pagination
+            testId="users"
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            busy={isFetching}
+            onPageChange={setPage}
+            onPageSizeChange={changePageSize}
+          />
+          </>
         )}
       </Panel>
 
       <Notice tone="muted">
         角色：{ROLE_LABELS.admin} 可管理用户与配置；{ROLE_LABELS.operator}{" "}
-        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码都会立即使其所有会话失效。
+        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码会立即令其所有会话失效。
       </Notice>
 
       {createOpen && (
@@ -351,8 +378,9 @@ export function UsersPage() {
               </Button>
             </div>
             <form onSubmit={submitCreate} className="space-y-3">
-              <Field label="用户名">
+              <Field label="用户名" htmlFor="new-user-name-input">
                 <Input
+                  id="new-user-name-input"
                   value={username}
                   data-testid="new-user-name"
                   placeholder="例如 alice"
@@ -360,8 +388,9 @@ export function UsersPage() {
                   onChange={(event) => setUsername(event.target.value)}
                 />
               </Field>
-              <Field label="角色">
+              <Field label="角色" htmlFor="new-user-role-select">
                 <Select
+                  id="new-user-role-select"
                   value={role}
                   data-testid="new-user-role"
                   onChange={(event) => setRole(event.target.value as Role)}

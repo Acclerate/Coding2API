@@ -24,6 +24,7 @@ from src.provider.codearts.client import (
     derive_chat_id,
     new_chat_id,
     parse_balance,
+    parse_credits,
     prepare_body,
     request_path,
     sdk_date,
@@ -107,11 +108,13 @@ def test_client_models_from_items_and_helpers():
     assert [m.id for m in models] == ["a", "b"]
     assert models[0].credit_rate == 0.7 and models[0].max_input_tokens == 8000
     assert models[0].max_output_tokens == 100
+    assert models[0].benefit is False                # 内置条目不是福利
     assert models[1].credit_rate is None          # 无 credit → 不猜
     benefit_models = _models_from_items([
         {"model_id": "c", "name": "C", "credit": [{"ratio_display": "0.7x"}]}],
         benefit=True)
     assert benefit_models[0].credit_rate is None  # 福利走每日 token 池，不打倍率
+    assert benefit_models[0].benefit is True      # 但标记为福利（前端打「福」标）
     none_models = _models_from_items([
         {"model_id": "c", "name": 5, "context_window": True, "max_tokens": -1}],
         benefit=False)
@@ -213,6 +216,100 @@ def test_client_parse_balance_variants():
     # daily_tokens_used 缺失时按 0 处理 → 剩余等于额度
     assert parse_balance({"daily_token_limit": 10},
                          now=noon).remaining == pytest.approx(10 / 10000)
+
+def test_client_parse_credits_real_shape():
+    """积分账解析（2026-10-15 实测形状）：合计项进 remaining/total，分项进 packages。
+
+    单位是积分本身，**不折 token**（与 `parse_balance` 相反）——两个接口量级差
+    三个数量级，套错单位会把 13500 积分显示成 1.35。
+    """
+    noon = 1_780_300_800
+    data = {
+        "metrics": [
+            {"name": "usageDataChatMessages", "value": -1, "show": False},
+            {"name": "usageTokenChatMessages", "value": 0,
+             "usage_token_num": 3109, "package_token_amount": 1, "show": True},
+            {"name": "usageTotalPackageCredit", "value": 0,
+             "package_credit_amount": 13500.0, "package_credit_used": 1.28,
+             "package_credit_remain": 13498.72, "show": True},
+            {"name": "usageBasicPackageCredit", "value": 0,
+             "package_credit_amount": 500.0, "package_credit_used": 0.0,
+             "package_credit_remain": 500.0, "show": True},
+            {"name": "usageOnDemandPackageCredit", "value": 0,
+             "package_credit_amount": 0.0, "package_credit_used": 0.0,
+             "package_credit_remain": 0.0, "show": True},
+            {"name": "usageBonusPackageCredit", "value": 0,
+             "package_credit_amount": 13000.0, "package_credit_used": 1.28,
+             "package_credit_remain": 12998.72, "show": True},
+        ],
+        "start_date": "2026-10-01", "end_date": "2026-11-02",
+        "package": {"package_name_cn": "体验版", "is_credit_package": True},
+    }
+    quota = parse_credits(data, now=noon)
+    assert quota.probe_failed is False
+    assert quota.remaining == pytest.approx(13498.72)   # 积分原值，不折 token
+    assert quota.total == pytest.approx(13500.0)
+    assert quota.probed_at == noon
+    # 到期日：本地 0 点，且进到期阶梯（积分用不完同样作废）
+    end = time.localtime(quota.cycle_end)
+    assert (end.tm_year, end.tm_mon, end.tm_mday, end.tm_hour) == (2026, 11, 2, 0)
+    assert quota.expiry_ladder == [(quota.cycle_end, pytest.approx(13498.72))]
+    # 分项包带中文名与共用到期日；合计项本身不进 packages（否则重复计数）
+    assert [p["name"] for p in quota.packages] == ["基础积分", "按需积分", "福利积分"]
+    assert quota.packages[0] == {"name": "基础积分", "total": 500.0, "used": 0.0,
+                                 "end": quota.cycle_end}
+    # token 量级的 metric（usageTokenChatMessages）没有 credit 字段 → 不进 packages
+    assert all(p["name"] != "usageTokenChatMessages" for p in quota.packages)
+
+
+def test_client_parse_credits_unknown_and_edge_shapes():
+    """缺失 / 畸形一律「未知」，绝不返回 remaining=0 被判已耗尽。"""
+    assert parse_credits({}).probe_failed is True
+    assert parse_credits({"metrics": "x"}).probe_failed is True
+    assert parse_credits({"metrics": [{"name": "other"}]}).probe_failed is True
+    # 合计项存在但数值全是 bool / 字符串 → 视为未提供
+    assert parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": True,
+         "package_credit_remain": "x"}]}).probe_failed is True
+    # 只有 amount 没有 remain：不猜剩余，但总量可用，且不判失败
+    partial = parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 100.0}]})
+    assert partial.probe_failed is False
+    assert partial.remaining is None and partial.total == pytest.approx(100.0)
+    # 无 end_date：可解析但无到期信息 → 不登记阶梯、cycle_end 为 None
+    no_date = parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 10.0,
+         "package_credit_remain": 3.0}]})
+    assert no_date.cycle_end is None and no_date.expiry_ladder is None
+    # 剩余为 0：不携带可消耗额度 → 不进到期排序（与每日池同口径）
+    drained = parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 10.0,
+         "package_credit_remain": 0.0}], "end_date": "2026-11-02"})
+    assert drained.expiry_ladder is None and drained.cycle_end is not None
+    # 畸形分项条目被跳过（非 dict / 名称非字符串 / 无任何数值）
+    messy = parse_credits({"metrics": [
+        "junk", {"name": 3, "package_credit_amount": 1.0},
+        {"name": "usageBonusPackageCredit"},
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 5.0,
+         "package_credit_remain": 4.0}]})
+    assert messy.packages is None
+    # 非法日期（月份 13）不崩、当无到期信息；未知 metric 名回落到原名
+    bad_date = parse_credits({"metrics": [
+        {"name": "usageNewPackageCredit", "package_credit_amount": 1.0,
+         "package_credit_used": 0.0},
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 5.0,
+         "package_credit_remain": 4.0}], "end_date": "2026-13-45"})
+    assert bad_date.cycle_end is None
+    assert [p["name"] for p in bad_date.packages] == ["usageNewPackageCredit"]
+    # end_date 非字符串（上游换形状）同样当无到期信息
+    assert parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 5.0}],
+        "end_date": 20261102}).cycle_end is None
+    # end_date 是字符串但非日期形状（正则不匹配）→ 当无到期信息
+    assert parse_credits({"metrics": [
+        {"name": "usageTotalPackageCredit", "package_credit_amount": 5.0}],
+        "end_date": "长期有效"}).cycle_end is None
+
 
 def test_client_upstream_error_kind():
     error = UpstreamHTTPError(401, b"")
@@ -432,6 +529,80 @@ async def test_client_claim_benefit_and_quota_and_identity():
         return httpx.Response(200, json={"principal_id": "p", "account_id": "a"})
 
     assert await _client(urnless).caller_identity(_cred()) == ("p", "", "a")
+
+async def test_client_probe_quota_attaches_credits_and_merges_ladder():
+    """探测顺带拉积分账：`credits_*` 挂在同一 Quota 上，积分到期并入阶梯。
+
+    两本账是上游两个独立接口，合并后调度「窗口内到期额度多者先用」也会
+    先烧积分；主账（每日池）自己的阶梯不受影响，两段并存。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == codearts_events.EP_STATISTICS_PLUGIN:
+            return httpx.Response(200, json={
+                "metrics": [{"name": "usageTotalPackageCredit",
+                             "package_credit_amount": 13500.0,
+                             "package_credit_remain": 13498.72},
+                            {"name": "usageBonusPackageCredit",
+                             "package_credit_amount": 13000.0,
+                             "package_credit_used": 1.28}],
+                "end_date": "2026-11-02"})
+        return httpx.Response(200, json={"daily_token_limit": 10000000,
+                                         "daily_tokens_used": 1000000})
+
+    client = _client(handler)
+    quota = await client.probe_quota(_cred())
+    assert quota.remaining == pytest.approx(900.0)          # 主账：每日池
+    assert quota.credits_remaining == pytest.approx(13498.72)  # 第二本账：积分
+    assert quota.credits_total == pytest.approx(13500.0)
+    # 两段阶梯并存：每日池（次日 0 点）+ 积分（套餐到期日）
+    assert len(quota.expiry_ladder) == 2
+    # 积分那一段另留一份（供管理台按账本展示）：金额＝积分账剩余，且等于合并阶梯的
+    # 第二段——合并阶梯只多出每日池那一段。
+    assert quota.credits_expiry_ladder == [(quota.expiry_ladder[1][0],
+                                            pytest.approx(13498.72))]
+    assert quota.credits_expiry_ladder[0] == quota.expiry_ladder[1]
+    assert quota.expiry_ladder[0][0] == quota.cycle_end   # 第一段是每日池（次日 0 点）
+    # 积分分项包并入展示明细（主账不产 packages，故这里是合并而非覆盖）
+    assert [p["name"] for p in quota.packages] == ["福利积分"]
+
+
+async def test_client_probe_quota_credits_without_ladder_or_packages():
+    """积分账无到期日 / 无分项包时只挂 credits_*，不伪造阶梯或空明细。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == codearts_events.EP_STATISTICS_PLUGIN:
+            return httpx.Response(200, json={
+                "metrics": [{"name": "usageTotalPackageCredit",
+                             "package_credit_amount": 100.0,
+                             "package_credit_remain": 40.0}]})
+        return httpx.Response(200, json={"remaining": 9})
+
+    client = _client(handler)
+    quota = await client.probe_quota(_cred())
+    assert quota.credits_remaining == pytest.approx(40.0)
+    assert quota.packages is None            # 无分项包 → 不塞空列表
+    # 主账（通用形状）本就不产阶梯；积分无 end_date 也不补 → 整条为 None
+    assert quota.expiry_ladder is None
+    assert quota.credits_expiry_ladder is None
+
+
+async def test_client_probe_quota_keeps_balance_when_credits_fail(caplog):
+    """积分接口挂了不得把整次探测判失败：每日池明明有额度，不能显示成未知。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == codearts_events.EP_STATISTICS_PLUGIN:
+            return httpx.Response(500, content=b"down")
+        return httpx.Response(200, json={"daily_token_limit": 100,
+                                         "daily_tokens_used": 10})
+
+    client = _client(handler)
+    with caplog.at_level("WARNING"):
+        quota = await client.probe_quota(_cred())
+    assert quota.probe_failed is False
+    assert quota.remaining == pytest.approx(90 / 10000)
+    assert quota.credits_remaining is None and quota.credits_total is None
+    assert quota.expiry_ladder == [(quota.cycle_end, pytest.approx(90 / 10000))]
+    assert quota.credits_expiry_ladder is None
+    assert "积分余额拉取失败" in caplog.text
+
 
 async def test_client_probe_quota_never_refreshes_even_in_window():
     """额度探测只读余额：即使凭证已在刷新窗口，也不得消费一次性 refresh_token。

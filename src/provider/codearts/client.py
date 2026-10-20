@@ -60,6 +60,7 @@ from .events import (
     EP_OPS_CLAIM,
     EP_OPS_CONFIRM,
     EP_OPS_DELIVERY,
+    EP_STATISTICS_PLUGIN,
     EP_TOKEN_BALANCE,
     HEADER_MAAS_TYPE,
     MAAS_BENEFIT,
@@ -72,7 +73,10 @@ from .events import (
 logger = logging.getLogger(__name__)
 
 # 流式无总超时防长流截断；短请求 30s 防悬挂（与 TRAE / Kilo 同策略）
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+# 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
+# 经代理链路 10s 会稳定超时；首字等待由 read=None +
+# stream_first_event_timeout_seconds 负责，两者不要混为一谈。
+STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 SHORT_TIMEOUT = httpx.Timeout(30.0)
 
 # 冷启动种子：首次发现完成前也要带 benefit 头，否则第一轮请求必吃一次
@@ -322,7 +326,8 @@ class CodeArtsClient:
         async with self._stream().stream("POST", url, content=raw, headers=headers) as response:
             if response.status_code >= 400:
                 body_bytes = await base.read_body_bounded(response)
-                raise UpstreamHTTPError(response.status_code, body_bytes)
+                raise UpstreamHTTPError(response.status_code, body_bytes,
+                                        **base.retry_hints(response.headers))
             async for line in codearts_events.iter_data_lines(response.aiter_bytes()):
                 for event in codearts_events.parse_line(line, snapshot):
                     _fill_estimated_credit(event, benefit=benefit)
@@ -428,7 +433,10 @@ class CodeArtsClient:
         """额度余额（只读，不刷新）。
 
         额度是**每日 token 池**（当日 0 点清零）；另有独立的积分余额走
-        `/v1/statistics/plugin`，两者是并行的两套账，**不要混**。
+        `/snap-manager/v1/statistics/plugin`，两者是并行的两套账，**不要混**。
+        积分账（内置模型计费）在这里顺带探测并挂在 `credits_*` 上——它是
+        第二本账，**不参与调度口径的 health**（选号仍按主账），但到期日会并入 `expiry_ladder` 参与
+        「快过期先用」的选号排序（见 `Quota.credits_remaining`）。
         临时凭证的续期**不在**这里做：refresh_token 是一次性的，必须由
         `tasks.refresh.RefreshTask`（先落库再同步）独占轮转。若此处顺手刷新，
         一个 refresh_token 会被两个地方各消费一次，后到的报
@@ -437,7 +445,52 @@ class CodeArtsClient:
         """
         url = f"{self.benefit_host}{EP_TOKEN_BALANCE}"
         data = await self._get_json(url, credential, short_headers())
-        return parse_balance(data)
+        quota = parse_balance(data)
+        return await self._attach_credits(credential, quota)
+
+    async def _attach_credits(self, credential: CodeArtsCredential,
+                              quota: Quota) -> Quota:
+        """补积分账（best-effort）：失败保留主账，绝不把探测整体判失败。
+
+        两本账在上游是独立接口，一个挂了不代表另一个没有额度。若让积分接口的
+        失败把 `probe_failed` 置真，每日池明明有额度也会被显示成「未知」。
+        """
+        try:
+            credits = await self._fetch_credits(credential)
+        except (UpstreamHTTPError, UpstreamProtocolViolation) as error:
+            logger.warning("CodeArts 积分余额拉取失败: %s", error)
+            return quota
+        # `_fetch_credits` 返回的 Quota 用 remaining/total 承载积分值（它只是
+        # 解析中转），这里再挂到主账的 credits_* 槽位——两者不可混：主账的
+        # remaining/total 是每日 token 池。
+        quota.credits_remaining = credits.remaining
+        quota.credits_total = credits.total
+        # 积分包独立到期（实测 end_date 是「体验版」月度周期），并入主账的
+        # 到期阶梯：调度「窗口内即将到期额度多者先用」因此也会先烧积分。
+        # 主账自己的阶梯（每日池次日 0 点）不受影响，两段相加即该凭证的
+        # 窗口内到期总量。
+        if credits.expiry_ladder:
+            # 积分那一段另留一份：管理台按账本拆分展示到期积分（福利组＝每日池、
+            # 内置组＝积分账），合并后的阶梯分不出哪段属于哪本账。
+            quota.credits_expiry_ladder = list(credits.expiry_ladder)
+            quota.expiry_ladder = [*(quota.expiry_ladder or []),
+                                   *credits.expiry_ladder]
+        # 积分分项包（基础 / 按需 / 福利）并入展示明细：主账（每日池）不产
+        # packages（parse_balance 恒 None），故这里是「有则合并」而非覆盖。
+        if credits.packages:
+            quota.packages = [*(quota.packages or []), *credits.packages]
+        return quota
+
+    async def _fetch_credits(self, credential: CodeArtsCredential) -> Quota:
+        """`/snap-manager/v1/statistics/plugin` → 积分账（单位已是积分）。
+
+        **前缀必须带 `snap-manager`**（实测不带回 APIG.0101），与 `/v1/ops/*`
+        相反；头 `Agent-Type: PromptCenter` 同内置模型接口。
+        """
+        url = f"{self.endpoint}{EP_STATISTICS_PLUGIN}"
+        data = await self._get_json(
+            url, credential, short_headers(AGENT_TYPE_PROMPT_CENTER))
+        return parse_credits(data)
 
     # ------------------------------------------------------------ 每日签到
 
@@ -651,6 +704,7 @@ def _models_from_items(items: Any, *, benefit: bool) -> list[Model]:
             name=_first_str(item, ("model_name", "modelName", "name", "display_name"))
             or model_id,
             credit_rate=None if benefit else _credit_rate(item.get("credit")),
+            benefit=benefit,
             max_input_tokens=_first_int(item, ("context_window", "contextWindow",
                                                "max_input_tokens")),
             max_output_tokens=_first_int(item, ("max_tokens", "maxTokens",
@@ -796,6 +850,102 @@ def parse_balance(data: dict[str, Any], *, now: int | None = None) -> Quota:
 def _opt_credits(tokens: float | None) -> float | None:
     """可空的 token 额度 → 积分；None 原样返回（区分「未提供」与「0」）。"""
     return None if tokens is None else units.tokens_to_credits(tokens)
+
+
+# 积分账里代表「本账号积分合计」的那一条 metric（实测：其余是分项包）。
+_CREDIT_TOTAL_METRIC = "usageTotalPackageCredit"
+# 分项包 → 中文包名（展示用）。上游只给英文 metric 名，包名映射写在这里，
+# 未知 metric 回落到 metric 名本身（上游加包时前端不至于显示空白）。
+_CREDIT_PACKAGE_NAMES: dict[str, str] = {
+    "usageBasicPackageCredit": "基础积分",
+    "usageOnDemandPackageCredit": "按需积分",
+    "usageBonusPackageCredit": "福利积分",
+}
+
+
+def parse_credits(data: dict[str, Any], *, now: int | None = None) -> Quota:
+    """`/snap-manager/v1/statistics/plugin` 响应 → 积分账 Quota（单位：积分）。
+
+    这是 CodeArts 的**第二本账**：内置模型（GLM-5.2 / OpenPangu 等）按积分计费，
+    与福利模型走的每日 token 池并行、互不通气（实测两接口各自独立）。上游
+    数值本身已是积分，**不做单位折算**（勿套 `units`，那套是 token 池专用）。
+
+    形状（实测 2026-10-15）：
+    `metrics[]` 每项含 `package_credit_amount` / `_used` / `_remain`，其中
+    `usageTotalPackageCredit` 是合计，其余（Basic/OnDemand/Bonus）是分项包。
+    故 `remaining/total` 取合计项，分项写进 `packages`（展示用），并给积分包
+    登记到期阶梯——顶层 `end_date` 是整份套餐的到期日（实测每账号不同，如
+    `2026-11-02`），积分用不完同样作废，应参与「快过期先用」。
+
+    取不到合计项、或合计项无有效数值时返回 `probe_failed=True`（**未知**），
+    绝不返回 `remaining=0` 被判「已耗尽」——积分账缺失不代表内置模型不能用。
+    """
+    stamp = int(time.time()) if now is None else now
+    metrics = data.get("metrics")
+    if not isinstance(metrics, list):
+        return Quota(probe_failed=True, probed_at=stamp)
+    total_item = next(
+        (item for item in metrics
+         if isinstance(item, dict) and item.get("name") == _CREDIT_TOTAL_METRIC),
+        None)
+    if total_item is None:
+        return Quota(probe_failed=True, probed_at=stamp)
+    remaining = _opt_number(total_item, "package_credit_remain")
+    total = _opt_number(total_item, "package_credit_amount")
+    if remaining is None and total is None:
+        return Quota(probe_failed=True, probed_at=stamp)
+    end = _package_end_date(data.get("end_date"))
+    packages: list[dict[str, Any]] = []
+    for item in metrics:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name == _CREDIT_TOTAL_METRIC:
+            continue
+        amount = _opt_number(item, "package_credit_amount")
+        used = _opt_number(item, "package_credit_used")
+        if amount is None and used is None:
+            continue
+        packages.append({
+            "name": _CREDIT_PACKAGE_NAMES.get(name, name),
+            "total": amount or 0.0,
+            "used": used or 0.0,
+            "end": end,
+        })
+    ladder = [(end, remaining)] if end and remaining and remaining > 0 else None
+    return Quota(remaining=remaining, total=total, cycle_end=end,
+                 expiry_ladder=ladder, packages=packages or None, probed_at=stamp)
+
+
+def _opt_number(obj: dict[str, Any], key: str) -> float | None:
+    """取可空数值字段；bool / 非数值 / 缺失返回 None（区分「未提供」与 0）。"""
+    value = obj.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _package_end_date(value: Any) -> int | None:
+    """套餐到期日（`"2026-11-02"`，本地 0 点）→ epoch；解析不出返回 None。
+
+    上游只给日期不给时刻，按服务端本地时区（部署为 Asia/Shanghai）取当日 0 点，
+    与「0 点清零」的其它口径一致。
+    """
+    if not isinstance(value, str):
+        return None
+    match = _DATE_RE.match(value.strip())
+    if match is None:
+        return None
+    try:
+        local = time.strptime(match.group(0), "%Y-%m-%d")
+    except ValueError:
+        # 正则只保证「四位-两位-两位」形状，月份/日仍可能是 13/45 这类非法值。
+        return None
+    return int(time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                            0, 0, 0, 0, 0, -1)))
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 def _next_local_midnight(now: int) -> int:

@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.provider.base import Quota
@@ -368,3 +370,218 @@ def test_build_runner_accepts_shared_status_store(repo):
     config = Settings(_env_file=None, APP_SECRET=SECRET)
     runner = build_runner(credentials, {}, StatsCollector(db), config, status=store)
     assert runner.status is store
+
+
+# ------------------------------------------------------- 手动触发（run_task）
+
+async def test_run_task_executes_and_returns_fresh_status(repo):
+    """手动触发跑真一轮并回最新运行态：ran=True、runs 递增、带 report。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+
+    result = await runner.run_task("quota_probe")
+
+    assert result["key"] == "quota_probe"
+    assert result["ran"] is True and result["busy"] is False
+    assert result["runs"] == 1
+    assert result["last_ok"] is True
+    assert result["last_report"] == {
+        "attempted": 1, "succeeded": 1, "failed": 0, "skipped": 0}
+    # 回读的与 store 里的是同一份
+    assert runner.status.runs("quota_probe") == 1
+
+
+async def test_run_task_unknown_key_raises(repo):
+    """未装配 / 不存在的 key 显式报错，由端点翻成 400。"""
+    from src.tasks.runner import UnknownTaskError
+
+    runner = _runner(repo, StubProvider())
+    with pytest.raises(UnknownTaskError) as caught:
+        await runner.run_task("ghost")
+    assert caught.value.key == "ghost"
+    # growth 未装配 → 同样不在清单里
+    with pytest.raises(UnknownTaskError):
+        await runner.run_task("growth")
+
+
+async def test_run_task_reports_noop_as_not_ran(repo):
+    """开关关着的任务手动触发记 ran=False：不把「关了」谎报成「跑过了」。"""
+    credentials, db = repo
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": StubProvider()}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": StubProvider()}),
+        refresh=RefreshTask(credentials, {"codebuddy": StubProvider()}, skew_seconds=1),
+        retention=RetentionTask(StatsCollector(db)),
+        activity=ActivityTask(credentials, {"codebuddy": StubProvider()}),
+        activity_enabled=lambda: False,
+    )
+
+    result = await runner.run_task("activity")
+
+    assert result["ran"] is False and result["busy"] is False
+    assert result["runs"] == 0
+    assert runner.status.get("activity") is None
+
+
+async def test_run_task_bypasses_activity_hour_window(repo):
+    """手动触发绕过 due() 时点窗口：窗口外也真跑（开关开着）。"""
+    credentials, db = repo
+    provider = _ActivityProvider()
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=1),
+        retention=RetentionTask(StatsCollector(db)),
+        activity=ActivityTask(credentials, {"codebuddy": provider}),
+        activity_enabled=lambda: True,
+    )
+    # 构造一个恒不到点的 due（时点窗口外）
+    runner._activity.due = lambda: False
+
+    result = await runner.run_task("activity")
+
+    assert result["ran"] is True
+    assert provider.activity_calls == 1
+
+
+async def test_run_task_skips_when_already_running(repo):
+    """同一任务已在跑时立刻返回 busy，不排队、不并发打上游。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+    runner._running.add("quota_probe")          # 模拟周期循环正在跑
+
+    result = await runner.run_task("quota_probe")
+
+    assert result["ran"] is False and result["busy"] is True
+    assert runner.status.runs("quota_probe") == 0
+
+
+async def test_run_task_records_failure_with_error(repo):
+    """手动触发失败同样算「跑了一轮」：ran=True 但 last_ok=False 带 error。"""
+    runner = _runner(repo, StubProvider())
+
+    def boom() -> dict:
+        raise RuntimeError("磁盘写满")
+
+    runner._retention.run_once = boom  # type: ignore[method-assign]
+
+    result = await runner.run_task("retention")
+
+    assert result["ran"] is True and result["busy"] is False
+    assert result["last_ok"] is False and result["last_error"] == "磁盘写满"
+    assert result["runs"] == 1
+
+
+async def test_run_task_releases_running_flag_after_run(repo):
+    """跑完必须释放「运行中」标记，否则该任务再也触发不了。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+
+    await runner.run_task("quota_probe")
+
+    assert "quota_probe" not in runner._running
+
+
+async def test_run_guarded_skips_when_key_busy(repo):
+    """周期循环撞上手动触发（或反之）时跳过本轮，不并发跑同一任务。"""
+    runner = _runner(repo, StubProvider())
+    calls: list[int] = []
+
+    async def body():
+        calls.append(1)
+        return TaskReport(attempted=1)
+
+    runner._running.add("quota_probe")          # 该 key 正被占用
+
+    ok, ran = await runner._run_guarded(body, "额度探测", key="quota_probe")
+
+    assert (ok, ran) == (False, False)
+    assert calls == []                          # 根本没跑
+    assert runner.status.runs("quota_probe") == 0
+
+
+async def test_run_guarded_without_key_runs_and_reports(repo):
+    """无 key 的路径（测试 / 一次性任务）照跑，且 ran 跟随 ok。"""
+    runner = _runner(repo, StubProvider())
+    calls: list[int] = []
+
+    async def body():
+        calls.append(1)
+        return None
+
+    ok, ran = await runner._run_guarded(body, "一次性")
+
+    assert (ok, ran) == (True, True)
+    assert calls == [1]
+
+
+def test_task_item_reports_running_flag(repo):
+    """task_status 的 running 字段与内部集合一致：前端据此禁用按钮。"""
+    runner = _runner(repo, StubProvider())
+    assert runner.task_status()[0]["running"] is False
+    runner._running.add("quota_probe")
+    assert runner.task_status()[0]["running"] is True
+
+
+class _ActivityProvider(StubProvider):
+    """支持活跃上报的最小 provider 桩。"""
+
+    def __init__(self) -> None:
+        self.activity_calls = 0
+
+    def activity_scope(self, _data):
+        return "scope"
+
+    async def activity(self, _data):
+        from src.provider.codebuddy.activity import ActivityResult
+
+        self.activity_calls += 1
+        return ActivityResult(ok=True, message="")
+
+
+async def test_run_task_is_exposed_by_the_endpoint(admin_client):
+    """端点把 runner 的手动触发结果原样回给管理台。"""
+    _app, client = admin_client
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["key"] == "quota_probe"
+    assert body["ran"] is True and body["busy"] is False
+    assert body["runs"] == 2      # 启动首轮 + 手动一轮
+
+
+def test_run_task_endpoint_requires_admin(admin_client):
+    _app, client = admin_client
+    client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 403
+
+
+def test_run_task_endpoint_rejects_unknown_key(admin_client):
+    _app, client = admin_client
+    response = client.post("/api/tasks/ghost/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 400
+    assert "unknown task" in response.json()["error"]["message"]
+
+
+def test_run_task_endpoint_without_runner_returns_400(tmp_path):
+    """lifespan 未运行时 app.state 上没有 runner，不能 500。"""
+    from fastapi.testclient import TestClient
+
+    from src.main import build_app
+
+    app = build_app(Settings(_env_file=None, APP_SECRET=SECRET,
+                             ADMIN_USERNAMES="root", DATA_DIR=str(tmp_path)))
+    client = TestClient(app)
+    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 400
+    assert "not available" in response.json()["error"]["message"]

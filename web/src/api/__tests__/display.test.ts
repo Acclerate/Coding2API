@@ -14,10 +14,14 @@ import {
   taskReportLabel,
   tokenExpiryView,
   activeModelCooldowns,
+  CREDITS_QUOTA_SEMANTICS,
   credentialState,
+  credentialHealth,
   formatDuration,
   formatNumber,
   formatTime,
+  upstreamLevelLabel,
+  upstreamLevelTone,
   hasQuotaProbe,
   healthView,
   modelCooldownLabel,
@@ -361,6 +365,13 @@ describe("display helpers", () => {
     // 国际版 Qoder 无旧签到接口，但额度语义不变（不在此断言）
   });
 
+  it("第二本账（积分）的口径文案", () => {
+    // 口径文案必须点明「与每日额度池并行的独立账本」，否则会被读成同一本账
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("独立账本");
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("内置模型");
+    expect(CREDITS_QUOTA_SEMANTICS).toContain("调度口径不变");
+  });
+
   it("凭证状态机覆盖全部状态", () => {
     expect(credentialState(makeCredential() as never, 0)).toBe("ready");
     expect(credentialState(makeCredential({ disabled: 1 }) as never, 0)).toBe("disabled");
@@ -369,6 +380,28 @@ describe("display helpers", () => {
     expect(credentialState(makeCredential({ health: -1 }) as never, 0)).toBe("exhausted");
     // 冷却已过期 → 不再是 cooling
     expect(credentialState(makeCredential({ cooling_until: 50 }) as never, 100)).toBe("ready");
+  });
+
+  it("CodeArts 两本账各读各的健康度（内置组不与额度列自相矛盾）", () => {
+    // 主账（每日池）已耗尽、积分账几乎满：库里 health=-1，积分派生值 100
+    const codearts = makeCredential({
+      provider: "codearts", health: -1,
+      quota_credits_remaining: 13498.72, quota_credits_total: 13500,
+      quota_credits_health: 100,
+    }) as never;
+    // 福利组（每日池）读主账 → 已耗尽
+    expect(credentialHealth(codearts, "pool")).toBe(-1);
+    expect(credentialState(codearts, 0, credentialHealth(codearts, "pool"))).toBe("exhausted");
+    // 内置组（积分账）读派生值 → 100%，状态不能是「额度耗尽」
+    expect(credentialHealth(codearts, "credits")).toBe(100);
+    expect(healthView(credentialHealth(codearts, "credits"), "codearts"))
+      .toMatchObject({ kind: "known", percent: 100, tone: "ok" });
+    expect(credentialState(codearts, 0, credentialHealth(codearts, "credits"))).toBe("ready");
+    // 缺省账本＝主账，与调度口径一致
+    expect(credentialHealth(codearts)).toBe(-1);
+    // 非 CodeArts 渠道积分账恒 null → 内置组也只会读到 null（此时按「未探测」）
+    const trae = makeCredential({ provider: "trae", quota_credits_health: null }) as never;
+    expect(credentialHealth(trae, "credits")).toBeNull();
   });
 
   it("时长格式化覆盖秒/分/时/天与零值", () => {
@@ -382,7 +415,7 @@ describe("display helpers", () => {
 
   it("探测失败原因有中文文案，且未知值有兜底", () => {
     expect(probeFailureLabel("credential_rejected")).toContain("重新登录");
-    expect(probeFailureLabel("upstream_unavailable")).toContain("与本账号凭证无关");
+    expect(probeFailureLabel("upstream_unavailable")).toContain("与凭证无关");
     expect(probeFailureLabel("network_unreachable")).toContain("连不上渠道服务器");
     expect(probeFailureLabel(undefined)).toBe("未知错误");
     expect(probeFailureLabel("something_new" as never)).toBe("未知错误");
@@ -393,6 +426,9 @@ describe("display helpers", () => {
     expect(usageErrorLabel("client_disconnect")).toBe("客户端中断");
     expect(usageErrorLabel("model_unavailable")).toBe("该模型暂时不可用");
     expect(usageErrorLabel("no_healthy_credential")).toBe("无可用凭证");
+    // A1 流式超时：两个新枚举都要有中文文案（不能落到兜底「失败（xxx）」）
+    expect(usageErrorLabel("upstream_first_event_timeout")).toBe("上游首字超时");
+    expect(usageErrorLabel("upstream_idle_timeout")).toBe("上游流中断");
     expect(usageErrorLabel(null)).toBe("失败");
     expect(usageErrorLabel(undefined)).toBe("失败");
     // 后端新增枚举时前端不能显示空白：兜底文案带原值便于对照排查
@@ -428,5 +464,26 @@ describe("display helpers", () => {
       { model: "m", cooling_until: 1, hits: 1, reason: "model" })).toContain("其它模型不受影响");
     expect(modelCooldownLabel(
       { model: "m", cooling_until: 1, hits: 1, reason: "blocked" })).toContain("无此模型");
+  });
+
+  it("上游档位：六档各有中文名，未知取值不原样透传", () => {
+    expect(upstreamLevelLabel("operational")).toBe("正常");
+    expect(upstreamLevelLabel("degraded")).toBe("性能下降");
+    expect(upstreamLevelLabel("partial")).toBe("部分中断");
+    expect(upstreamLevelLabel("major")).toBe("重大故障");
+    expect(upstreamLevelLabel("maintenance")).toBe("维护中");
+    expect(upstreamLevelLabel("unknown")).toBe("未知");
+    // 后端新增档位时前端不显示空白
+    expect(upstreamLevelLabel("brand_new_level")).toBe("未知");
+  });
+
+  it("上游档位色调：partial / major 同为 danger，unknown 用 muted", () => {
+    expect(upstreamLevelTone("operational")).toBe("ok");
+    expect(upstreamLevelTone("degraded")).toBe("warn");
+    expect(upstreamLevelTone("maintenance")).toBe("warn");
+    expect(upstreamLevelTone("partial")).toBe("danger");
+    expect(upstreamLevelTone("major")).toBe("danger");
+    // 抓取失败不是「上游挂了」，不该抢真实故障的红色
+    expect(upstreamLevelTone("unknown")).toBe("muted");
   });
 });

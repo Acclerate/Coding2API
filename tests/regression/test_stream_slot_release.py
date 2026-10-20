@@ -66,7 +66,7 @@ class _Scheduler:
     def should_rotate(self, tried):
         return self._rotate
 
-    def note_error(self, candidate, kind, now, *, model=None):
+    def note_error(self, candidate, kind, now, *, model=None, retry_at=None):
         return type("Outcome", (), {"cooling_until": None, "err_count": 1,
                                     "disabled": False})()
 

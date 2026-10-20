@@ -29,7 +29,7 @@ def test_default_registry_contains_both_providers(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -51,7 +51,7 @@ def test_default_registry_contains_both_providers(tmp_path):
         ).json()["data"]
     by_id = {item["id"]: item["providers"] for item in data}
     # CB 的 list_models 抛错 → 该上游被跳过（不拖垮整个列表），TRAE 正常返回
-    assert by_id["glm-5.2-trae"] == ["trae"]
+    assert by_id["glm-5.3-trae"] == ["trae"]
 
 
 def test_models_endpoint_skips_providers_without_credentials(tmp_path):
@@ -144,7 +144,7 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
 
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2"), Model(id="DeepSeek-V4-Flash")]
+            return [Model(id="glm-5.3"), Model(id="DeepSeek-V4.1-Flash")]
 
         def import_credential(self, raw):
             return raw
@@ -160,18 +160,18 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
         # 第一次：拉取成功，缓存写入
         first = client.get("/v1/models", headers=auth).json()["data"]
         assert {item["id"] for item in first} == {
-            "glm-5.2-trae",
-            "deepseek-v4-flash-trae",
+            "glm-5.3-trae",
+            "deepseek-v4.1-flash-trae",
         }
         cached_keys = app.state.services.model_list_cache["trae"].keys()
-        assert cached_keys == {"glm-5.2", "deepseek-v4-flash"}
+        assert cached_keys == {"glm-5.3", "deepseek-v4.1-flash"}
 
         # 第二次：拉取失败 → 用缓存兜底，列表不缺模型
         trae.fail = True
         second = client.get("/v1/models", headers=auth).json()["data"]
         assert {item["id"] for item in second} == {
-            "glm-5.2-trae",
-            "deepseek-v4-flash-trae",
+            "glm-5.3-trae",
+            "deepseek-v4.1-flash-trae",
         }
         assert {item["id"] for item in second} and all(
             item["providers"] == ["trae"] for item in second
@@ -181,15 +181,15 @@ def test_models_cache_used_when_fetch_fails(tmp_path):
         trae.fail = False
         third = client.get("/v1/models", headers=auth).json()["data"]
         assert {item["id"] for item in third} == {
-            "glm-5.2-trae",
-            "deepseek-v4-flash-trae",
+            "glm-5.3-trae",
+            "deepseek-v4.1-flash-trae",
         }
 
 
 def test_models_blocklist_filters_noise_and_old(tmp_path):
     """默认黑名单滤非用户模型（custom_model_*/subagent/summary/file_search_agent/
-    default/hunyuan-image-*），MODEL_BLOCKLIST 覆盖后可再滤老模型；
-    直连指定不受列表过滤影响。"""
+    default/hunyuan-image-*）与已下架老模型（2026-10-19 起默认含老一代），
+    MODEL_BLOCKLIST 覆盖后语义完全替换；直连指定不受列表过滤影响。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
 
     class NoisyProvider:
@@ -199,7 +199,7 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
             from src.provider.base import Model
 
             return [
-                Model(id="glm-5.2"),
+                Model(id="glm-5.3"),
                 Model(id="kimi-k2.6"),
                 Model(id="custom_model_claude"),
                 Model(id="explore_sub_agent_v13"),
@@ -222,7 +222,8 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
                 "/v1/models", headers={"Authorization": f"Bearer {key}"}
             ).json()["data"]
         }
-    # 默认黑名单：噪音全滤（实测内部/不可用模型），老模型默认保留（是否滤由配置决定）
+    # 默认黑名单：噪音全滤（实测内部/不可用模型）；老模型（kimi-k2.6 等
+    # 上游已下架一代）2026-10-19 起也进默认黑名单，在售主力（glm-5.3）保留。
     # 断言按对外 id（`归一键-渠道`）写——黑名单六种写法里含拼 `-渠道` 的形态
     assert "custom_model_claude-trae" not in ids
     assert "explore_sub_agent_v13-trae" not in ids
@@ -230,7 +231,8 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
     assert "file_search_agent-trae" not in ids
     assert "default-trae" not in ids
     assert "hunyuan-image-alpha-trae" not in ids
-    assert {"glm-5.2-trae", "kimi-k2.6-trae"} <= ids
+    assert "kimi-k2.6-trae" not in ids
+    assert "glm-5.3-trae" in ids
 
     # 覆盖黑名单：额外滤老模型（完全替换语义，需重写噪音规则）
     settings2 = Settings(
@@ -249,16 +251,16 @@ def test_models_blocklist_filters_noise_and_old(tmp_path):
                 "/v1/models", headers={"Authorization": f"Bearer {key2}"}
             ).json()["data"]
         }
-    assert "kimi-k2.6-trae" not in ids2 and "glm-5.2-trae" in ids2
+    assert "kimi-k2.6-trae" not in ids2 and "glm-5.3-trae" in ids2
 
 
 def test_models_blocklist_default_covers_retired_upstream_models(tmp_path):
-    """默认黑名单含 2026-10-10 复测补入的三条「上游已下架」。
+    """默认黑名单覆盖「上游已下架/不可用」的模型（2026-10-19 与线上对齐）。
 
-    `hy4-preview-x`（CB 400 11102）与同名的 `hy4-preview` 只差后缀，故必须
-    写全名而不是 `hy4-preview*`；`qwen3.8-flash` 只命中 Qoder 的 qfmodel，
-    CB/TRAE 的 `qwen3.8-max` 不受影响；`glyph-cluster` 按 kilo 展示名清洗出的
-    归一键命中，不误伤同渠道其它模型。
+    `hy4-preview` 整代（含 `-x` 变体）、kilo 的自动档（展示名归一成 `auto`）、
+    `qwen3.8-flash`（只命中 Qoder 的 qfmodel）、`glyph-cluster`（按 kilo 展示名
+    清洗出的归一键命中）都在默认列表里；近邻的 `qwen3.8-max` 与在售主力
+    `openpangu` 不受牵连。
     """
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
 
@@ -298,7 +300,7 @@ def test_models_blocklist_default_covers_retired_upstream_models(tmp_path):
                     Model(
                         id="stealth/glyph-cluster", name="Stealth: Glyph Cluster (free)"
                     ),
-                    Model(id="kilo-auto/free", name="Auto Free"),
+                    Model(id="openpangu-2.0-pro", name="OpenPangu 2.0 Pro"),
                 ],
             ),
         },
@@ -317,8 +319,12 @@ def test_models_blocklist_default_covers_retired_upstream_models(tmp_path):
     assert "hy4-preview-x-codebuddy" not in ids
     assert "qwen3.8-flash-qoder" not in ids
     assert "glyph-cluster-kilo" not in ids
-    # 近邻模型不受牵连：同名不同 id 的 hy4-preview、qwen3.8-max、kilo-auto 都在
-    assert {"hy4-preview-codebuddy", "qwen3.8-max-qoder", "kilo-auto-kilo"} <= ids
+    # 2026-10-19 对齐线上：hy4-preview 整代（不只 -x 变体）与 kilo 的自动档
+    # （展示名归一成 auto）也在默认黑名单里
+    assert "hy4-preview-codebuddy" not in ids
+    assert "kilo-auto-kilo" not in ids
+    # 近邻不受牵连：qwen3.8-max（与 flash 只差尾缀）、openpangu（在售主力）都在
+    assert {"qwen3.8-max-qoder", "openpangu-2.0-pro-kilo"} <= ids
 
 
 def test_models_blocklist_matches_normalized_id_and_display_name(tmp_path):
@@ -407,7 +413,7 @@ def test_models_blocklist_hot_reload_applies_without_waiting_for_ttl(tmp_path):
 
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2"), Model(id="kimi-k2.6")]
+            return [Model(id="glm-5.3"), Model(id="kimi-k3")]
 
         def import_credential(self, raw):
             return raw
@@ -420,26 +426,26 @@ def test_models_blocklist_hot_reload_applies_without_waiting_for_ttl(tmp_path):
     with TestClient(app) as client:
         client.cookies.set("coding2api_session", create_session_token("root", SECRET))
         first = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in first} == {"glm-5.2-trae", "kimi-k2.6-trae"}
+        assert {item["id"] for item in first} == {"glm-5.3-trae", "kimi-k3-trae"}
         # 缓存存的是**未过滤**表（两条都在），否则热更在 TTL 内无法生效
         assert set(app.state.services.model_list_cache["trae"]) == {
-            "glm-5.2",
-            "kimi-k2.6",
+            "glm-5.3",
+            "kimi-k3",
         }
 
         # TTL 未过（刚拉过），此时改黑名单
         client.put(
             "/api/settings",
-            json={"values": {"model_blocklist": "kimi-k2.6"}},
+            json={"values": {"model_blocklist": "kimi-k3"}},
             headers={"Referer": "http://testserver/"},
         )
         second = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in second} == {"glm-5.2-trae"}  # 立即生效
+        assert {item["id"] for item in second} == {"glm-5.3-trae"}  # 立即生效
 
         # 上游随后失败：兜底缓存也不能让被滤模型复活
         provider.fail = True
         third = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in third} == {"glm-5.2-trae"}
+        assert {item["id"] for item in third} == {"glm-5.3-trae"}
 
         # 清空黑名单（'' 与 null 等价 = 恢复默认）：被滤模型立刻回来
         client.put(
@@ -448,7 +454,7 @@ def test_models_blocklist_hot_reload_applies_without_waiting_for_ttl(tmp_path):
             headers={"Referer": "http://testserver/"},
         )
         fourth = client.get("/v1/models", headers=auth).json()["data"]
-        assert {item["id"] for item in fourth} == {"glm-5.2-trae", "kimi-k2.6-trae"}
+        assert {item["id"] for item in fourth} == {"glm-5.3-trae", "kimi-k3-trae"}
 
 
 def test_codebuddy_import_via_api(tmp_path):

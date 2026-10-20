@@ -5,15 +5,19 @@
  * 没有分组看不出渠道结构，每行还复读同样的渠道名与周期语义。这里把三件事抽成
  * 可单测的纯函数，`CredentialsPage` 只负责渲染：
  *
- * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态；
+ * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态 × 标签；
  * - 分组：按渠道聚合，组顺序与全站渠道顺序一致（`providerRank`）；
  * - 计数：给筛选控件提供「各项各有多少条」，让零计数的筛选项不占位。
  *
  * 状态判定复用 `credentialState`（与表格里那个 Badge 同一口径），
  * 不在这里另起一套「可用」定义，否则筛选结果会和徽章自相矛盾。
+ *
+ * 唯一的例外是 CodeArts 的虚拟渠道：状态筛选与池概况仍按**主账**（真实调度口径
+ * `health`）判，因为一条凭证是否被选中跟展示分组无关；而组头的状态分布按本组
+ * 那本账算（见 `groupByProvider`），与组内额度列同源。
  */
 
-import { credentialState, STATE_LABEL } from "../api/display";
+import { credentialHealth, credentialState, STATE_LABEL } from "../api/display";
 import type { CredentialState } from "../api/display";
 import { providerLabel, providerRank } from "../api/providers";
 import type { Credential } from "../api/types";
@@ -28,17 +32,32 @@ export interface CredentialFilters {
   provider: string;
   /** 状态筛选：`ANY` 或 `CredentialState` */
   state: string;
+  /** 标签筛选：`ANY` 或某个标签（**精确匹配**，大小写不敏感） */
+  tag: string;
 }
 
 /** 默认筛选：全部可见（页面首屏即池子全貌）。 */
-export const DEFAULT_FILTERS: CredentialFilters = { query: "", provider: ANY, state: ANY };
+export const DEFAULT_FILTERS: CredentialFilters = {
+  query: "", provider: ANY, state: ANY, tag: ANY,
+};
+
+/**
+ * 标签比对用的大小写不敏感键。
+ *
+ * 后端按大小写不敏感去重但保留首次写法，故同一标签在库里只会有一种写法；
+ * 这里再归一一次是为了前端筛选下拉与行内徽章在任何写法下都能对上。
+ */
+function tagKey(tag: string): string {
+  return tag.trim().toLowerCase();
+}
 
 /**
  * 单条凭证是否通过筛选。
  *
  * 搜索同时匹配昵称、渠道展示名与凭证 id：用户可能记得「主账号」「TRAE」或
  * 后端给的 id，任一种都该能找到。渠道名参与匹配是有意的——按渠道筛选之外，
- * 直接打字「codebuddy」也应当收敛。
+ * 直接打字「codebuddy」也应当收敛。**标签不参与搜索**：它是结构化维度，
+ * 已经单列一个下拉；混进搜索词会让「查一个恰好叫『生产』的昵称」变得不可能。
  */
 export function matchesFilters(
   credential: Credential,
@@ -47,6 +66,10 @@ export function matchesFilters(
 ): boolean {
   if (filters.provider !== ANY && credential.provider !== filters.provider) return false;
   if (filters.state !== ANY && credentialState(credential, now) !== filters.state) return false;
+  if (filters.tag !== ANY && !(credential.tags ?? []).some(
+    (tag) => tagKey(tag) === tagKey(filters.tag))) {
+    return false;
+  }
   const needle = filters.query.trim().toLowerCase();
   if (!needle) return true;
   const fields = [credential.nickname, credential.id, providerLabel(credential.provider)];
@@ -61,13 +84,86 @@ export function filterCredentials(
   return credentials.filter((credential) => matchesFilters(credential, filters, now));
 }
 
-export interface ProviderGroup {
+/**
+ * CodeArts 在凭证页拆成两个**虚拟渠道**。
+ *
+ * 为什么不在后端真拆 provider：CodeArts 的 `refresh_token` 是一次性的（与
+ * `client_id=codearts-agent` + DPoP 私钥三者绑定，刷后即作废），两条凭证行会
+ * 各刷一次、第二条必报 `the refresh token has been used` 并烧掉票据。所以拆分
+ * 只发生在展示层：同一批账号在两个组各出现一次，**福利**只读展示每日 token 池，
+ * **内置**承载全部操作与积分账（两本账的区分轴是模型，不是渠道，见 PROPOSAL §2.4）。
+ */
+export const CODEARTS_INTERNAL_KEY = "codearts-internal";
+export const CODEARTS_BENEFIT_KEY = "codearts-benefit";
+
+/** 虚拟渠道在组内的展示次序：内置（承载全部操作）在前，福利（只读）在后。 */
+const CHANNEL_ORDER: Record<string, number> = {
+  [CODEARTS_INTERNAL_KEY]: 0,
+  [CODEARTS_BENEFIT_KEY]: 1,
+};
+
+/**
+ * 一组展示的是哪本账。
+ *
+ * `pool`＝每日 token 池（福利模型计费），`credits`＝积分账（内置模型计费）。
+ * 两本账在上游是两个独立接口、互不通气，数值量级也差一个数量级，故**一个组
+ * 只讲一本账**：组头额度合计、行内额度数字、变动流水都按它取。
+ */
+export type Ledger = "pool" | "credits";
+
+/** 展示渠道的定义：一个真实渠道一组，CodeArts 拆成两组。 */
+interface ChannelDef {
+  key: string;
   provider: string;
+  label: string;
+  readOnly: boolean;
+  ledger: Ledger;
+}
+
+/**
+ * 一条凭证归属的展示渠道（可多个）。
+ *
+ * CodeArts 同时进「内置」与「福利」两组；其余渠道只有自己一组。`key` 与
+ * `provider` 分开：筛选 / 行内语义仍按真实 `provider` 判断（`quotaSemantics`、
+ * `hasQuotaProbe` 等），只有分组与 testid 用 `key`。
+ */
+function channelDefs(provider: string): ChannelDef[] {
+  const label = providerLabel(provider);
+  if (provider !== "codearts") {
+    // 其余渠道只有一本账（主账＝每日 token 池口径的余额），积分账恒为 null。
+    return [{ key: provider, provider, label, readOnly: false, ledger: "pool" }];
+  }
+  return [
+    { key: CODEARTS_INTERNAL_KEY, provider, label: `${label} 内置`,
+      readOnly: false, ledger: "credits" },
+    { key: CODEARTS_BENEFIT_KEY, provider, label: `${label} 福利`,
+      readOnly: true, ledger: "pool" },
+  ];
+}
+
+/** 组间顺序：先按全站渠道顺序，再按虚拟渠道次序（内置前、福利后），最后按 key 定序。 */
+function compareGroups(left: ProviderGroup, right: ProviderGroup): number {
+  return providerRank(left.provider) - providerRank(right.provider)
+    || (CHANNEL_ORDER[left.key] ?? 0) - (CHANNEL_ORDER[right.key] ?? 0)
+    || left.key.localeCompare(right.key);
+}
+
+export interface ProviderGroup {
+  /** 分组唯一键：真实渠道＝provider；CodeArts 虚拟渠道＝`codearts-internal` / `codearts-benefit` */
+  key: string;
+  /** 真实渠道 id（行内渠道语义仍按它判断） */
+  provider: string;
+  /** 组头展示名（虚拟渠道带「内置 / 福利」后缀） */
+  label: string;
+  /** 只读组（福利渠道）：只展示额度，不渲染勾选与任何操作 */
+  readOnly: boolean;
+  /** 本组讲哪一本账：pool＝每日 token 池 / credits＝积分账（额度合计与流水都按它取） */
+  ledger: Ledger;
   /** 组内凭证，保持传入顺序（即后端排序），分组不改变排序语义 */
   items: Credential[];
   /** 组内各状态计数（只含出现过的态），供组头展示状态分布 */
   states: Partial<Record<CredentialState, number>>;
-  /** 组内额度剩余合计；全部为 null（免费层）时为 null，展示成 — */
+  /** 组内额度剩余合计；全部为 null（免费层 / 无该账）时为 null，展示成 — */
   remaining: number | null;
   /** 组内额度总量合计；与 remaining 同口径 */
   total: number | null;
@@ -84,46 +180,61 @@ export interface ProviderGroup {
  * 30s 轮询会让列表顺序随排序键变化，若按出现顺序排组，组头会在页面上乱跳。
  * 未知渠道排在已知渠道之后，与模型列表口径一致。
  *
- * 聚合口径与行内展示同源：状态走 `credentialState`，额度与到期积分直接对行内
- * 字段求和。**null 语义必须保住**：免费层（zen / kilo）的 `quota_remaining`
- * 与到期积分恒为 null，若当 0 求和会把「无额度接口」显示成「额度 0」。
+ * 聚合口径与行内展示同源：状态走 `credentialState`，额度直接对**本组那本账**的
+ * 字段求和（内置组＝`quota_credits_*`，其余＝`quota_remaining/total`）。
+ * **null 语义必须保住**：免费层（zen / kilo）的 `quota_remaining` 与内置组的
+ * 未探测积分账恒为 null，若当 0 求和会把「无额度接口 / 未探测」显示成「额度 0」。
  * 故只对非 null 求和，一个都没有时返回 null（调用方显示 —）。
  */
 export function groupByProvider(
   credentials: Credential[],
   now: number = Date.now() / 1000,
 ): ProviderGroup[] {
-  const buckets = new Map<string, Credential[]>();
+  const buckets = new Map<string, { channel: ChannelDef; items: Credential[] }>();
   for (const credential of credentials) {
-    const bucket = buckets.get(credential.provider);
-    if (bucket) bucket.push(credential);
-    else buckets.set(credential.provider, [credential]);
+    for (const channel of channelDefs(credential.provider)) {
+      const bucket = buckets.get(channel.key);
+      if (bucket) bucket.items.push(credential);
+      else buckets.set(channel.key, { channel, items: [credential] });
+    }
   }
-  return [...buckets.entries()]
-    .map(([provider, items]) => {
+  return [...buckets.values()]
+    .map(({ channel, items }) => {
       const states: Partial<Record<CredentialState, number>> = {};
+      const credits = channel.ledger === "credits";
       for (const item of items) {
-        const state = credentialState(item, now);
+        // 状态按**本组那本账**的健康度算：内置组讲积分账，若仍读主账，会出现
+        // 「额度还剩一大截却记在『额度耗尽』」的组头分布。
+        const state = credentialState(item, now, credentialHealth(item, channel.ledger));
         states[state] = (states[state] ?? 0) + 1;
       }
       return {
-        provider,
+        key: channel.key,
+        provider: channel.provider,
+        label: channel.label,
+        readOnly: channel.readOnly,
+        ledger: channel.ledger,
         items,
         states,
-        remaining: sumDefined(items, (item) => item.quota_remaining),
-        total: sumDefined(items, (item) => item.quota_total),
-        expiring: sumDefined(items, (item) => item.quota_expiring_credits),
+        remaining: sumDefined(
+          items, (item) => credits ? item.quota_credits_remaining : item.quota_remaining),
+        total: sumDefined(
+          items, (item) => credits ? item.quota_credits_total : item.quota_total),
+        expiring: sumDefined(
+          items,
+          (item) => credits
+            ? item.quota_credits_expiring
+            : item.quota_expiring_credits,
+        ),
         expiringSecondary: sumDefined(
           items,
-          (item) => item.quota_expiring_credits_secondary,
+          (item) => credits
+            ? item.quota_credits_expiring_secondary
+            : item.quota_expiring_credits_secondary,
         ),
       };
     })
-    .sort(
-      (left, right) =>
-        providerRank(left.provider) - providerRank(right.provider) ||
-        left.provider.localeCompare(right.provider),
-    );
+    .sort(compareGroups);
 }
 
 /**
@@ -147,16 +258,13 @@ export const DEFAULT_GROUP_SORT: GroupSort = "quota";
  */
 export function sortGroups(groups: ProviderGroup[], sort: GroupSort): ProviderGroup[] {
   if (sort === "provider") return groups;
-  const byProviderOrder = (left: ProviderGroup, right: ProviderGroup) =>
-    providerRank(left.provider) - providerRank(right.provider) ||
-    left.provider.localeCompare(right.provider);
   return [...groups].sort((left, right) => {
     if (left.remaining !== right.remaining) {
       if (left.remaining === null) return 1;
       if (right.remaining === null) return -1;
       return right.remaining - left.remaining;
     }
-    return byProviderOrder(left, right);
+    return compareGroups(left, right);
   });
 }
 
@@ -206,6 +314,34 @@ export const STATE_ORDER: CredentialState[] = [
   "off",
   "exhausted",
 ];
+
+/**
+ * 标签筛选项：列表里出现过的标签（带计数），按**首次出现顺序**排。
+ *
+ * 不像渠道那样有全站固定顺序（标签是用户自由起的），按出现顺序排能让常用标签
+ * 稳定地留在原位；同一条凭证上的多个标签合计只算一次。
+ */
+export function tagOptions(credentials: Credential[]): CountedOption[] {
+  const counts = new Map<string, { label: string; count: number }>();
+  for (const credential of credentials) {
+    // 同一条凭证内的重复标签（老数据/大小写不一）只算一次——下拉里的数字是
+    // 「携带该标签的凭证数」，不是标签出现次数。
+    const seenHere = new Set<string>();
+    for (const tag of credential.tags ?? []) {
+      const key = tagKey(tag);
+      if (seenHere.has(key)) continue;
+      seenHere.add(key);
+      const seen = counts.get(key);
+      if (seen) seen.count += 1;
+      else counts.set(key, { label: tag.trim(), count: 1 });
+    }
+  }
+  return [...counts.entries()].map(([value, item]) => ({
+    value,
+    label: item.label,
+    count: item.count,
+  }));
+}
 
 /**
  * 状态筛选项：五态带计数。

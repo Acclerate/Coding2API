@@ -159,6 +159,38 @@ def test_stats_events_by_column_uses_offset_pagination():
     db.close()
 
 
+def test_stats_events_sort_by_cache_rate():
+    """命中率（派生列 cached ÷ input）可排序；未上报 / 输入为 0 的行为 NULL。
+
+    SQL 层的 NULL 排序是 SQLite 默认（升序最前、降序最后），与其它可空列
+    （input_tokens / credit 等）完全一致——不在这里单独特判，否则同一个表里
+    两种「缺失」次序，用户反而看不懂。
+    """
+    db = Database(":memory:")
+    apply_schema(db.connect())
+    collector, query = StatsCollector(db), StatsQuery(db)
+    # 三条：命中率 0.5、0.9、无输入（None）
+    collector.record(username="u", provider="trae", model="low", ok=True,
+                     input_tokens=100, cached_tokens=50, now=1000)
+    collector.record(username="u", provider="trae", model="high", ok=True,
+                     input_tokens=100, cached_tokens=90, now=1001)
+    collector.record(username="u", provider="trae", model="none", ok=True, now=1002)
+    # 降序：命中率高的在前，无输入的 NULL 排最后
+    desc = query.events(sort="cache_rate", order="desc")["events"]
+    assert [e["model"] for e in desc] == ["high", "low", "none"]
+    # 升序：NULL 排最前（SQLite 默认，与其它可空列一致）
+    asc = query.events(sort="cache_rate", order="asc")["events"]
+    assert [e["model"] for e in asc] == ["none", "low", "high"]
+    # 输入为 0 视为不可算（NULL），不参与比值：与「未上报」同为 NULL，排在
+    # 有比值的行之后（两条 NULL 之间按 rowid 兜底，次序不敏感）
+    collector.record(username="u", provider="trae", model="zero", ok=True,
+                     input_tokens=0, cached_tokens=5, now=1003)
+    zero = query.events(sort="cache_rate", order="desc")["events"]
+    assert [e["model"] for e in zero[:2]] == ["high", "low"]
+    assert set(e["model"] for e in zero[2:]) == {"none", "zero"}
+    db.close()
+
+
 def test_list_endpoints_accept_sort_params(tmp_path):
     """端到端：各列表端点接受 sort/order，未知键回落且不报错。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),

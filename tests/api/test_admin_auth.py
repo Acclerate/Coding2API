@@ -25,6 +25,31 @@ def test_login_success_sets_httponly_cookie(tmp_path):
         assert "httponly" in cookie.lower() and "samesite=lax" in cookie.lower()
         assert client.get("/api/auth/session").json()["username"] == "root"
 
+def test_login_sets_secure_cookie_only_on_https_entrypoint(tmp_path):
+    """同一实例双入口：隧道(https)下发 Secure，LAN(http)不下发。
+
+    Secure Cookie 会被浏览器在 http 上丢弃，所以不能写死；`Secure` 由请求
+    的实际协议（X-Forwarded-Proto / Host）决定，两条入口才能都登录。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root",
+                        ALLOWED_HOSTS="192.168.124.35,ai-api.robbs.work",
+                        PUBLIC_BASE_URL="https://ai-api.robbs.work")
+    app = build_app(settings)
+    with TestClient(app) as client:
+        tunnel = client.post(
+            "/api/auth/login", json={"username": "root", "password": "rootpw"},
+            headers={"Host": "ai-api.robbs.work", "X-Forwarded-Proto": "https"})
+        assert tunnel.status_code == 200
+        assert "secure" in tunnel.headers["set-cookie"].lower()
+
+        lan = client.post(
+            "/api/auth/login", json={"username": "root", "password": "rootpw"},
+            headers={"Host": "192.168.124.35:8000"})
+        assert lan.status_code == 200
+        assert "secure" not in lan.headers["set-cookie"].lower()
+
+
 def test_login_rejects_cross_origin_request(tmp_path):
     """login CSRF：跨站 Origin 的登录请求必须 403（无 Cookie 也校验）。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),

@@ -98,4 +98,16 @@ describe("api client", () => {
     await api.statsByProvider("alice", 5);
     await api.logout();
   });
+
+  it("上游状态快照：GET /api/upstream-status，无查询参数", async () => {
+    const spy = vi.fn(async () => new Response(JSON.stringify({ sources: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", spy);
+
+    await api.upstreamStatus();
+
+    expect(spy).toHaveBeenCalledWith(
+      "/api/upstream-status",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+  });
 });

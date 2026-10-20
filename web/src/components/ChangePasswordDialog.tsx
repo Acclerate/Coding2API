@@ -80,8 +80,9 @@ export function ChangePasswordDialog({
           </div>
         )}
         <div className="space-y-3">
-          <Field label="当前密码">
+          <Field label="当前密码" htmlFor="password-current-input">
             <Input
+              id="password-current-input"
               type="password"
               value={currentPassword}
               autoComplete="current-password"
@@ -89,8 +90,9 @@ export function ChangePasswordDialog({
               onChange={(event) => setCurrentPassword(event.target.value)}
             />
           </Field>
-          <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`}>
+          <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`} htmlFor="password-new-input">
             <Input
+              id="password-new-input"
               type="password"
               value={newPassword}
               autoComplete="new-password"
@@ -98,8 +100,9 @@ export function ChangePasswordDialog({
               onChange={(event) => setNewPassword(event.target.value)}
             />
           </Field>
-          <Field label="确认新密码">
+          <Field label="确认新密码" htmlFor="password-confirm-input">
             <Input
+              id="password-confirm-input"
               type="password"
               value={confirmPassword}
               autoComplete="new-password"

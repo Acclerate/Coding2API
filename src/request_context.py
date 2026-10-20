@@ -60,3 +60,75 @@ def get_request_id() -> str | None:
 def resolve_request_id(header: str | None) -> str:
     """入站头 → 最终请求 ID：合法则沿用（便于与客户端日志对齐），否则自生成。"""
     return sanitize_request_id(header) or new_request_id()
+
+
+# 发起请求的 API Key id（api_keys.id）。同上：走 contextvar 是因为调用链
+# `鉴权依赖 → api 出口 → executor → stats_collector` 跨引擎层，不该为一个计量
+# 字段污染所有中间层签名。**只由鉴权层设置**（`src/api/deps.py` 校验通过后），
+# 绝不从请求头读——入站头是客户端可写的，信它等于把归属权交给调用方。
+_api_key_id: ContextVar[str | None] = ContextVar("api_key_id", default=None)
+
+
+def set_api_key_id(value: str | None) -> None:
+    """在当前上下文设置 API Key id（鉴权依赖在放行之前调用；None=复原）。"""
+    _api_key_id.set(value)
+
+
+def get_api_key_id() -> str | None:
+    """读当前上下文的 API Key id；无请求上下文（后台任务/脚本）返回 None。"""
+    return _api_key_id.get()
+
+
+# 入站请求头带来的会话标识（E1）：客户端（Codex / Claude Code / opencode 等）
+# 用 `x-session-id` 这类头声明「这是同一段对话」，比消息前缀兜底可靠得多。
+# 与 request_id 同一套纪律：**入站头是客户端可写输入**，按白名单字符集与长度
+# 校验后才采信，不合法一律丢弃；且只作会话粘性的**兜底键**（优先级低于请求体
+# 里的显式键），不会影响模型、路由或鉴权。
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+# 接受的头名，按优先级排列。前三个是 opencode / Codex 生态实际在用的写法，
+# 后两个是 conversation_id 的头形式（部分客户端把它放头里）。
+SESSION_ID_HEADERS: tuple[bytes, ...] = (
+    b"x-session-id",
+    b"x-opencode-session",
+    b"x-session-affinity",
+    b"conversation-id",
+    b"conversation_id",
+)
+
+_session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
+
+
+def sanitize_session_id(raw: str | None) -> str | None:
+    """校验会话标识；不合法（含换行/超长/空）返回 None，由调用方丢弃。"""
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    return text if SESSION_ID_PATTERN.match(text) else None
+
+
+def session_id_from_headers(headers) -> str | None:
+    """从入站头取会话标识（`headers` 为 ASGI 的 [(bytes, bytes), ...]）。
+
+    按 `SESSION_ID_HEADERS` 的顺序取第一个**合法**的非空值；全部不合法返回
+    None。头名大小写不敏感（ASGI 里规范为小写，但仍统一 lower 一次防调用方
+    传大小写混合的列表）。
+    """
+    for name in SESSION_ID_HEADERS:
+        for key, value in headers:
+            if key.lower() == name:
+                candidate = sanitize_session_id(value.decode("latin-1"))
+                if candidate is not None:
+                    return candidate
+    return None
+
+
+def set_session_id(value: str | None) -> None:
+    """在当前上下文设置会话标识（请求入口调用；None = 复原）。"""
+    _session_id.set(value)
+
+
+def get_session_id() -> str | None:
+    """读当前上下文的会话标识；无请求上下文返回 None。"""
+    return _session_id.get()
+

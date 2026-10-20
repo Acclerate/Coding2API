@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from src.tasks import TaskReport
-from src.tasks.pacer import Pacer, stable_key
+from src.tasks.pacer import JITTER_RATIO, Pacer, stable_key
 
 
 async def test_pacer_disabled_is_noop():
@@ -32,8 +32,9 @@ async def test_pacer_fixed_interval_sleeps_remaining():
 
     pacer = Pacer(5, 5, sleep=fake_sleep, now=lambda: clock["t"])
     await pacer.wait_turn()                 # 首次不睡
-    await pacer.wait_turn()                 # 第二次补足 5s
-    assert slept == [5.0]
+    await pacer.wait_turn()                 # 第二次补足 5s（含抖动）
+    assert len(slept) == 1
+    assert 5.0 <= slept[0] <= 5.0 * (1 + JITTER_RATIO)
 
 async def test_pacer_random_interval_within_bounds():
     pacer = Pacer(5, 20)
@@ -91,8 +92,9 @@ async def test_pacer_concurrent_spaces_sequential_starts():
                   now=lambda: clock["t"])
     await pacer.wait_turn("k")
     pacer.release("k")                           # 上一请求结束
-    await pacer.wait_turn("k")                   # 紧接又来一个 → 补 5s
-    assert slept == [5.0]
+    await pacer.wait_turn("k")                   # 紧接又来一个 → 补 5s（含抖动）
+    assert len(slept) == 1
+    assert 5.0 <= slept[0] <= 5.0 * (1 + JITTER_RATIO)
 
 async def test_pacer_concurrent_buckets_are_independent():
     """不同凭证分属不同桶：一个账号在途不拖住另一个账号。"""
@@ -382,11 +384,19 @@ def test_task_report_dict():
 
 def test_pacer_random_single_value_path():
     pacer = Pacer(3, 3)
-    assert pacer.next_interval() == 3
+    intervals = [pacer.next_interval() for _ in range(20)]
+    assert all(3 <= value <= 3 * (1 + JITTER_RATIO) for value in intervals)
+    assert len(set(intervals)) > 1           # 定值间隔也抖动，非同拍
     assert pacer.disabled is False
 
-def test_pacer_fixed_interval_returns_min_directly():
-    assert Pacer(7, 7).next_interval() == 7
+def test_pacer_fixed_interval_jitter_is_upward_only():
+    """定值间隔的抖动**只向上**：`min` 是频率风控护栏，不可击穿。"""
+    assert all(Pacer(7, 7).next_interval() >= 7 for _ in range(20))
+
+def test_pacer_range_interval_is_not_jittered_further():
+    """`min < max` 的区间本就均匀随机，抖动不叠加（否则越出 `[min, max]`）。"""
+    intervals = [Pacer(5, 20).next_interval() for _ in range(50)]
+    assert all(5 <= value <= 20 for value in intervals)
 
 def test_pacer_disabled_next_interval_is_zero():
     assert Pacer(0, 0).next_interval() == 0.0

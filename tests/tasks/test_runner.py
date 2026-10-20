@@ -282,6 +282,108 @@ async def test_runner_starts_backup_loop_when_assembled(repo, tmp_path):
         await runner.stop()
 
 
+def test_build_runner_wires_upstream_status(repo):
+    """upstream_status 传入时接线：周期从配置读，开关与对象原样挂上。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET,
+                      UPSTREAM_STATUS_MINUTES=7, UPSTREAM_STATUS_ENABLED=False)
+    task = UpstreamStatusTask(UpstreamStatusStore(),
+                              enabled=lambda: config.upstream_status_enabled)
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          upstream_status=task)
+
+    assert runner._upstream_status is task
+    assert runner._upstream_status_interval == 7 * 60
+    assert runner._task_enabled("upstream_status") is False
+    assert "upstream_status" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("upstream_status") == 7 * 60
+
+
+def test_upstream_status_interval_has_floor(repo):
+    """周期下限 1 分钟（与热更项 minimum 对齐）。"""
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, UPSTREAM_STATUS_MINUTES=0)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._upstream_status_interval == 60
+
+
+def test_upstream_status_not_assembled_by_default(repo):
+    """老调用方不传 upstream_status 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._upstream_status is None
+    assert "upstream_status" not in {spec.key for spec in runner._loop_specs()}
+    assert "upstream_status" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_upstream_status_without_task_raises(repo):
+    """未装配时 _sync_upstream_status 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="upstream status task not configured"):
+        await runner._sync_upstream_status()
+
+
+async def test_runner_upstream_status_loop_runs_task(repo):
+    """循环体委托给任务对象；任务关闭时 no-op 不入账（页面显示「未运行」）。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore, spec_by_key
+
+    credentials, _db = repo
+    provider = StubProvider()
+    flag = {"on": False}
+    store = UpstreamStatusStore()
+    spec = spec_by_key("kilo")
+    assert spec is not None
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(store, specs=(spec,),
+                                           enabled=lambda: flag["on"]),
+    )
+
+    # 关着：返回 None，不覆盖运行态
+    assert await runner._sync_upstream_status() is None
+    assert runner.status.runs("upstream_status") == 0
+
+    flag["on"] = True
+    ok = await runner._guarded(runner._sync_upstream_status(), "上游状态页",
+                               key="upstream_status")
+    assert ok is True
+    assert runner.status.runs("upstream_status") == 1
+    assert runner.status.get("upstream_status").report == {
+        "sources": 0, "abnormal": 0, "failed": 0}
+
+
+async def test_runner_starts_upstream_status_loop_when_assembled(repo):
+    """装配后必须真的多起一条循环。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, _db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(UpstreamStatusStore(), specs=()),
+    )
+    await runner.start()
+    try:
+        assert len(runner._tasks) == 5
+        assert "upstream_status" in {item["key"] for item in runner.task_status()}
+    finally:
+        await runner.stop()
+
+
 async def test_providers_release_http_pools_on_shutdown(tmp_path):
     """lifespan 关闭时必须释放 provider 的连接池。"""
     from src.provider.codebuddy.client import CodeBuddyProvider
@@ -423,6 +525,9 @@ def test_run_entry_point_starts_uvicorn(monkeypatch, tmp_path):
     assert captured["port"] == 9123
     assert captured["log_level"] == "warning"
     assert captured["app"] is not None
+    # uvicorn 自带 access log 与 RequestLogMiddleware 重复（且无时间戳 /
+    # request_id），必须关掉
+    assert captured["access_log"] is False
     # 停机排空：不给 timeout_graceful_shutdown 就是无限等（长流卡住直到 SIGKILL）
     assert captured["timeout_graceful_shutdown"] == main.GRACEFUL_SHUTDOWN_SECONDS
 
@@ -623,3 +728,157 @@ async def test_sync_helpers_raise_when_optional_tasks_unwired(repo):
     for sync in (runner._sync_growth, runner._sync_activity, runner._sync_alert):
         with pytest.raises(RuntimeError, match="not configured"):
             await sync()
+
+
+class _Store:
+    """最小 SettingsStore：只实现读写，避免测试依赖数据库。"""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, str] = {}
+
+    def load(self) -> dict[str, str]:
+        return dict(self.rows)
+
+    def set(self, key: str, value: str, now: int | None = None) -> None:
+        self.rows[key] = value
+
+    def delete(self, key: str) -> None:
+        self.rows.pop(key, None)
+
+
+def _runtime(**overrides):
+    from src.runtime_settings import RuntimeSettings
+
+    base = Settings(_env_file=None, APP_SECRET=SECRET, **overrides)
+    store = _Store()
+    return RuntimeSettings(base, store), store
+
+
+def test_checkin_interval_follows_schedule_config(repo):
+    """签到时点是否配置决定醒转周期：留空 10 分钟，配了则 1 分钟。
+
+    抖动=0 时 due() 窗口只有「恰好那一分钟」，10 分钟周期下醒来时刻几乎必然
+    错开，结果是一天一次都不签——比旧的全天轮询更糟。
+    """
+    credentials, db = repo
+    config, store = _runtime()
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+    assert runner._interval_seconds("checkin") == 600.0
+
+    store.set("checkin_times", "09:37")
+    config.reload()
+    assert runner._checkin.has_times() is True
+    assert runner._interval_seconds("checkin") == 60.0
+
+    # 全是坏段等同留空：退回旧行为，不让一条笔误锁死签到
+    store.set("checkin_times", "25:00,bad")
+    config.reload()
+    assert runner._checkin.has_times() is False
+    assert runner._interval_seconds("checkin") == 600.0
+
+
+def test_build_runner_wires_checkin_schedule(repo):
+    """时点与抖动从热更项接线（零参 callable，改动立刻生效）。"""
+    credentials, db = repo
+    config, store = _runtime(CHECKIN_TIMES="09:37,21:10", CHECKIN_JITTER_MINUTES=5)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._checkin._times() == "09:37,21:10"
+    assert runner._checkin._jitter() == 5
+    store.set("checkin_times", "")
+    config.reload()
+    assert runner._checkin._times() == ""
+
+
+def test_build_runner_wires_model_probe(repo):
+    """model_probe 传入时接线：周期从配置读，循环与间隔都挂上。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, MODEL_PROBE_MINUTES=90)
+    task = ModelProbeTask(credentials, {}, ModelProbeRepository(db))
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          model_probe=task,
+                          model_probe_minutes=lambda: config.model_probe_minutes)
+
+    assert runner._model_probe is task
+    assert runner._model_probe_interval == 90 * 60
+    assert "model_probe" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("model_probe") == 90 * 60
+    assert "model_probe" in {item["key"] for item in runner.task_status()}
+
+
+def test_model_probe_interval_floor(repo):
+    """周期下限 1 分钟：填 0（关闭）时循环仍在，只是每轮判成 no-op。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET,
+                                   MODEL_PROBE_MINUTES=0))
+
+    assert runner._model_probe_interval == 60
+
+
+def test_model_probe_not_assembled_by_default(repo):
+    """老调用方不传 model_probe 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._model_probe is None
+    assert "model_probe" not in {spec.key for spec in runner._loop_specs()}
+    assert "model_probe" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_model_probe_without_task_raises(repo):
+    """未装配时 _sync_model_probe 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="model probe task not configured"):
+        await runner._sync_model_probe()
+
+
+async def test_runner_model_probe_disabled_is_noop(repo):
+    """周期 0（默认）= 关闭：返回 None 且不记运行态（页面显示「未运行」）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 0,
+    )
+
+    assert await runner._sync_model_probe() is None
+    assert runner.status.runs("model_probe") == 0
+
+
+async def test_runner_model_probe_runs_task_when_enabled(repo):
+    """周期 > 0 时委托给任务对象（无负缓存行 → 空报告也算跑过一轮）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 60,
+    )
+
+    ok = await runner._guarded(runner._sync_model_probe(), "模型探活",
+                               key="model_probe")
+
+    assert ok is True
+    assert runner.status.runs("model_probe") == 1
+    assert runner.status.get("model_probe").report == {
+        "attempted": 0, "succeeded": 0, "failed": 0, "skipped": 0}

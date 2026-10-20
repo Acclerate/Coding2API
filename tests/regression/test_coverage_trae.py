@@ -146,7 +146,7 @@ def _executor(repo_tuple, script, **kw):
     credentials, _db = repo_tuple
     provider = _ScriptedProvider(script)
     executor = Executor(ExecutorDeps(providers={"trae": provider}, credentials=credentials,
-                                     scheduler=Scheduler(**kw), default_model="glm-5.2"))
+                                     scheduler=Scheduler(**kw), default_model="glm-5.3"))
     return executor, provider, credentials
 
 
@@ -522,7 +522,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         id = "codebuddy"
 
         async def list_models(self, _credential_data):
-            return [Model(id="glm-5.2"), Model(id="only-cb")]
+            return [Model(id="glm-5.3"), Model(id="only-cb")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -531,7 +531,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         id = "trae"
 
         async def list_models(self, _credential_data):
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -547,7 +547,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         data = test_client.get("/v1/models",
                                headers={"Authorization": f"Bearer {key}"}).json()["data"]
     by_id = {item["id"]: item["providers"] for item in data}
-    # 同名 `glm-5.2` 两渠道都有 → 拆成两条，各钉死自己的渠道
-    assert by_id["glm-5.2-codebuddy"] == ["codebuddy"]
-    assert by_id["glm-5.2-trae"] == ["trae"]
+    # 同名 `glm-5.3` 两渠道都有 → 拆成两条，各钉死自己的渠道
+    assert by_id["glm-5.3-codebuddy"] == ["codebuddy"]
+    assert by_id["glm-5.3-trae"] == ["trae"]
     assert by_id["only-cb-codebuddy"] == ["codebuddy"]

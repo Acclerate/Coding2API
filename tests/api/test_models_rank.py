@@ -25,7 +25,7 @@ def test_models_by_provider_rates_per_channel(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2", credit_rate=self._rate)]
+            return [Model(id="glm-5.3", credit_rate=self._rate)]
 
         def import_credential(self, raw):
             return raw
@@ -44,13 +44,13 @@ def test_models_by_provider_rates_per_channel(tmp_path):
                 "/v1/models", headers={"Authorization": f"Bearer {key}"}
             ).json()["data"]
         }
-    assert set(data) == {"glm-5.2-codebuddy", "glm-5.2-trae"}
+    assert set(data) == {"glm-5.3-codebuddy", "glm-5.3-trae"}
     # by_provider 同时给出各渠道的 raw_id（渠道请求 key）与倍率，互不覆盖
-    assert data["glm-5.2-codebuddy"]["by_provider"] == {
-        "codebuddy": {"raw_id": "glm-5.2", "credit_rate": 0.29}
+    assert data["glm-5.3-codebuddy"]["by_provider"] == {
+        "codebuddy": {"raw_id": "glm-5.3", "credit_rate": 0.29}
     }
-    assert data["glm-5.2-trae"]["by_provider"] == {
-        "trae": {"raw_id": "glm-5.2", "credit_rate": 0.17}
+    assert data["glm-5.3-trae"]["by_provider"] == {
+        "trae": {"raw_id": "glm-5.3", "credit_rate": 0.17}
     }
 
 

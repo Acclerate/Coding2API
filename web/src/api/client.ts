@@ -17,6 +17,7 @@ import type {
   GrowthRunResult,
   ActivityReportResult,
   ModelCatalogResponse,
+  ModelInfo,
   ModelStats,
   CredentialStats,
   ProbeResult,
@@ -27,13 +28,16 @@ import type {
   StatsOverview,
   TimelinePoint,
   ModelTimelineResponse,
+  NavBadges,
   StatsEventsResponse,
   StatsEventFilters,
   CsvExport,
   SettingsResponse,
   TasksResponse,
+  TaskRunResult,
   UpstreamAuthPoll,
   UpstreamAuthStart,
+  UpstreamStatusResponse,
   UserStats,
   UserRow,
 } from "./types";
@@ -99,8 +103,9 @@ export const api = {
     }),
 
   // ------------------------------------------------------------ 用户管理
-  users: (sort?: string, order?: string) =>
-    request<{ users: UserRow[] }>(`/api/users${query({ sort, order })}`),
+  users: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<{ users: UserRow[]; total: number }>(
+      `/api/users${query({ sort, order, limit, offset })}`),
   createUser: (username: string, role: Role) =>
     request<ActivationIssued>("/api/users", { method: "POST", ...json({ username, role }) }),
   updateUserRole: (username: string, role: Role) =>
@@ -126,7 +131,6 @@ export const api = {
   audit: (filters: { actor?: string; action?: string; limit?: number; offset?: number;
                      sort?: string; order?: string } = {}) =>
     request<AuditResponse>(`/api/audit${query(filters)}`),
-
   // ---------------------------------------------------------------- 凭证
   credentials: (sort?: string, order?: string) =>
     request<CredentialsResponse>(`/api/credentials${query({ sort, order })}`),
@@ -151,6 +155,12 @@ export const api = {
       method: "PUT",
       ...json(limits),
     }),
+  /** 整体替换一条凭证的标签（空数组 = 清空）。 */
+  setCredentialTags: (id: string, tags: string[]) =>
+    request<{ tags: string[] }>(`/api/credentials/${id}/tags`, {
+      method: "PUT",
+      ...json({ tags }),
+    }),
   /** 批量运维：一次对多条凭证执行同一动作，后端逐条隔离返回结果。 */
   batchCredentials: (action: BatchAction, ids: string[], enabled?: boolean) =>
     request<BatchResult>("/api/credentials/batch", {
@@ -165,9 +175,9 @@ export const api = {
     request<GrowthRunResult>(`/api/credentials/${id}/growth`, { method: "POST" }),
   growthHistory: (id: string) =>
     request<{ events: GrowthEvent[] }>(`/api/credentials/${id}/growth`),
-  creditEvents: (id: string, sort?: string, order?: string) =>
+  creditEvents: (id: string, ledger?: string, sort?: string, order?: string) =>
     request<{ events: CreditEvent[] }>(
-      `/api/credentials/${id}/credit-events${query({ sort, order })}`),
+      `/api/credentials/${id}/credit-events${query({ ledger, sort, order })}`),
   reportActivity: (id: string) =>
     request<ActivityReportResult>(`/api/credentials/${id}/activity`, { method: "POST" }),
 
@@ -191,8 +201,9 @@ export const api = {
     }),
 
   // ------------------------------------------------------------- API Key
-  apiKeys: (sort?: string, order?: string) =>
-    request<{ api_keys: ApiKey[] }>(`/api/api-keys${query({ sort, order })}`),
+  apiKeys: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<{ api_keys: ApiKey[]; total: number }>(
+      `/api/api-keys${query({ sort, order, limit, offset })}`),
   createApiKey: (payload: {
     name: string;
     provider_binding?: string;
@@ -202,6 +213,12 @@ export const api = {
   }) =>
     request<ApiKeyCreated>("/api/api-keys", { method: "POST", ...json(payload) }),
   deleteApiKey: (id: string) => request<{ ok: boolean }>(`/api/api-keys/${id}`, { method: "DELETE" }),
+  /**
+   * 会话鉴权的模型列表（与 Playground 同源 `/api/playground/models`）：
+   * 供「API Key 管理」页的 CC Switch 默认模型下拉使用，无需用户自己造 Key。
+   */
+  playgroundModels: (signal?: AbortSignal) =>
+    request<{ data: ModelInfo[] }>("/api/playground/models", { signal }),
 
   // ------------------------------------------------------------ 运行时配置
   settings: () => request<SettingsResponse>("/api/settings"),
@@ -209,12 +226,29 @@ export const api = {
     request<SettingsResponse>("/api/settings", { method: "PUT", ...json({ values }) }),
   /** 后台任务运行态（进程内）：与 /api/settings 同页展示。 */
   tasks: () => request<TasksResponse>("/api/tasks"),
-  /** 运维告警记录：后台评估命中后落库，倒序回看。 */
-  alerts: (sort?: string, order?: string) =>
-    request<AlertsResponse>(`/api/alerts${query({ sort, order })}`),
-  /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示。 */
-  modelCatalog: (sort?: string, order?: string) =>
-    request<ModelCatalogResponse>(`/api/model-catalog${query({ sort, order })}`),
+  /** 手动运行一个后台任务一轮（管理台「立即运行」）；同步等结果返回。 */
+  runTask: (key: string) =>
+    request<TaskRunResult>(`/api/tasks/${encodeURIComponent(key)}/run`, { method: "POST" }),
+  /** 运维告警记录：后台评估命中后落库，倒序回看（分页）。 */
+  alerts: (sort?: string, order?: string, limit?: number, offset?: number) =>
+    request<AlertsResponse>(`/api/alerts${query({ sort, order, limit, offset })}`),
+  /** 人工标记一条告警已恢复（规则已下线 / 误报时的显式出口；admin + CSRF + 审计）。 */
+  resolveAlert: (id: string) =>
+    request<{ ok: boolean }>(`/api/alerts/${encodeURIComponent(id)}/resolve`,
+                             { method: "POST" }),
+  /** 上游官方状态页聚合快照（进程内、重启归零）：只读展示，不参与选号 / 熔断。 */
+  upstreamStatus: () => request<UpstreamStatusResponse>("/api/upstream-status"),
+  /**
+   * 侧栏「数据提醒」角标：一个聚合端点覆盖整个侧栏，避免 Layout 挂 7 个页面级
+   * hook。**按角色裁剪**——缺失的键 = 无权看（见 `NavBadges`）。
+   */
+  navBadges: () => request<NavBadges>("/api/nav-badges"),
+  /** OpenRouter 模型目录（刊例价 + 明细元数据），模型列表页只读展示（服务端分页 + 筛选）。 */
+  modelCatalog: (sort?: string, order?: string, q?: string, onlyAvailable?: boolean,
+                 limit?: number, offset?: number) =>
+    request<ModelCatalogResponse>(
+      `/api/model-catalog${query({ sort, order, q, only_available: onlyAvailable,
+                                   limit, offset })}`),
 
   // ---------------------------------------------------------------- 统计
   // `since` / `until`：自定义时间窗两端（半开 `[since, until)`，epoch 秒）。
@@ -251,6 +285,12 @@ export const api = {
     request<StatsEventsResponse>(
       `/api/stats/events${query({ username, since, until, before, limit, sort, order,
                                   offset, ...filters })}`),
+  /** 明细实时流（SSE）地址：交给 `EventSource` 订阅，页面不自己拼查询串。
+   *
+   * `EventSource` 自动带同源 Cookie、断线重连，但不支持自定义头（CSRF 只对
+   * 写请求要求，GET 不受影响）。`username` 是作用域收窄，其余是明细过滤。 */
+  statsEventsStreamUrl: (username?: string, filters?: StatsEventFilters) =>
+    `/api/stats/events/stream${query({ username, ...filters })}`,
   /** 明细 CSV 导出：返回文件内容与截断标记（响应头），由页面触发下载。 */
   statsEventsCsv: async (username?: string, since?: number, until?: number,
                          filters?: StatsEventFilters): Promise<CsvExport> => {
@@ -279,7 +319,7 @@ export const api = {
   },
 };
 
-function query(params: Record<string, string | number | undefined>): string {
+function query(params: Record<string, string | number | boolean | undefined>): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== "") search.set(key, String(value));

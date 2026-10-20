@@ -60,6 +60,7 @@ export const TASKS = {
       description: "探测上游剩余额度并写回凭证健康度。",
       interval_seconds: 3600,
       enabled: true,
+      running: false,
       runs: 5,
       last_started_at: SERVER_TIME - 130,
       last_finished_at: SERVER_TIME - 120,
@@ -73,6 +74,7 @@ export const TASKS = {
       description: "全天每 10 分钟检查一次。",
       interval_seconds: 600,
       enabled: true,
+      running: false,
       runs: 3,
       last_started_at: SERVER_TIME - 310,
       last_finished_at: SERVER_TIME - 300,
@@ -86,6 +88,7 @@ export const TASKS = {
       description: "按配置时点补发对话事件。",
       interval_seconds: 600,
       enabled: false,
+      running: false,
       runs: 0,
       last_started_at: null,
       last_finished_at: null,
@@ -103,15 +106,39 @@ export const body = () =>
 export const tasksBody = () => JSON.parse(JSON.stringify(TASKS));
 
 /** 统一 fetch mock：GET 分派 settings/tasks，PUT 交给调用方断言。 */
-export function mockAll(put?: (init: RequestInit) => Response) {
+export function mockAll(put?: (init: RequestInit) => Response,
+                        run?: (url: string) => Response) {
   const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
+    if (init?.method === "POST" && url.includes("/run")) {
+      return run ? run(url) : jsonResponse(runBody("quota_probe"));
+    }
     if (init?.method === "PUT") return put ? put(init) : jsonResponse(body());
     if (url.includes("/api/tasks")) return jsonResponse(tasksBody());
     return jsonResponse(body());
   });
   vi.stubGlobal("fetch", spy);
   return spy;
+}
+
+/** POST /api/tasks/{key}/run 的成功返回：任务最新运行态 + 本轮结果。 */
+export function runBody(
+  key: string,
+  overrides: Record<string, unknown> = {},
+) {
+  const base = (TASKS.tasks.find((task) => task.key === key) ?? TASKS.tasks[0]) as
+    Record<string, unknown>;
+  return JSON.parse(JSON.stringify({
+    ...base,
+    runs: (base.runs as number) + 1,
+    last_finished_at: SERVER_TIME,
+    last_ok: true,
+    last_error: null,
+    last_report: { attempted: 2, succeeded: 2, failed: 0, skipped: 0 },
+    ran: true,
+    busy: false,
+    ...overrides,
+  }));
 }
 
 export function withSettings(settings: unknown[]) {

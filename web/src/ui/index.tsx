@@ -118,7 +118,7 @@ export function Panel({
 
 // ================================================================ Badge
 // 语义色调(ok/warn/danger/muted/accent)：柔和底色 + 强调文字，不用重描边。
-type Tone = "ok" | "warn" | "danger" | "muted" | "accent";
+export type Tone = "ok" | "warn" | "danger" | "muted" | "accent";
 
 const TONE_CLASS: Record<Tone, string> = {
   ok: "bg-ok/12 text-ok-ink ring-1 ring-inset ring-ok/25",
@@ -155,22 +155,71 @@ export function Badge({
   );
 }
 
+/**
+ * 导航角标：侧栏（及日后页面内）的「待办计数」标记。
+ *
+ * 与 `Badge` 的分工：`Badge` 是静态状态标签，`NavBadge` 承载**会变的计数**，
+ * 因此数字用 `tabular-nums`（轮询刷新时宽度不抖）、超上限收敛成 `99+`、
+ * 值为 0 / 空时不渲染（不占位）。
+ *
+ * 无障碍：可见数字 `aria-hidden`，另配 `sr-only` 全语义文案——否则读屏会把
+ * 导航项名与裸数字读成两段无关联的话（「运维告警 3」）。
+ */
+export function NavBadge({
+  value,
+  tone = "muted",
+  label,
+}: {
+  /** 计数或文字形态；数字 > 99 显示 "99+"；0 / 空串 / undefined 不渲染 */
+  value?: number | string;
+  tone?: Tone;
+  /** 无障碍全语义，如「2 条告警尚未恢复」 */
+  label: string;
+}) {
+  const text = typeof value === "number" ? (value > 99 ? "99+" : String(value)) : value;
+  if (!text || text === "0") return null;
+  return (
+    <span
+      className={cn(
+        "ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full px-1.5 text-[11px] font-medium tabular-nums",
+        TONE_CLASS[tone],
+      )}
+    >
+      <span aria-hidden>{text}</span>
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
 // ================================================================ Field (Label)
 
 export function Field({
   label,
   hint,
   children,
+  htmlFor,
 }: {
   label: string;
   hint?: string;
   children: ReactNode;
+  /**
+   * 关联控件的 id。传了才把 label 与控件绑上（读屏报字段名、点 label 聚焦控件）。
+   *
+   * 不默认用 useId 自动生成：控件如果是 page 传进来的（多数场景），
+   * 生成的 id 到不了它身上，绑了反而给一个错的 aria 关系。
+   */
+  htmlFor?: string;
 }) {
   return (
     <div className="space-y-1.5">
-      <Label className="text-xs font-medium text-muted-foreground">{label}</Label>
+      <Label className="text-xs font-medium text-muted-foreground" htmlFor={htmlFor}>
+        {label}
+      </Label>
       {children}
-      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+      {hint && (
+        // hint 与 label 的关联靠调用方给控件 aria-describedby（hint 没有 id 可指）
+        <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>
+      )}
     </div>
   );
 }

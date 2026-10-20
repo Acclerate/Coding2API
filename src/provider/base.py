@@ -6,9 +6,13 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -30,12 +34,12 @@ class ErrKind(StrEnum):
     其他模型（实测 6004 只冷却触发的那个模型）。
     """
 
-    PLAN = "plan"      # 权益耗尽（1005）→ 12h 长冷却
+    PLAN = "plan"  # 权益耗尽（1005）→ 12h 长冷却
     # 余额不足（402 / 14018）：等签到恢复，冷却到次日 04:00 而非固定时长
     CREDIT = "credit"
-    SOFT = "soft"      # 限流/404 → 60s，不累计错误数
-    DEAD = "dead"      # session 失效 → 硬禁用
-    OTHER = "other"    # 其他 4xx/5xx → 累计，连续 3 次 → 10m
+    SOFT = "soft"  # 限流/404 → 60s，不累计错误数
+    DEAD = "dead"  # session 失效 → 硬禁用
+    OTHER = "other"  # 其他 4xx/5xx → 累计，连续 3 次 → 10m
     INVALID = "invalid"  # 请求无效（如模型不存在）→ 不冷却凭证，直接 400 回客户端
     # 模型级限流（6004）：只冷却触发的那个模型，切其他模型立即可用
     MODEL = "model"
@@ -45,7 +49,8 @@ class ErrKind(StrEnum):
     # 该后端无此模型（11102）：(账号, 模型) 负缓存，重试无意义
     BLOCKED = "blocked"
     # 请求级错误（请求体坏 11101 / 上下文超限 11115 / 渠道风控 11128 /
-    # 图片无效 11135）：不是账号的问题，不冷却、不累计；仍会换号重试
+    # 图片无效 11135 / CodeArts 非多模态模型收到图片 001001020）：不是账号
+    # 的问题，不冷却、不累计；仍会换号重试
     REQUEST = "request"
 
 
@@ -74,6 +79,119 @@ def body_hint(body: bytes, limit: int = 2048) -> str:
 # 错误响应体的读取上限：只用于生成可读诊断，超出部分丢弃。防止恶意/异常
 # 上游返回超大 body 时把代理进程读爆内存（错误路径本不需要完整正文）。
 BOUNDED_BODY_LIMIT = 256 * 1024
+
+
+_RETRY_AFTER_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*([A-Za-z]+)")
+_RETRY_AFTER_PREFIX = re.compile(r"^(?:try\s+again\s+)?(?:in\s+)?", re.IGNORECASE)
+# 文本式 `Retry-After` 的单位（`Try again in 17h 59m`）：h/m/s 及其常见长写法
+_RETRY_AFTER_UNITS = {
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hrs": 3600.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+    "m": 60.0,
+    "min": 60.0,
+    "mins": 60.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "s": 1.0,
+    "sec": 1.0,
+    "secs": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+}
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """按名取响应头（大小写不敏感，兼容 httpx.Headers 与普通 dict）。"""
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        value = getter(name)
+        if value is not None:
+            return str(value)
+    items = getattr(headers, "items", None)
+    if items is None:
+        return ""
+    lowered = name.lower()
+    for key, value in items():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
+
+
+def _retry_after_delta(raw: str, now: int) -> float | None:
+    """`Retry-After` 原始值 → 距现在多少秒；无法识别返回 None。
+
+    支持三种真实形态：整数秒（RFC 9110 标准）、HTTP-date（标准）、以及
+    部分上游回的「Try again in 17h 59m」文本（实测 cline-proxy 一类网关）。
+    负数 / 过去时刻 / 无法整除的脏值一律 None：宁可回落本地常量，也不
+    让一个坏头把所有凭证瞬间打爆（见 scheduler.note_error 的双端钳制）。
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return float(int(text))
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        moment = None
+    if moment is not None:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.timestamp() - now
+    body = _RETRY_AFTER_PREFIX.sub("", text)
+    total = 0.0
+    cursor = 0
+    matched = False
+    for match in _RETRY_AFTER_TEXT.finditer(body):
+        # token 之间只允许空白 / 逗号 / and（`17h 59m`、`1 hour, 30 min`）
+        if not re.fullmatch(r"[\s,]*(?:and\s+)?", body[cursor : match.start()]):
+            return None
+        unit = _RETRY_AFTER_UNITS.get(match.group(2).lower())
+        if unit is None:
+            return None
+        total += float(match.group(1)) * unit
+        matched = True
+        cursor = match.end()
+    if not matched or body[cursor:].strip():
+        return None
+    if not math.isfinite(total):
+        return None
+    return total
+
+
+def parse_retry_after(headers: Any, now: int) -> int | None:
+    """上游 `Retry-After` → 「何时恢复」的 epoch 秒；缺头/非法返回 None。
+
+    这是唯一解析入口：七渠道在构造 `UpstreamHTTPError` 时统一调用
+    `retry_hints`（本函数的薄包装），再交给调度器按错误分类的作用域钳制。
+    """
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return int(now + delta)
+
+
+def parse_retry_after_seconds(headers: Any, now: int) -> float | None:
+    """上游 `Retry-After` → 距现在多少秒（同上，保留小数供诊断）。"""
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return delta
+
+
+def retry_hints(headers: Any, now: int | None = None) -> dict[str, Any]:
+    """`UpstreamHTTPError` 的 retry 关键字参数（无头时两值均为 None）。
+
+    让各渠道的 raise 点保持一行：`**retry_hints(response.headers)`。
+    """
+    moment = int(time.time()) if now is None else now
+    return {
+        "retry_at": parse_retry_after(headers, moment),
+        "retry_after_seconds": parse_retry_after_seconds(headers, moment),
+    }
 
 
 async def read_body_bounded(response: Any, limit: int = BOUNDED_BODY_LIMIT) -> bytes:
@@ -130,13 +248,27 @@ class UpstreamHTTPError(Exception):
 
     `kind()` 由子类绑定各自的 classify_status，因为 1005 等业务码的
     判定规则是上游协议私有的。
+
+    `retry_at` / `retry_after_seconds` 来自上游 `Retry-After` 头（见
+    `parse_retry_after`）：调度器在**该错误分类的作用域**内据此拉长冷却，
+    实现「上游说什么时候恢复就什么时候恢复」。缺头时为 None，行为与
+    历史版本逐字节一致。
     """
 
     classify_status: ClassVar[Callable[[int, bytes], ErrKind]]
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        retry_at: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         self.status = status
         self.body = body
+        self.retry_at = retry_at
+        self.retry_after_seconds = retry_after_seconds
         # 异常文本里的 body 摘要只进服务端日志（executor 对这些异常打 warning）；
         # 对外响应经 `_error_summary` 只取 status/受控标识，绝不回显上游正文。
         super().__init__(f"upstream http {status}: {body_hint(body)}")
@@ -183,7 +315,14 @@ class UpstreamTransportError(ConnectionError):
     只承载**原始传输异常**（`httpx.TransportError` 等），由各渠道客户端在
     请求处捕获后 `raise ... from error` 抛出，好让上层按类型翻译成可操作
     的原因（network_unreachable），而不是让 `httpx` 私有异常泄漏到翻译层。
+
+    分类固定为 SOFT：传输层失败（连不上 / 写请求体超时 / 读超时）是**链路
+    瞬态**，与具体账号无关，按 SOFT 短冷却、可换号重试，且不累计错误数——
+    累计到阈值会把健康凭证踢出池子，反而放大了网络抖动的影响。
     """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.SOFT
 
 
 @dataclass(slots=True)
@@ -191,8 +330,8 @@ class Usage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
-    cached_tokens: int | None = None   # 输入中命中缓存的 token（上游可选，缺省 None）
-    credit: float | None = None   # 上游可选字段，两边都经常为 None
+    cached_tokens: int | None = None  # 输入中命中缓存的 token（上游可选，缺省 None）
+    credit: float | None = None  # 上游可选字段，两边都经常为 None
     # credit 是否为本服务推算（TRAE 按官方单价、CodeArts 福利模型按每日 token 池 1:1）。
     # True 时展示层标 ≈；上游真给 credit 的渠道恒为 False。
     credit_estimated: bool = False
@@ -212,13 +351,24 @@ class Event:
     error_kind: ErrKind | None = None
 
 
+def event_error_kind(event: Event) -> ErrKind:
+    """中立 error 事件的业务分类，未标时按 OTHER。
+
+    provider 解析时已按自己的错误码语义写好 `error_kind`；合成事件 / 测试桩
+    未标时才落到 OTHER（「其它上游失败」），绝不猜成更重的死禁。executor 的
+    流内错误处理与 `UpstreamStreamError.kind()` 共用此口径，避免两处各写一份
+    兜底而漂移。
+    """
+    return event.error_kind if event.error_kind is not None else ErrKind.OTHER
+
+
 @dataclass(slots=True)
 class Quota:
     """额度探测结果。probe_failed 与「探测到 0」必须区分（三态）。"""
 
     remaining: float | None = None
     total: float | None = None
-    cycle_end: int | None = None      # 最早到期（epoch）；无到期信息的渠道为 None
+    cycle_end: int | None = None  # 最早到期（epoch）；无到期信息的渠道为 None
     # 到期阶梯 [(到期 epoch, 该套餐剩余积分)]：选号按"窗口内即将到期积分"排序。
     # 按包独立到期的渠道（CodeBuddy、TRAE 的权益包）有值；企业版等无此信息为 None。
     expiry_ladder: list[tuple[int, float]] | None = None
@@ -226,6 +376,17 @@ class Quota:
     # 与 expiry_ladder 分开存：后者的结构装不下名称，且两者口径不同
     # （明细额外含「已过期但仍有余额」与「已用完但仍有效」的包）。
     packages: list[dict[str, Any]] | None = None
+    # 第二本账：积分（CodeArts 内置模型的计费单位，与每日 token 池并行）。
+    # 只有双账本渠道（当前仅 CodeArts）填，其余渠道恒 None——`remaining`/`total`
+    # 仍是各渠道的主账（CodeArts 为每日 token 池），**调度健康度只看主账**；
+    # 管理台内置组另用 `credits_health_score` 派生一个积分账健康度（只展示，
+    # 不改选号）；积分到期日由渠道并入 `expiry_ladder` 参与到期排序（见 codearts/client）。
+    credits_remaining: float | None = None
+    credits_total: float | None = None
+    # 积分账自己的到期阶梯（仅 CodeArts）：与并入主账 `expiry_ladder` 的那一段
+    # 同源，单独留一份供管理台**按账本**展示到期积分——选号仍要两本账合并的
+    # 阶梯，故不替换主账字段。其余渠道恒 None。
+    credits_expiry_ladder: list[tuple[int, float]] | None = None
     probed_at: int | None = None
     probe_failed: bool = False
 
@@ -235,6 +396,13 @@ EXHAUSTED = -1
 """HealthScore：0-100 已知；None 未知；-1 已耗尽。"""
 
 
+def _ratio_health(remaining: float | None, total: float | None) -> int:
+    """剩余/总量 → 0-100 百分比（夹紧）；总量缺失或 ≤0 判为「已耗尽」。"""
+    if total is None or total <= 0:
+        return EXHAUSTED
+    return max(0, min(100, round((remaining or 0.0) / total * 100)))
+
+
 def health_score(quota: Quota | None) -> int | None:
     """三态健康度：known(0-100) / unknown(None) / exhausted(-1)。"""
     if quota is None or quota.probe_failed:
@@ -242,10 +410,22 @@ def health_score(quota: Quota | None) -> int | None:
     # 探测成功但额度字段全为空（如 lingma 无 openapi 额度端点）→ 未知，非耗尽
     if quota.remaining is None and quota.total is None:
         return UNKNOWN
-    if quota.total is None or quota.total <= 0:
-        return EXHAUSTED
-    remaining = quota.remaining or 0.0
-    return max(0, min(100, round(remaining / quota.total * 100)))
+    return _ratio_health(quota.remaining, quota.total)
+
+
+def credits_health_score(remaining: float | None, total: float | None) -> int | None:
+    """第二本账（CodeArts 积分）的派生健康度，供管理台内置组展示。
+
+    **不参与调度**：调度器只用 `health`（主账＝每日 token 池），选号口径不变。
+    积分账只在列表层给一个与额度列同源的百分比——否则内置组会出现
+    「额度列显示积分 x / y，健康度却是每日池的 0%」，两个数字自相矛盾。
+
+    两字段同时为 None = 积分接口未探测（best-effort 失败或从未探到），与主账
+    `probe_failed` 同语义：回「未探测」而不是「已耗尽」。
+    """
+    if remaining is None and total is None:
+        return UNKNOWN
+    return _ratio_health(remaining, total)
 
 
 @dataclass(slots=True)
@@ -286,7 +466,7 @@ class StepStatus(StrEnum):
     """成长中心单步结果。区分 skipped（无事可做）与 failed（需要人看）。"""
 
     DONE = "done"
-    IDLE = "idle"        # 无事可做（Buddy 还在路上 / 名额用完）——不是错误
+    IDLE = "idle"  # 无事可做（Buddy 还在路上 / 名额用完）——不是错误
     SKIPPED = "skipped"  # 渠道不支持 / 配置关闭
     FAILED = "failed"
 
@@ -306,7 +486,7 @@ class GrowthStep:
     status: StepStatus
     detail: str = ""
     credit: float | None = None
-    reportable: bool | None = None      # None=按 status 判定（DONE/FAILED 进）
+    reportable: bool | None = None  # None=按 status 判定（DONE/FAILED 进）
 
 
 @dataclass(slots=True)
@@ -319,10 +499,10 @@ class GrowthResult:
 
     ok: bool = True
     steps: list[GrowthStep] = field(default_factory=list)
-    credit: float | None = None        # 本轮累计获得积分
+    credit: float | None = None  # 本轮累计获得积分
     energy: int | None = None
     streak_days: int | None = None
-    report: str = ""                   # 一行中文汇报（存 events 表 / 直接展示）
+    report: str = ""  # 一行中文汇报（存 events 表 / 直接展示）
     session_dead: bool = False
 
     @property
@@ -343,6 +523,10 @@ class Model:
     name: str = ""
     # 消耗倍数：CB 为 "x0.29 credits" 解析出的数值；TRAE 为 consumption_rate.rate
     credit_rate: float | None = None
+    # 福利模型标记（当前只有 CodeArts 用）：来自「限时免费套餐」目录，走每日
+    # token 池而非积分账，上游不给倍率。展示层据此在渠道徽章上打「福」标——
+    # 不能用 `credit_rate == 0` 代替（那是 zen/kilo 的真·免费，额度不会用尽）。
+    benefit: bool = False
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     supports_images: bool | None = None
@@ -410,8 +594,9 @@ class Provider(Protocol):
     async def probe_quota(self, credential_data: dict) -> Quota: ...
 
     # 执行与分类
-    async def stream_chat(self, credential_data: dict, payload: dict,
-                          model: str) -> AsyncIterator[Event]: ...
+    async def stream_chat(
+        self, credential_data: dict, payload: dict, model: str
+    ) -> AsyncIterator[Event]: ...
     def classify(self, status: int, body: bytes) -> ErrKind: ...
     def list_models(self, credential_data: dict) -> list[Model]: ...
     async def aclose(self) -> None: ...

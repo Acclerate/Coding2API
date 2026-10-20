@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from src.compat.anthropic.request import parse_messages_request
@@ -125,10 +127,63 @@ def test_parse_user_blocks_reject_bad_entries():
             {"type": "tool_result", "tool_use_id": ""}]}]))
     with pytest.raises(InvalidRequest, match="not supported"):
         parse_messages_request(_body(messages=[{"role": "user", "content": [
-            {"type": "image"}]}]))
+            {"type": "document"}]}]))
     with pytest.raises(InvalidRequest, match="unknown content block type"):
         parse_messages_request(_body(messages=[{"role": "user", "content": [
             {"type": "bogus"}]}]))
+
+
+def test_parse_user_image_blocks():
+    """`image` 块归一为 chat 的 image_url：base64 拼 data URL，url 直传。"""
+    parsed = parse_messages_request(_body(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "看图"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "QUJD"}},
+        {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+    ]}]))
+    assert parsed.messages == [{"role": "user", "content": [
+        {"type": "text", "text": "看图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+    ]}]
+
+
+def test_parse_pure_text_still_folds_to_string():
+    """纯文本块仍折成字符串：历史请求（无图）映射结果必须与改动前逐字节一致。"""
+    parsed = parse_messages_request(_body(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]))
+    assert parsed.messages == [{"role": "user", "content": "ab"}]
+
+
+def test_parse_image_only_user_block():
+    """只有图片、没有文本块时也产出 user 消息（不能因无文本而丢整条）。"""
+    parsed = parse_messages_request(_body(messages=[{"role": "user", "content": [
+        {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}]}]))
+    assert parsed.messages == [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}]
+
+
+@pytest.mark.parametrize("block, fragment", [
+    ({"type": "image", "source": "x"}, "source must be an object"),
+    ({"type": "image", "source": {"type": "file", "file_id": "f"}},
+     "source.type 'file' is not supported"),
+    ({"type": "image", "source": {"type": "base64", "data": "x"}},
+     "media_type must be a non-empty string"),
+    ({"type": "image", "source": {"type": "base64", "media_type": "image/png"}},
+     "data must be a non-empty string"),
+    ({"type": "image", "source": {"type": "base64", "media_type": "",
+                                  "data": "x"}},
+     "media_type must be a non-empty string"),
+    ({"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                  "data": ""}},
+     "data must be a non-empty string"),
+    ({"type": "image", "source": {"type": "url"}}, "url must be a non-empty string"),
+    ({"type": "image", "source": {"type": "url", "url": ""}},
+     "url must be a non-empty string"),
+])
+def test_parse_image_block_bad_shapes(block, fragment):
+    with pytest.raises(InvalidRequest, match=re.escape(fragment)):
+        parse_messages_request(_body(messages=[{"role": "user", "content": [block]}]))
 
 def test_parse_tool_result_content_bad_shapes():
     with pytest.raises(InvalidRequest, match=r"content\[0\] must be an object"):
@@ -137,7 +192,7 @@ def test_parse_tool_result_content_bad_shapes():
     with pytest.raises(InvalidRequest, match="not supported"):
         parse_messages_request(_body(messages=[{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t",
-             "content": [{"type": "image"}]}]}]))
+             "content": [{"type": "document"}]}]}]))
     with pytest.raises(InvalidRequest, match="unknown tool_result.content type"):
         parse_messages_request(_body(messages=[{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t",
@@ -145,6 +200,29 @@ def test_parse_tool_result_content_bad_shapes():
     with pytest.raises(InvalidRequest, match="string or an array"):
         parse_messages_request(_body(messages=[{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t", "content": 5}]}]))
+
+
+def test_parse_tool_result_with_image():
+    """`tool_result` 内图片 → tool 消息 content 数组（chat 的 tool 消息带
+    image_url 已实测被上游接受）。纯文本结果仍返回字符串。"""
+    parsed = parse_messages_request(_body(messages=[{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "读到的图："},
+            {"type": "image", "source": {"type": "base64",
+                                         "media_type": "image/png", "data": "QUJD"}},
+        ]},
+    ]}]))
+    assert parsed.messages[0]["content"] == [
+        {"type": "text", "text": "读到的图："},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+    ]
+
+
+def test_parse_image_part_bad_source_in_tool_result():
+    with pytest.raises(InvalidRequest, match=r"tool_result.content\[0\].source"):
+        parse_messages_request(_body(messages=[{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t",
+             "content": [{"type": "image"}]}]}]))
 
 def test_parse_assistant_blocks_merge_into_one_message():
     parsed = parse_messages_request(_body(messages=[{"role": "assistant", "content": [

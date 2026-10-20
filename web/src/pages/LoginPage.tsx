@@ -8,18 +8,18 @@ import { Button, Input, Notice } from "../ui";
 const HIGHLIGHTS = [
   {
     icon: Boxes,
-    title: "七渠道统一调度",
+    title: "统一调度",
     text: "CodeBuddy / TRAE / Qoder / CodeArts 与免费层汇入单一 OpenAI 兼容出口。",
   },
   {
     icon: Zap,
-    title: "健康度自动选号",
-    text: "按剩余额度与冷却状态挑号，失败自动轮换，会话粘性保持一致。",
+    title: "自动选号",
+    text: "按额度与冷却状态挑号，失败自动轮换，会话保持粘性。",
   },
   {
     icon: ShieldCheck,
-    title: "凭证加密入库",
-    text: "账号集中维护、全员共享；用量按 Key 归属统计并留审计。",
+    title: "凭证集中管理",
+    text: "账号加密入库、全员共享；用量按 Key 归属统计并留审计。",
   },
 ];
 
@@ -140,7 +140,7 @@ export function LoginPage() {
           </div>
 
           <p className="mt-6 text-center text-xs leading-relaxed text-muted-foreground lg:text-left">
-            账号由管理员在「用户管理」中创建，你会收到一次性激活链接来自设密码。
+            账号由管理员创建，你会收到一次性激活链接来自设密码。
           </p>
         </form>
       </div>

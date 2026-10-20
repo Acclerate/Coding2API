@@ -4,7 +4,10 @@
 `QODER_MAX_CONCURRENCY`）用「占满的号不再参与选号」来保护单账号：一个账号
 被并发打进上游时先排限流/封号，而多配几个号本来就是为了分摊。本项目把这条
 护栏做成**全局**开关（`MAX_INFLIGHT_PER_CREDENTIAL`，默认 0 = 不限），
-选号前过滤 + 选中后登记、请求结束释放。
+选号前过滤 + 选中后登记、请求结束释放。**计数与上限解耦**：即便上限为 0
+（不限并发），租约仍照常登记——在途数是调度器的「最少连接」负载键
+（`Candidate.inflight`），并发请求靠它摊到空闲号，而不是全部压到排序确定的
+同一个号上。
 
 **为什么独立于 `tasks/pacer.py` 的 `max_concurrency`**：pacer 的桶是按渠道
 分的、且只覆盖走 pacer 的渠道；这里是**跨渠道的凭证级**上限，语义是「同一个
@@ -84,8 +87,11 @@ class InflightTracker:
 class InflightGuard:
     """选号前的在途过滤 + 选中后的租约登记。
 
-    上限从 `limit_source()` 现读（热更）；≤0 表示不限，此时 `blocked` 恒
-    False、也不做登记（省掉无意义的字典操作）。
+    上限从 `limit_source()` 现读（热更）；≤0 表示**不限并发**（`blocked` 恒
+    False），但**仍照常登记租约**——在途计数是调度器的「最少连接」负载键
+    （`Candidate.inflight`），关掉上限时它照样要能反映实时负载，否则并发请求
+    会全部落到排序确定的同一个号上（见 `Scheduler.select`）。租约登记是纯
+    内存字典操作，成本可忽略。
     """
 
     def __init__(self, limit_source: Callable[[], int],
@@ -110,10 +116,8 @@ class InflightGuard:
         return self._tracker.count(credential_id) >= limit
 
     def acquire(self, credential_id: str) -> None:
-        if self.limit <= 0:
-            return
         self._tracker.acquire(credential_id)
 
     def release(self, credential_id: str) -> None:
-        # 不限时从未登记，这里也无需清理；仍走到 tracker 更稳（幂等且零成本）
+        # 不限时也登记过，这里必须对称释放；tracker 幂等，多余释放零成本
         self._tracker.release(credential_id)
