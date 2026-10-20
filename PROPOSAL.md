@@ -231,3 +231,48 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 **12 张表**，`SCH
 ## 9. 其它文档
 
 技术栈、模块规格、Provider 协议、请求时序与测试策略见 [`TECHNICAL.md`](TECHNICAL.md)；使用与部署、配置清单见 [`README.md`](README.md)；架构图 / 请求时序图 / 凭证调度状态机见 [`diagrams/`](diagrams/)。
+
+## 10. 待办与 fork 差异（相对上游 RobbsLuo/Coding2API）
+
+本 fork 在 `my/main` 上独立演进，以下为**已知的刻意差异与待办**，合并上游时优先核对这里。
+
+### 待办：Qoder 国内/国际双区域同池共存
+
+上游对 Qoder 国际版的支持是「按凭证 realm」——聊天网关已按凭证取址（intl 走
+api1→api2→api3 故障切换），但三处仍是**进程级单值**，故一次只能完整服务一个
+区域（env 指向哪边，另一边的对应能力就失效）：
+
+| 断点 | 位置 | 现状 |
+|---|---|---|
+| openapi 业务端点（额度/签到/token 刷新） | `provider/qoder/client.py` 各方法（`self.host`） | 全局单 host；响应头已按凭证 realm 取（`build_openapi_headers`），URL 未跟上——半成品状态 |
+| 登录区域 | `main.py` `_upstream_auth`：`QoderOAuth(detect_realm_from_domain(host))` | 由 `QODER_API_ENDPOINT` 推导，一个实例一个区域（`QoderOAuth` docstring 已预留「两区域用两个实例」的说法，未接线） |
+| 网关覆盖 | `client.py` `_gateway_hosts` 的替换条件 | 自定义 gateway 对**默认区域（cn）凭证**也替换首项——env 指向国际版时 cn 凭证的聊天会被带去国际网关（403 code 105） |
+
+**实施方案（B：补齐按凭证 realm，不动渠道结构）**：
+
+1. openapi URL 从 `self.host` 改为 `credential.realm_config().openapi`（`realm_config()`
+   现成，headers 已经这么做，补齐 URL 即可）
+2. `_gateway_hosts` 的覆盖条件收敛为「自定义 gateway 只对所属区域的凭证生效」
+3. 登录入口带区域选择：`_upstream_auth` 为 qoder 建两个 `QoderOAuth` 实例
+   （cn / intl），前端「登录 Qoder」旁加「登录 Qoder 国际版」
+
+**明确不做 A 方案**（复制 `qoder_intl` 独立渠道，同 CodeBuddy 国际版模式）：要动
+调度渠道表、模型排序、前端与一批测试，且与上游分歧大——每次合并上游都要重解
+冲突（2026-10-20 合并 v0.8.0 时模型列表区已为此付出 16 文件的冲突代价）。
+
+**不改代码的临时同池法**：env 保持国内默认，用「JSON 导入」手工导入国际版凭证
+（JSON 带 `"realm": "intl"` 或 `"domain": "qoder.com"`）——聊天与模型列表正常
+（网关按凭证走），代价是额度探测失败（显示「无探测」）且无自动刷新（token
+到期需重导）。
+
+### 未合入的上游功能（文档与代码差异来源）
+
+2026-10-20 合并上游 v0.8.0 时，模型列表核心取本 fork 的「每模型一条」设计
+（对外 id = `归一键-渠道`，请求即钉死渠道）；以下上游功能依赖其**合并式条目
+结构**，暂未合入（相关文档描述已标注，合入后恢复）：
+
+- 自定义模型别名（`MODEL_ALIASES`；`src/model_alias.py` 解析器与配置/热更项已
+  随合并存在，但无消费者接线）
+- `GET /v1/models/{id}` 单模型查询
+- 条目 `cost` / `reasoning_efforts` / `benefit` 字段（前端 `modelExtras.ts` 为
+  防御式取值，后端字段一上前端即显示，无需改前端）

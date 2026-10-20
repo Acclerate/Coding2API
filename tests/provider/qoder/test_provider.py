@@ -29,6 +29,7 @@ async def test_provider_classify_import_and_credential_from():
     assert imported["access_token"] == "t" and imported["realm"] == "intl"
     assert provider.credential_from(imported).uid == "u"
 
+
 async def test_provider_stream_chat_pacer_and_error_release():
     from src.provider.qoder import QoderProvider
 
@@ -48,8 +49,9 @@ async def test_provider_stream_chat_pacer_and_error_release():
 
     pacer = Pacer()
     provider = QoderProvider(client=handler_for(handler), pacer=pacer)
-    events = [e async for e in provider.stream_chat(
-        cred().to_dict(), {"messages": []}, "m")]
+    events = [
+        e async for e in provider.stream_chat(cred().to_dict(), {"messages": []}, "m")
+    ]
     assert any(e.kind is EventKind.CONTENT for e in events)
     assert pacer.turns == 1 and pacer.released == 1
     await provider.aclose()
@@ -64,6 +66,7 @@ async def test_provider_stream_chat_pacer_and_error_release():
     assert pacer2.released == 1
     await provider2.aclose()
 
+
 async def test_provider_models_quota_refresh_and_scopes():
     from src.provider.qoder import QoderProvider
 
@@ -71,8 +74,9 @@ async def test_provider_models_quota_refresh_and_scopes():
         if request.url.path == qoder_events.EP_MODELS.split("?")[0]:
             return httpx.Response(200, json={"chat": [{"key": "m1"}]})
         if request.url.path == qoder_events.EP_QUOTA:
-            return httpx.Response(200, json={"userQuota": {"total": 10,
-                                                           "remaining": 10}})
+            return httpx.Response(
+                200, json={"userQuota": {"total": 10, "remaining": 10}}
+            )
         raise AssertionError(request.url.path)
 
     provider = QoderProvider(client=handler_for(handler))
@@ -87,6 +91,7 @@ async def test_provider_models_quota_refresh_and_scopes():
     # lingma 区域无签到活动：凭证级 None（任务层据此跳过），不出网
     assert provider.checkin_scope({"uid": "u", "realm": "lingma"}) is None
     await provider.aclose()
+
 
 async def test_provider_lingma_checkin_short_circuits_without_upstream():
     """lingma 凭证的签到/签到状态直接返回「无活动」，不触碰上游。
@@ -103,10 +108,34 @@ async def test_provider_lingma_checkin_short_circuits_without_upstream():
     provider = QoderProvider(client=handler_for(handler))
     result = await provider.checkin({"realm": "lingma", "access_token": "pt-x"})
     assert result.ok is False and "无每日签到活动" in (result.message or "")
-    status = await provider.checkin_status({"realm": "lingma",
-                                            "access_token": "pt-x"})
+    status = await provider.checkin_status({"realm": "lingma", "access_token": "pt-x"})
     assert status["active"] is False and status["today_checked_in"] is False
     await provider.aclose()
+
+
+async def test_provider_lingma_probe_quota_uses_model_discovery():
+    """lingma 凭证的额度探测改走模型发现（同网关同签名），额度数值未知。
+
+    lingma-api 域名下没有 openapi 额度端点（打过去只会被拒、管理台误报
+    「凭证被渠道拒绝」）；模型发现成功即视为存活，返回三态的 None。
+    handler 只认模型发现路径，签到/额度路径一旦被调用即失败。
+    """
+    from src.provider.qoder import QoderProvider
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == qoder_events.EP_MODELS.split("?")[0]:
+            return httpx.Response(200, json={"chat": [{"key": "m1"}]})
+        raise AssertionError(f"lingma 探测不应打 openapi 路径: {request.url.path}")
+
+    provider = QoderProvider(client=handler_for(handler))
+    quota = await provider.probe_quota(
+        {"realm": "lingma", "access_token": "pt-x", "uid": "u"}
+    )
+    assert quota.probed_at > 0
+    assert quota.remaining is None and quota.total is None
+    assert quota.probe_failed is False
+    await provider.aclose()
+
 
 async def test_provider_refresh_delegates_for_oauth():
     from src.provider.qoder import QoderProvider
@@ -119,14 +148,16 @@ async def test_provider_refresh_delegates_for_oauth():
     assert refreshed["access_token"] == "dt-new"
     await provider.aclose()
 
+
 async def test_client_lazy_clients_and_aclose():
     client = QoderClient()
-    assert client._stream is client._stream       # noqa: SLF001
-    assert client._short is client._short         # noqa: SLF001
+    assert client._stream is client._stream  # noqa: SLF001
+    assert client._short is client._short  # noqa: SLF001
     assert client.host == "https://openapi.qoder.com.cn"
     assert client.gateway == "https://gateway.qoder.com.cn"
     await client.aclose()
-    await QoderClient().aclose()                  # 未创建过：不报错
+    await QoderClient().aclose()  # 未创建过：不报错
+
 
 def test_realm_configs_and_gateway_candidates():
     cn = qoder_events.get_realm_config("cn")
@@ -140,20 +171,28 @@ def test_realm_configs_and_gateway_candidates():
     assert cn.nonce_dashed is True
     intl = qoder_events.get_realm_config("intl")
     assert intl.send_redirect_uri is False and intl.nonce_dashed is False
-    assert qoder_events.get_realm_config("nope") is cn          # 未知回落国内
-    assert qoder_events.gateway_candidates("intl")[1:] == ["https://api2.qoder.sh",
-                                                           "https://api3.qoder.sh"]
+    assert qoder_events.get_realm_config("nope") is cn  # 未知回落国内
+    assert qoder_events.gateway_candidates("intl")[1:] == [
+        "https://api2.qoder.sh",
+        "https://api3.qoder.sh",
+    ]
     assert qoder_events.detect_realm_from_domain("a.qoder.sh") == "intl"
     assert qoder_events.detect_realm_from_domain("qoder.com.cn") == "cn"
+
 
 def test_envelope_helpers_tolerate_malformed_input():
     assert qoder_events.decode_envelope(SSEFrame(event="", data="  ")) is None
     assert qoder_events.decode_envelope(SSEFrame(event="", data="[DONE]")) is not None
     envelope_none_body = qoder_events.decode_envelope(
-        SSEFrame(event="", data=json.dumps({"statusCodeValue": 418})))
+        SSEFrame(event="", data=json.dumps({"statusCodeValue": 418}))
+    )
     assert envelope_none_body is not None and envelope_none_body.status == 418
-    assert qoder_events.decode_envelope(
-        SSEFrame(event="", data=json.dumps({"body": None}))) is None
+    assert (
+        qoder_events.decode_envelope(
+            SSEFrame(event="", data=json.dumps({"body": None}))
+        )
+        is None
+    )
     for bad in ("{not json", "[1,2]"):
         with pytest.raises(UpstreamProtocolViolation):
             qoder_events.decode_envelope(SSEFrame(event="", data=bad))
@@ -163,8 +202,10 @@ def test_envelope_helpers_tolerate_malformed_input():
         qoder_events.parse_inner_chunk("nope")
     # 非 200 且无 body 时把外层 JSON 当详情
     with_status = qoder_events.decode_envelope(
-        SSEFrame(event="", data=json.dumps({"statusCodeValue": "bad"})))
+        SSEFrame(event="", data=json.dumps({"statusCodeValue": "bad"}))
+    )
     assert with_status is not None and with_status.status == 502
+
 
 async def test_provider_checkin_and_status_without_client_pacer():
     from src.provider.qoder import QoderProvider
@@ -172,13 +213,15 @@ async def test_provider_checkin_and_status_without_client_pacer():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == qoder_events.EP_CAMPAIGNS:
             return httpx.Response(200, json=_campaigns(_campaign("p-1")))
-        return httpx.Response(200, json={"status": "CLAIMED", "replayed": False,
-                                         "benefit": {"amount": 5}})
+        return httpx.Response(
+            200, json={"status": "CLAIMED", "replayed": False, "benefit": {"amount": 5}}
+        )
 
-    provider = QoderProvider(client=handler_for(handler))     # pacer=None
+    provider = QoderProvider(client=handler_for(handler))  # pacer=None
     result = await provider.checkin(cred().to_dict())
     assert result.ok is True and result.credit == 5.0
     await provider.aclose()
+
 
 async def test_provider_stream_chat_without_pacer():
     from src.provider.qoder import QoderProvider
@@ -186,7 +229,7 @@ async def test_provider_stream_chat_without_pacer():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=sse(inner({"content": "hi"}, finish="stop")))
 
-    provider = QoderProvider(client=handler_for(handler))     # pacer=None
+    provider = QoderProvider(client=handler_for(handler))  # pacer=None
     events = [e async for e in provider.stream_chat(cred().to_dict(), {}, "m")]
     assert any(e.kind is EventKind.CONTENT for e in events)
     await provider.aclose()

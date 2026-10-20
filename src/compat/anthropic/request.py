@@ -103,29 +103,27 @@ def _system_content(system: Any) -> str | list[dict[str, Any]]:
     raise InvalidRequest("system must be a string or an array")
 
 
-def _text_from_system_message(content: Any, where: str) -> str:
-    """`role:"system"` 消息的 content（字符串或 text 块数组）→ 纯文本。
+def _text_from_system_message(content: list[Any], where: str) -> str:
+    """`role:"system"` 消息的 content（text 块数组）→ 纯文本。
 
-    与顶层 `system` 同构校验；图片等不支持的块依旧 400。
+    调用方（`_map_messages`）已把字符串 content 直接收集、非 list 的报过 400，
+    进到这里的 content 必为 list；与顶层 `system` 同构校验，图片等不支持的
+    块依旧 400。
     """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for index, block in enumerate(content):
-            if not isinstance(block, dict):
-                raise InvalidRequest(f"{where}.content[{index}] must be an object")
-            kind = block.get("type")
-            if kind == "text":
-                parts.append(_block_text(block, f"{where}.content[{index}]"))
-            elif kind in ("image", "document"):
-                raise InvalidRequest(
-                    f"content block type {kind!r} is not supported by this gateway"
-                )
-            else:
-                raise InvalidRequest(f"unknown content block type {kind!r}")
-        return "".join(parts)
-    raise InvalidRequest(f"{where}.content must be a string or an array")
+    parts: list[str] = []
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise InvalidRequest(f"{where}.content[{index}] must be an object")
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(_block_text(block, f"{where}.content[{index}]"))
+        elif kind in ("image", "document"):
+            raise InvalidRequest(
+                f"content block type {kind!r} is not supported by this gateway"
+            )
+        else:
+            raise InvalidRequest(f"unknown content block type {kind!r}")
+    return "".join(parts)
 
 
 def _block_text(block: dict[str, Any], where: str) -> str:

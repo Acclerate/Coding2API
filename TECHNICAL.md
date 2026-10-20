@@ -444,6 +444,13 @@ PRAGMA foreign_keys = ON;      -- 仅 api_keys 之外无外键（users 与 api_k
 - **升级只在启动时发生**：迁移与 bootstrap 都挂在 `build_app` 里，所以「改了 schema 但没重启」＝老库 + 新前端。
 
 ## 9. 模型目录与模型名
+
+> **fork 状态注记（2026-10-20）**：本 fork 的模型列表取「每模型一条」设计——对外 id
+> = `归一键-渠道`（如 `kimi-k3-qoder`），请求即钉死该渠道；**不跨渠道合并同名模型**。
+> 本节中「合并键 / 对外 id 一律是归一键」的描述、`_finalize`/`_merge_provider` 流程、
+> `serve_model` 单模型查询与 `MODEL_ALIASES` 自定义别名均为**上游实现**，本 fork 暂未
+> 合入（差异清单与合入计划见 `PROPOSAL.md` §10）；保留原文供后续合并上游时参考。
+
 ### 9.1 三字段与归一键
 七条渠道（codebuddy / codebuddy_intl / trae / zen / kilo / qoder / codearts）的每个模型统一成三个字段，规则集中在渠道中立的 `src/provider/naming.py`（纯函数，不 import 任何 provider 子模块）：
 

@@ -27,7 +27,7 @@
 
 ## 特性
 
-- **OpenAI 兼容出口**：`/v1/chat/completions`（流式 + 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Anthropic / Claude Code）、`/v1/models` 与 `/v1/models/{id}`（单模型查询）、`/v1/user/balance`（DeepSeek 兼容余额）。
+- **OpenAI 兼容出口**：`/v1/chat/completions`（流式 + 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Anthropic / Claude Code）、`/v1/models`、`/v1/usage`（Key 自助用量）、`/v1/user/balance`（DeepSeek 兼容余额）。
 - **统一调度**：扁平模型名按健康度自动选号，`模型@渠道` 强制指定。候选含免费渠道时**免费优先**，之后**在途最少优先**（并发摊到空闲号），再按到期额度、三态健康度 + 分级冷却避开坏号，打平则**余额多者优先**。模型级限流只避让该模型（同账号其他模型立即可用）；某模型只有一个渠道持有且它在模型级冷却时，直接回「该模型暂不可用」。同一对话多轮粘住同一凭证，出错才轮换。
 - **到期额度优先消化**：主窗口（默认 36h）内将过期的额度多者先用，避免过期浪费；打平再比 7 天窗口。额度单位统一为积分。
 - **模型列表按渠道凭证加载**：只展示**当前有可用凭证**的渠道，未接入不出现幽灵模型；暂停或凭证失效时其模型暂时消失，恢复即回来。
@@ -198,7 +198,7 @@ Playground 请求表单可选填 `temperature` / `max_tokens` / `reasoning_effor
 
 **额度与签到**：支持额度探测（`GET /api/v2/quota/usage`）与每日签到（积分可累积）。签到为**活动制**（`/sash/api/v1/me/campaigns`，需带 `Cosy-ClientType`），旧 `daily-check-in` 仅作回退；本服务自动查询并领取可领活动，管理台可手动触发。**签到活动每日 10:00（UTC+8）刷新**（领取后 30 天有效），后台任务按该窗口封账：凌晨看到的「已领」只封到当天 09:59，10:00 新一轮出现后自动补签。新协议不提供连续天数，界面不再显示「连续 N 天」。**国际版没有签到接口**（该端点 404），记为「本区域无此接口」，不是错误。
 
-**端点与节流**：默认国内版（`openapi.qoder.com.cn` + `gateway.qoder.com.cn`），国际版改 `QODER_API_ENDPOINT=https://openapi.qoder.sh` 并确认白名单含国际版域名（签名携带完整 `cosy-*` 头，白名单防误发）。默认 `QODER_CHAT_MIN_INTERVAL=5`（独立节流器），可在「任务与配置」热更。
+**端点与节流**：默认国内版（`openapi.qoder.com.cn` + `gateway.qoder.com.cn`），国际版改 `QODER_API_ENDPOINT=https://openapi.qoder.sh` 并确认白名单含国际版域名（签名携带完整 `cosy-*` 头，白名单防误发）。默认 `QODER_CHAT_MIN_INTERVAL=5`（独立节流器），可在「任务与配置」热更。**注意这是整进程切区域，国内/国际账号无法同时完整使用**（openapi 业务端点与登录区域是进程级单值；聊天网关按凭证走，已导入的另一区域凭证聊天不受影响）——双区域同池共存的改造是待办，方案与临时同池法见 `PROPOSAL.md` §10。
 
 **上游节点故障**：Qoder 有时把自身推理节点故障包成 400（`[FAIL]node:… msg:Execution failed`）。本服务识别为**模型级瞬时故障**——只冷却该模型，耗尽候选时返回「该模型暂时不可用」的 503（`no_healthy_credential`），而非误报「模型不存在」；稍后重试通常自愈。
 
@@ -625,6 +625,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `GROWTH_IRREVERSIBLE_ACTIONS` | `true` | 是否允许成长中心的不可逆动作：抽奖、连登兑换、开盲盒、消耗补登卡 |
 | `ACTIVITY_REPORT_ENABLED` | `false` | 活跃上报（CodeBuddy 与国际版）：每天为账号补发一条对话事件续连登。**默认关闭**——条款禁止篡改活动数据，上游改版即失效 |
 | `ACTIVITY_REPORT_HOUR` | `10` | 活跃上报的本地（北京）时间整点窗口；仅在开关开启时生效 |
+| `CHECKIN_ENABLED` | `true` | 每日签到总开关：`false` = 不需要签到活动的部署整体关掉（任务 no-op，管理台显示停用）。与渠道级跳过正交——无签到接口的区域（如 Qoder 国际版）仍由 provider 逐凭证跳过。可热更 |
 | `CHECKIN_TIMES` | `""` | 每日签到执行时点：本地时间 `HH:MM`，逗号分隔（如 `09:37,21:10`）。命中时点才跑一轮；**留空 = 全天每 10 分钟检查一次**（旧行为，升级后不做任何配置也不变节奏）。坏段忽略并记 warning，全是坏段等同留空。上游签到幂等，多设几个时点只是多几次重试机会。配了时点后循环改为**每 60 秒**醒一次（否则抖动=0 时窗只有一分钟，必然整天漏签）。可热更 |
 | `CHECKIN_JITTER_MINUTES` | `0` | 签到抖动（分钟）：在时点**之前**提前一个 `0..N` 的随机偏移执行，把多部署摊开、避免同一分钟齐打上游。按「日期 + 时点」记去重键，抖动只改执行时刻，不会让同一时点跑两次。`0` = 不抖。可热更 |
 | `LOG_BUFFER_LINES` | `500` | 管理台「服务端日志」页的进程内环形缓冲行数（只收本进程 `logging` 记录，不读文件）。`0` = 关闭该页（`GET /api/logs` 与 `/api/logs/stream` 均 404）。每行发出前过脱敏白名单，命中 `token` / `secret` / `authorization` / `cookie` / `password` / `api_key` 或 `sk-…` 形状的**整行丢弃**。可热更 |
@@ -694,7 +695,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `STREAM_FIRST_EVENT_TIMEOUT_SECONDS` | `0` | 流式**首事件**超时（秒）：上游接了连接却长时间不吐第一个数据帧时，在**出帧前**换号重试（此时切换安全，客户端没收到任何内容）。注释帧 / 心跳不重置该计时。`0` = 关闭。**默认必须保持关闭**——实测慢上下文首字可达 40–71s，默认值会误杀正常请求；要用请按部署实际填（推荐 `60`）。可热更 |
 | `STREAM_IDLE_TIMEOUT_SECONDS` | `0` | 流式**空闲**超时（秒）：**已出帧**后上游长时间不再吐数据时断流，只发一帧错误收尾——半截输出不可回滚，换号会把两个账号的内容拼给客户端。`0` = 关闭（推荐 `300`）。可热更 |
 | `SHORT_COOLDOWN_WAIT_SECONDS` | `0` | 短冷却「等待续上」（秒）：全池都在短冷却、没有任何立即可用候选时，最短剩余冷却不超过该值则等待后重取一次，而不是直接 503。等待期间不占在途租约、不计入轮换预算。`0` = 关闭（快速失败，旧行为）。可热更 |
-| `MODEL_ALIASES` | `""` | 自定义模型别名：`对外名=模型@渠道;对外名2=模型`，`@渠道` 省略则自动选。列表与请求解析用同一份；与真实 id / 自动别名撞车、目标不存在、渠道不持有该模型时该段跳过并记 ERROR。留空 = 不启用。可热更 |
+| `MODEL_ALIASES` | `""` | 自定义模型别名：`对外名=模型@渠道;对外名2=模型`，`@渠道` 省略则自动选。**本 fork 暂未生效**（上游功能未合入本 fork 的模型列表实现，配置项与热更项暂无消费者，见 `PROPOSAL.md` §10）。可热更 |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | 单账号在途请求上限（跨渠道全局）：并发占满的号不再参与选号；`0` = 不限。租约请求结束释放，另有 600s TTL 兜底漏释放 |
 | `METRICS_ENABLED` | `true` | 是否暴露 `GET /metrics`（Prometheus text 格式，**不鉴权**，与 `/healthz` 同口径）；`false` 关闭（返回 404）。可热更 |
 | `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）：每个业务请求（`/api/*`、`/v1/*`、`/authorize`）一行 `event=request request_id=… method=… route=… status=… duration_ms=…`。路由用模板（`/api/credentials/{credential_id}`）不用实际 ID；**不写 query string、请求体、用户名**，靠 `request_id` 关联 `usage_events`。5xx 记 WARNING、其余 INFO；静态资源与探针不记（uvicorn 自带 access log 已关闭）。`false` 关闭请求级日志。可热更 |
@@ -706,7 +707,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 
 上表中带「可热更」语义的 **58 项**可不改 `.env`、不重启，直接在管理台「任务与配置」页修改：
 
-`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`MODEL_ALIASES`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`、`STREAM_IDLE_TIMEOUT_SECONDS`、`SHORT_COOLDOWN_WAIT_SECONDS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`MODEL_PROBE_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`、`CHECKIN_TIMES`、`CHECKIN_JITTER_MINUTES`、`LOG_BUFFER_LINES`。
+`DEFAULT_MODEL`、`MODEL_BLOCKLIST`、`MODEL_ALIASES`、`CONTEXT_COMPRESS_ENABLED`、`CONTEXT_COMPRESS_RESERVE_TOKENS`、`CONTEXT_COMPRESS_MIN_KEEP_MESSAGES`、`CONTEXT_COMPRESS_SAFETY_RATIO`、`MODEL_FALLBACK_GROUPS`、`STREAM_FIRST_EVENT_TIMEOUT_SECONDS`、`STREAM_IDLE_TIMEOUT_SECONDS`、`SHORT_COOLDOWN_WAIT_SECONDS`、`QUOTA_EXPIRY_WINDOW_SECONDS`、`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`、`CONVERSATION_STICKY_SECONDS`、`MAX_INFLIGHT_PER_CREDENTIAL`、`GROWTH_IRREVERSIBLE_ACTIONS`、`GROWTH_INTERVAL_MINUTES`、`REFRESH_INTERVAL_MINUTES`、`QUOTA_PROBE_MINUTES`、`MODEL_CATALOG_MINUTES`、`OPENROUTER_CATALOG_MINUTES`、`USD_CNY_RATE`、`CODEBUDDY_CHAT_MIN_INTERVAL`、`CODEBUDDY_INTL_CHAT_MIN_INTERVAL`、`ZEN_CHAT_MIN_INTERVAL`、`KILO_CHAT_MIN_INTERVAL`、`QODER_CHAT_MIN_INTERVAL`、`CODEARTS_CHAT_MIN_INTERVAL`、`CODEARTS_MAX_CONCURRENCY`、`CODEARTS_REQUEST_WINDOW_SECONDS`、`PACER_MIN_SECONDS`、`PACER_MAX_SECONDS`、`ACTIVITY_REPORT_ENABLED`、`ACTIVITY_REPORT_HOUR`、`ALERT_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_INTERVAL_MINUTES`、`ALERT_SILENCE_MINUTES`、`ALERT_FOR_TICKS`、`ALERT_CLEAR_TICKS`、`ALERT_POOL_READY_MIN`、`ALERT_TASK_FAILURES`、`ALERT_TOKEN_EXPIRY_HOURS`、`ALERT_ERROR_RATE_THRESHOLD`、`ALERT_ERROR_RATE_MIN_REQUESTS`、`ALERT_ERROR_RATE_WINDOW_MINUTES`、`BACKUP_INTERVAL_MINUTES`、`BACKUP_KEEP`、`UPSTREAM_STATUS_ENABLED`、`UPSTREAM_STATUS_MINUTES`、`MODEL_PROBE_MINUTES`、`METRICS_ENABLED`、`REQUEST_LOG_ENABLED`、`FORCE_DISABLE_THINKING`、`REASONING_EFFORT_MAP`、`ANTHROPIC_THINKING_EFFORTS`、`CHECKIN_ENABLED`、`CHECKIN_TIMES`、`CHECKIN_JITTER_MINUTES`、`LOG_BUFFER_LINES`。
 
 要点：**优先级 `DB 覆盖值 > .env`**——改过后 .env 对该项不再生效，页面标「DB 覆盖」，点「恢复默认」删掉覆盖行才回落 .env。值存 `runtime_settings` 表（纯 key/value），新增可热更项无需迁移；白名单外的 key、非法类型 / 越界值写入前即拒。启动期项（`APP_SECRET` / `PORT` / `DATA_DIR` / `USERS_FILE` / `OPENROUTER_MODELS_URL` / 上游端点白名单）**不在**白名单。接口 `GET /api/settings` 读快照、`PUT /api/settings` 写（admin + CSRF），传 `null` 恢复默认。该页同时展示**后台任务运行态**，页面按 tab 组织；运行态是**进程内**的（`GET /api/tasks`，admin，页面每 30 秒刷新），重启归零。
 
