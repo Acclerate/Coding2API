@@ -107,3 +107,36 @@ def test_healthz_503_when_pool_is_empty(tmp_path):
     assert response.status_code == 503
     assert response.json()["credentials"] == {
         "total": 0, "ready": 0, "cooling": 0, "paused": 0, "disabled": 0}
+
+
+def test_health_accepts_head(client):
+    """HEAD /health 必须 200：外部监控常用 `curl -I`，只注册 GET 会一直吃 405。
+
+    FastAPI 的 APIRoute 不会自动给 GET 补 HEAD（Starlette 才会），所以要显式
+    声明两种方法；HEAD 的 body 由 ASGI 层丢弃，这里只校验状态码与空 body。
+    """
+    response = client.head("/health")
+    assert response.status_code == 200
+    assert response.content == b""
+
+
+def test_healthz_accepts_head(tmp_path):
+    """HEAD /healthz 与 GET 同语义：池子可用 200、不可用 503，body 为空。"""
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    app = build_app(settings)
+    with TestClient(app) as http:
+        ready = http.head("/healthz")
+    assert ready.status_code == 200
+    assert ready.content == b""
+
+    # 全部禁用 → ready=0，HEAD 也必须回 503（监控据此摘流量）
+    conn = sqlite3.connect(settings.db_path)
+    conn.execute("UPDATE credentials SET enabled = 0")
+    conn.commit()
+    conn.close()
+    with TestClient(app) as http:
+        unavailable = http.head("/healthz")
+    assert unavailable.status_code == 503
+    assert unavailable.content == b""

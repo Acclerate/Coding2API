@@ -98,6 +98,24 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "格式 `组名=成员1,成员2;组名2=成员3`；成员可带 `@渠道` 固定回退渠道。"
                "留空 = 不启用。回退会用尽该组（×3 轮换预算）后正常 503。",
                group="routing"),
+    HotSetting("model_aliases", str, "自定义模型别名",
+               "给客户端一个稳定的对外模型名（上游改 id 时只改这里）。格式 "
+               "`对外名=模型@渠道;对外名2=模型`；列表与请求解析用同一份。"
+               "与真实模型 id 或自动别名撞车视为配置错误，不静默覆盖。"
+               "留空 = 不启用。", group="routing"),
+    HotSetting("stream_first_event_timeout_seconds", float, "流式首事件超时（秒）",
+               "上游接了连接却长时间不吐第一个数据帧时，在**出帧前**换号重试"
+               "（此时切换安全）。注释帧/心跳不重置计时。0 = 关闭；实测慢上下文"
+               "首字可达 40–71s，内置默认必须保持关闭，用时按部署实际填（推荐 60）。",
+               minimum=0.0, group="routing"),
+    HotSetting("stream_idle_timeout_seconds", float, "流式空闲超时（秒）",
+               "**已出帧**后上游长时间不再吐数据时断流并以错误帧收尾——半截输出"
+               "不可回滚，换号会把两个账号的内容拼给客户端。0 = 关闭（推荐 300）。",
+               minimum=0.0, group="routing"),
+    HotSetting("short_cooldown_wait_seconds", float, "短冷却等待上限（秒）",
+               "全池都在短冷却、没有任何立即可用候选时，最短剩余冷却不超过该值"
+               "则等待后续上（而非直接 503）。等待期间不占在途租约。0 = 关闭"
+               "（快速失败，保持旧行为）。", minimum=0.0, group="affinity"),
     HotSetting("quota_expiry_window_seconds", int, "到期积分主窗口（秒）",
                "把「距到期 ≤ 该秒数」的积分加总作为选号第一排序指标；"
                "≤0 关闭整套到期排序（次窗口一并失效）。", minimum=0,
@@ -113,13 +131,19 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("max_inflight_per_credential", int, "单账号在途上限",
                "同一凭证的并发请求达到该值后不再参与选号，避免把单账号打进上游"
                "限流/封号（跨渠道全局生效）。0 = 不限。租约在请求结束后释放，"
-               "另有 600s TTL 兜底漏释放。", minimum=0, group="affinity"),
+               "另有 600s TTL 兜底漏释放。在途数同时是选号的负载键：并发请求"
+               "按「在途最少优先」摊到空闲号（0 = 不限时也照常计数）。",
+               minimum=0, group="affinity"),
     HotSetting("growth_irreversible_actions", bool, "成长中心不可逆动作",
                "是否允许抽奖 / 连登兑换 / 开盲盒 / 消耗补登卡。关闭后仍会领取"
                "旅行礼物与任务奖励。", task="growth"),
     HotSetting("growth_interval_minutes", int, "成长中心周期（分钟）",
                "成长中心后台任务的一轮间隔；下限 5 分钟（更密只会撞上游风控）。",
                minimum=5, task="growth", floor=5),
+    HotSetting("checkin_enabled", bool, "每日签到开关",
+               "Qoder 账号的每日签到（领积分）。lingma 区域无此活动、自动跳过；"
+               "不需要该活动的部署可整体关闭，后台不再定时出网。管理台手动"
+               "「签到」按钮不受影响。", task="checkin"),
     HotSetting("refresh_interval_minutes", int, "token 预刷新周期（分钟）",
                "后台 token 预刷新任务的一轮间隔；下限 5 分钟。短寿命渠道"
                "（CodeArts STS 2h）会把预刷新窗口封顶，此时该周期必须窄于窗口，"
@@ -133,6 +157,12 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "/v1/models 或 Playground 时才刷新，纯 API 用法的部署会让"
                "「模型→渠道」归属表与落盘快照一起变陈旧。下限 5 分钟。",
                minimum=5, task="model_catalog", floor=5),
+    HotSetting("model_probe_minutes", int, "模型探活周期（分钟）",
+               "对仍被负缓存（上游「无此模型」）的 (渠道, 模型) 发一次最小对话的"
+               "间隔：探活成功立即解除避让，额度/限流类失败只记「不确定」不禁用。"
+               "0 = 关闭（默认）：探活会真发上游请求、消耗额度，是否开启按余量"
+               "决定；负缓存本身 6 小时起步，开启后建议 ≥60 分钟。",
+               minimum=0, task="model_probe"),
     HotSetting("openrouter_catalog_minutes", int, "模型目录刷新周期（分钟）",
                "后台拉取 OpenRouter 公开模型列表的间隔：一次抓取代刊例价（成本"
                "估算）、明细元数据（「模型列表」页）与 Artificial Analysis 能力"
@@ -188,6 +218,19 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("activity_report_hour", int, "活跃上报时点（0-23）",
                "本地（北京）时间整点窗口；该小时内每 10 分钟检查一次，每号每天"
                "最多补发一条。", minimum=0, maximum=23, task="activity"),
+    HotSetting("checkin_times", str, "签到时点",
+               "本地时间 HH:MM，逗号分隔（如 `09:37,21:10`）。命中时点才跑一轮"
+               "签到；留空 = 全天每 10 分钟检查一次（旧行为）。上游签到幂等，"
+               "多设几个时点只是多几次重试机会。", task="checkin"),
+    HotSetting("checkin_jitter_minutes", int, "签到抖动（分钟）",
+               "在时点**之前**提前一个 0..N 分钟的随机偏移执行，避免多部署"
+               "同一分钟齐打上游。按「日期 + 时点」去重，抖动不会让同一时点"
+               "跑两次。0 = 不抖。", minimum=0, maximum=1440, task="checkin"),
+    HotSetting("log_buffer_lines", int, "日志页保留行数",
+               "「任务与配置」→ 日志页的进程内环形缓冲行数（只收本进程日志，"
+               "不读文件）。0 = 关闭该页（端点返回 404）。日志行发出前经脱敏"
+               "白名单过滤，含 token / secret / authorization / cookie 的行整行丢弃。",
+               minimum=0, group="observability"),
     # 运维告警：全部归到「运维告警」任务卡片下——改阈值时人就在看
     # 这个任务最近报了什么。webhook 留空 = 只留站内记录、不外推。
     HotSetting("alert_enabled", bool, "运维告警开关",
@@ -235,11 +278,46 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("backup_keep", int, "备份保留份数",
                "只保留最近这么多份备份，更旧的按时间删除；0 表示不清理（只备份）。",
                minimum=0, task="backup"),
+    # 上游状态页聚合：改周期时人就在看这个任务最近抓到了什么。
+    HotSetting("upstream_status_enabled", bool, "上游状态页抓取",
+               "是否抓取各模型 / 网关提供方的官方状态接口并在「上游状态」页展示。"
+               "关闭后页面保留上一次快照并标注已关闭。", task="upstream_status"),
+    HotSetting("upstream_status_minutes", int, "上游状态页周期（分钟）",
+               "并发抓取全部状态源的一轮间隔；官方状态页本身是分钟级更新，抓得"
+               "更密只是白打别人的接口。下限 1 分钟。", minimum=1,
+               task="upstream_status", floor=1),
     HotSetting("metrics_enabled", bool, "Prometheus 指标出口",
                "是否暴露 `GET /metrics`（Prometheus text 格式：请求/token/凭证池/"
                "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
                "（不含凭证 ID / 用户名）。关闭后端点返回 404。",
                group="observability"),
+    HotSetting("request_log_enabled", bool, "请求级结构化日志",
+               "每个业务请求（`/api/*`、`/v1/*`、`/authorize`）写一行 logfmt："
+               "`event=request request_id=… method=… route=… status=… duration_ms=…`。"
+               "路由用模板（`/api/credentials/{credential_id}`）而不是实际 ID；"
+               "**不写 query string、请求体、用户名**。5xx 记 WARNING、其余记 INFO。"
+               "关闭后只剩 uvicorn 的裸 access log。",
+               group="observability"),
+    # reasoning 控制：只给机制、不给策略（不内置默认矩阵——未核实就是编造）
+    HotSetting("force_disable_thinking", bool, "剥离思考内容",
+               "开启后出站响应不再包含模型的思考内容（chat 的 reasoning_content / "
+               "Anthropic 的 thinking 块 / Responses 的 reasoning item 一并过滤）。"
+               "**只过滤响应、不改写请求体**：上游仍照常思考，只是不交给客户端。",
+               group="routing"),
+    HotSetting("reasoning_effort_map", str, "档位映射（出站）",
+               "把客户端显式给的 `reasoning_effort` 改写成渠道期望的档位。格式 "
+               "`渠道=from:to,from:to;*=from:to`（渠道取 KNOWN_PROVIDERS，`*` 兜底）；"
+               "目标写 `none` 表示删除该键、走渠道默认。留空 = 原样透传。只改写"
+               "客户端显式值，渠道自身补的默认档不受影响。",
+               group="routing"),
+    HotSetting("anthropic_thinking_efforts", str, "Anthropic thinking→档位",
+               "把 Anthropic 入站的 `thinking.budget_tokens` 翻成上游 "
+               "`reasoning_effort`。格式 `预算:档位,预算:档位,disabled:档位`："
+               "`disabled` 匹配 `thinking.type==\"disabled\"`，其余取「阈值 ≤ "
+               "budget_tokens 中最大的那一档」，低于最小阈值则不映射。留空 = "
+               "完全不映射（`thinking` 照旧忽略）。Anthropic 未给档位对应表，"
+               "阈值由使用者自行决定。",
+               group="routing"),
 )
 
 HOT_BY_KEY: dict[str, HotSetting] = {item.key: item for item in HOT_SETTINGS}
@@ -556,6 +634,22 @@ class RuntimeSettings:
         return str(self.get("model_fallback_groups"))
 
     @property
+    def model_aliases(self) -> str:
+        return str(self.get("model_aliases"))
+
+    @property
+    def stream_first_event_timeout_seconds(self) -> float:
+        return float(self.get("stream_first_event_timeout_seconds"))
+
+    @property
+    def stream_idle_timeout_seconds(self) -> float:
+        return float(self.get("stream_idle_timeout_seconds"))
+
+    @property
+    def short_cooldown_wait_seconds(self) -> float:
+        return float(self.get("short_cooldown_wait_seconds"))
+
+    @property
     def blocklist_patterns(self) -> tuple[str, ...]:
         """与 `Settings.blocklist_patterns` 同口径，但基于生效值重算。
 
@@ -617,6 +711,10 @@ class RuntimeSettings:
         return int(self.get("model_catalog_minutes"))
 
     @property
+    def model_probe_minutes(self) -> int:
+        return int(self.get("model_probe_minutes"))
+
+    @property
     def openrouter_catalog_minutes(self) -> int:
         return int(self.get("openrouter_catalog_minutes"))
 
@@ -669,8 +767,24 @@ class RuntimeSettings:
         return bool(self.get("activity_report_enabled"))
 
     @property
+    def checkin_enabled(self) -> bool:
+        return bool(self.get("checkin_enabled"))
+
+    @property
     def activity_report_hour(self) -> int:
         return int(self.get("activity_report_hour"))
+
+    @property
+    def checkin_times(self) -> str:
+        return str(self.get("checkin_times"))
+
+    @property
+    def checkin_jitter_minutes(self) -> int:
+        return int(self.get("checkin_jitter_minutes"))
+
+    @property
+    def log_buffer_lines(self) -> int:
+        return int(self.get("log_buffer_lines"))
 
     # ---------------------------------------------------------- 运维告警
 
@@ -732,9 +846,37 @@ class RuntimeSettings:
     def backup_keep(self) -> int:
         return int(self.get("backup_keep"))
 
+    # ------------------------------------------------------ 上游状态页聚合
+
+    @property
+    def upstream_status_enabled(self) -> bool:
+        return bool(self.get("upstream_status_enabled"))
+
+    @property
+    def upstream_status_minutes(self) -> int:
+        return int(self.get("upstream_status_minutes"))
+
     @property
     def metrics_enabled(self) -> bool:
         return bool(self.get("metrics_enabled"))
+
+    @property
+    def request_log_enabled(self) -> bool:
+        return bool(self.get("request_log_enabled"))
+
+    # ------------------------------------------------------ reasoning 控制
+
+    @property
+    def force_disable_thinking(self) -> bool:
+        return bool(self.get("force_disable_thinking"))
+
+    @property
+    def reasoning_effort_map(self) -> str:
+        return str(self.get("reasoning_effort_map"))
+
+    @property
+    def anthropic_thinking_efforts(self) -> str:
+        return str(self.get("anthropic_thinking_efforts"))
 
     # ---------------------------------------------------------- 透明委托
 

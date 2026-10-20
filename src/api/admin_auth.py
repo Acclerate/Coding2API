@@ -21,6 +21,7 @@ from ..auth.session import create_session_token
 from ..auth.users import create_password_hash, verify_password
 from ..compat.openai.request import InvalidRequest
 from ..config import Settings
+from ..webapp.security import session_cookie_secure
 from .deps import (
     SESSION_COOKIE,
     Services,
@@ -40,12 +41,16 @@ def resolve_public_callback_url(settings: Settings) -> str:
 
 
 def issue_session(response: JSONResponse, services: Services, username: str, *,
-                  role: str, must_change_password: bool) -> None:
-    """按当前 epoch 签发会话 Cookie（三处签发共用，避免 TTL/属性漂移）。"""
+                  request: Request, role: str, must_change_password: bool) -> None:
+    """按当前 epoch 签发会话 Cookie（三处签发共用，避免 TTL/属性漂移）。
+
+    `Secure` 按请求的实际协议判定（见 `session_cookie_secure`）：同一实例可能
+    同时有 LAN(http) 与隧道(https) 两条入口，写死任一侧都会打断另一侧。
+    """
     epoch = services.users.session_epoch(username) or 0
     token = create_session_token(username, services.settings.app_secret, epoch=epoch)
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax",
-                        secure=services.settings.public_base_url.startswith("https://"),
+                        secure=session_cookie_secure(request, services.settings),
                         max_age=12 * 3600, path="/")
 
 
@@ -93,7 +98,7 @@ def create_router(services: Services) -> APIRouter:
                                  "is_operator": role in (ROLE_ADMIN, ROLE_OPERATOR),
                                  "role": role,
                                  "must_change_password": must_change})
-        issue_session(response, services, username, role=role,
+        issue_session(response, services, username, request=request, role=role,
                       must_change_password=must_change)
         return response
 
@@ -137,8 +142,8 @@ def create_router(services: Services) -> APIRouter:
         # 改密会 bump epoch：换发一张新 Cookie，否则本次请求返回后自己也被登出。
         response = JSONResponse({"ok": True})
         role = services.users.role_of(principal.username) or ""
-        issue_session(response, services, principal.username, role=role,
-                      must_change_password=False)
+        issue_session(response, services, principal.username, request=request,
+                      role=role, must_change_password=False)
         return response
 
     # ------------------------------------------------- 上游登录（poll 轨道）

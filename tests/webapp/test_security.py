@@ -384,6 +384,56 @@ def test_login_throttle_evicts_keys_over_capacity():
     assert ("g", "") in throttle._events
 
 
+def _request(headers: dict[str, str]):
+    """构造只带指定头的 Request（用于 session_cookie_secure 分支测试）。"""
+    from starlette.requests import Request
+
+    return Request(scope={"type": "http",
+                          "headers": [(k.lower().encode(), v.encode())
+                                      for k, v in headers.items()]})
+
+
+def test_session_cookie_secure_follows_forwarded_proto():
+    """有 XFP 时以第一个条目为准；非法值落到 Host 判定分支。"""
+    from src.webapp.security import session_cookie_secure
+
+    http_settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                             PUBLIC_BASE_URL="http://127.0.0.1:8000")
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "https"}),
+        http_settings) is True
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "http"}),
+        http_settings) is False
+    # 多值取第一段（隧道叠加多级代理时会追加）
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "HTTPS, http"}),
+        http_settings) is True
+    # 非法协议视为无该头 → 明文部署一律不 Secure
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "ftp"}),
+        http_settings) is False
+
+
+def test_session_cookie_secure_without_forwarded_proto():
+    """无 XFP：仅当 Host 命中 https 的 PUBLIC_BASE_URL 主机才判 Secure。"""
+    from src.webapp.security import session_cookie_secure
+
+    https_settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                              PUBLIC_BASE_URL="https://ai-api.robbs.work")
+    assert session_cookie_secure(_request({"host": "ai-api.robbs.work"}),
+                                 https_settings) is True
+    assert session_cookie_secure(_request({"host": "ai-api.robbs.work:443"}),
+                                 https_settings) is True
+    # 直连其它地址（LAN IP）视为明文
+    assert session_cookie_secure(_request({"host": "192.168.124.35:8000"}),
+                                 https_settings) is False
+    assert session_cookie_secure(_request({}), https_settings) is False
+    # https 但 base 主机解析为空（无 scheme / 无 host）→ 不 Secure
+    empty = Settings(_env_file=None, APP_SECRET=SECRET, PUBLIC_BASE_URL="https:///oops")
+    assert session_cookie_secure(_request({"host": "oops"}), empty) is False
+
+
 def test_host_allowed_public_base_url_edge_shapes():
     """PUBLIC_BASE_URL 无 scheme / path_host 为空时不炸也不误放行。"""
     from src.config import Settings

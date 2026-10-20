@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PlaygroundPage } from "../PlaygroundPage";
 import { jsonResponse, mockFetch, renderPage, userEvent } from "@/test-utils";
@@ -52,6 +52,26 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
     expect(screen.getByTestId("playground-page")).toBeInTheDocument();
     expect(screen.queryByTestId("playground-key")).not.toBeInTheDocument();
+  });
+
+  it("自定义别名条目在选择器里带「自定义别名」徽章（当前选择条同样标）", async () => {
+    mockFetch({ "/api/playground/models": {
+      object: "list",
+      data: [
+        {
+          id: "team-fast", object: "model", owned_by: "Coding2API",
+          providers: ["trae"], name: "team-fast",
+          custom_alias: true, alias_target: "glm-5.2",
+        },
+      ],
+    } });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const option = screen.getByTestId("model-option-team-fast@trae");
+    expect(within(option).getByTestId("model-alias-badge")).toHaveTextContent("自定义别名");
+    expect(within(screen.getByTestId("model-current"))
+      .getByTestId("model-current-alias")).toHaveTextContent("自定义别名");
   });
 
   it("默认选中倍率最小的模型；选中后展示上限与能力，双渠道倍率在选择器里按渠道显示", async () => {
@@ -206,9 +226,9 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     // 无倍率数据：只显示渠道徽章，不显示倍率
     const noRate = screen.getByTestId("model-option-no-rate@trae");
     expect(noRate).toHaveTextContent("TRAE");
-    // 无倍率数据：渠道徽章里没有倍率块（免费/「x」数字）
+    // 无倍率数据：渠道徽章里没有倍率块（「免」/「x」数字）
     expect(noRate.querySelector('[data-testid="channel-pill-trae"]')).toBeInTheDocument();
-    expect(noRate.textContent).not.toMatch(/x\d|免费/);
+    expect(noRate.textContent).not.toMatch(/x\d|免/);
   });
 
   it("多渠道徽章不挤压模型名：名称保底宽度、徽章在右侧折行", async () => {
@@ -292,7 +312,39 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByText("没有匹配的模型")).toBeInTheDocument();
   });
 
-  it("免费模型（x0）的倍率块显示「免费」，单渠道当前选择条不打自动路由标", async () => {
+  it("福利模型（CodeArts 每日池）在渠道徽章打「福」标，多渠道只标该渠道", async () => {
+    const BENEFIT_MODELS = {
+      object: "list",
+      data: [
+        {
+          id: "deepseek-v4.1-flash", object: "model", owned_by: "Coding2API",
+          providers: ["codearts", "trae"],
+          by_provider: {
+            codearts: { raw_id: "deepseek-v4.1-flash", benefit: true },
+            trae: { raw_id: "deepseek-v4.1-flash", credit_rate: 0.08 },
+          },
+        },
+        {
+          id: "benefit-only", object: "model", owned_by: "Coding2API",
+          providers: ["codearts"], benefit: true,
+        },
+      ],
+    };
+    mockFetch({ "/api/playground/models": BENEFIT_MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    // 多渠道：只有 codearts 那侧打「福」标（trae 侧不打）
+    const dual = screen.getByTestId("model-option-deepseek-v4.1-flash");
+    expect(within(dual).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
+    expect(within(dual).queryByTestId("channel-benefit-trae")).not.toBeInTheDocument();
+
+    // 单渠道福利：顶层 benefit 也打「福」标
+    const single = screen.getByTestId("model-option-benefit-only@codearts");
+    expect(within(single).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
+  });
+
+  it("免费模型（x0）的倍率块显示「免」，单渠道当前选择条不打自动路由标", async () => {
     const FREE_MODELS = {
       object: "list",
       data: [
@@ -308,7 +360,7 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
 
     const current = screen.getByTestId("model-current");
     expect(current).toHaveTextContent("kilo-auto/free");
-    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免费");
+    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免");
     // 单渠道模型不显示「自动路由」标
     expect(current).not.toHaveTextContent("自动路由");
   });
@@ -671,6 +723,73 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     await userEvent.click(screen.getByTestId("model-option-plain@codebuddy"));
     await userEvent.click(screen.getByTestId("model-option-thinker@codebuddy"));
     expect(screen.getByTestId("param-effort")).toHaveValue("");
+  });
+
+  it("提示词框内 Ctrl/⌘ + Enter 直接发送", async () => {
+    const calls = spyChat(MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
+
+    await waitFor(() =>
+      expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(true),
+    );
+  });
+
+  it("多渠道时当前选择条只渲染一份渠道徽章（徽章即渠道按钮）", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const current = screen.getByTestId("model-current");
+    // 徽章不再静态列一遍、渠道按钮再列一遍：每个渠道在「当前选择」条里只出现一次
+    for (const provider of ["codebuddy", "trae"]) {
+      expect(within(current).getAllByTestId(`channel-pill-${provider}`)).toHaveLength(1);
+      // 徽章就挂在渠道按钮内部，点它即强制该渠道
+      expect(
+        within(within(current).getByTestId(`provider-pin-${provider}`))
+          .getByTestId(`channel-pill-${provider}`),
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("请求进行中再次提交被忽略，不重复发请求", async () => {
+    let release: () => void = () => {};
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: { url: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push({ url });
+        if (url.includes("/api/playground/models")) return jsonResponse(MODELS);
+        await pending;
+        return jsonResponse({ choices: [{ message: { content: "ok" } }] });
+      }),
+    );
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+    await userEvent.click(screen.getByTestId("stream-toggle"));
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.click(screen.getByTestId("send-request"));
+
+    // 请求在途：⌘/Ctrl+Enter 走 requestSubmit()，真实浏览器里不受发送按钮
+    // disabled 约束（jsdom 会拦，所以这里直接派发 submit 事件来覆盖该路径）。
+    // 没有 busy 守卫时这里会发出第二个 POST，重复计费。
+    const form = screen.getByTestId("playground-prompt").closest("form")!;
+    fireEvent.submit(form);
+
+    release();
+    await waitFor(() =>
+      expect(screen.getByTestId("playground-answer")).toHaveTextContent("ok"),
+    );
+    expect(calls.filter((item) => item.url.includes("/api/playground/chat/completions")))
+      .toHaveLength(1);
   });
 
   it("非法数值拦住发送并给出提示，不发请求", async () => {

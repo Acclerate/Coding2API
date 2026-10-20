@@ -16,6 +16,8 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage").then(m => ({ defa
 const UsersPage = lazy(() => import("./pages/UsersPage").then(m => ({ default: m.UsersPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then(m => ({ default: m.AuditPage })));
 const AlertsPage = lazy(() => import("./pages/AlertsPage").then(m => ({ default: m.AlertsPage })));
+const LogsPage = lazy(() => import("./pages/LogsPage").then(m => ({ default: m.LogsPage })));
+const UpstreamStatusPage = lazy(() => import("./pages/UpstreamStatusPage").then(m => ({ default: m.UpstreamStatusPage })));
 
 const LOADING = (
   <div className="grid h-full place-items-center text-sm text-[var(--color-ink-muted)]">载入中…</div>
@@ -29,6 +31,15 @@ const LOADING = (
  */
 function RequireAdmin({ isAdmin, children }: { isAdmin: boolean; children: React.ReactNode }) {
   if (!isAdmin) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
+/** 操作员（含 admin）页面的路由守卫：viewer 送回首页。与侧栏 `operator` 项同口径。 */
+function RequireOperator({ isOperator, children }: {
+  isOperator: boolean;
+  children: React.ReactNode;
+}) {
+  if (!isOperator) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -65,11 +76,13 @@ export function App() {
           <Route path="/credentials" element={<Navigate to="/" replace />} />
           <Route path="/api-keys" element={<ApiKeysPage />} />
           <Route path="/stats" element={<StatsPage />} />
-          <Route path="/models" element={<ModelCatalogPage />} />
           <Route path="/playground" element={<PlaygroundPage />} />
           <Route path="/users" element={<RequireAdmin isAdmin={session.data.is_admin}><UsersPage /></RequireAdmin>} />
           <Route path="/audit" element={<RequireAdmin isAdmin={session.data.is_admin}><AuditPage /></RequireAdmin>} />
+          <Route path="/logs" element={<RequireAdmin isAdmin={session.data.is_admin}><LogsPage /></RequireAdmin>} />
           <Route path="/alerts" element={<RequireAdmin isAdmin={session.data.is_admin}><AlertsPage /></RequireAdmin>} />
+          <Route path="/upstream" element={<RequireOperator isOperator={session.data.is_operator}><UpstreamStatusPage /></RequireOperator>} />
+          <Route path="/models" element={<RequireOperator isOperator={session.data.is_operator}><ModelCatalogPage /></RequireOperator>} />
           <Route path="/settings" element={<RequireAdmin isAdmin={session.data.is_admin}><SettingsPage /></RequireAdmin>} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

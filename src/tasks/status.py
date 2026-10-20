@@ -35,7 +35,8 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
     TaskSpec("refresh", "token 预刷新",
              "到期前窗口内轮换 refresh token；只在进入窗口时真正调用上游。"),
     TaskSpec("checkin", "每日签到",
-             "全天每 10 分钟检查一次；成功后该凭证当日封账，失败持续重试。"),
+             "按配置时点（留空 = 全天每 10 分钟）检查；抖动提前 0..N 分钟，"
+             "同一时点每天只跑一次。成功后该凭证当日封账，失败持续重试。"),
     TaskSpec("growth", "成长中心",
              "领旅行礼物 / 派 Buddy / 领任务奖 / 补登 / 兑换 / 抽奖 / 开盲盒；"
              "周期见「成长中心周期」。"),
@@ -46,6 +47,10 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
     TaskSpec("model_catalog", "渠道模型列表刷新",
              "兜底重拉各渠道模型表：没有它，列表只在有人访问 /v1/models 或 "
              "Playground 时才刷新，纯 API 用法的部署会让归属表与落盘快照变陈旧。"),
+    TaskSpec("model_probe", "模型可用性探活",
+             "对仍被负缓存（「上游无此模型」）的 (渠道, 模型) 发一次最小对话："
+             "成功即解除避让，额度/限流类失败只记 inconclusive 不禁用。"
+             "周期见「模型探活周期」。"),
     TaskSpec("openrouter_catalog", "模型目录刷新（OpenRouter）",
               "一次抓取 OpenRouter 公开模型列表，落盘三份数据：刊例价（成本估算）、"
               "明细元数据（「模型列表」页）、Artificial Analysis 能力指数"
@@ -57,6 +62,11 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
     TaskSpec("backup", "数据库备份",
              "周期性把主库一致性快照（VACUUM INTO）写进 DATA_DIR/backups/，"
              "并只保留最近 N 份；周期与保留份数见「备份周期」「备份保留份数」。"),
+    TaskSpec("upstream_status", "上游状态页",
+             "并发抓各模型 / 网关提供方的官方状态接口（OpenCode Zen / Kilo / "
+             "DeepSeek / Together / Moonshot / MiniMax / OpenAI / Anthropic），"
+             "归一化后存内存供「上游状态」页展示。只做解释不做决策，不参与选号；"
+             "周期见「上游状态页周期」。"),
 )
 
 TASK_BY_KEY: dict[str, TaskSpec] = {spec.key: spec for spec in TASK_SPECS}

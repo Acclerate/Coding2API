@@ -69,9 +69,11 @@ def test_v1_models_and_playground_carry_benchmarks(tmp_path, monkeypatch):
         key = _create_api_key(client)
         data = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"}).json()
         rows = {row["id"]: row for row in data["data"]}
-        assert rows["glm-5.3"]["benchmarks"]["intelligence_index"] == 44.8
+        # 对外 id 带渠道后缀（_seed_models 塞的是 trae），能力分按对外 id /
+        # 归一主体 / 展示名三路匹配——主体 `glm-5.3` 命中
+        assert rows["glm-5.3-trae"]["benchmarks"]["intelligence_index"] == 44.8
         # 前缀不算匹配：没有分数就不带该字段，而不是带一个错的值
-        assert "benchmarks" not in rows["glm-5.3-flash"]
+        assert "benchmarks" not in rows["glm-5.3-flash-trae"]
 
 def test_models_endpoint_without_table_has_no_benchmarks(tmp_path, monkeypatch):
     """能力表为空（拉取失败 / 未装配）时，条目与加字段前完全一致。"""
@@ -237,6 +239,118 @@ def test_model_catalog_availability_ignores_channel_without_credentials(tmp_path
         rows = {row["id"]: row for row in client.get("/api/model-catalog").json()["models"]}
     assert rows["z-ai/glm-5.3"]["available"] is False
 
+def test_model_catalog_filters_and_paginates_server_side(tmp_path, monkeypatch):
+    """`q` / `only_available` / `limit` / `offset` 都在服务端生效，`total` 是筛选后条数。
+
+    `count` 仍是目录全量（页头「命中 N / 共 M」），只有 `total` 随筛选变化。
+    """
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+        "moonshotai/kimi-k3": {"id": "moonshotai/kimi-k3", "name": "Kimi K3",
+                               "provider": "moonshotai", "input": 0.5, "output": 1.0,
+                               "cache_read": 0.05},
+        "xai/grok": {"id": "xai/grok", "name": "Grok", "provider": "xai",
+                     "input": 2.0, "output": 4.0, "cache_read": 0.2},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    # 只有 glm-5.3 接了渠道 → only_available 只剩它
+    _seed_models(app.state.services, models={"glm-5.3": "GLM 5.3"})
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+
+        # 空 q（None / 纯空白）不筛；count 恒为目录全量
+        all_payload = client.get("/api/model-catalog", params={"q": "  "}).json()
+        assert all_payload["count"] == 3
+        assert all_payload["total"] == 3
+
+        # q 命中 id：大小写不敏感
+        by_id = client.get("/api/model-catalog", params={"q": "KIMI"}).json()
+        assert [row["id"] for row in by_id["models"]] == ["moonshotai/kimi-k3"]
+        assert by_id["total"] == 1
+
+        # q 命中名称（id 里没有 needle）
+        by_name = client.get("/api/model-catalog", params={"q": "grok"}).json()
+        assert [row["id"] for row in by_name["models"]] == ["xai/grok"]
+
+        # 既不命中 id 也不命中名称 → 空表 + total=0
+        none_hit = client.get("/api/model-catalog", params={"q": "zzz"}).json()
+        assert none_hit["models"] == [] and none_hit["total"] == 0
+
+        # only_available 只留接入渠道的行
+        available = client.get("/api/model-catalog", params={"only_available": True}).json()
+        assert [row["id"] for row in available["models"]] == ["z-ai/glm-5.3"]
+        assert available["total"] == 1
+
+        # limit / offset 切片：id 升序下取第 2 条（kimi-k3 < xai/grok < z-ai/glm-5.3）
+        page = client.get("/api/model-catalog", params={"limit": 1, "offset": 1}).json()
+        assert [row["id"] for row in page["models"]] == ["xai/grok"]
+        assert page["total"] == 3
+
+
+def test_model_catalog_marks_suspected_from_recent_failures(tmp_path, monkeypatch):
+    """`suspected`：最近窗口内该模型有过模型级失败（口径见可用性视图）。
+
+    目录 id（`z-ai/glm-5.3`）与网关侧对外名（`glm-5.3`）靠候选键对上；没有
+    失败记录的行**不带**该字段（「没数据」不等于「确认健康」）。`only_suspected`
+    只留带该字段的行，`availability_days` 随响应下发供前端显示「近 N 天」。
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {}, {}, {
+        "z-ai/glm-5.3": {"id": "z-ai/glm-5.3", "name": "GLM 5.3", "provider": "z-ai",
+                         "input": 1.0, "output": 2.0, "cache_read": 0.1},
+        "moonshotai/kimi-k3": {"id": "moonshotai/kimi-k3", "name": "Kimi K3",
+                               "provider": "moonshotai", "input": 0.5, "output": 1.0,
+                               "cache_read": 0.05},
+    })
+    app = _benchmarks_app(tmp_path, monkeypatch, table=None, raw={})
+    with TestClient(app):
+        pass
+    db = app.state.stats_collector._db  # noqa: SLF001 - 直接造明细（见下）
+    now = int(time.time())
+    with db.transaction() as conn:
+        # `upstream_blocked` 不在受控集合里，必须直接写库（走 record 会被置 None）
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_1", now - 60, "root", "trae", "glm-5.3", 0, "upstream_blocked"))
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_2", now - 90, "root", "trae", "glm-5.3", 0, "invalid_request"))
+        conn.execute(
+            "INSERT INTO usage_events (id, ts, username, provider, model, ok, error_type)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("evt_3", now - 120, "root", "kilo", "glm-5.3", 0, "invalid_request"))
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        payload = client.get("/api/model-catalog").json()
+        only = client.get("/api/model-catalog",
+                          params={"only_suspected": True}).json()
+        clamped = client.get("/api/model-catalog",
+                             params={"availability_days": 999}).json()
+    rows = {row["id"]: row for row in payload["models"]}
+    assert rows["z-ai/glm-5.3"]["suspected"]["failures"] == 2
+    # 同一候选键对应两条 (渠道, 模型)：只保留失败最多的那条
+    assert rows["z-ai/glm-5.3"]["suspected"]["provider"] == "trae"
+    assert "suspected" not in rows["moonshotai/kimi-k3"]
+    assert [row["id"] for row in only["models"]] == ["z-ai/glm-5.3"]
+    assert only["total"] == 1
+    assert payload["availability_days"] == 7
+    assert clamped["availability_days"] == 30
+
+
 def test_model_catalog_endpoint_empty_table(tmp_path, monkeypatch):
     """无快照时回空表 + saved_at=None（页面显示空态，不是错误）。"""
     async def no_models(_url):
@@ -257,6 +371,19 @@ def test_model_catalog_endpoint_requires_session(tmp_path):
     app = _price_app(tmp_path)
     with TestClient(app) as client:
         assert client.get("/api/model-catalog").status_code == 401
+
+
+def test_model_catalog_endpoint_rejects_viewer(tmp_path):
+    """viewer（非 operator）403：模型列表已移入管理组，与上游状态同门槛。"""
+    from fastapi.testclient import TestClient
+
+    from src.auth.session import create_session_token
+
+    save_catalog(str(tmp_path), {"m": (1.0, 2.0, 0.5)}, {}, {})
+    app = _price_app(tmp_path)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+        assert client.get("/api/model-catalog").status_code == 403
 
 # --------------------------------------------------------- 汇率热更
 

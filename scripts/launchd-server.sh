@@ -25,8 +25,9 @@ if ! "$ROOT/scripts/build-web.sh"; then
 fi
 
 echo "launchd-server: 启动后端…"
-# --timeout-graceful-shutdown 必须与 src/main.py 的 GRACEFUL_SHUTDOWN_SECONDS 一致：
-# 这条路径直接跑 uvicorn CLI（不经 src.main:run），漏了它本地就是「无限等」，
-# 与 Docker/systemd 行为不一致（kickstart -k 会一直卡到被强杀）。
-exec /opt/homebrew/bin/uv run python -m uvicorn src.main:build_app \
-    --factory --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 30
+# 走 src.main:run（而非 uvicorn CLI）：HOST/PORT 是 config.py 的文档化配置项，
+# 写死 --host/--port 会让 .env 里的设置静默失效——launchd 不读 .env，
+# 只有进程自己（pydantic-settings）读，所以监听地址必须由 run() 决定。
+# 与 Docker CMD 同一条路径，GRACEFUL_SHUTDOWN_SECONDS 由 run() 内部传给 uvicorn，
+# 三条启动路径的停机窗口自动同源，不再各写一个数字（写死过 30，见 git 历史）。
+exec /opt/homebrew/bin/uv run python -m src.main

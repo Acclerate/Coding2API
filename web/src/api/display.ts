@@ -7,7 +7,7 @@
  * 是两回事——前者不该提示用户去点「探测」。
  */
 
-import type { Credential, Health, ModelCooldown, ProbeFailureReason } from "../api/types";
+import type { Credential, Health, ModelCooldown, ProbeFailureReason, UpstreamLevel } from "../api/types";
 
 export type HealthKind = "known" | "unknown" | "noprobe" | "exhausted";
 
@@ -43,6 +43,23 @@ export function healthView(health: Health, provider?: string): HealthView {
 }
 
 /**
+ * 一条凭证在**某个展示组**里的健康度。
+ *
+ * CodeArts 在凭证页拆成两组、每组只讲一本账，健康度也必须跟着账本走：
+ * 后端 `health` 只按主账（每日 token 池）算，积分账另有派生的
+ * `quota_credits_health`。若内置组仍读 `health`，就会出现「额度列显示
+ * 积分还剩 99%、健康度却 0%」的自相矛盾。
+ *
+ * 其余渠道与福利组都读主账；调度口径始终只有 `health` 一个（派生值不改选号）。
+ */
+export function credentialHealth(
+  credential: Credential,
+  ledger: "pool" | "credits" = "pool",
+): Health {
+  return ledger === "credits" ? credential.quota_credits_health : credential.health;
+}
+
+/**
  * 周期语义：CodeBuddy 的额度随周期重置，TRAE 是单调递减的账户余额，
  * Zen / Kilo 走免费层、上游没有额度接口（探测恒为「未知」），
  * CodeArts 是**每日积分池**（上游 1000 万 token 折 1000 积分，当日 0 点清零、不累计）。
@@ -63,6 +80,8 @@ export function quotaSemantics(credential: Credential): string {
   // 1 积分 = 10000 token），当日 0 点清零——上游不给重置时间戳，固定按时段
   // 描述，不能退化成「本周期剩余」。这里的「积分」是合成折算值，与上游真积分
   // （内置模型计费单位）同名不同物，故文案用「额度池」而非「积分」。
+  // 另有并行的积分账（内置模型）在凭证页「CodeArts 内置」组单独展示，
+  // 见 CREDITS_QUOTA_SEMANTICS。
   if (credential.provider === "codearts") {
     return "每日额度池（token 折算，当日 0 点清零）";
   }
@@ -73,6 +92,20 @@ export function quotaSemantics(credential: Credential): string {
   const date = new Date(credential.quota_cycle_end * 1000).toLocaleDateString("zh-CN");
   return `本周期剩余，${date} 重置`;
 }
+
+/**
+ * 第二本账（CodeArts 积分）的口径说明：内置模型（GLM-5.2 / OpenPangu 等）
+ * 按积分计费，与福利模型走的每日 token 池是**并行的两本账**、互不通气
+ * （上游两个接口各自独立，实测）。其余渠道无此账（`quota_credits_*` 恒 null），
+ * 故调用方要先判空再渲染。
+ *
+ * 措辞刻意与主账区分：主账是「额度池（token 折算）」，这里是「积分」——
+ * 上游数值本身就是积分，不经 `units` 折算，两者同名不同物。
+ */
+export const CREDITS_QUOTA_SEMANTICS =
+  "内置模型积分（GLM-5.2 / OpenPangu 等）：与每日额度池并行的独立账本，" +
+  "按积分计费，套餐到期日作废。选号仍按每日池额度算（调度口径不变），" +
+  "但本组健康度按积分账算，与本组额度同源；到期日计入「快过期先用」。";
 
 /**
  * 额度单位统一为「积分」：CodeArts 上游的 token 已在后端折成积分
@@ -164,11 +197,17 @@ export type CredentialState =
   | "off"
   | "exhausted";
 
-export function credentialState(credential: Credential, now = Date.now() / 1000): CredentialState {
+export function credentialState(
+  credential: Credential,
+  now = Date.now() / 1000,
+  /** 本组讲的那本账的健康度；缺省＝主账（`credential.health`）。
+   *  CodeArts 内置组传积分账派生的健康度，否则会出现「额度 99% + 额度耗尽」。 */
+  health: Health = credential.health,
+): CredentialState {
   if (credential.disabled) return "disabled";
   if (!credential.enabled) return "off";
   if (cooldownRemaining(credential.cooling_until, now) > 0) return "cooling";
-  if (credential.health !== null && credential.health < 0) return "exhausted";
+  if (health !== null && health < 0) return "exhausted";
   return "ready";
 }
 
@@ -424,7 +463,9 @@ export type UsageErrorType =
   | "no_healthy_credential"
   | "rate_limit"
   | "upstream_error"
-  | "upstream_protocol";
+  | "upstream_protocol"
+  | "upstream_first_event_timeout"
+  | "upstream_idle_timeout";
 
 /** 明细失败类型的中文说明（TECHNICAL §11.2：界面只展示稳定枚举的翻译）。 */
 export const USAGE_ERROR_LABEL: Record<UsageErrorType, string> = {
@@ -436,6 +477,8 @@ export const USAGE_ERROR_LABEL: Record<UsageErrorType, string> = {
   rate_limit: "额度耗尽",
   upstream_error: "渠道错误",
   upstream_protocol: "渠道响应异常",
+  upstream_first_event_timeout: "上游首字超时",
+  upstream_idle_timeout: "上游流中断",
 };
 
 /** 未知取值不得原样透传（TECHNICAL §11.2），兜底为「失败」。 */
@@ -446,16 +489,61 @@ export function usageErrorLabel(errorType: string | null | undefined): string {
 
 
 export const PROBE_FAILURE_LABEL: Record<ProbeFailureReason, string> = {
-  credential_rejected: "凭证被渠道拒绝，需要重新登录该账号",
+  credential_rejected: "凭证被渠道拒绝，需重新登录",
   rate_limited: "渠道限流，稍后重试",
-  upstream_unavailable: "渠道服务异常，与本账号凭证无关",
+  upstream_unavailable: "渠道服务异常，与凭证无关",
   upstream_rejected: "渠道拒绝了这次请求",
-  upstream_response_invalid: "渠道响应格式与预期不符，可能是官方接口变更",
+  upstream_response_invalid: "渠道响应格式与预期不符（疑似接口变更）",
   upstream_timeout: "渠道响应超时",
-  network_unreachable: "连不上渠道服务器，检查本机网络或代理",
+  network_unreachable: "连不上渠道服务器，检查网络或代理",
   unknown_error: "未知错误",
 };
 
 export function probeFailureLabel(reason: ProbeFailureReason | undefined): string {
   return reason ? (PROBE_FAILURE_LABEL[reason] ?? "未知错误") : "未知错误";
+}
+
+// ---------------------------------------------------------- 上游状态页
+
+/**
+ * 上游档位的中文名（与后端六档一一对应）。
+ *
+ * 措辞区分「故障」与「维护」：维护是计划内、不一定是问题，但也不能显示成
+ * 一切正常——用户看到 429 时最需要知道的是「现在到底是不是上游在动」。
+ */
+export const UPSTREAM_LEVEL_LABEL: Record<UpstreamLevel, string> = {
+  operational: "正常",
+  degraded: "性能下降",
+  partial: "部分中断",
+  major: "重大故障",
+  maintenance: "维护中",
+  unknown: "未知",
+};
+
+/**
+ * 上游档位 → 徽标色调。
+ *
+ * `partial` 与 `major` 都归 danger：两者都意味着「有模型用不了」，只是范围不同，
+ * 分两种红只会让配色更碎；范围差异由文字承担。`unknown` 用 muted——抓取失败
+ * 不是「上游挂了」，不该和真实故障抢同一个红色。
+ */
+export function upstreamLevelTone(level: UpstreamLevel): "ok" | "warn" | "danger" | "muted" {
+  switch (level) {
+    case "operational":
+      return "ok";
+    case "degraded":
+      return "warn";
+    case "partial":
+    case "major":
+      return "danger";
+    case "maintenance":
+      return "warn";
+    default:
+      return "muted";
+  }
+}
+
+/** 上游档位展示名；未知取值不原样透传（与 usageErrorLabel 同一口径）。 */
+export function upstreamLevelLabel(level: string): string {
+  return UPSTREAM_LEVEL_LABEL[level as UpstreamLevel] ?? "未知";
 }

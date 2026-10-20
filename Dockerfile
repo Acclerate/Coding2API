@@ -50,8 +50,11 @@ ENV DATA_DIR=/app/data \
     PORT=8000
 
 EXPOSE 8000
+# 端口跟随上面的 PORT（默认 8000）：写死 8000 会让非默认 PORT 的
+# `docker run` 部署永远不 healthy。用 python 读 os.environ 而非 shell 展开，
+# 因为 HEALTHCHECK 的 exec 形式不做变量替换。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"
+    CMD python -c "import os,urllib.request;urllib.request.urlopen(f\"http://127.0.0.1:{os.environ.get('PORT','8000')}/health\")"
 
 # CMD 走 src.main:run（而非硬编码 --host/--port）：HOST/PORT 是文档化配置项
 # （config.py + README），硬编码会让它们只对本地启动生效、在容器里静默失效。

@@ -56,6 +56,9 @@ EP_MODEL_BUILTIN = "/v1/model/builtin"
 EP_BENEFIT_CONFIG = "/api/v1/gateway/config"
 EP_BENEFIT_CLAIM = "/api/v1/benefit/claim"
 EP_TOKEN_BALANCE = "/api/v1/user/tokens/balance"
+# 积分账（内置模型）统计：**挂在 snap 引擎根上、带 `snap-manager` 前缀**，
+# 与 `/v1/ops/*`（签到，不带前缀）相反；不带前缀回 APIG.0101（实测）。
+EP_STATISTICS_PLUGIN = "/snap-manager/v1/statistics/plugin"
 EP_LOGIN_TICKET = "/v1/login/ticket"
 EP_OAUTH_TOKENS = "/v1/oauth2/tokens"
 EP_CURRENT_USER = "/v1/current/user"
@@ -93,6 +96,11 @@ _MODEL_ABSENT_MARKERS = ("002002009", "not registered", "4004.200", "benefit not
 _CONCURRENCY_MARKERS = ("00001041", "并发")
 # 模型级限流：上游点名当前模型（TPM、429 等），配额类限流恢复慢，走 MODEL。
 _MODEL_THROTTLE_MARKERS = ("tpm", "429", "rate limit", "throttl")
+# 请求本身不合法（换账号 / 重试都没用）→ REQUEST，不冷却、不累计。
+# `InferHub.001001020.406 The request model is not multimodal` 是实测原文：
+# 请求带了图片而该模型不支持多模态。判成其它类型会让正常用户请求把整条渠道
+# 拉进冷却（3 次 OTHER → 10min 冷却），故按请求侧错误单独分类。
+_REQUEST_MARKERS = ("001001020", "not multimodal")
 # HTTP 状态码侧的限流/并发标记。与流内业务码不同，这里判的是**响应体文本**：
 # 上游把并发超限放在 HTTP 400（不是 429），命中即应算可重试的限流。
 # 并发与否的区分见 _CONCURRENCY_MARKERS（先判并发，再判模型级限流）。
@@ -314,6 +322,8 @@ def classify_error_code(code: str | None) -> ErrKind:
         return ErrKind.CONCURRENCY
     if any(marker in text for marker in _MODEL_THROTTLE_MARKERS):
         return ErrKind.MODEL
+    if any(marker in text for marker in _REQUEST_MARKERS):
+        return ErrKind.REQUEST
     if "1005" in text or "quota" in text or "insufficient" in text:
         return ErrKind.PLAN
     if "apig.0301" in text or "decrypt token" in text:

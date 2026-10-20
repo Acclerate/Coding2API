@@ -23,12 +23,14 @@ from ..audit.actions import (
     ACTION_CREDENTIAL_PIN,
     ACTION_CREDENTIAL_REVIVE,
     ACTION_CREDENTIAL_SWITCH_ACCOUNT,
+    ACTION_CREDENTIAL_TAGS,
     ACTION_CREDENTIAL_TOGGLE,
 )
 from ..auth.rbac import require_operator
 from ..compat.openai.request import InvalidRequest
 from ..provider.base import GrowthResult, GrowthStep, StepStatus
 from ..sorting import sort_rows
+from ..tags import parse_tags
 from .deps import Services, csrf_protected, principal_from_request
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,8 @@ BATCH_CONCURRENCY = 4
 
 # 批量动作 → 审计动作。探测 / 签到是只读语义（与单条端点一致，不写审计），
 # 只有真正改动凭证状态的 toggle / revive 落一条汇总流水。
+# 写入本身有兜底：审计落库失败只记 warning，不让整批操作返回 500
+# （逐条结果比留痕更重要，且变更此时已提交生效）。
 BATCH_AUDIT_ACTIONS = {
     "toggle": ACTION_CREDENTIAL_TOGGLE,
     "revive": ACTION_CREDENTIAL_REVIVE,
@@ -170,7 +174,10 @@ async def probe_credential_once(credentials, provider, data, credential_id: str)
         return {"probed": False, "reason": reason}
     credentials.save_quota(credential_id, quota)
     return {"probed": True, "remaining": quota.remaining, "total": quota.total,
-            "cycle_end": quota.cycle_end}
+            "cycle_end": quota.cycle_end,
+            # 第二本账（CodeArts 积分）：其余渠道恒 None，前端据此隐藏该行
+            "credits_remaining": quota.credits_remaining,
+            "credits_total": quota.credits_total}
 
 
 async def checkin_credential_once(credentials, provider, data, credential_id: str,
@@ -255,10 +262,15 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(f"unknown provider {provider_id!r}")
         credential_data = registry[provider_id].import_credential(
             payload.get("credential") or {})
+        try:
+            # 导入时可选带标签（列表页「添加」对话框不填即为空）
+            tags = parse_tags(payload.get("tags"))
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
         credential_id = credentials.add(provider=provider_id,
                                         credential_data=credential_data,
                                         nickname=str(payload.get("nickname") or ""),
-                                        added_by=principal.username)
+                                        added_by=principal.username, tags=tags)
         logger.info("管理员 %s 新增凭证 %s（上游 %s）", principal.username, credential_id,
                     provider_id)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_IMPORT,
@@ -319,6 +331,28 @@ def create_router(services: Services) -> APIRouter:
                               target=credential_id, detail=_limits_detail(limits))
         record = services.limits.get(credential_id)
         return {"limits": record.as_dict() if record is not None else None}
+
+    @router.put("/api/credentials/{credential_id}/tags")
+    async def set_credential_tags(credential_id: str, payload: dict,
+                                  _csrf: None = Depends(csrf_protected),
+                                  principal=Depends(principal_from_request)):
+        """整体替换一条凭证的标签（空列表 = 清空）。
+
+        标签只影响列表展示与筛选，不参与调度/鉴权，因此不触发任何缓存失效
+        （与限额护栏不同：那个要 `limit_guard.invalidate()`）。
+        """
+        require_operator(principal)
+        try:
+            tags = parse_tags(payload.get("tags"))
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
+        if not credentials.set_tags(credential_id, tags):
+            raise InvalidRequest("credential not found")
+        logger.info("管理员 %s 设置凭证 %s 标签: %s", principal.username, credential_id,
+                    ",".join(tags) or "（清空）")
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_TAGS,
+                              target=credential_id, detail=",".join(tags) or "（清空）")
+        return {"tags": tags}
 
     @router.post("/api/credentials/pin")
     async def pin_credential(payload: dict,
@@ -432,11 +466,19 @@ def create_router(services: Services) -> APIRouter:
         succeeded = sum(1 for result in results if result["ok"])
         # 审计只记一条汇总，不逐条落库：批量暂停 50 个号是一次操作、一个意图，
         # 50 行审计会把流水刷成噪声，反而更难定位「谁在什么时候批量做了什么」。
+        # toggle 带上方向：暂停与取消暂停是同一动作名，不写方向就看不出意图。
+        direction = f"（{'启用' if enabled else '暂停'}）" if action == "toggle" else ""
         audit_action = BATCH_AUDIT_ACTIONS.get(action)
         if audit_action is not None:
-            services.audit.record(
-                actor=principal.username, action=audit_action, target=None,
-                detail=f"批量 {action}：{succeeded}/{len(results)} 成功")
+            # 审计落库失败**不得**吞掉逐条结果：`results` 是操作员唯一的反馈
+            # （成功 N / 失败 M 与失败原因），而写审计只是留痕。二者是两件事，
+            # 且此时逐条变更已经提交生效，返回 500 会让操作员以为整批没跑。
+            try:
+                services.audit.record(
+                    actor=principal.username, action=audit_action, target=None,
+                    detail=f"批量 {action}{direction}：{succeeded}/{len(results)} 成功")
+            except Exception as error:  # noqa: BLE001 - 留痕失败不该毁掉操作结果
+                logger.warning("批量 %s 审计写入失败: %s", action, error)
         logger.info("管理员 %s 批量 %s %d 个凭证（成功 %d）", principal.username, action,
                     len(results), succeeded)
         return {"action": action, "total": len(results), "succeeded": succeeded,
@@ -463,9 +505,13 @@ def create_router(services: Services) -> APIRouter:
 
     @router.get("/api/credentials/{credential_id}/credit-events")
     async def credit_events(credential_id: str, limit: int = 20, sort: str | None = None,
-                            order: str | None = None,
+                            order: str | None = None, ledger: str = "pool",
                             principal=Depends(principal_from_request)):
-        """积分变动流水：两次额度探测之间的净变化（倒序）。
+        """变动流水：两次额度探测之间的净变化（倒序）。
+
+        `ledger` 选账本：`pool`（默认）＝每日 token 池，`credits`＝积分账。
+        两本账量级与语义都不同，必须分开读，混在一起会被当成同一本账的连续
+        读数。未知取值由仓储回落 `pool`（与老库默认列值一致）。
 
         刻意不返回「来源」枚举：上游不打日志，diff 看到的只是区间净变化，
         写「签到 +5」就是把猜测当事实。source 只表达归因已知度
@@ -475,7 +521,7 @@ def create_router(services: Services) -> APIRouter:
         if services.credentials.provider_of(credential_id) is None:
             raise InvalidRequest("credential not found")
         return {"events": services.credit_events.recent(
-            credential_id, limit=limit, sort=sort, order=order)}
+            credential_id, limit=limit, sort=sort, order=order, ledger=ledger)}
 
     @router.post("/api/credentials/{credential_id}/growth")
     async def run_growth(credential_id: str,

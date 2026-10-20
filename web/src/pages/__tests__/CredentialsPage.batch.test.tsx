@@ -95,9 +95,35 @@ describe("CredentialsPage 批量运维", () => {
     await expandCredentialGroups();
     await userEvent.click(screen.getByTestId("select-cb1"));
     await userEvent.click(screen.getByTestId("select-cb2"));
-    await userEvent.click(screen.getByTestId("batch-toggle"));
+    await userEvent.click(screen.getByTestId("batch-pause"));
     await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
     expect(batchCall(spy)).toEqual({ action: "toggle", ids: ["cb1", "cb2"], enabled: false });
+    expect(screen.getByTestId("credentials-batch-result")).toHaveTextContent("已暂停：成功 2 / 2");
+  });
+
+  it("批量取消暂停显式传 enabled=true（暂停后可放回池子）", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "toggle", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "cb1", ok: true }, { id: "cb2", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", enabled: 0 }),
+        makeCredential({ id: "cb2", enabled: 0 }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("select-cb2"));
+    await userEvent.click(screen.getByTestId("batch-resume"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    expect(batchCall(spy)).toEqual({ action: "toggle", ids: ["cb1", "cb2"], enabled: true });
+    // 与「暂停」共用 action=toggle，结果措辞必须按触发按钮而非 action 反查，
+    // 否则取消暂停会弹出「已暂停」
+    expect(screen.getByTestId("credentials-batch-result"))
+      .toHaveTextContent("已取消暂停：成功 2 / 2");
   });
 
   it("组头全选纳入本渠道全部账号，再次点击取消", async () => {
@@ -118,6 +144,72 @@ describe("CredentialsPage 批量运维", () => {
     await userEvent.click(screen.getByTestId("select-cb1"));
     await userEvent.click(screen.getByTestId("batch-clear"));
     expect(screen.queryByTestId("credentials-batch-bar")).not.toBeInTheDocument();
+  });
+
+  it("全部签到：对池内全部可签到凭证提交批量，免费层与国际站剔除", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "checkin", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "trae1", ok: true }, { id: "cb1", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "trae1", nickname: "TRAE 号" }),
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "CB 号" }),
+        // zen 免费层无签到能力、CodeBuddy 国际站 checkin=None：行内没有
+        // 签到按钮，也不该混进一键签到
+        makeCredential({ id: "zen1", provider: "zen", nickname: "免费层" }),
+        makeCredential({ id: "intl1", provider: "codebuddy_intl", nickname: "国际站" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    // 按钮在面板标题栏，分组折叠时也可见、可点
+    await userEvent.click(screen.getByTestId("checkin-all"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    expect(batchCall(spy)).toEqual({ action: "checkin", ids: ["trae1", "cb1"] });
+    expect(screen.getByTestId("credentials-batch-result"))
+      .toHaveTextContent("签到完成：成功 2 / 2");
+  });
+
+  it("全部签到不动多选集合：签完选中项仍保留", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "checkin", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "cb1", ok: true }, { id: "cb2", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy" }),
+        makeCredential({ id: "cb2", provider: "codebuddy" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("checkin-all"));
+    await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
+    // 提交的是全池（与勾选无关），勾选也不被顺带清空——它不是「全选 + 签到」
+    expect(batchCall(spy).ids).toEqual(["cb1", "cb2"]);
+    expect(screen.getByTestId("batch-selected-count")).toHaveTextContent("已选 1 个");
+  });
+
+  it("池内没有可签到凭证时「全部签到」禁用而非消失", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "zen1", provider: "zen" }),
+        makeCredential({ id: "intl1", provider: "codebuddy_intl" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    expect(screen.getByTestId("checkin-all")).toBeDisabled();
+  });
+
+  it("只读用户看不到「全部签到」", async () => {
+    mockFetch({ "/api/credentials": listBody([makeCredential({ id: "cb1" })], false) });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    expect(screen.queryByTestId("checkin-all")).not.toBeInTheDocument();
   });
 
   it("部分失败：浮层列出失败原因与昵称，色调为 warn", async () => {
@@ -144,7 +236,7 @@ describe("CredentialsPage 批量运维", () => {
     expect(toast).toHaveTextContent("探测完成：成功 1 / 2，失败 1");
     const failure = within(toast).getByTestId("batch-failure");
     // 失败行用昵称而不是裸 id，并翻译成可操作的中文
-    expect(failure).toHaveTextContent("备用号：凭证被渠道拒绝，需要重新登录该账号");
+    expect(failure).toHaveTextContent("备用号：凭证被渠道拒绝，需重新登录");
   });
 
   it("执行前就失败的原因（凭证不存在 / 渠道不支持）翻译成人话", async () => {
@@ -178,7 +270,7 @@ describe("CredentialsPage 批量运维", () => {
     const toast = await screen.findByTestId("credentials-batch-result");
     const failures = within(toast).getAllByTestId("batch-failure");
     const text = failures.map((node) => node.textContent).join("\n");
-    expect(text).toContain("凭证不存在（可能已被删除）");
+    expect(text).toContain("凭证不存在（可能已删除）");
     expect(text).toContain("该渠道不支持此操作");
     expect(text).toContain("执行失败，详见服务端日志");
     // 未知 error 原样透传（后端契约里的稳定枚举，不该被前端吞掉）
@@ -231,7 +323,7 @@ describe("CredentialsPage 批量运维", () => {
     await userEvent.click(screen.getByTestId("batch-revive"));
     const toast = await screen.findByTestId("credentials-batch-result");
     expect(within(toast).getByTestId("batch-failure"))
-      .toHaveTextContent("cred_deleted：凭证不存在（可能已被删除）");
+      .toHaveTextContent("cred_deleted：凭证不存在（可能已删除）");
   });
 
   it("请求整体失败时走 error 浮层", async () => {

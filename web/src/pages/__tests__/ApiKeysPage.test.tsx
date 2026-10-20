@@ -228,7 +228,7 @@ describe("ApiKeysPage", () => {
     await openCreateDialog();
 
     await userEvent.click(screen.getByRole("button", { name: "创建" }));
-    expect(await screen.findByText(/请检查渠道绑定、模型白名单、IP 白名单与到期时间格式/)).toBeInTheDocument();
+    expect(await screen.findByText(/检查渠道绑定、模型白名单、IP 白名单与到期时间格式/)).toBeInTheDocument();
   });
 });
 

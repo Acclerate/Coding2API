@@ -2,9 +2,10 @@ import { useMemo, useState } from "react";
 import { Check, RefreshCw, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ModelBenchmarks, ModelInfo } from "../api/types";
+import { aliasTitle, isCustomAlias } from "../api/modelExtras";
 import { providerChartColor, providerLabel, providerRank } from "../api/providers";
 import { ProviderIcon } from "./ProviderIcon";
-import { Input } from "../ui";
+import { Badge, Input } from "../ui";
 
 /** 列表条目：原始 ModelInfo + 受控选中值。 */
 export type PickableModel = ModelInfo & { value: string };
@@ -29,6 +30,21 @@ export function providerRate(item: ModelInfo, provider: string): number | undefi
   if (perProvider !== undefined) return perProvider;
   if (item.providers.length === 1) return item.credit_rate;
   return undefined;
+}
+
+/**
+ * 某渠道的模型是否为**福利模型**（当前只有 CodeArts）。
+ *
+ * 福利模型走每日 token 池、上游不给倍率，展示层在渠道徽章上打「福」标区分
+ * 于内置模型。判据与倍率同构：优先按渠道细分（`by_provider`），单渠道条目
+ * 回退顶层 `benefit`；多渠道缺细分标记时返回 false——**不能**拿顶层冒充，
+ * 否则会把福利标到同条目的其它渠道上。
+ */
+export function providerBenefit(item: ModelInfo, provider: string): boolean {
+  const perProvider = item.by_provider?.[provider]?.benefit;
+  if (perProvider !== undefined) return perProvider;
+  if (item.providers.length === 1) return item.benefit === true;
+  return false;
 }
 
 /** 模型排序用倍率：多渠道取各渠道最小倍率；无倍率视为最大（排最后）。 */
@@ -144,17 +160,21 @@ function sortProviders(providers: string[]): string[] {
 /**
  * 品牌着色渠道徽章：底/边/字都取自该渠道的图表主色，渠道一眼可辨。
  *
- * 倍率作为其内的加粗数字块单独强调（`x0.29`；免费额度显示「免费」）。
+ * 倍率作为其内的加粗数字块单独强调（`x0.29`；免费额度显示「免」）。
  * `rawId` 非空时作为 tooltip：该渠道实际请求的 key。
+ * `benefit` 为真时在渠道名后加一个「福」标：福利模型走每日 token 池、
+ * 上游不给倍率，没有倍率块可看，这个标是它与内置模型唯一的区分点。
  */
 function ChannelPill({
   provider,
   rate,
   rawId,
+  benefit,
 }: {
   provider: string;
   rate?: number;
   rawId?: string;
+  benefit?: boolean;
 }) {
   const color = providerChartColor(provider);
   return (
@@ -171,9 +191,18 @@ function ChannelPill({
     >
       <ProviderIcon provider={provider} size={13} />
       {providerLabel(provider)}
+      {benefit && (
+        <span
+          data-testid={`channel-benefit-${provider}`}
+          title="福利模型：走每日免费 token 池，不消耗积分"
+          className="rounded bg-warn/15 px-1 font-bold text-warn-ink"
+        >
+          福
+        </span>
+      )}
       {rate !== undefined && (
         <span className="rounded bg-background/70 px-1 font-bold tabular-nums">
-          {rate === 0 ? "免费" : `x${rate}`}
+          {rate === 0 ? "免" : `x${rate}`}
         </span>
       )}
     </span>
@@ -274,6 +303,11 @@ function ModelRow({
           自身 `flex-wrap`，多渠道放不下时**在右侧区域内折行**，而不是整组掉到
           名称下方独占一行（内层 `justify-end` 让每行都贴右）。 */}
       <span className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+        {isCustomAlias(item) && (
+          <span data-testid="model-alias-badge" title={aliasTitle(item)}>
+            <Badge tone="accent">自定义别名</Badge>
+          </span>
+        )}
         <BenchmarkBadge item={item} />
         {providers.map((provider) => (
           <ChannelPill
@@ -281,6 +315,7 @@ function ModelRow({
             provider={provider}
             rate={providerRate(item, provider)}
             rawId={providerRawId(item, provider)}
+            benefit={providerBenefit(item, provider)}
           />
         ))}
       </span>
@@ -325,6 +360,9 @@ export function ModelPicker({
   const selectedItem =
     models.find((item) => item.value === value) ??
     models.find((item) => item.id === baseValue);
+  // 可强制指定渠道：多渠道 + 传了 onPin。此时「当前选择」条里的渠道徽章
+  // 本身就是按钮，不再另起一行重复列渠道。
+  const pinnable = Boolean(onPin) && (selectedItem?.providers.length ?? 0) > 1;
 
   return (
     <div className="space-y-3" data-testid="model-picker">
@@ -375,67 +413,77 @@ export function ModelPicker({
             )}
           </span>
           <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+            {isCustomAlias(selectedItem) && (
+              <span data-testid="model-current-alias" title={aliasTitle(selectedItem)}>
+                <Badge tone="accent">自定义别名</Badge>
+              </span>
+            )}
             <BenchmarkBadge item={selectedItem} />
-            {sortProviders(selectedItem.providers).map((provider) => (
+            {/* 不可指定渠道（单渠道 / 无 onPin）时，这里直接列渠道徽章；
+                可指定时徽章本身就是下面的渠道按钮，避免同一组渠道渲染两遍 */}
+            {!pinnable && sortProviders(selectedItem.providers).map((provider) => (
               <ChannelPill
                 key={provider}
                 provider={provider}
                 rate={providerRate(selectedItem, provider)}
                 rawId={providerRawId(selectedItem, provider)}
+                benefit={providerBenefit(selectedItem, provider)}
               />
             ))}
           </span>
-          {/* 右侧统一区：多渠道放渠道指定控件，已强制时追加「已强制 XX」标；
-              单渠道模型 value 天然带 @provider，也走「已强制」标显示在右侧 */}
-          {((onPin && selectedItem.providers.length > 1) || pinnedProvider) && (
+          {/* 右侧统一区：多渠道放渠道指定控件（徽章即按钮，点选即强制该渠道），
+              已强制时追加「已强制 XX」标；单渠道模型 value 天然带 @provider，
+              也走「已强制」标显示在右侧 */}
+          {pinnable && onPin && (
             <span className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
-              {onPin && selectedItem.providers.length > 1 && (
-                <>
-                  <span className="text-[11px] font-medium text-muted-foreground">渠道</span>
-                  <span className="flex flex-wrap items-center gap-1" data-testid="provider-pin">
-                    <button
-                      type="button"
-                      data-testid="provider-pin-auto"
-                      aria-pressed={pinnedProvider === ""}
-                      onClick={() => onPin(baseValue)}
-                      className={cn(
-                        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
-                        pinnedProvider === ""
-                          ? "border-primary/40 bg-primary/10 text-primary-ink"
-                          : "border-border text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      自动路由
-                    </button>
-                    {sortProviders(selectedItem.providers).map((provider) => (
-                      <button
-                        key={provider}
-                        type="button"
-                        data-testid={`provider-pin-${provider}`}
-                        aria-pressed={pinnedProvider === provider}
-                        onClick={() => onPin(`${baseValue}@${provider}`)}
-                        className={cn(
-                          "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
-                          pinnedProvider === provider
-                            ? "border-primary/40 bg-primary/10 text-primary-ink"
-                            : "border-border text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        <ProviderIcon provider={provider} size={11} />
-                        {providerLabel(provider)}
-                      </button>
-                    ))}
-                  </span>
-                </>
-              )}
-              {pinnedProvider && (
-                <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-[11px] font-semibold text-primary-ink">
-                  已强制 {providerLabel(pinnedProvider)}
-                </span>
-              )}
+              <span className="text-[11px] font-medium text-muted-foreground">渠道</span>
+              <span className="flex flex-wrap items-center gap-1" data-testid="provider-pin">
+                <button
+                  type="button"
+                  data-testid="provider-pin-auto"
+                  aria-pressed={pinnedProvider === ""}
+                  onClick={() => onPin(baseValue)}
+                  className={cn(
+                    "inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors",
+                    pinnedProvider === ""
+                      ? "border-primary/40 bg-primary/10 text-primary-ink"
+                      : "border-border text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  自动路由
+                </button>
+                {sortProviders(selectedItem.providers).map((provider) => (
+                  <button
+                    key={provider}
+                    type="button"
+                    data-testid={`provider-pin-${provider}`}
+                    aria-pressed={pinnedProvider === provider}
+                    title={`只走 ${providerLabel(provider)}`}
+                    onClick={() => onPin(`${baseValue}@${provider}`)}
+                    className={cn(
+                      "rounded-md transition-shadow",
+                      pinnedProvider === provider
+                        ? "ring-2 ring-primary/50 ring-offset-1 ring-offset-background"
+                        : "opacity-90 hover:opacity-100",
+                    )}
+                  >
+                    <ChannelPill
+                      provider={provider}
+                      rate={providerRate(selectedItem, provider)}
+                      rawId={providerRawId(selectedItem, provider)}
+                      benefit={providerBenefit(selectedItem, provider)}
+                    />
+                  </button>
+                ))}
+              </span>
             </span>
           )}
-          {!pinnedProvider && !onPin && selectedItem.providers.length > 1 && (
+          {pinnedProvider && (
+            <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-[11px] font-semibold text-primary-ink">
+              已强制 {providerLabel(pinnedProvider)}
+            </span>
+          )}
+          {!pinnedProvider && !pinnable && selectedItem.providers.length > 1 && (
             <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground">
               自动路由
             </span>
@@ -446,7 +494,7 @@ export function ModelPicker({
       <div
         role="listbox"
         data-testid="model-list"
-        className="max-h-80 space-y-4 overflow-y-auto pr-1"
+        className="max-h-80 space-y-4 overflow-y-auto rounded-lg border border-border/60 p-2"
       >
         {sections.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">没有匹配的模型</p>

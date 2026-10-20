@@ -47,6 +47,111 @@ def test_build_chat_body_empty_and_alternate_effort_shapes():
     assert nested["parameters"] == {"max_tokens": 10, "reasoning_effort": "low"}
     assert "parameters" not in build_chat_body({"max_tokens": 0, "tools": None}, "m")
 
+def test_build_chat_body_keeps_well_formed_tool_sequence(caplog):
+    """user → assistant(tool_calls) → tool 是合法序列，原样转发且不记 warning。"""
+    messages = [
+        {"role": "user", "content": "查天气"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function",
+             "function": {"name": "weather", "arguments": ""}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "晴"},
+    ]
+    with caplog.at_level("WARNING", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+    assert "孤立 tool" not in caplog.text
+
+def test_build_chat_body_drops_orphan_tool_and_keeps_order(caplog):
+    """前面没有带 tool_calls 的 assistant：孤立 tool 丢弃，其余顺序不变。"""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "孤儿结果"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "再来"},
+    ]
+    with caplog.at_level("WARNING", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[2], messages[3]]
+    assert any("孤立 tool 消息" in r.getMessage() and "1" in r.getMessage()
+               for r in caplog.records)
+
+def test_build_chat_body_drops_tool_with_unmatched_id():
+    """assistant 声明 id=a，tool 回 id=b：id 对不上也算孤立。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "call_b", "content": "错配"},
+        {"role": "tool", "content": "缺 tool_call_id"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "对上了"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[3]]
+
+def test_build_chat_body_keeps_parallel_tool_results():
+    """并行 tool_calls 的多条 tool 结果都跟在同一个 assistant 后，全部保留。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}},
+            {"id": "b", "type": "function", "function": {"name": "g"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "1"},
+        {"role": "tool", "tool_call_id": "b", "content": "2"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+
+def test_build_chat_body_unions_consecutive_assistant_tool_calls():
+    """`/v1/responses` 的并行 function_call 拆成多条 assistant，声明需并集。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "b", "type": "function", "function": {"name": "g"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "1"},
+        {"role": "tool", "tool_call_id": "b", "content": "2"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+
+def test_build_chat_body_plain_assistant_resets_declared_ids():
+    """中间夹了一条不带 tool_calls 的 assistant：它打断了配对，其后的 tool 孤立。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "assistant", "content": "我先说一句"},
+        {"role": "tool", "tool_call_id": "a", "content": "晚到的结果"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[1]]
+
+def test_build_chat_body_tool_after_empty_tool_calls_is_orphan():
+    """`tool_calls: []` 的 assistant 没有声明任何 id，其后的 tool 视为孤立。"""
+    messages = [
+        {"role": "assistant", "content": "无调用", "tool_calls": []},
+        {"role": "tool", "tool_call_id": "call_a", "content": "孤儿"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0]]
+
+def test_drop_orphan_tool_messages_tolerates_junk_entries():
+    """畸形历史（非 dict 消息、畸形 tool_calls 元素）不参与匹配，但原样保留。"""
+    messages = [
+        "junk",
+        {"role": "assistant", "content": "", "tool_calls": [
+            "junk", {"id": 1}, {"id": ""}, {"id": "call_a"}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "ok"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "孤儿"},
+        {"role": "tool", "content": "缺 tool_call_id"},
+        {"role": "tool", "tool_call_id": ["unhashable"], "content": "畸形 id"},
+    ]
+    kept, dropped = qoder_client._drop_orphan_tool_messages(messages)
+    assert kept == [messages[0], messages[1], messages[2]]
+    assert dropped == 3
+
+def test_build_chat_body_passes_through_non_list_messages():
+    """畸形 payload（messages 非数组）不做结构假设，原样交给上游裁决。"""
+    body = build_chat_body({"messages": {"role": "tool"}}, "m")
+    assert body["messages"] == {"role": "tool"}
+
 def test_openapi_headers_use_stable_device_ids():
     headers = build_openapi_headers(cred())
     assert headers["Authorization"] == "Bearer dt-token-1"
@@ -103,6 +208,21 @@ async def test_stream_chat_inner_error_frame_is_classified():
     assert [e.kind for e in events] == [EventKind.CONTENT, EventKind.ERROR]
     assert events[1].error_code == 418
     assert events[1].error_kind is ErrKind.SOFT
+
+async def test_inner_error_message_keeps_nested_details():
+    """错误正文放宽到 2000：200 字符会截在转义的 details 中间，根因丢失。"""
+    detail = json.dumps({"error": {"message": "Messages with role 'tool' must be a "
+                                             "response to a preceding message with "
+                                             "'tool_calls'", "padding": "y" * 1400}})
+    body = json.dumps({"code": "400", "details": detail})
+    assert 200 < len(body) < 2000
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=envelope(body, status=400))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert events[0].error_message == body
+    assert "preceding message with 'tool_calls'" in events[0].error_message
 
 async def test_stream_chat_top_level_done_and_blank_frames():
     def handler(_request: httpx.Request) -> httpx.Response:

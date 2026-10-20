@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..pricing import PriceTable, estimate_cost_usd, to_cny
-from ..request_context import get_request_id
+from ..request_context import get_api_key_id, get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,12 @@ CONTROLLED_ERROR_TYPES = frozenset({
     #                            冷却不可用（_exhaust_error_type；换个模型即可用）
     #   rate_limit         — 权益耗尽（_error_type_for(PLAN)）
     #   upstream_error / upstream_protocol — 其它上游失败
+    #   upstream_first_event_timeout — 出帧前上游不吐首个数据事件（A1）
+    #   upstream_idle_timeout        — 已出帧后上游停止吐数据（A1）
     "client_disconnect", "credential_unavailable",
     "invalid_request", "no_healthy_credential", "model_unavailable",
     "rate_limit", "upstream_error", "upstream_protocol",
+    "upstream_first_event_timeout", "upstream_idle_timeout",
 })
 MAX_MODEL_LENGTH = 64
 
@@ -73,19 +76,27 @@ class UsageEvent:
     latency_ms: int | None
     ttfb_ms: int | None
     request_id: str | None
+    api_key_id: str | None
 
 
 class StatsCollector:
     def __init__(self, db, *,
                  prices: Callable[[], Mapping[str, tuple[float, float, float]]] | None = None,
-                 usd_cny_rate: Callable[[], float] | None = None) -> None:
+                 usd_cny_rate: Callable[[], float] | None = None,
+                 on_record: Callable[[dict[str, Any]], None] | None = None) -> None:
         """`prices` / `usd_cny_rate` 是零参取值器（热更：每写一条现读当前价表
         与汇率）。两者都缺省为 None = 不估算成本（既有测试与老装配保持原行为，
         cost 两列恒为 NULL）。
+
+        `on_record` 是「明细落库后」的回调（装配时接 `LiveEventHub.publish`，
+        供 `GET /api/stats/events/stream` 的 SSE 实时流）。回调拿到的是**已脱敏**
+        的行字典（与 `/api/stats/events` 同一字段集，另带 rowid），且异常被吞
+        ——统计写入绝不能因为一个订阅者出问题而失败。
         """
         self._db = db
         self._prices = prices
         self._usd_cny_rate = usd_cny_rate
+        self._on_record = on_record
         # 进程内「失败请求 × 原因」计数（供 /metrics 的 errors_total）。
         # 为什么不落库、不读明细表：① usage_hourly 没有 error_type 维度；
         # ② usage_events 只留 90 天，用它算 `_total` 会让计数器随裁剪**下降**
@@ -164,27 +175,70 @@ class StatsCollector:
             # 不为一个可观测性字段给所有中间层加参数。后台任务/脚本无请求上下文
             # → None（该列可空）。
             request_id=get_request_id(),
+            # Key 归属同上：由鉴权层写 contextvar，后台任务/管理台内部请求
+            # 无 Key 归属 → None（该列可空，语义=未归属）。
+            api_key_id=get_api_key_id(),
         )
         if not event.ok and event.error_type is not None:
             key = (event.provider, event.error_type)
             self._error_totals[key] = self._error_totals.get(key, 0) + 1
         with self._db.transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO usage_events (id, ts, username, provider, credential_id, model, "
                 "ok, error_type, input_tokens, output_tokens, reasoning_tokens, cached_tokens, "
                 "credit, credit_estimated, cost_usd, cost_cny, latency_ms, ttfb_ms, "
-                "request_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "request_id, api_key_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (event.id, event.ts, event.username, event.provider, event.credential_id,
                  event.model, int(event.ok), event.error_type, event.input_tokens,
                  event.output_tokens, event.reasoning_tokens, event.cached_tokens, event.credit,
                  int(event.credit_estimated), event.cost_usd, event.cost_cny,
-                 event.latency_ms, event.ttfb_ms, event.request_id),
+                 event.latency_ms, event.ttfb_ms, event.request_id, event.api_key_id),
             )
             # 当前小时增量累加：总览/图表都读小时表，不能等 5 分钟一轮的
             # retention rollup 才可见（否则刚发生的请求统计页面显示 0）。
             # 增量累加与全量重算等价：rollup 后续会把这一小时算成同样的值。
             self._bump_hourly(conn, event)
+            # 事务内拿 rowid，提交后再广播：订阅者拿到的是「已落库」的行，
+            # 与随后刷新 `/api/stats/events` 看到的是同一条（含 rowid 游标）。
+            rowid = cursor.lastrowid
+        self._notify(rowid, event)
+
+    def _notify(self, rowid: int | None, event: UsageEvent) -> None:
+        """把刚写入的明细推给实时流订阅者（未装配 / 出问题都不影响写入）。
+
+        广播在**事务提交之后**：订阅者收到就能立刻用 rowid 接着翻页，不会
+        看到一条回滚掉的记录。回调异常一律吞掉——统计是旁路，绝不能让它
+        把聊天响应搞失败。
+        """
+        if self._on_record is None:
+            return
+        payload = {
+            "rowid": rowid,
+            "id": event.id,
+            "ts": event.ts,
+            "username": event.username,
+            "provider": event.provider,
+            "model": event.model,
+            "credential_id": event.credential_id,
+            "ok": int(event.ok),
+            "error_type": event.error_type,
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+            "reasoning_tokens": event.reasoning_tokens,
+            "cached_tokens": event.cached_tokens,
+            "credit": event.credit,
+            "credit_estimated": int(event.credit_estimated),
+            "cost_usd": event.cost_usd,
+            "cost_cny": event.cost_cny,
+            "latency_ms": event.latency_ms,
+            "ttfb_ms": event.ttfb_ms,
+            "request_id": event.request_id,
+        }
+        try:
+            self._on_record(payload)
+        except Exception as error:  # noqa: BLE001 - 实时流失败不影响统计写入
+            logger.warning("实时事件广播失败: %s", error)
 
     @staticmethod
     def _bump_hourly(conn, event: UsageEvent) -> None:

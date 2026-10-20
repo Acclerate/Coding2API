@@ -1,12 +1,18 @@
 """会话粘性：同一对话的多轮请求固定使用同一凭证。
 
 OpenAI Chat Completions 本身无会话概念，客户端（agent/CLI）的「对话」有
-两种可识别形态，按可靠性依次取用：
+三种可识别形态，按可靠性依次取用：
 
 1. **请求体显式会话标识**：`conversation_id` / `conversationId` /
    `prompt_cache_key`（`metadata` 对象内或请求体顶层）。客户端直接给出
    会话身份，最可靠——即便消息数组被裁剪/压缩也能粘住。
-2. **回落：消息数组的增量前缀指纹**：下一轮的 messages 以上一轮的完整
+2. **请求头会话标识**（E1）：`x-session-id` / `x-opencode-session` /
+   `x-session-affinity` / `conversation-id` / `conversation_id`。由请求入口
+   中间件校验后放进 contextvar（`request_context.set_session_id`），这里经
+   `get_session_id()` 读——**不给 `pin_for`/`remember` 加 headers 参数**，
+   否则参数要一路穿过路由 → executor → 调度等中间层，签名被污染且新增调用
+   点容易漏传（与 `request_id` 同一范式）。
+3. **回落：消息数组的增量前缀指纹**：下一轮的 messages 以上一轮的完整
    messages 为前缀再追加，据此匹配。仅当请求体**没有** `user_id`（顶层或
    `metadata` 内）时才使用——同一用户的并行对话消息前缀可能相同，派生
    兜底键会把它们误钉到同一凭证。
@@ -25,6 +31,19 @@ reasoning_effort，**不含任何会话标识键**，故后两项无法用本地
 键里掺入用户名，防止不同 API 用户的相同标识/消息数组串到同一凭证。
 TTL 内没有后续轮次即视为对话结束，条目过期；条目数有上限，超量先淘汰
 过期条目、再按最旧淘汰。纯内存即可：重启后丢粘性只影响一轮选号。
+
+**为什么头排在 body 显式键之后、前缀兜底之前**：body 里的
+`conversation_id` / `prompt_cache_key` 是客户端**为这次对话**显式给出的身份，
+语义最精确（同一客户端可能用同一个头跑多段对话，也可能复用会话头而不改
+body）；而请求头是这个客户端会话的**粗粒度**标识，比「猜消息前缀」可靠
+得多——消息被裁剪/压缩后前缀匹配会失效，头不会，且头能覆盖带 `user_id`
+的场景（`user_id` 只用来否定前缀兜底，不否定显式身份）。因此顺序是
+body 显式键 > 头 > 前缀兜底。
+
+**头为何也要掺 username**：头值是客户端自己填的，两个用户完全可能都写
+`default` / `session-1` 这类值；不掺用户名就会让互不相关的用户共用同一条
+粘性记录，把 A 的凭证泄漏成 B 的首选。掺法也带来源前缀（`header:`），
+避免与 body 的 `conversation_id:abc` 同值撞键。
 """
 
 from __future__ import annotations
@@ -32,12 +51,17 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from ..config import live
+from ..request_context import get_session_id, sanitize_session_id
 
 # 请求体里的显式会话标识键名，按优先级排列（前两个等价，客户端实现不一）
 _EXPLICIT_KEYS: tuple[str, ...] = ("conversation_id", "conversationId", "prompt_cache_key")
+
+# 请求头来源键的前缀：与 body 键同值也不撞键（`header:abc` ≠ `conversation_id:abc`）
+_HEADER_SOURCE = "header"
 
 
 def _nonempty_str(value: object) -> str | None:
@@ -79,6 +103,35 @@ def has_user_id(raw: dict[str, Any]) -> bool:
                for container in _containers(raw))
 
 
+def header_key(*, read_session_id: Callable[[], str | None] | None = None) -> str | None:
+    """请求头会话标识（E1）→ 带来源前缀的键；无/非法返回 None。
+
+    值经 `sanitize_session_id` 再校验一次：中间件已校验过，但 contextvar 也可能
+    由测试/别处直接设置，这里守住「非法值永不参与粘性」这条线。键带 `header:`
+    来源前缀，避免与 body 的 `conversation_id:abc` 同值撞键；用户名在
+    `_explicit_digest` 里掺入，防止两个用户填同一个头值串号。
+    """
+    reader = read_session_id or get_session_id
+    value = sanitize_session_id(reader())
+    if value is None:
+        return None
+    return f"{_HEADER_SOURCE}:{value}"
+
+
+def resolve_explicit(raw: dict[str, Any], *,
+                     read_session_id: Callable[[], str | None] | None = None) -> str | None:
+    """解析显式会话键：body 显式键（最高）> 请求头会话标识（次之）。
+
+    抽成一步是为了让 `pin_for` 与 `remember` 共用**完全一致**的优先级——
+    若两边各写一遍，很容易「pin 读头键、remember 写 body 键」，下一轮就断粘。
+    `read_session_id` 可注入（默认现读 contextvar），测试无需构造真实请求。
+    """
+    body = explicit_key(raw)
+    if body is not None:
+        return body
+    return header_key(read_session_id=read_session_id)
+
+
 def _message_digest(message: object) -> bytes:
     """单条消息的规范哈希：键序归一，杜绝 JSON 键序差异造成假失配。"""
     text = json.dumps(message, ensure_ascii=False, sort_keys=True,
@@ -108,13 +161,14 @@ class ConversationAffinity:
                 now: float | None = None) -> str | None:
         """本对话已粘的凭证；无匹配（含禁用/过期）返回 None。
 
-        显式标识直接单键命中；否则退回最长前缀匹配：上一轮请求存的指纹
-        正是本轮某个前缀的指纹，最长匹配者即本对话最近一轮实际使用的凭证。
+        显式会话键（body 显式键 > 请求头）直接单键命中；两者都没有时才退回
+        最长前缀匹配：上一轮请求存的指纹正是本轮某个前缀的指纹，最长匹配者即
+        本对话最近一轮实际使用的凭证。
         """
         if self.ttl_seconds <= 0 or not isinstance(raw, dict):
             return None
         current = now if now is not None else time.monotonic()
-        explicit = explicit_key(raw)
+        explicit = resolve_explicit(raw)
         if explicit is not None:
             return self._lookup(self._explicit_digest(explicit, username), current)
         messages = raw.get("messages")
@@ -128,7 +182,7 @@ class ConversationAffinity:
         if self.ttl_seconds <= 0 or not isinstance(raw, dict):
             return
         current = now if now is not None else time.monotonic()
-        explicit = explicit_key(raw)
+        explicit = resolve_explicit(raw)
         if explicit is not None:
             self._touch(self._explicit_digest(explicit, username), credential_id, current)
             self._evict(current)

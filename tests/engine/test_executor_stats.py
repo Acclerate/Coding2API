@@ -350,3 +350,47 @@ async def test_stream_plan_error_records_failure(repo):
         pass
     assert collector.events[-1]["ok"] is False
     assert collector.events[-1]["username"] == "carol"
+
+async def test_stream_inline_request_error_records_real_type(repo):
+    """流内业务错误（HTTP 200 内嵌 error 帧）要落**真实**类型而非 upstream_protocol。
+
+    回归 CodeArts「渠道响应异常」：业务错误内嵌在 200 的 SSE 里，
+    executor 存成 `UpstreamStreamError`，而该异常此前没有 `.kind()`，
+    分类器兜底成 `upstream_protocol`。REQUEST 类还不应冷却/累计凭证。
+    """
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [[
+        Event(kind=EventKind.ERROR, error_code=406,
+              error_message="The request model is not multimodal",
+              error_kind=ErrKind.REQUEST)]], collector, max_rotate=1)
+
+    from src.compat.openai.request import parse_chat_request
+
+    async for _ in executor.stream(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            username="dave"):
+        pass
+    assert collector.events[-1]["error_type"] == "invalid_request"
+    assert collector.events[-1]["error_type"] != "upstream_protocol"
+    # 请求侧错误不是凭证的错：不冷却、不累计
+    assert credentials.candidates()[0].cooling_until is None
+
+async def test_complete_inline_request_error_records_real_type(repo):
+    """非流式路径同口径：`aggregate()` 抛出的流内错误也带真实分类。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    collector = RecordingCollector()
+    executor = _exec_with_stats(repo, [[
+        Event(kind=EventKind.ERROR, error_code=406,
+              error_message="The request model is not multimodal",
+              error_kind=ErrKind.REQUEST)]], collector, max_rotate=1)
+
+    from src.compat.openai.request import parse_chat_request
+
+    with pytest.raises(NoHealthyCredential):
+        await executor.complete(parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}]}), username="erin")
+    assert collector.events[-1]["error_type"] == "invalid_request"
+    assert credentials.candidates()[0].cooling_until is None

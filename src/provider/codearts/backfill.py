@@ -12,7 +12,9 @@
 - `usage_events`：`credit`（非空的行）；
 - `usage_hourly`：`credit_sum`（非空的行）——直接除，不重算，避免丢掉
   「明细已过保留期、只剩汇总」的历史小时；
-- `credit_events`：属于 codearts 凭证的 `before` / `after` / `delta`。
+- `credit_events`：属于 codearts 凭证的 `before` / `after` / `delta`
+  （**仅 `ledger='pool'` 的行**——那是每日 token 池折算出来的历史流水；
+  `ledger='credits'` 的行本就是积分口径，除一遍会算错）。
 
 **仅执行一次**：折算即除以 `TOKENS_PER_CREDIT`，重复执行会把已折算的值再除一遍。
 `scripts/convert_codearts_credit_unit.py` 默认只预览、需 `--apply` 才写库，并在
@@ -95,7 +97,7 @@ def pending(conn) -> dict[str, int]:
             "WHERE provider = 'codearts' AND credit_sum IS NOT NULL"
         ).fetchone()[0],
         "credit_events": conn.execute(
-            "SELECT COUNT(*) FROM credit_events WHERE credential_id IN "
+            "SELECT COUNT(*) FROM credit_events WHERE ledger = 'pool' AND credential_id IN "
             "(SELECT id FROM credentials WHERE provider = 'codearts')"
         ).fetchone()[0],
     }
@@ -130,7 +132,7 @@ def convert_codearts_credit_unit(db) -> dict[str, int]:
             (TOKENS_PER_CREDIT,)).rowcount
         credit_events = conn.execute(
             "UPDATE credit_events SET before = before / ?, after = after / ?,"
-            " delta = delta / ? WHERE credential_id IN "
+            " delta = delta / ? WHERE ledger = 'pool' AND credential_id IN "
             "(SELECT id FROM credentials WHERE provider = 'codearts')",
             (TOKENS_PER_CREDIT, TOKENS_PER_CREDIT, TOKENS_PER_CREDIT)).rowcount
     return {

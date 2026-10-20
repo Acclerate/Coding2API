@@ -296,6 +296,29 @@ describe("StatsPage", () => {
     expect(within(table).getByText("≈¥0.008")).toBeInTheDocument();
   });
 
+  it("请求明细：Token 合并列显示 输入/输出 · 命中率，未上报显示 —", async () => {
+    mockFetch({
+      "/api/stats/overview": OVERVIEW,
+      "/api/stats/by-provider": PROVIDERS,
+      "/api/stats/by-model": MODELS,
+      "/api/stats/by-user": USERS,
+      "/api/stats/by-credential": CREDENTIALS,
+      "/api/stats/model-timeline": MODEL_TIMELINE,
+      "/api/stats/events": EVENTS_PAGE1,
+    });
+    renderPage(<StatsPage />, ADMIN);
+    await settle();
+
+    const table = screen.getByTestId("events-table");
+    expect(within(table).getByText("Token")).toBeInTheDocument();
+    // 成功行：输入 120 / 输出 480 · 命中率 75.0%（命中 90 ÷ 输入 120）
+    const okRow = within(table).getByText("glm-5.2").closest("tr")!;
+    expect(okRow).toHaveTextContent("120 / 480 · 75.0%");
+    // 失败行未上报缓存/输入 → 三项占位符
+    const failedRow = within(table).getByText("额度耗尽").closest("tr")!;
+    expect(failedRow).toHaveTextContent("— / — · —");
+  });
+
   it("请求明细：推算 credit 标 ≈，真实 credit 不标", async () => {
     mockFetch({
       "/api/stats/overview": OVERVIEW,
@@ -351,11 +374,12 @@ describe("StatsPage", () => {
     expect(within(table).getByText("glm-5.2")).toBeInTheDocument();
     expect(within(table).getByText("成功")).toBeInTheDocument();
     expect(within(table).getByText("额度耗尽")).toBeInTheDocument();
-    expect(within(table).getByText("8.2 s")).toBeInTheDocument();
-    expect(within(table).getByText("2.4 s")).toBeInTheDocument();
-    expect(within(table).getByText("90")).toBeInTheDocument();
-    expect(within(table).getByText("460 ms")).toBeInTheDocument();
-    expect(within(table).getByText("120 ms")).toBeInTheDocument();
+    // 合并列：延迟「耗时 / 首字」，Token「输入 / 输出 · 命中率」
+    const okRow = within(table).getByText("glm-5.2").closest("tr")!;
+    expect(okRow).toHaveTextContent("120 / 480 · 75.0%");
+    expect(okRow).toHaveTextContent("8.2 s / 2.4 s");
+    const failRow = within(table).getByText("额度耗尽").closest("tr")!;
+    expect(failRow).toHaveTextContent("460 ms / 120 ms");
     expect(screen.getByTestId("events-prev")).toBeDisabled();
     expect(screen.getByTestId("events-next")).toBeEnabled();
   });

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable
 
+from ..config import live
 from ..db.repo import CredentialRepository
 from . import TaskReport
 from .pacer import Pacer
@@ -13,24 +15,115 @@ from .pacer import Pacer
 logger = logging.getLogger(__name__)
 
 
+def parse_checkin_times(text: str) -> tuple[int, ...]:
+    """`HH:MM,HH:MM` → 距 0 点的分钟数（升序去重）。坏段忽略 + warning。
+
+    解析**宽容**（与 `engine.reasoning.parse_effort_map` 同风格）：一行坏配置
+    不能让网关起不来，也不能因一个笔误丢掉别的合法时点。空段 / 缺冒号 /
+    非数字 / 越界（`25:00`、`09:99`）都只丢该段。留空返回空元组 =
+    「不限时点」（旧的全天轮询行为）。
+    """
+    minutes: set[int] = set()
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        hour_raw, sep, minute_raw = chunk.partition(":")
+        if not sep:
+            logger.warning("签到时点 %r 缺少冒号，已忽略", chunk)
+            continue
+        try:
+            hour, minute = int(hour_raw.strip()), int(minute_raw.strip())
+        except ValueError:
+            logger.warning("签到时点 %r 不是 HH:MM 数字，已忽略", chunk)
+            continue
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            logger.warning("签到时点 %r 超出 00:00-23:59，已忽略", chunk)
+            continue
+        minutes.add(hour * 60 + minute)
+    return tuple(sorted(minutes))
+
+
 class CheckinTask:
     """每日签到：按「endpoint + X-User-Id」隔离，同账号多凭证共享一次。"""
 
     def __init__(self, credentials: CredentialRepository, providers: dict,
                  *, on_success: Callable[[str], None] | None = None,
-                 pacer: Pacer | None = None) -> None:
+                 pacer: Pacer | None = None,
+                 times: str | Callable[[], str] = "",
+                 jitter_minutes: int | Callable[[], int] = 0,
+                 rng: Callable[[int], int] | None = None) -> None:
         self._credentials = credentials
         self._providers = providers
         self._on_success = on_success
         self._pacer = pacer
+        # 时点与抖动可热更：存取值器，due() 每次现读（不是装配快照）。
+        self._times = live(times)
+        self._jitter = live(jitter_minutes)
+        # 抖动偏移的随机源：`rng(上限)` 返回 0..上限。可注入，测试不依赖真随机。
+        self._rng = rng or (lambda span: random.randint(0, span))
         # done_key → 封账截止的 epoch 秒。原先是 set（只有「当天封/不封」），
         # 现在带截止时刻：渠道的签到周期不一定等于本地自然日（Qoder 每日 10:00
         # 才换活动），封到自然日结束会把新周期整段封掉。
+        # 注意与下面的「时点放行」是两套键：这里是每个凭证/G 作用域的封账，
+        # 那边是「今天这个时点已经触发过一轮」，语义不能合并。
         self._done_scopes: dict[str, int] = {}
+        # 时点放行：键固定为「本地日期 + 时点分钟数」，抖动只改窗口、不改归属，
+        # 所以执行时刻落在窗口里哪个分钟都不会让同一时点跑两次。
+        self._slot_offsets: dict[str, int] = {}   # 当日该时点抽到的抖动偏移（分钟）
+        self._fired_slots: set[str] = set()       # 当日已放行的时点
+
+    def has_times(self) -> bool:
+        """是否配置了签到时点（决定 runner 的醒转周期：配了就要 1 分钟精度）。"""
+        return bool(parse_checkin_times(self._times()))
 
     def due(self, *, now: time.struct_time | None = None) -> bool:
-        """全天每 10 分钟一轮（由 runner 周期控制），不再受时刻限制。"""
-        return True
+        """是否该跑一轮签到。
+
+        - `checkin_times` 留空 → 恒 True，保持「全天每 10 分钟一轮」的旧行为
+          （老部署升级后不打任何补丁也不会改变签到节奏）。
+        - 有配置 → 只在某个时点的抖动窗口 `[时点 - 偏移, 时点]` 内返回 True。
+          偏移每个「日期 + 时点」只抽一次（0..`checkin_jitter_minutes`），
+          抖动=0 时窗口退化成「恰好该分钟」；跨零点时截到当日 0 点。
+        - 放行一次即记 `日期 + 时点` 键（不是实际执行时刻），同一时点当天
+          不再放行；跨天记录由 `_prune_slots` 清掉。
+
+        注意窗口宽度与 runner 的醒转周期：配了时点时 runner 改为 **每 60 秒**
+        醒一次（见 `TaskRunner._checkin_interval`），故抖动=0 也能稳定命中那
+        一分钟；留空时仍是 10 分钟一轮的旧节奏。抖动继续用于把多部署摊开。
+        """
+        times = parse_checkin_times(self._times())
+        if not times:
+            return True                      # 留空 = 旧行为
+        current = now or time.localtime()
+        day = self._day_key(current)
+        self._prune_slots(day)
+        moment = current.tm_hour * 60 + current.tm_min
+        jitter = max(0, int(self._jitter()))
+        for slot in times:
+            key = f"{day}:{slot}"
+            if key in self._fired_slots:
+                continue
+            offset = self._slot_offsets.get(key)
+            if offset is None:               # 当日首次见到该时点 → 抽一次偏移
+                # 抖动最多提前到当日 0 点：偏移量不能超过时点本身，否则窗口会
+                # 跨到前一天，而键是「今天 + 时点」，语义就乱了。
+                span = min(jitter, slot)
+                offset = min(max(0, int(self._rng(span))), span) if span else 0
+                self._slot_offsets[key] = offset
+            if slot - offset <= moment <= slot:
+                self._fired_slots.add(key)
+                return True
+        return False
+
+    def _prune_slots(self, day: str) -> None:
+        """丢掉非当天的抖动计划 / 放行记录：键以日期开头，跨天后不可能再命中，
+        长驻进程否则每天每时点各攒两条（无上限）。"""
+        prefix = f"{day}:"
+        for key in [key for key in self._slot_offsets if not key.startswith(prefix)]:
+            del self._slot_offsets[key]
+        self._fired_slots = {key for key in self._fired_slots
+                             if key.startswith(prefix)}
 
     def _day_key(self, now: time.struct_time) -> str:
         return f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
@@ -76,7 +169,13 @@ class CheckinTask:
             # 身份未知（provider 返回空 scope）时绝不共享：共享会让第二个账号被
             # 永久跳过（空 scope 相同 → seen 去重命中），代价是漏签一个号且无任何
             # 报错。回落到 credential_id 最坏只是多签一次，上游签到幂等（返回 ALREADY）。
-            scope = checkin_scope(data) or f"credential|{candidate.credential_id}"
+            # `None` 是另一回事——凭证级「本通道无签到活动」（如 Qoder lingma
+            # 区域）：整类跳过，不出网、不重试、不计失败。
+            scope = checkin_scope(data)
+            if scope is None:
+                report.skipped += 1
+                continue
+            scope = scope or f"credential|{candidate.credential_id}"
             done_key = self._done_key(day, scope)
             if self._sealed(done_key, current):
                 report.skipped += 1                      # 封账未到期，不再调上游

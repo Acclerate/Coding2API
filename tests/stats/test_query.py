@@ -54,8 +54,10 @@ def test_group_methods_reject_non_whitelisted_key(stats):
     """
     import pytest
 
+    from src.stats.query import _percentile_join
+
     _collector, query = stats
-    for method in (query._group_hourly, query._group_events):
+    for method in (query._group_hourly, query._group_events, _percentile_join):
         with pytest.raises(ValueError, match="非法分组键"):
             method("1=1; DROP TABLE usage_events")
 
@@ -184,6 +186,159 @@ def test_stats_overview_empty_and_filters(stats):
     assert empty["requests"] == 0 and empty["success_rate"] is None
     assert empty["avg_latency_ms"] is None
     assert query.by_provider() == []
+
+def test_stats_groups_report_latency_percentiles(stats):
+    """分组行带 P95 延迟（耗时/首字各算一条），与均值一起下发。
+
+    分位值只能从明细算（小时汇总只有 sum/count），故只覆盖 90 天；
+    口径与均值一致：只算成功请求。
+    """
+    collector, query = stats
+    # 10 条成功：latency 100..1000、ttfb 10..100。P95 = 第 10 小 = 1000 / 100
+    for value in range(100, 1100, 100):
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         latency_ms=value, ttfb_ms=value // 10)
+    # 失败请求带超大延迟：不进分位（否则尾延迟被失败请求顶爆）
+    collector.record(username="u", provider="trae", model="m", ok=False, latency_ms=99999,
+                     ttfb_ms=99999)
+    row = query.by_provider(username="u")[0]
+    assert row["p95_latency_ms"] == 1000 and row["p95_ttfb_ms"] == 100
+    # 均值口径与 overview 一致（÷ 成功数，失败不计入）
+    overview = query.overview(username="u")
+    assert row["avg_latency_ms"] == overview["avg_latency_ms"] == 550
+    assert row["avg_ttfb_ms"] == overview["avg_ttfb_ms"] == 55
+
+def test_stats_group_percentiles_use_nearest_rank(stats):
+    """nearest-rank：第 p 百分位 = 第 ⌈p·n⌉ 小的值（向上取整）。
+
+    n=20 时 P95 取第 19 小而非第 20 小（⌈19⌉=19）；n=10 时两者都是第 10 小。
+    用整数公式 `(95*n + 99)/100` 实现，避开浮点误差把名次算偏。
+    """
+    collector, query = stats
+    for value in range(1, 21):                       # 1..20
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         latency_ms=value * 100)
+    assert query.by_provider(username="u")[0]["p95_latency_ms"] == 1900
+    for value in range(21, 31):                      # 追加 10 条 → n=30，第 29 小
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         latency_ms=value * 100)
+    assert query.by_provider(username="u")[0]["p95_latency_ms"] == 2900
+
+def test_stats_group_percentiles_rank_latency_and_ttfb_separately(stats):
+    """ttfb 对非流式 / 未产出首字的成功请求为 NULL：两列各自独立排名。
+
+    `COUNT(col)` 忽略 NULL，天然只数有值样本；NULL 行排在样本之后不占名次。
+    """
+    collector, query = stats
+    # 3 条成功有 latency、其中只有 1 条有 ttfb
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=100, ttfb_ms=10)
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=200, ttfb_ms=None)
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=300, ttfb_ms=None)
+    row = query.by_provider(username="u")[0]
+    assert row["p95_latency_ms"] == 300              # 3 个样本 → 第 ⌈2.85⌉=3 小
+    assert row["p95_ttfb_ms"] == 10                  # 1 个样本 → 唯一值
+    # 均值口径照旧：ttfb_sum 把 NULL 折成 0 累加、除以同一个 ok_count
+    # （与 overview / collector 逐字节一致，不是新口径）
+    assert row["avg_latency_ms"] == 200 and row["avg_ttfb_ms"] == 3
+
+def test_stats_group_percentiles_null_when_no_success(stats):
+    """全失败 / 无延迟上报：分位列 None（前端显示 —），不拿 0 冒充有数据。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=False, latency_ms=500)
+    collector.record(username="u", provider="codebuddy", model="m", ok=True,
+                     latency_ms=None, ttfb_ms=None)
+    rows = {row["provider"]: row for row in query.by_provider(username="u")}
+    assert rows["trae"]["p95_latency_ms"] is None and rows["trae"]["p95_ttfb_ms"] is None
+    assert rows["codebuddy"]["p95_latency_ms"] is None
+    # 行仍在（请求数 > 0），只是延迟列空——LEFT JOIN 而非 INNER 的用意
+    assert rows["trae"]["requests"] == 1
+    assert rows["codebuddy"]["requests"] == 1
+
+def test_stats_group_percentiles_single_sample(stats):
+    """单样本分组：P95 即该样本本身（⌈0.95⌉=1）。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=250, ttfb_ms=60)
+    row = query.by_provider(username="u")[0]
+    assert row["p95_latency_ms"] == 250 and row["p95_ttfb_ms"] == 60
+
+def test_stats_group_percentiles_all_dimensions(stats):
+    """四个维度都带分位值：三条路径（hourly × 3 + events）共用同一实现。"""
+    collector, query = stats
+    for i, value in enumerate(range(100, 1100, 100)):
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         credential_id="cred_a", latency_ms=value, ttfb_ms=value // 10,
+                         now=1_700_000_000 + i)
+    for rows in (query.by_provider(username="u"), query.by_model(username="u"),
+                 query.by_user(username="u"),
+                 query.by_credential(username="u")):
+        assert rows[0]["p95_latency_ms"] == 1000 and rows[0]["p95_ttfb_ms"] == 100
+
+def test_stats_group_percentiles_respect_scope_and_window(stats):
+    """分位子查询独立应用作用域与时间窗（取值列用 ts，不是 hour_utc）。
+
+    窗外的大延迟若混进来，P95 会被与当前范围无关的旧数据顶高。
+    """
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=100, now=1000)
+    collector.record(username="v", provider="trae", model="m", ok=True,
+                     latency_ms=900, now=1000)
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     latency_ms=99999, now=9000)
+    # 只看 u：v 的 900 不进分位
+    assert query.by_provider(username="u")[0]["p95_latency_ms"] == 99999
+    # until=7200 切掉 9000 那条：只剩 100
+    assert query.by_provider(username="u", until=7200)[0]["p95_latency_ms"] == 100
+    # since=7200 只留 9000 那条
+    assert query.by_provider(username="u", since=7200)[0]["p95_latency_ms"] == 99999
+    # 明细路径（凭证维度）同样尊重时间窗
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     credential_id="cred_a", latency_ms=100, now=1000)
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     credential_id="cred_a", latency_ms=99999, now=9000)
+    assert query.by_credential(username="u", until=7200)[0]["p95_latency_ms"] == 100
+
+def test_stats_groups_sort_by_latency_keys(stats):
+    """延迟排序键：均值走 SQL 表达式，分位走 JOIN 列；ok_count=0 排最后。"""
+    collector, query = stats
+    # trae：2 条成功（latency 100/200）→ 均值 150、P95 200
+    for value in (100, 200):
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         latency_ms=value, ttfb_ms=10)
+    # codebuddy：1 条成功 latency 500 → 均值/P95 都是 500
+    collector.record(username="u", provider="codebuddy", model="m", ok=True,
+                     latency_ms=500, ttfb_ms=90)
+    # zen：全失败 → ok_count=0，延迟键上必须是 NULL（排最后）
+    collector.record(username="u", provider="zen", model="m", ok=False, latency_ms=9999)
+
+    def order(sort: str, order_by: str) -> list[str]:
+        return [row["provider"] for row in
+                query.by_provider(username="u", sort=sort, order=order_by)]
+
+    # 均值降序：codebuddy(500) > trae(150) > zen(NULL)
+    assert order("avg_latency_ms", "desc") == ["codebuddy", "trae", "zen"]
+    assert order("avg_ttfb_ms", "desc") == ["codebuddy", "trae", "zen"]
+    # 分位降序：codebuddy(500) > trae(200) > zen(NULL)
+    assert order("p95_latency_ms", "desc") == ["codebuddy", "trae", "zen"]
+    # 升序时 SQLite 把 NULL 排最前（与降序排最后相反）：缺失不是「最小」，
+    # 但这是 SQLite 对所有可空列的既有语义，延迟列不特殊化
+    assert order("p95_ttfb_ms", "asc") == ["zen", "trae", "codebuddy"]
+    # 未知键仍回落默认（请求数降序）：trae 2 > codebuddy 1 = zen 1，并列按分组键
+    assert order("ghost", "desc") == ["trae", "codebuddy", "zen"]
+
+def test_stats_group_percentiles_survive_hourly_rollup(stats):
+    """分位值与汇总无关：rollup 重算小时表不影响明细上的分位结果。"""
+    collector, query = stats
+    for value in (100, 200, 300):
+        collector.record(username="u", provider="trae", model="m", ok=True,
+                         latency_ms=value)
+    before = query.by_provider(username="u")[0]["p95_latency_ms"]
+    collector.rollup_hourly()
+    assert query.by_provider(username="u")[0]["p95_latency_ms"] == before == 300
 
 def test_overview_matches_timeline_beyond_retention_window(stats):
     """超过 90 天的时段：总览与图表必须同值（同读小时汇总）。

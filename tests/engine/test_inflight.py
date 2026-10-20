@@ -79,13 +79,17 @@ def test_tracker_acquire_sweeps_expired_before_counting():
 # ---------------------------------------------------------------- InflightGuard
 
 
-def test_guard_unlimited_never_blocks_or_registers():
+def test_guard_unlimited_never_blocks_but_still_counts():
+    """不限并发（≤0）时 blocked 恒 False，但仍登记租约——在途数是调度器的
+    负载键，关掉上限时也要反映实时负载（否则并发全落排序确定的同一个号）。"""
     guard = InflightGuard(lambda: 0)
     assert guard.limit == 0
     assert guard.blocked("c1") is False
     guard.acquire("c1")
-    assert guard.count("c1") == 0            # ≤0 时不做无意义的登记
-    guard.release("c1")                      # 幂等
+    assert guard.count("c1") == 1            # 不限也计数
+    assert guard.blocked("c1") is False      # 但永不因上限被挡
+    guard.release("c1")
+    assert guard.count("c1") == 0            # 对称释放
 
 
 def test_guard_negative_limit_normalized_to_unlimited():
@@ -110,9 +114,9 @@ def test_guard_reads_limit_lazily_for_hot_update():
     limit = {"value": 0}
     guard = InflightGuard(lambda: limit["value"])
     guard.acquire("c1")
-    assert guard.count("c1") == 0            # 不限时未登记
+    assert guard.count("c1") == 1            # 不限也登记（负载键）
+    assert guard.blocked("c1") is False      # 上限 0 = 不限，不挡
     limit["value"] = 1
-    guard.acquire("c1")
     assert guard.blocked("c1") is True       # 热更后的上限立即生效
 
 
@@ -258,3 +262,28 @@ async def test_executor_stream_inflight_skips_full_credential(repo):
     assert chunks[-1] == SSE_DONE
     assert provider.credentials == [{"accessToken": "free"}]
     assert guard.count(free_id) == 0
+
+
+async def test_executor_concurrent_requests_spread_across_credentials(repo):
+    """并发请求摊到空闲凭证（最少连接），而不是全压排序确定的同一个号。
+
+    上限为 0（不限）时旧实现不登记租约 → 负载键恒 0 → 排序退化到最后一键，
+    三个并发全落同一凭证。现在在途参与排序，三个并发应命中三个不同凭证。
+    """
+    credentials, _db = repo
+    ids = [_add(credentials, f"tok{i}", f"n{i}") for i in range(3)]
+    # 三个号健康度/余额全打平：纯靠负载键分摊
+    for cid in ids:
+        credentials.save_success(cid)
+    guard = InflightGuard(lambda: 0)          # 不限并发，仅用计数做负载键
+    provider = RecordingProvider([GOOD_trae])
+    executor = _build(credentials, provider, guard)
+
+    streams = [executor.stream(_stream_request()) for _ in range(3)]
+    for stream in streams:                    # 三个都启动（各自登记租约）
+        await stream.__anext__()
+    # 三个并发落到三个不同凭证（tok0/1/2 各一次）
+    assert sorted(c["accessToken"] for c in provider.credentials) == ["tok0", "tok1", "tok2"]
+    for stream in streams:
+        await stream.aclose()
+    assert all(guard.count(cid) == 0 for cid in ids)   # 关闭后全部释放

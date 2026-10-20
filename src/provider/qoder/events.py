@@ -94,6 +94,22 @@ REALM_CONFIGS: dict[str, RealmConfig] = {
         send_redirect_uri=False,
         nonce_dashed=False,
     ),
+    "lingma": RealmConfig(
+        # 通义灵码登录态（Qoder CN IDE「Log in with Lingma」，阿里云 RAM 企业账号）：
+        # 推理与模型发现走 lingma-api，COSY 签名与 qoder 网关同构、同一服务端公钥。
+        # 凭证是 state.vscdb 的 pt-/rt- 平台令牌，只能手工导入（auth_source=manual，
+        # 不走设备码登录，也不做 deviceToken 刷新）；openapi 业务端点（额度/签到）
+        # 在该域名下不存在，探测失败仅影响额度展示，不影响聊天与模型列表。
+        name="灵码 (Lingma)",
+        openapi="https://lingma-api.tongyi.aliyun.com",
+        gateway="https://lingma-api.tongyi.aliyun.com",
+        website="https://devops.aliyun.com",
+        client_id="",
+        redirect_uri="",
+        domain="tongyi.aliyun.com",
+        user_agent="QoderWork/1.1.64",
+        send_client_id=False,
+    ),
 }
 
 DEFAULT_REALM = "cn"

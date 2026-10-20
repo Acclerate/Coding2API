@@ -37,8 +37,8 @@ from .deps import ApiKeyPrincipal, Services, api_key_user
 from .model_catalog import load_catalog, save_catalog
 from .model_merge import (
     _build_aliases,
+    _collect_models,
     _entry_response,
-    _merge_provider,
     _sort_key,
     _visible,
 )
@@ -66,22 +66,27 @@ def credential_providers(services: Services) -> set[str]:
     口径与调度器一致（`selectable_only=True`：未暂停、未硬禁用）；冷却中的
     凭证仍算「有凭证」——渠道接了只是暂时限流，模型列表不该跟着闪没。
     """
-    return {row.provider
-            for row in services.credentials.candidates(selectable_only=True)}
+    return {
+        row.provider for row in services.credentials.candidates(selectable_only=True)
+    }
 
 
 def merged_entries(services: Services, connected: set[str]) -> list[dict[str, Any]]:
-    """按当前缓存表合并出全部条目（归一键 → 定稿后按 `_sort_key` 排序）。
+    """按当前缓存表收集出全部条目（每模型一条，按 `_sort_key` 排序）。
 
     只看 `services.model_list_cache`，不看「本次拉到了什么」：这样缓存兜底、
-    TTL 复用、落盘恢复三条路径共用同一段合并逻辑，行为一致。渠道过滤用
+    TTL 复用、落盘恢复三条路径共用同一段收集逻辑，行为一致。渠道过滤用
     `connected`（有可用凭证），与 `list_models` 的拉取范围保持同口径。
     """
     patterns = services.settings.blocklist_patterns
-    grouped: dict[str, dict[str, Any]] = {}   # 归一键 → {providers, meta, raw_ids, ...}
+    grouped: dict[str, dict[str, Any]] = (
+        {}
+    )  # 组键 → {base, providers, meta, raw_ids, ...}
     for provider_id, table in services.model_list_cache.items():
         if provider_id in connected and table:
-            _merge_provider(grouped, provider_id, _visible(table, patterns))
+            _collect_models(
+                grouped, provider_id, _visible(table, patterns, provider_id)
+            )
     # 先按渠道优先级 + 归一键排序（对外 id 尚未算出），再定稿：`_disambiguate`
     # 要靠这个顺序决定对外 id 撞车时谁保留。定稿后顺序不再变化，输出即此序。
     return sorted(grouped.values(), key=_sort_key)
@@ -109,7 +114,9 @@ def publish_aliases(services: Services, connected: set[str]) -> None:
     _publish(services, merged_entries(services, connected))
 
 
-async def _refresh_provider(services: Services, provider_id: str, provider: Any) -> None:
+async def _refresh_provider(
+    services: Services, provider_id: str, provider: Any
+) -> None:
     """拉一条渠道的模型表：成功更新缓存并落盘，失败保留旧缓存（兜底）。
 
     缓存里存**未过滤**的原始表：过滤在每个出口现做，否则黑名单热更后缓存里
@@ -120,7 +127,8 @@ async def _refresh_provider(services: Services, provider_id: str, provider: Any)
     candidates = services.credentials.candidates([provider_id], selectable_only=True)
     credential_data = (
         services.credentials.credential_data(candidates[0].credential_id)
-        if candidates else {}
+        if candidates
+        else {}
     )
     try:
         models = await provider.list_models(credential_data)
@@ -132,7 +140,9 @@ async def _refresh_provider(services: Services, provider_id: str, provider: Any)
         else:
             logger.warning("模型列表获取失败 %s: %s", provider_id, error)
         return
-    services.model_list_cache[provider_id] = {model.id.lower(): model for model in models}
+    services.model_list_cache[provider_id] = {
+        model.id.lower(): model for model in models
+    }
     services.model_list_fetched_at[provider_id] = time.monotonic()
     save_catalog(services.settings.data_dir, services.model_list_cache)
 
@@ -165,18 +175,22 @@ def restore_model_catalog(services: Services) -> int:
     restored = 0
     now = time.time()
     for provider_id, (saved_at, table) in load_catalog(
-            services.settings.data_dir, now=now).items():
+        services.settings.data_dir, now=now
+    ).items():
         # 未注册的渠道（换过的装配）与没有可用凭证的渠道都不恢复：目录里的
         # 快照不该让「用户已暂停的渠道」重新出现在模型列表里。
         if provider_id not in services.registry or provider_id not in connected:
             continue
         services.model_list_cache[provider_id] = table
-        services.model_list_fetched_at[provider_id] = (
-            time.monotonic() - max(0.0, now - saved_at))
+        services.model_list_fetched_at[provider_id] = time.monotonic() - max(
+            0.0, now - saved_at
+        )
         restored += 1
     if restored:
         publish_aliases(services, connected)
-        logger.info("已从落盘目录恢复模型目录: %s", ",".join(sorted(services.model_list_cache)))
+        logger.info(
+            "已从落盘目录恢复模型目录: %s", ",".join(sorted(services.model_list_cache))
+        )
     return restored
 
 
@@ -202,8 +216,7 @@ async def _refresh_providers(services: Services, connected: set[str]) -> None:
             publish_aliases(services, connected)
 
 
-def _schedule_refresh(services: Services, connected: set[str],
-                      stale: set[str]) -> None:
+def _schedule_refresh(services: Services, connected: set[str], stale: set[str]) -> None:
     """把「过期渠道」的刷新丢到后台（去重 + 完成后自动摘除）。
 
     HTTP 出口专用：**有缓存就直接返回旧列表**，把 zen 探活的十几秒从请求路径
@@ -239,9 +252,12 @@ def _schedule_refresh(services: Services, connected: set[str],
     task.add_done_callback(_done)
 
 
-def _build_response(services: Services, connected: set[str],
-                    allowed_models: str = "",
-                    benchmarks: BenchmarkTable | None = None) -> dict:
+def _build_response(
+    services: Services,
+    connected: set[str],
+    allowed_models: str = "",
+    benchmarks: BenchmarkTable | None = None,
+) -> dict:
     """按当前缓存合并出响应（不碰上游），并就地 publish 别名表。
 
     `allowed_models` 非空时按该 Key 的模型白名单过滤展示：白名单是
@@ -255,14 +271,19 @@ def _build_response(services: Services, connected: set[str],
     _publish(services, entries)
     if allowed_models:
         from ..auth.access import model_allowed
-        entries = [entry for entry in entries
-                   if model_allowed(entry["id"], allowed_models)]
-    return {"object": "list", "data": [_entry_response(entry, benchmarks)
-                                       for entry in entries]}
+
+        entries = [
+            entry for entry in entries if model_allowed(entry["id"], allowed_models)
+        ]
+    return {
+        "object": "list",
+        "data": [_entry_response(entry, benchmarks) for entry in entries],
+    }
 
 
-async def serve_models(services: Services, allowed_models: str = "",
-                       request: Request | None = None) -> dict:
+async def serve_models(
+    services: Services, allowed_models: str = "", request: Request | None = None
+) -> dict:
     """HTTP 出口（`/v1/models`、Playground）：先回旧列表，过期渠道后台刷。
 
     stale-while-revalidate：TTL 到期不再把 zen 探活的十几秒压在请求上。只有某
@@ -279,19 +300,25 @@ async def serve_models(services: Services, allowed_models: str = "",
     Services 依赖）。不传（测试 / 内部调用）时条目不带 `benchmarks` 字段。
     """
     connected = credential_providers(services)
-    stale = {provider_id for provider_id in connected
-             if _needs_refresh(services, provider_id, now=time.monotonic())}
+    stale = {
+        provider_id
+        for provider_id in connected
+        if _needs_refresh(services, provider_id, now=time.monotonic())
+    }
     if any(not services.model_list_cache.get(provider_id) for provider_id in stale):
         # 无可回退模型（冷启动无快照 / 新接入渠道）：必须同步拉一次
         await _refresh_providers(services, connected)
     elif stale:
         _schedule_refresh(services, connected, stale)
-    benchmarks = getattr(request.app.state, "model_benchmarks", None) if request else None
+    benchmarks = (
+        getattr(request.app.state, "model_benchmarks", None) if request else None
+    )
     return _build_response(services, connected, allowed_models, benchmarks)
 
 
-async def list_models(services: Services,
-                      benchmarks: BenchmarkTable | None = None) -> dict:
+async def list_models(
+    services: Services, benchmarks: BenchmarkTable | None = None
+) -> dict:
     """同步拉取并合并模型列表（供后台预热 / 兜底刷新循环）。
 
     同一模型在各渠道的内部代号互不相同（Qoder `kmodel_latest` = TRAE
@@ -322,8 +349,9 @@ def create_router(services: Services) -> APIRouter:
     router = APIRouter()
 
     @router.get("/v1/models")
-    async def list_v1_models(request: Request,
-                             principal: ApiKeyPrincipal = Depends(api_key_user)):
+    async def list_v1_models(
+        request: Request, principal: ApiKeyPrincipal = Depends(api_key_user)
+    ):
         return await serve_models(services, principal.allowed_models, request)
 
     return router

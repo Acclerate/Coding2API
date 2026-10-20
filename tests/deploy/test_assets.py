@@ -153,6 +153,62 @@ def test_compose_forwards_port_used_by_entrypoint():
     assert "--host" not in cmd.group(1) and "--port" not in cmd.group(1)
 
 
+def test_compose_port_follows_through_mapping_and_healthcheck():
+    """PORT 同时是「容器内监听端口」与「宿主机映射端口」，三处必须同源。
+
+    曾踩过：`ports` 写成 `"${PORT:-8000}:8000"`（target 写死 8000）而
+    `PORT` 又透传进容器当监听端口。设 `PORT=9000` 时应用监听 9000、映射却
+    指向 8000、健康检查也打 8000 —— 容器永远不 healthy，且无任何报错线索。
+    CI 只跑默认 PORT，所以这个 bug 对 CI 不可见，必须静态盯住。
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    # 端口映射两侧都引用 PORT（target 不得写死）
+    assert re.search(r"\$\{PORT:-8000\}:\$\{PORT:-8000\}", text), \
+        "ports 的 target 必须跟随 PORT，否则非默认 PORT 的部署永远不 healthy"
+    # 健康检查必须读容器内的 PORT，而不是写死 8000
+    healthcheck = re.search(r"healthcheck:\n(?:.*\n)*?\s+retries: \d+", text)
+    assert healthcheck, "compose 缺 healthcheck 段"
+    assert "os.environ.get('PORT'" in healthcheck.group(0), \
+        "healthcheck 端口必须跟随 PORT"
+
+
+def test_dockerfile_healthcheck_follows_port_variable():
+    """Dockerfile 的 HEALTHCHECK 同样不得写死 8000（`docker run` 路线）。
+
+    compose 会覆盖 healthcheck，但直接用 `docker run` 时用的是镜像里这条；
+    写死端口会让 `docker run -e PORT=9000` 的容器永远不 healthy。
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    healthcheck = re.search(r"HEALTHCHECK[^\n]*\n\s+CMD (.+)", text)
+    assert healthcheck, "Dockerfile 缺 HEALTHCHECK 的 CMD"
+    command = healthcheck.group(1)
+    assert "127.0.0.1:8000" not in command, "Dockerfile 健康检查写死了 8000"
+    assert "os.environ.get('PORT'" in command, "Dockerfile 健康检查端口必须跟随 PORT"
+
+
+def test_compose_forwards_tz():
+    """TZ 必须在 compose 透传，否则 .env 里设了也被静默忽略。
+
+    compose 的 .env 只用于 `${}` 插值、**不自动注入容器**；镜像里虽有
+    `TZ=Asia/Shanghai` 兜底，但用户改成别的时区时不透传就等于没改。
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    assert re.search(r"^\s+TZ:", text, re.MULTILINE), \
+        ".env 里的 TZ 不会被注入容器（compose 未声明该 env）"
+
+
+def test_compose_declares_host_gateway_for_host_side_proxy():
+    """容器内 127.0.0.1 指容器自身，代理跑在宿主时必须能走 host.docker.internal。
+
+    `PROVIDER_PROXIES` 只校验格式、不校验可达，地址写错不会启动失败，只会
+    让该渠道全部请求连不上。compose 必须声明 extra_hosts 把宿主暴露进来。
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    assert "extra_hosts:" in text, "compose 缺 extra_hosts"
+    assert "host.docker.internal:host-gateway" in text, \
+        "缺 host.docker.internal 映射，容器无法访问宿主代理"
+
+
 def test_ci_workflow_paths_match_repository():
     """CI 里用到的路径必须存在，否则 workflow 必然失败。"""
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -181,6 +237,10 @@ def test_ci_compose_job_builds_fresh_image_with_admin_user():
 # -------------------------------------------------─ macOS launchd 部署产物
 
 LAUNCHD_TEMPLATE = ROOT / "deploy" / "launchd" / "com.coding2api.plist"
+FRPC_PLIST_TEMPLATE = ROOT / "deploy" / "launchd" / "com.coding2api.frpc.plist"
+# newsyslog 的日志路径可以来自任一个 launchd 模板（本体 / frpc 隧道）
+LAUNCHD_TEMPLATES = (LAUNCHD_TEMPLATE, FRPC_PLIST_TEMPLATE)
+LAUNCHD_AGENTS = Path.home() / "Library" / "LaunchAgents"
 BUILD_WEB = ROOT / "scripts" / "build-web.sh"
 LAUNCHD_SERVER = ROOT / "scripts" / "launchd-server.sh"
 
@@ -271,14 +331,39 @@ def test_launchd_template_starts_via_wrapper_not_bare_uvicorn():
     assert "uvicorn" not in args, "uvicorn 应写在 wrapper 里，便于构建失败时不阻断"
 
 
+def _shell_code_lines(path: Path) -> str:
+    """剥掉 shell 注释行，只留可执行代码。
+
+    断言「脚本里不得出现 uvicorn / --host」时不能连解释性注释一起算：
+    注释恰恰要写清「为什么不再用 uvicorn CLI」，那是给后人看的。
+    """
+    return "\n".join(
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#"))
+
+
+def test_launchd_server_does_not_hardcode_listen_address():
+    """脚本不得硬编码 --host/--port：HOST/PORT 是文档化配置项。
+
+    CLI 参数优先级高于环境变量，写死 --host 127.0.0.1 会让 .env 里的
+    HOST 静默失效——本地表现为「局域网 IP 访问不了、只有回环能通」，
+    且 curl 本地永远成功，极难定位。走 src.main:run 才是唯一读 .env 的路径。
+    """
+    code = _shell_code_lines(LAUNCHD_SERVER)
+    assert "--host" not in code, "监听地址必须由 src.main:run 从 .env 读取"
+    assert "--port" not in code, "监听端口必须由 src.main:run 从 .env 读取"
+    assert "python -m src.main" in code, "应走 src.main:run（唯一读 .env 的启动路径）"
+    assert "uvicorn" not in code, "改走 src.main:run 后不应再出现 uvicorn CLI"
+
+
 def test_launchd_server_uses_exec_so_keepalive_tracks_the_real_process():
-    """uvicorn 必须用 exec 替换脚本进程。
+    """服务进程必须用 exec 替换脚本进程。
 
     否则 launchd 监管的是 bash，kickstart -k 的 SIGTERM 打到 bash，
-    真正的 uvicorn 会变成孤儿继续占着 8000 端口。
+    真正的服务进程会变成孤儿继续占着 8000 端口。
     """
     text = LAUNCHD_SERVER.read_text(encoding="utf-8")
-    assert re.search(r"^exec ", text, re.MULTILINE), "缺少 exec，信号无法直达 uvicorn"
+    assert re.search(r"^exec ", text, re.MULTILINE), "缺少 exec，信号无法直达服务进程"
 
 
 def test_launchd_server_does_not_abort_when_build_fails():
@@ -382,7 +467,6 @@ def test_describe_probe_failure_handles_timeout_and_unknown():
 NEWSYSLOG = ROOT / "deploy" / "newsyslog" / "coding2api.conf"
 LOGROTATE = ROOT / "deploy" / "logrotate" / "coding2api"
 SYSTEMD_UNIT = ROOT / "deploy" / "systemd" / "coding2api.service"
-LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.coding2api.plist"
 
 # 部署模板里的占位符（安装脚本渲染成实际值，见 scripts/install-*.sh）。
 # 模板不得写死开发机路径，否则克隆到别处就不可用。
@@ -409,26 +493,45 @@ def test_compose_limits_docker_log_growth():
     assert "json-file" in text
 
 
+def _plist_label(template: Path) -> str:
+    """读模板里的 Label（渲染前后不变，无需替换占位符）。"""
+    import plistlib
+
+    with template.open("rb") as handle:
+        return str(plistlib.load(handle)["Label"])
+
+
 def test_newsyslog_rule_matches_launchd_plist_paths():
     """轮转路径必须与 launchd 实际写的文件一致，否则规则永远不生效。"""
-    # 模板对模板：两处用的是同一个 __PROJECT_ROOT__ 占位符，渲染后必须一致
+    # 模板对模板：两处用的是同一个 __PROJECT_ROOT__ 占位符，渲染后必须一致。
+    # 路径可能来自任一 launchd 模板（本体或 frpc 隧道），逐个模板查。
     template = NEWSYSLOG.read_text(encoding="utf-8")
-    plist_template = LAUNCHD_TEMPLATE.read_text(encoding="utf-8")
+    plist_templates = "\n".join(t.read_text(encoding="utf-8") for t in LAUNCHD_TEMPLATES)
     template_paths = [line.split()[0] for line in template.splitlines()
                       if line.strip() and not line.startswith("#")]
     assert template_paths, "newsyslog 模板里没有有效条目"
     for path in template_paths:
-        assert path in plist_template, f"newsyslog 模板里的 {path} 不在 launchd 模板中"
+        assert path in plist_templates, f"newsyslog 模板里的 {path} 不在任何 launchd 模板中"
 
-    # 渲染后与本机实际安装的 plist 对齐（CI 上没有安装文件则跳过）
-    paths = [line.split()[0] for line in _render_template(template).splitlines()
+    # 渲染后与本机实际安装的 plist 对齐：只校验「该路径所属的模板已安装」的那些
+    # （例如 frpc 尚未启用时其 plist 不存在，无法对照，跳过而不是误报）。
+    # CI 上两个 plist 都不存在，整段跳过。
+    rendered = _render_template(template)
+    paths = [line.split()[0] for line in rendered.splitlines()
              if line.strip() and not line.startswith("#")]
-    if LAUNCHD_PLIST.is_file():
-        plist = LAUNCHD_PLIST.read_text(encoding="utf-8")
-        for path in paths:
-            assert path in plist, f"newsyslog 规则里的 {path} 不在 launchd plist 中"
+    for launchd_template in LAUNCHD_TEMPLATES:
+        label = _plist_label(launchd_template)
+        installed = LAUNCHD_AGENTS / f"{label}.plist"
+        if not installed.is_file():
+            continue
+        owned = [p for p in paths
+                 if p in _render_template(launchd_template.read_text(encoding="utf-8"))]
+        installed_text = installed.read_text(encoding="utf-8")
+        for path in owned:
+            assert path in installed_text, \
+                f"newsyslog 规则里的 {path} 不在已安装的 {label} plist 中"
     # 每条规则必须有 7 个字段（路径 属主 权限 份数 大小 时间 标志）
-    for line in _render_template(template).splitlines():
+    for line in rendered.splitlines():
         if line.strip() and not line.startswith("#"):
             assert len(line.split()) == 7, f"newsyslog 字段数不对（需 7 列）: {line}"
 
@@ -454,7 +557,7 @@ def test_systemd_unit_sends_logs_to_journal():
 def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     """停机排空时长必须处处一致，且容器/systemd 窗口 >= 应用侧排空窗口。
 
-    三条启动路径（Docker CMD → src.main:run、systemd/launchd → uvicorn CLI）
+    三条启动路径（Docker CMD / launchd → src.main:run、systemd → uvicorn CLI）
     各写一遍同一个数字，最容易漂移；漂移的后果是「本地排空 30s、生产无限等」
     或「应用还在排空就被 SIGKILL、长流统计丢失」。这里把它们对一遍。
     """
@@ -463,12 +566,15 @@ def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     from src.main import GRACEFUL_SHUTDOWN_SECONDS
 
     assert GRACEFUL_SHUTDOWN_SECONDS > 0
-    # launchd 与 systemd 直接跑 uvicorn CLI，必须显式带同一个 flag
-    for path in (ROOT / "scripts" / "launchd-server.sh", SYSTEMD_UNIT):
-        text = path.read_text(encoding="utf-8")
-        found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
-        assert found, f"{path.name} 缺 --timeout-graceful-shutdown"
-        assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, path.name
+    # launchd 与 Docker 都走 src.main:run，flag 由 run() 内部传入，脚本里没有
+    # 这个数字可对；systemd 仍直接跑 uvicorn CLI，必须显式带同一个 flag。
+    text = SYSTEMD_UNIT.read_text(encoding="utf-8")
+    found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
+    assert found, f"{SYSTEMD_UNIT.name} 缺 --timeout-graceful-shutdown"
+    assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, SYSTEMD_UNIT.name
+    # launchd 走 run() 的前提：脚本代码里不得再出现 uvicorn CLI（否则数字又分裂）
+    launchd = _shell_code_lines(ROOT / "scripts" / "launchd-server.sh")
+    assert "uvicorn" not in launchd, "launchd 改走 src.main:run 后不应再出现 uvicorn CLI"
     # Docker：stop_grace_period 是容器给进程的停机窗口，必须 >= 应用排空窗口
     compose = COMPOSE.read_text(encoding="utf-8")
     grace = _re.search(r"stop_grace_period: (\d+)s", compose)
@@ -562,3 +668,211 @@ def test_version_is_single_sourced_everywhere():
             continue
         text = path.read_text(encoding="utf-8")
         assert f'version="{canonical}"' not in text, f"{path} 硬编码了版本号"
+
+
+# ------------------------------------------------- 公网入口（VPS + frp 反向隧道）
+#
+# 家宽在 CGNAT 后没有可入站地址，公网入口只能由内网侧主动连出建隧道。
+# 这组产物把「客户端 --443/TLS--> VPS(nginx) --frp 隧道--> Mac:8000」固化下来，
+# 关键不变量在这里锁死：frp 映射端口不得对公网暴露、token 不得内联进配置、
+# nginx 必须透传 Host 与 X-Forwarded-Proto、SSE 必须关缓冲。
+
+FRP_DIR = ROOT / "deploy" / "frp"
+FRPS_TOML = FRP_DIR / "frps.toml"
+FRPC_TOML = FRP_DIR / "frpc.toml"
+NGINX_CONF = ROOT / "deploy" / "nginx" / "coding2api.conf"
+FRPS_UNIT = ROOT / "deploy" / "systemd" / "frps.service"
+FRPC_RUN = ROOT / "scripts" / "frpc-run.sh"
+INSTALL_FRPC = ROOT / "scripts" / "install-frpc.sh"
+
+# nginx 的 proxy_read_timeout 必须盖过应用侧非流式聚合上限（config.py 默认 600s），
+# 否则长对话会被 nginx 先掐断，表现为客户端 504 而不是应用的超时错误。
+MIN_PROXY_READ_TIMEOUT_SECONDS = 600
+
+
+def _toml_int(text: str, key: str) -> int:
+    """取出形如 `key = 123` 的整数值（frp 配置是 TOML，值可能带下划线）。"""
+    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(\d+)\s*$", text, re.M)
+    assert match, f"找不到整数配置项 {key}"
+    return int(match.group(1))
+
+
+def test_frps_binds_mapped_port_to_loopback():
+    """映射端口必须只监听回环：公网入口是 nginx，明文 8000 不能直接开在公网。
+
+    不设 proxyBindAddr 时 frps 按 bindAddr(0.0.0.0) 绑定，等于绕开 nginx 的
+    TLS 与应用自身的 Host 校验，把回源流量摊成明文。
+    """
+    text = FRPS_TOML.read_text(encoding="utf-8")
+    assert re.search(r'^\s*proxyBindAddr\s*=\s*"127\.0\.0\.1"', text, re.M), \
+        "frps 的 proxyBindAddr 必须锁到回环"
+
+
+def test_frps_and_frpc_read_token_from_file_not_inline():
+    """token 必须走独立文件：配置文件会被 cp / 备份 / 贴进工单，内联等于随处分发。"""
+    for path in (FRPS_TOML, FRPC_TOML):
+        text = path.read_text(encoding="utf-8")
+        assert re.search(r'^\s*auth\.tokenSource\.type\s*=\s*"file"', text, re.M), \
+            f"{path.name} 的 token 必须从文件读"
+        assert re.search(r"^\s*auth\.tokenSource\.file\.path\s*=", text, re.M), \
+            f"{path.name} 缺少 tokenSource 文件路径"
+        # 内联形式 `auth.token = "..."` 一律禁止（tokenSource 不会被误伤：
+        # 等号紧跟 token 才是内联）
+        assert not re.search(r'^\s*auth\.token\s*=', text, re.M), \
+            f"{path.name} 内联了 token"
+
+
+def test_frps_forces_tls_and_restricts_allowed_remote_ports():
+    """隧道跨公网：必须强制 TLS；且只放行约定的那一个远程端口。"""
+    text = FRPS_TOML.read_text(encoding="utf-8")
+    assert re.search(r"^\s*transport\.tls\.force\s*=\s*true", text, re.M), \
+        "frps 必须强制客户端启用 TLS"
+    assert re.search(r"^\s*allowPorts\s*=\s*\[", text, re.M), "frps 必须限制可申请的远程端口"
+    assert "single = 8000" in text, "allowPorts 应只放行 8000"
+
+
+def test_frps_dashboard_stays_on_loopback():
+    """dashboard 不对公网暴露，也就不需要把密码写进配置文件。"""
+    text = FRPS_TOML.read_text(encoding="utf-8")
+    assert re.search(r'^\s*webServer\.addr\s*=\s*"127\.0\.0\.1"', text, re.M), \
+        "frps dashboard 必须只听回环"
+    assert "password" not in text, "dashboard 只听回环时不该在配置里放密码"
+
+
+def test_frpc_has_no_machine_specific_values():
+    """客户端配置必须可直接克隆使用：地址走环境变量模板，token 走文件。"""
+    text = FRPC_TOML.read_text(encoding="utf-8")
+    assert '{{ .Envs.FRP_SERVER_ADDR }}' in text, "serverAddr 必须用环境变量模板"
+    assert '{{ .Envs.FRP_TOKEN_FILE }}' in text, "token 路径必须用环境变量模板"
+    # 不得出现写死的地址 / 家目录（拼接以免本文件自身被
+    # test_deploy_templates_contain_no_personal_absolute_paths 误伤）
+    assert ("/" + "Users" + "/") not in text
+    assert ("/" + "home" + "/") not in text
+
+
+def test_frpc_maps_local_8000_to_remote_8000():
+    """回源目标就是本机后端（127.0.0.1:8000），映射端口与 nginx 反代目标一致。"""
+    text = FRPC_TOML.read_text(encoding="utf-8")
+    assert _toml_int(text, "localPort") == 8000
+    assert _toml_int(text, "remotePort") == 8000
+    assert re.search(r'^\s*localIP\s*=\s*"127\.0\.0\.1"', text, re.M), \
+        "回源必须走回环，不能是 0.0.0.0"
+    assert re.search(r'^\s*type\s*=\s*"tcp"', text, re.M), "应使用 tcp 代理"
+    # 健康检查打本机存活探针，服务没起来时不在 frps 上挂死映射
+    assert "healthCheck" in text and 'path = "/health"' in text
+
+
+def test_nginx_proxy_target_matches_frp_remote_port():
+    """nginx 反代目标必须与 frp 映射端口一致，否则整条链路断在第一跳。"""
+    nginx = NGINX_CONF.read_text(encoding="utf-8")
+    remote_port = _toml_int(FRPC_TOML.read_text(encoding="utf-8"), "remotePort")
+    assert f"proxy_pass http://127.0.0.1:{remote_port};" in nginx, \
+        f"nginx 应反代到 127.0.0.1:{remote_port}"
+
+
+def test_nginx_passes_host_and_forwarded_proto():
+    """Host 原样透传（ALLOWED_HOSTS 校验）；XFP 决定会话 Cookie 的 Secure。"""
+    text = NGINX_CONF.read_text(encoding="utf-8")
+    assert "proxy_set_header Host $host;" in text, "Host 必须原样透传"
+    assert "proxy_set_header X-Forwarded-Proto $scheme;" in text, \
+        "缺 X-Forwarded-Proto 会让 https 入口下发不带 Secure 的会话 Cookie"
+    assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;" in text
+
+
+def test_nginx_disables_buffering_for_sse():
+    """聊天是 SSE 长流：不关缓冲会把 token 攒起来一次性吐出。"""
+    text = NGINX_CONF.read_text(encoding="utf-8")
+    assert "proxy_buffering off;" in text, "SSE 必须关 proxy_buffering"
+    assert "proxy_cache off;" in text
+
+
+def test_nginx_read_timeout_covers_longest_conversation():
+    """读超时要盖过应用侧非流式聚合上限，否则长对话被 nginx 先掐断。"""
+    text = NGINX_CONF.read_text(encoding="utf-8")
+    match = re.search(r"^\s*proxy_read_timeout\s+(\d+)s;", text, re.M)
+    assert match, "缺少 proxy_read_timeout"
+    assert int(match.group(1)) >= MIN_PROXY_READ_TIMEOUT_SECONDS, \
+        f"proxy_read_timeout 需 >= {MIN_PROXY_READ_TIMEOUT_SECONDS}s"
+
+
+def test_nginx_body_limit_aligns_with_app_middleware():
+    """两侧同值才能让超限统一由应用裁决（否则 nginx 先返回 HTML 形状的 413）。"""
+    from src.webapp.limits import DEFAULT_BODY_LIMIT
+
+    text = NGINX_CONF.read_text(encoding="utf-8")
+    expected = f"client_max_body_size {DEFAULT_BODY_LIMIT // (1024 * 1024)}m;"
+    assert expected in text, f"nginx 上传上限应与应用对齐（{expected}）"
+
+
+def test_nginx_uses_domain_placeholder_not_hardcoded_host():
+    """域名是部署期值：模板用占位符，安装时替换，仓库里不留具体域名。"""
+    text = NGINX_CONF.read_text(encoding="utf-8")
+    assert "__TUNNEL_DOMAIN__" in text, "缺少域名占位符"
+    assert text.count("server_name __TUNNEL_DOMAIN__;") == 2, "两个 server 块都要用占位符"
+
+
+def test_frps_unit_runs_unprivileged_and_hardened():
+    """frps 不需要 root（端口都 > 1024）：专用账号 + 只读文件系统。"""
+    text = FRPS_UNIT.read_text(encoding="utf-8")
+    assert re.search(r"^User=frps$", text, re.M), "frps 应以专用非 root 账号运行"
+    assert re.search(r"^ExecStart=/usr/local/bin/frps -c /etc/frp/frps\.toml$", text, re.M)
+    assert re.search(r"^NoNewPrivileges=true$", text, re.M)
+    assert re.search(r"^ProtectSystem=strict$", text, re.M)
+    assert re.search(r"^StandardOutput=journal$", text, re.M), "日志交给 journald"
+    # unit 里不放任何密钥：token 走 /etc/frp/frps-token（600，属主 frps），
+    # 否则 `systemctl cat frps` 会把密钥暴露给任何用户
+    assert not re.search(r"^Environment", text, re.M), "unit 里不得内联环境变量/密钥"
+
+
+def test_frpc_plist_template_is_valid_and_renders():
+    """plist 模板必须合法，且占位符渲染后路径落到项目根内。"""
+    import plistlib
+
+    text = FRPC_PLIST_TEMPLATE.read_text(encoding="utf-8")
+    assert PROJECT_ROOT_TOKEN in text, "plist 模板必须用 __PROJECT_ROOT__ 占位符"
+    assert "__FRP_SERVER_ADDR__" in text, "服务器地址应是占位符"
+    assert ("/" + "Users" + "/") not in text, "模板不得写死开发机路径"
+
+    rendered = _render_template(text).replace("__FRP_SERVER_ADDR__", "vps.example.com")
+    data = plistlib.loads(rendered.encode("utf-8"))
+    assert data["Label"] == "com.coding2api.frpc"
+    assert data["EnvironmentVariables"]["FRP_SERVER_ADDR"] == "vps.example.com"
+    # token 文件落在项目根的 secrets/ 下（该目录已在 .gitignore 中）
+    assert data["EnvironmentVariables"]["FRP_TOKEN_FILE"] == f"{ROOT}/secrets/frpc-token"
+    # plist 里只出现 token 的**文件路径**，不出现 token 值本身：launchctl print
+    # 会把 plist 原样打印出来，任何内联密钥都等于对同机用户公开。
+    env_keys = set(data["EnvironmentVariables"])
+    assert not [k for k in env_keys if "TOKEN" in k and k != "FRP_TOKEN_FILE"], \
+        "plist 只应注入 token 文件路径，不得注入 token 值"
+
+
+def test_frpc_plist_writes_logs_covered_by_newsyslog():
+    """launchd 写的 frpc 日志必须与 newsyslog 规则一致，否则日志无限增长。"""
+    plist_text = _render_template(FRPC_PLIST_TEMPLATE.read_text(encoding="utf-8"))
+    newsyslog = NEWSYSLOG.read_text(encoding="utf-8")
+    for suffix in ("frpc.out.log", "frpc.err.log"):
+        assert f"logs/{suffix}" in plist_text, f"plist 未把日志写到 logs/{suffix}"
+        assert f"logs/{suffix}" in newsyslog, f"newsyslog 缺少 logs/{suffix} 的轮转规则"
+
+
+def test_frpc_run_resolves_binary_and_execs():
+    """wrapper 解析 frpc 位置后 exec（PID 即 frpc），并指向仓库内配置。"""
+    text = FRPC_RUN.read_text(encoding="utf-8")
+    assert "command -v frpc" in text, "应按 PATH 解析 frpc"
+    assert "/opt/homebrew/bin/frpc" in text, "应兜底 Homebrew 前缀"
+    assert 'exec "$FRPC_BIN" -c "$CONFIG"' in text, "必须 exec 替换进程"
+    assert 'CONFIG="$ROOT/deploy/frp/frpc.toml"' in text
+    assert FRPC_RUN.stat().st_mode & 0o111, "wrapper 必须可执行"
+
+
+def test_install_frpc_renders_placeholders_and_installs_agent():
+    """安装脚本：渲染两个占位符 → 写 LaunchAgents → 加载；token 落在 secrets/。"""
+    text = INSTALL_FRPC.read_text(encoding="utf-8")
+    assert 'LABEL="com.coding2api.frpc"' in text
+    assert "__PROJECT_ROOT__" in text and "__FRP_SERVER_ADDR__" in text
+    assert 'DEST="$HOME/Library/LaunchAgents/$LABEL.plist"' in text
+    assert "launchctl bootstrap" in text and "launchctl bootout" in text
+    assert "--uninstall" in text
+    assert 'TOKEN_FILE="$ROOT/secrets/frpc-token"' in text
+    assert "umask 077" in text, "token 文件必须按 600 落盘"
+    assert INSTALL_FRPC.stat().st_mode & 0o111, "安装脚本必须可执行"

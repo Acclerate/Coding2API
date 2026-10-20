@@ -9,7 +9,7 @@ import pytest
 from src.compat.openai.errors import UpstreamStreamError, error_payload
 from src.compat.openai.response import StreamTranslator, aggregate
 from src.engine.sse import SSE_DONE
-from src.provider.base import Event, EventKind, Usage
+from src.provider.base import ErrKind, Event, EventKind, Usage
 from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
 from tests.helpers.sse import parse_frames
@@ -107,6 +107,21 @@ def test_aggregate_without_usage_reports_nulls():
 def test_aggregate_raises_on_stream_error():
     with pytest.raises(UpstreamStreamError):
         aggregate([Event(kind=EventKind.ERROR, error_code=1005, error_message="quota")], "m")
+
+def test_upstream_stream_error_kind_uses_event_classification():
+    """流内业务错误经 `.kind()` 暴露真实分类。
+
+    此前没有这个方法，executor 的分类器（只认 `.kind()`）兜底成
+    `upstream_protocol`，界面显示「渠道响应异常」，真实类型被吞掉。
+    """
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=1005, error_kind=ErrKind.PLAN))
+    assert error.kind() is ErrKind.PLAN
+
+def test_upstream_stream_error_kind_defaults_to_other():
+    """未带业务分类的流内错误回落 OTHER（与 executor 的兜底同口径）。"""
+    error = UpstreamStreamError(Event(kind=EventKind.ERROR, error_message="boom"))
+    assert error.kind() is ErrKind.OTHER
 
 def test_error_payload_shape():
     payload = error_payload("msg", "code", 400)

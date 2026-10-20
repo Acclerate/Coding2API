@@ -64,7 +64,7 @@ export function ActivatePage() {
       setDone(true);
     } catch (caught) {
       const message = caught instanceof ApiError ? caught.message : "";
-      setError(message.includes("activation") ? "链接无效或已过期，请向管理员索取新链接。" : "设置失败，请稍后重试。");
+      setError(message.includes("activation") ? "链接无效或已过期，请向管理员索取新链接" : "设置失败，请稍后重试");
       setPending(false);
     }
   };
@@ -83,7 +83,7 @@ export function ActivatePage() {
               <Notice tone="danger">
                 <span className="inline-flex items-center gap-1.5">
                   <TriangleAlert className="size-3.5" />
-                  链接无效或已过期，请向管理员索取新的激活链接。
+                  链接无效或已过期，请向管理员索取新激活链接。
                 </span>
               </Notice>
             </div>
@@ -104,8 +104,9 @@ export function ActivatePage() {
               <div className="text-sm text-muted-foreground">
                 正在为 <span className="font-medium text-foreground">{username ?? "…"}</span> 设置密码
               </div>
-              <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`}>
+              <Field label={`新密码（至少 ${MIN_PASSWORD_LENGTH} 位）`} htmlFor="activate-password-input">
                 <Input
+                  id="activate-password-input"
                   type="password"
                   value={password}
                   autoComplete="new-password"
@@ -114,8 +115,9 @@ export function ActivatePage() {
                   onChange={(event) => setPassword(event.target.value)}
                 />
               </Field>
-              <Field label="确认密码">
+              <Field label="确认密码" htmlFor="activate-confirm-input">
                 <Input
+                  id="activate-confirm-input"
                   type="password"
                   value={confirm}
                   autoComplete="new-password"

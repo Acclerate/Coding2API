@@ -99,7 +99,10 @@ PROBE_PROMPT = "hi"
 MODELS_CACHE_TTL_SECONDS = 1800.0
 
 # 流式无总超时防长流截断；短请求 30s 防悬挂（与 TRAE 同策略）
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+# 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
+# 经代理链路 10s 会稳定超时；首字等待由 read=None +
+# stream_first_event_timeout_seconds 负责，两者不要混为一谈。
+STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 SHORT_TIMEOUT = httpx.Timeout(30.0)
 
 # 403 门禁抖动重试（实测 2026-10-09/12 共 7 次）：上游**偶发**对同一请求回
@@ -385,7 +388,8 @@ class ZenClient:
                     continue
                 if response.status_code >= 400:
                     raw = await base.read_body_bounded(response)
-                    raise UpstreamHTTPError(response.status_code, raw)
+                    raise UpstreamHTTPError(response.status_code, raw,
+                                            **base.retry_hints(response.headers))
                 async for frame in iter_frames(response.aiter_bytes()):
                     for event in zen_events.parse_all_events(frame):
                         if event.kind is EventKind.TOOL_CALLS and event.tool_calls:

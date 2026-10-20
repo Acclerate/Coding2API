@@ -89,7 +89,9 @@ class Settings(BaseSettings):
     provider_proxies: str = ""
 
     # 路由与调度
-    default_model: str = "glm-5.2"
+    # 默认模型：六条渠道都已上架 `deepseek-v4.1-flash`（CB / TRAE / CodeArts /
+    # codebuddy_intl 同名，Qoder 走别名 `dfmodel`），故默认值取它而不是老模型
+    default_model: str = "deepseek-v4.1-flash"
     # token 预刷新的提前量（小时）：距 access token 到期 ≤ 该值就提前换新。
     # 注意它对**短寿命渠道**会被自行封顶（CodeArts STS 只有 2h，见
     # `CodeArtsCredential.refresh_skew_cap_seconds`），所以调大它不会让短寿命
@@ -126,16 +128,35 @@ class Settings(BaseSettings):
     # 缓存（30 分钟）对齐：再密也不会让 zen 多探活一次，只是白打其余渠道的
     # /models。
     model_catalog_minutes: int = 30
+    # 模型可用性探活周期（分钟）：只探仍被负缓存（「上游无此模型」）的
+    # (渠道, 模型)，一次最小对话。0 = 关闭（默认关闭）：探活会真发上游请求、
+    # 消耗额度，是否开启应由部署者按额度余量决定。开启后建议 ≥60 分钟——
+    # 负缓存本身 6h 起步，比它更密只是白耗额度。
+    model_probe_minutes: int = 0
     # 成长中心（仅 CodeBuddy 有）：一轮领取的周期，以及是否允许不可逆动作
     # （抽奖/连登兑换/开 Buddy 盲盒/消耗补登卡）。这些动作无法撤销，
     # 需要保守部署时可关闭：关闭后仍会领取旅行礼物与任务奖励。
     growth_interval_minutes: int = 60
     growth_irreversible_actions: bool = True
+    # 每日签到（Qoder 账号领积分；lingma 区域无此活动自动跳过）。不需要该
+    # 活动的部署（如纯 Lingma 企业凭证）可整体关闭，后台不再定时出网。
+    checkin_enabled: bool = True
     # 活跃上报（CodeBuddy 与 CodeBuddy 国际版）：默认关闭。给账号补发一条
     # 对话事件，续上成长中心连登天数/活跃地图，与积分、调度无关。官方条款禁止脚本
     # 篡改活动数据（处罚为取消资格并追回礼品），开启前请评估账号风险；上游改版即失效。
     activity_report_enabled: bool = False
     activity_report_hour: int = 10          # 本地（北京）时间整点窗口内执行一次
+    # 每日签到的执行时点（本地时间，HH:MM，逗号分隔；留空 = 全天每 10 分钟
+    # 检查一次的旧行为）。命中时点才跑一轮：上游签到本身幂等（回 ALREADY），
+    # 但每次都要打 status+claim+回查三次，全天轮询纯属白打。抖动见下一项。
+    checkin_times: str = ""
+    # 签到抖动（分钟，0 = 不抖）：在时点**之前**提前一个随机偏移执行，避免
+    # 一堆部署在同一分钟齐刷刷打上游。按「日期 + 时点」记去重键，抖动只改
+    # 执行时刻、不改归属，不会让同一时点跑两次。
+    checkin_jitter_minutes: int = 0
+    # 服务端日志页（「任务与配置」→ 日志）：进程内环形缓冲的保留行数，
+    # 0 = 关闭该页（端点返回 404）。只收本进程 logging 记录，不读文件。
+    log_buffer_lines: int = 500
     # 运维告警：周期评估四类风险，命中即落 alert_events 并可选推送
     # webhook。webhook 留空 = 只留站内记录、不外推。
     alert_enabled: bool = True
@@ -162,6 +183,14 @@ class Settings(BaseSettings):
     # 备份周期取整日是因为库本身不大（几十 MB 量级），更密只是白占磁盘。
     backup_interval_minutes: int = 1440
     backup_keep: int = 7
+    # 上游状态页聚合后台任务：并发抓各模型 / 网关提供方的公开状态接口，归一化
+    # 后存内存快照，管理台「上游状态」页只读展示。**只做解释不做决策**（状态页
+    # 滞后于我们自己的模型级冷却）。不落盘：状态分钟级易变，重启后拿旧快照
+    # 比显示「尚未抓取」更危险。
+    upstream_status_enabled: bool = True
+    upstream_status_minutes: int = 5            # 抓取周期（分钟），下限 1
+    # 单源 HTTP 超时（秒）：8 个源并发抓，慢的那个不该拖住整轮。
+    upstream_status_timeout_seconds: float = 10.0
     pacer_min_seconds: float = 5
     pacer_max_seconds: float = 20
     # CodeBuddy 聊天最小间隔：同渠道同凭证的「顺序连发」之间的最小请求间隔，
@@ -213,23 +242,33 @@ class Settings(BaseSettings):
     # 原代号的归一键、展示名、展示名的归一键四种写法任一命中即滤——用户照列表
     # 里看到的 `kimi-k3` / `Kimi K3` 写就能生效，老规则按原代号写也仍生效。
     # 覆盖此值时为完全替换（含默认噪音规则），增删请重写全量。
-    # 实测（2026-09-21，两边上游真实清单）补入的内部/不可用模型：
-    #   custom_model_* / *sub*agent* / summary / browser_use_* / file_search_agent
-    #   为上游内部或代理模型（chat 报 3003 / 非用户模型）
-    #   default 实测 HTTP 200 但零内容（不可用于 chat）
-    #   hunyuan-image-* 实测 HTTP 400 11103「backend is not supported」
-    # 2026-10-10 复测七渠道全量清单后补入三条「上游已下架」：
-    #   hy4-preview-x（CB 400 11102 service info not found；同名的 hy4-preview
-    #     仍可用，故写全名不用 glob）
-    #   qwen3.8-flash（Qoder qfmodel 400「Execution failed: null」；CB/TRAE 的
-    #     qwen3.8-max 正常，不受影响）
-    #   glyph-cluster（Kilo stealth/glyph-cluster 两次 121s 后 408；Kilo 其余正常）
-    # 刻意不加的：*-volc（deepseek-v3-2-volc 实测正常 chat）、aquila/sagitta/
-    #   seed-code-pro-0430（TRAE 实测均正常 chat）、glm-5.0-turbo/glm-5v-turbo/
-    #   hunyuan-chat/hy3/auto（2026-10-10 复测均正常 chat）
+    # 默认口径（2026-10-19 与线上生效值对齐）：**只展示当前在售的新模型**，
+    # 三类一律滤掉——
+    #   1. 上游内部/代理模型：custom_model_* / *sub*agent* / summary /
+    #      browser_use_* / file_search_agent（chat 报 3003 / 非用户模型）；
+    #      default 与 codebuddy_intl 的 default-model/fast-model/balanced-model/
+    #      primary-model/deep-model、Qoder 的 auto 是各上游的「自动路由」占位。
+    #   2. 已停售/被新一代取代的老模型：glm-4.* / glm-5 / glm-5.0* / glm-5.1 /
+    #      glm-5.2* / glm-5v-* / glm-5-turbo、kimi-k2.*（含 k2.5/2.6/k2-thinking）、
+    #      minimax-m2.5/m2.7/m3、deepseek-v3-* / deepseek-v4-*（v4.1 不受影响）、
+    #      qwen3.7-*、gpt-5.4/5.5、hy3* / hy4-preview、hunyuan-*、
+    #      seed-2.1* / seed-code-pro-* / seed-evolving、qwen3-vl-235b、
+    #      openpangu 之外的开源小模型（nemotron-3* / lfm2* / laguna* /
+    #      north-mini-code / inkling-small / xing4.0-29b-a4 / openrouter-models-router）。
+    #   3. 实测不可用的噪音：glyph-cluster（Kilo 两次 121s 后 408）、
+    #      hunyuan-*（含 hunyuan-image-* 的 400 11103 backend not supported）。
+    # 刻意不加的：deepseek-v4.1-flash / kimi-k3 / glm-5.3* / mimo-v2.6* /
+    #   qwen3.8-max / openpangu-2.0-*（在售主力，2026-10-19 实测正常 chat）。
     model_blocklist: str = (
         "custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,"
-        "default,hunyuan-image-*,hy4-preview-x,qwen3.8-flash,glyph-cluster"
+        "default,seed-code-pro-*,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,"
+        "glm-5.0*,glm-5.1,glm-5v-*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,"
+        "minimax-m2.5,deepseek-v3-*,hunyuan-*,hy3*,deepseek-v4-*,qwen3.7-*,auto,"
+        "nemotron-3-*,glm-5.2*,nemotron-3*,lfm2*,north-mini-code,"
+        "openrouter-models-router,fast,balanced,deep,primary,hy4-preview,"
+        "inkling-small,minimax-m2.7,kimi-k2.*,minimax-m3,gpt-5.4,gpt-5.5,"
+        "laguna*,qwen3-vl-235b,seed-2.1*,xing4.0-29b-a4,glyph-cluster,"
+        "qwen3.8-flash,seed-evolving"
     )
     # 诊断：把 /v1 入口的原始请求体落到 data/dumps/（排查客户端差异用）
     dump_request_bodies: bool = False
@@ -240,6 +279,19 @@ class Settings(BaseSettings):
     # 非流式聚合整体超时（秒）：上游只支持流式，非流式由引擎聚合；上游连接
     # 半开停滞会让请求无限悬挂并占住凭证。超时按瞬态错误换号重试；≤0 关闭
     upstream_complete_timeout_seconds: int = 600
+    # 流式首事件超时（秒）：上游接了连接却长时间不吐第一个**数据帧**时，
+    # 在出帧前换号重试（此时切换安全，客户端还没收到任何内容）。注释帧/心跳
+    # 不重置该计时。默认 0 = 关闭：实测慢上下文首字可达 40–71s，默认值会误杀
+    # 正常请求，需在管理台显式打开（推荐 60）。可热更。
+    stream_first_event_timeout_seconds: float = 0
+    # 流式空闲超时（秒）：**已出帧**后上游长时间不再吐数据，只能以错误帧收尾
+    # （半截输出不可回滚，换号会把两个账号的内容拼给客户端）。默认 0 = 关闭，
+    # 推荐 300。可热更。
+    stream_idle_timeout_seconds: float = 0
+    # 短冷却「等待续上」（秒）：全池都在短冷却、没有立即可用候选时，若最短的
+    # 剩余冷却不超过该值，则等待后重取一次（而不是直接 503）。0 = 关闭（快速
+    # 失败）。等待期间不占在途租约，避免把并发请求堆成连接洪峰。可热更。
+    short_cooldown_wait_seconds: float = 0
     # 单账号在途请求上限（全局，跨渠道）：同一凭证并发达到该值后不再参与选号，
     # 避免把单账号打进上游限流/封号；0 = 不限。租约在请求结束后释放，另有
     # 600s TTL 兜底（见 src/engine/inflight.py）。
@@ -257,9 +309,38 @@ class Settings(BaseSettings):
     # 依次回退到组内其他模型（组内成员自行带上 @渠道 或依赖目录收窄）。
     # 格式 `组名=成员1,成员2;组名2=成员3`；留空 = 不启用（保持原行为）。
     model_fallback_groups: str = ""
+    # 用户自定义模型别名（对外名 → 目标模型/渠道）：给客户端一个稳定对外名，
+    # 上游改 id 时只改这里。格式 `对外名=模型@渠道;...`；留空 = 不启用。
+    # 与真实对外 id 或自动别名撞车视为配置错误（不静默覆盖）。可热更。
+    model_aliases: str = ""
     # Prometheus 指标出口（GET /metrics）：默认开启。与 /healthz 同口径**不鉴权**，
     # 指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。可热更。
     metrics_enabled: bool = True
+    # 请求级结构化日志（logfmt，见 src/webapp/access_log.py）：默认开启。
+    # 只记 /api、/v1、/authorize 这些业务请求，每行含 request_id / 路由模板 /
+    # 状态码 / 耗时；**不写 query string、请求体、用户名**（脱敏口径见
+    # PROPOSAL §6）。关闭后回到只有 uvicorn 的裸 access log。可热更。
+    request_log_enabled: bool = True
+    # 全局剥离响应里的思考内容（`EventKind.REASONING`）：默认关闭。开启后
+    # **只过滤出站响应**、不改写请求体——上游仍照常思考（`reasoning_effort`
+    # 原样透传），只是不再把思考交给客户端。刻意不做请求侧改写：实测 CB
+    # `enable_thinking:false` 被上游忽略（仍产 reasoning 且计入 max_tokens），
+    # 而缺 `reasoning_effort` 反而退化成「可见推演」（思考混进 delta.content）；
+    # 其余渠道的请求侧接受性未核实，写请求体就是凭猜测改客户端意图。可热更。
+    force_disable_thinking: bool = False
+    # 出站 `reasoning_effort` 档位映射（默认空 = 原样透传）。格式
+    # `渠道=from:to,from:to;*=from:to`，渠道取 KNOWN_PROVIDERS，`*` 为兜底。
+    # 只改写客户端**显式**给的档位（渠道各自的 setdefault 补值不动）；
+    # 目标 `none` = 删除该键（走渠道默认）。只给机制不给策略：内置默认矩阵
+    # 未经上游核实，写了就是编造。可热更。
+    reasoning_effort_map: str = ""
+    # Anthropic 入站 `thinking.budget_tokens` → `reasoning_effort` 的映射
+    # （默认空 = 完全不映射，`thinking` 照旧被忽略）。格式
+    # `预算:档位,预算:档位,disabled:档位`：`disabled` 匹配 `thinking.type==
+    # "disabled"`，其余按「阈值 ≤ budget_tokens 中最大的一档」取值，低于最小
+    # 阈值则不映射。Anthropic 只规定 budget ≥1024、未给档位对应表，故阈值表
+    # 必须由使用者显式给出，不内置默认。可热更。
+    anthropic_thinking_efforts: str = ""
 
     @cached_property
     def admin_set(self) -> frozenset[str]:

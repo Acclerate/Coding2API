@@ -90,7 +90,8 @@ def test_batch_probe_success_path(batch_app):
     assert body["succeeded"] == 2 and body["failed"] == 0
     assert all(row["ok"] for row in body["results"])
     assert body["results"][0]["detail"] == {
-        "probed": True, "remaining": 7, "total": 10, "cycle_end": None}
+        "probed": True, "remaining": 7, "total": 10, "cycle_end": None,
+        "credits_remaining": None, "credits_total": None}
     # 探测是只读语义：不写审计（与单条端点一致）
     assert app.state.audit.query(action="credential.toggle") == []
 
@@ -152,7 +153,7 @@ def test_batch_toggle_sets_explicit_state(batch_app):
     # 写操作落一条汇总审计（不逐条刷流水）
     events = app.state.audit.query(action="credential.toggle")
     assert len(events) == 1
-    assert events[0]["detail"] == "批量 toggle：2/2 成功"
+    assert events[0]["detail"] == "批量 toggle（暂停）：2/2 成功"
     assert events[0]["actor"] == "root"
 
 def test_batch_toggle_defaults_to_enabled(batch_app):
@@ -162,7 +163,9 @@ def test_batch_toggle_defaults_to_enabled(batch_app):
     app.state.credentials.set_enabled(credential_id, False)
     client.post("/api/credentials/batch",
                 json={"action": "toggle", "ids": [credential_id]})
-    assert app.state.credentials.list_all()[0]["enabled"] == 1
+    # 按 id 取：`list_all()` 首位是启动时补的 zen 占位行，取 [0] 会断言到它
+    by_id = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert by_id[credential_id]["enabled"] == 1
 
 def test_batch_toggle_reports_missing_credential(batch_app):
     """toggle 对不存在的凭证逐条报错，同批其余条照常。"""
@@ -177,7 +180,7 @@ def test_batch_toggle_reports_missing_credential(batch_app):
     assert by_id["cred_ghost"]["error"] == "credential not found"
     # 审计 detail 反映真实成功率，不按「全部成功」写死
     events = app.state.audit.query(action="credential.toggle")
-    assert events[0]["detail"] == "批量 toggle：1/2 成功"
+    assert events[0]["detail"] == "批量 toggle（暂停）：1/2 成功"
 
 def test_batch_revive_reports_missing_credential(batch_app):
     app, client = batch_app
@@ -194,9 +197,55 @@ def test_batch_revive_reports_missing_credential(batch_app):
     assert by_id[credential_id]["ok"] is True
     assert by_id["cred_ghost"] == {"id": "cred_ghost", "ok": False,
                                    "error": "credential not found"}
-    assert app.state.credentials.list_all()[0]["disabled"] == 0
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert rows[credential_id]["disabled"] == 0
     events = app.state.audit.query(action="credential.revive")
     assert len(events) == 1 and events[0]["detail"] == "批量 revive：1/2 成功"
+
+def test_batch_toggle_resume_writes_enabled_direction(batch_app):
+    """批量「取消暂停」（enabled=true）与「暂停」是同一动作，靠审计方向区分。
+
+    没有这个方向的话，审计里只有「批量 toggle：N/M 成功」，看不出操作员到底
+    把号放回了池子还是摘了出去。
+    """
+    app, client = batch_app
+    credential_id = _add(app)
+    app.state.credentials.set_enabled(credential_id, False)
+    body = client.post("/api/credentials/batch",
+                       json={"action": "toggle", "ids": [credential_id],
+                             "enabled": True}).json()
+    assert body["succeeded"] == 1
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert rows[credential_id]["enabled"] == 1
+    events = app.state.audit.query(action="credential.toggle")
+    assert events[0]["detail"] == "批量 toggle（启用）：1/1 成功"
+
+def test_batch_audit_failure_does_not_lose_per_item_results(batch_app, monkeypatch):
+    """审计落库失败不得让整批返回 500——逐条结果比留痕更重要。
+
+    真实故障：DB 损坏时 `audit.record` 抛 `sqlite3.DatabaseError`，未捕获会
+    冒泡成 500 纯文本，前端 `res.json()` 拿到 "Internal Server Error" 解析失败。
+    此时逐条变更其实**已经提交生效**，返回 500 会让操作员以为整批没跑。
+    """
+    import sqlite3
+
+    app, client = batch_app
+    credential_id = _add(app)
+
+    def _boom(**_kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(app.state.audit, "record", _boom)
+    response = client.post("/api/credentials/batch",
+                           json={"action": "toggle", "ids": [credential_id],
+                                 "enabled": False})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["succeeded"] == 1 and body["failed"] == 0
+    assert body["results"] == [{"id": credential_id, "ok": True}]
+    # 变更本身仍然生效，不因留痕失败回滚
+    by_id = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert by_id[credential_id]["enabled"] == 0
 
 def test_batch_rejects_unknown_action(batch_app):
     _app, client = batch_app

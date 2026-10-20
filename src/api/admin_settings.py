@@ -17,10 +17,12 @@ import time
 
 from fastapi import APIRouter, Depends, Request
 
+from ..audit.actions import ACTION_SETTINGS_UPDATE
 from ..auth.rbac import require_admin
 from ..compat.openai.request import InvalidRequest
 from ..runtime_settings import GATEWAY_GROUPS, InvalidSetting
-from .deps import Services, csrf_protected, principal_from_request
+from ..tasks.runner import UnknownTaskError
+from .deps import Services, csrf_protected, principal_from_request, request_ip
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ def create_router(services: Services) -> APIRouter:
         return snapshot_payload()
 
     @router.put("/api/settings")
-    async def update_settings(payload: dict,
+    async def update_settings(payload: dict, request: Request,
                               _csrf: None = Depends(csrf_protected),
                               principal=Depends(principal_from_request)):
         require_admin(principal)
@@ -57,6 +59,12 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(str(error)) from error
         keys = ", ".join(sorted(values)) or "(空)"
         logger.info("管理员 %s 更新运行时配置 %s（DB 覆盖 .env）", principal.username, keys)
+        # 配置写入本身就是一次「谁能改网关行为」的变更，必须留痕：模型黑名单
+        # （C3 的一键黑名单按钮也走这条接口）与告警 webhook 被改掉却不进审计，
+        # 事后无法回答「是谁把它关的」。
+        services.audit.record(
+            actor=principal.username, action=ACTION_SETTINGS_UPDATE,
+            detail=keys, ip=request_ip(request, services.settings))
         return snapshot_payload()
 
     @router.get("/api/tasks")
@@ -74,5 +82,32 @@ def create_router(services: Services) -> APIRouter:
             "tasks": runner.task_status() if runner is not None else [],
             "server_time": int(time.time()),
         }
+
+    @router.post("/api/tasks/{key}/run")
+    async def run_task(key: str, request: Request,
+                       _csrf: None = Depends(csrf_protected),
+                       principal=Depends(principal_from_request)):
+        """手动运行一个后台任务一轮（管理台「立即运行」）。
+
+        与定时循环同一条路径（`TaskRunner._loop_specs` 单一来源），只多两点：
+        **不等间隔、不绕开关**。绕过时点窗口（`due()`）是因为手动就是
+        「立刻跑」；`activity` / `alert` 关闭时不绕——其 `run_once` 自身返回
+        None，响应里 `ran=false`，不把「关了」谎报成「跑过了」。
+
+        同步等结果返回（与 per-credential 的 probe / checkin / growth 手动
+        端点同口径）：管理台点完要能立刻看到 report / error，而不是先看到
+        「已触发」再轮询。任务正在跑时立刻返回 `busy=true`，不排队。
+        """
+        require_admin(principal)
+        runner = getattr(request.app.state, "task_runner", None)
+        if runner is None:
+            raise InvalidRequest("task runner not available")
+        try:
+            result = await runner.run_task(key)
+        except UnknownTaskError as error:
+            raise InvalidRequest(f"unknown task {error.key!r}") from error
+        logger.info("管理员 %s 手动运行后台任务 %s（ran=%s busy=%s）",
+                    principal.username, key, result["ran"], result["busy"])
+        return result
 
     return router

@@ -82,10 +82,14 @@ def create_router(services: Services) -> APIRouter:
 
     @router.get("/api/users")
     async def list_users(sort: str | None = None, order: str | None = None,
+                         limit: int = 50, offset: int = 0,
                          principal=Depends(principal_from_request)):
         _require(principal)
+        # limit/offset 分页；total 供前端算页数（仓储与端点的收敛口径一致）
         return {"users": [_public_view(row) for row in
-                          services.user_repo.list_all(sort=sort, order=order)]}
+                          services.user_repo.list_all(sort=sort, order=order,
+                                                      limit=limit, offset=offset)],
+                "total": services.user_repo.count_all()}
 
     @router.post("/api/users")
     async def create_user(request: Request, payload: dict,

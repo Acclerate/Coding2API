@@ -39,6 +39,33 @@ async def test_checkin_empty_scope_falls_back_to_credential_id(repo):
     assert report.attempted == 2 and report.succeeded == 2 and report.skipped == 0
     assert provider.calls == 2
 
+async def test_checkin_skips_per_credential_none_scope(repo):
+    """`checkin_scope(data)` 返回 None = 凭证级「本通道无签到活动」（Qoder
+    lingma 区域）：整类跳过，不出网、不重试、不计失败——否则每 10 分钟
+    误报一次 401 TOKEN_EXPIRE 签到失败。"""
+    credentials, _db = repo
+    credentials.add(provider="qoder", credential_data={"access_token": "pt-a",
+                                                       "realm": "lingma"})
+
+    class LingmaProvider:
+        id = "qoder"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def checkin(self, _data):
+            self.calls += 1
+            return CheckinResult(ok=True)
+
+        def checkin_scope(self, _data):
+            return None       # lingma 区域无签到活动
+
+    provider = LingmaProvider()
+    task = CheckinTask(credentials, {"qoder": provider})
+    report = await task.run_once()
+    assert report.attempted == 0 and report.failed == 0 and report.skipped == 1
+    assert provider.calls == 0
+
 async def test_checkin_dedupes_same_upstream_account(repo):
     """同上游账号的多张凭证只签一次（AGENTS.md 约束）。"""
     credentials, _db = repo
@@ -127,9 +154,8 @@ async def test_checkin_error_is_isolated(repo):
     assert report.failed == 1
 
 async def test_checkin_due_is_always_true():
-    """签到全天每 10 分钟一轮，不再受时刻限制（due 恒 True）。"""
-    task = CheckinTask.__new__(CheckinTask)
-    task._done_scopes = set()
+    """未配置时点（留空）时保持旧行为：全天每 10 分钟一轮，due 恒 True。"""
+    task = CheckinTask(None, {})  # type: ignore[arg-type]
     midnight = time.struct_time((2026, 9, 11, 0, 30, 0, 3, 254, 0))
     late = time.struct_time((2026, 9, 11, 23, 59, 0, 3, 254, 0))
     assert task.due(now=midnight) is True
@@ -189,3 +215,37 @@ async def test_checkin_on_success_callback_fires(repo):
     task = CheckinTask(credentials, {"codebuddy": ProbeProvider()}, on_success=seen.append)
     report = await task.run_once()
     assert report.succeeded == 1 and len(seen) == 1
+
+async def test_runner_sync_checkin_skips_when_disabled(repo):
+    """`checkin_enabled=False` 时 `_sync_checkin` 是 no-op：不出网、状态页显示停用。
+
+    不需要签到活动的部署（如纯 Lingma 企业凭证）整体关闭后台轮次；管理台
+    手动「签到」按钮不受影响（走 provider.checkin，不经过本开关）。
+    """
+    from src.tasks.quota_probe import QuotaProbeTask
+    from src.tasks.refresh import RefreshTask
+    from src.tasks.retention import RetentionTask
+    from src.tasks.runner import TaskRunner
+
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "a",
+                                                          "account_uid": "u"})
+    provider = ProbeProvider()
+
+    class _NullCollector:
+        pass
+
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(_NullCollector()),
+        checkin_enabled=lambda: False,
+    )
+    assert await runner._sync_checkin() is None        # noqa: SLF001 - 开关关
+    assert provider.checkin_calls == 0
+    assert runner._task_enabled("checkin") is False    # noqa: SLF001 - 状态页
+    # 打开后恢复执行
+    runner._checkin_enabled = lambda: True             # noqa: SLF001
+    assert await runner._sync_checkin() is not None
+    assert provider.checkin_calls == 1

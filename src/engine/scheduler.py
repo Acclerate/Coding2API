@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from ..config import live
 from ..provider.base import MODEL_SCOPED_KINDS, ErrKind
+
+logger = logging.getLogger(__name__)
 
 PLAN_COOLDOWN_SECONDS = 12 * 3600
 SOFT_COOLDOWN_SECONDS = 60
@@ -40,6 +43,10 @@ EXPIRY_WINDOW_SECONDS = 36 * 3600
 # 次要到期排序窗口：仅当主指标打平（最常见的是都为 0）时才启用，避免只看 36h
 # 而漏掉一周内仍会过期的额度。7 天覆盖 CodeBuddy 一个完整的小包到期周期
 SECONDARY_EXPIRY_WINDOW_SECONDS = 7 * 86400
+# 采用上游 `Retry-After` 时刻时的上界：再长也最多冷却到 24h 后。上游给的
+# 恢复时刻可能是「本月配额用完」那类远期值，照单全收等于把号永久移出池子
+# （还会让统计里的「冷却剩余」显示成几个月）。
+RETRY_AT_MAX_SECONDS = 24 * 3600
 
 
 def expiring_credits(
@@ -114,6 +121,32 @@ def blocked_backoff_duration(hits: int) -> int:
     return min(BLOCKED_BASE_SECONDS << shift, BLOCKED_MAX_SECONDS)
 
 
+def clamp_retry_at(retry_at: int | None, now: int, fallback: int) -> tuple[int, bool]:
+    """上游恢复时刻 → 实际冷却截止时刻；返回 (截止时刻, 是否采用了上游值)。
+
+    双端钳制（计划 A2）：
+
+    - **下界**：该 ErrKind 的现有常量冷却。上游给 0 / 过去时刻 / 比本地策略
+      还短的时刻都回落常量——`Retry-After: 0` 会让同一个号在冷却刚写下的
+      瞬间又变可选，被反复打爆（上游越是限流越容易被轮询放大）。
+    - **上界**：`RETRY_AT_MAX_SECONDS`（24h）。上游报「下个月恢复」也不该
+      把一个号移出池子整整一个月。
+
+    返回值第二项供日志打「采用上游时刻 X（原常量 Y）」——只有真的采用了
+    上游值才值得记一行，否则日志会被每个普通错误刷满。
+    """
+    constant = now + fallback
+    if retry_at is None:
+        return constant, False
+    upper = now + RETRY_AT_MAX_SECONDS
+    if retry_at <= constant:
+        # 缺省 / 过去时刻 / 比本地常量还短：一律按常量（含 clamp 下界语义）
+        return constant, False
+    if retry_at >= upper:
+        return upper, True
+    return retry_at, True
+
+
 @dataclass(frozen=True)
 class Candidate:
     """一条可调度凭证的调度相关快照。"""
@@ -133,6 +166,10 @@ class Candidate:
     # 注入。0 = 免费渠道，参与「免费优先」排序档（见 Scheduler.select）；
     # None = 未知 / 该模型无倍率数据（如 CodeArts 福利模型），不参与。
     credit_rate: float | None = None
+    # 本凭证**当前在途请求数**（InflightGuard 现查注入）。用作「最少连接」负载
+    # 键：并发请求摊到空闲号，避免全部压在同一凭证上（见 Scheduler.select）。
+    # 0 = 空闲（含未装配在途护栏的部署，此时恒 0，排序退回原链）。
+    inflight: int = 0
     # (凭证, 模型) 冷却表：model → ModelCooldown。模型级限流只写这里，
     # 不写 cooling_until，因此同账号的其他模型仍然可选
     model_cooldowns: Mapping[str, ModelCooldown] | None = None
@@ -215,17 +252,27 @@ class Scheduler:
 
         排序规则：**免费优先**（候选中存在 x0 免费渠道时，免费渠道整体排前；
         仅当本次候选带有倍率数据——executor 注入的 credit_rate——才生效）→
-        pin 优先 → 主窗口（36h）内即将到期额度多者优先 → 次窗口（7 天）内
-        即将到期额度多者优先 → known 降序 → unknown → exhausted 垫底 →
-        健康度打平时**账户剩余积分多者优先**。到期额度优先于健康度：快过期
-        的先用掉，避免白丢；但免费优先又压过到期额度——省下的真金白银比
-        「几百积分快过期先用」值钱（CodeBuddy 36h 窗口到期积分实测峰值
-        ~400，而免费渠道跑一条中等回复就省几十积分、长会话累计破百）。
-        两级窗口按字典序比较，主窗口打平（含都为 0）时才轮到次窗口，再打平
-        才比健康度。剩余积分只作健康度的**打平键**，不会越级把低健康度的
-        高余额号顶上去（健康度是「剩余/总量」比例，101% 也只是 100，同比例
-        下多留些余额以备后用）。主窗口 ≤0 视为关闭整套到期排序（次窗口一并
-        归零，见 `expiry_windows`），此时退回纯健康度排序。
+        pin 优先 → **在途最少优先**（最少连接负载均衡）→ 主窗口（36h）内即将
+        到期额度多者优先 → 次窗口（7 天）内即将到期额度多者优先 → known 降序
+        → unknown → exhausted 垫底 → 健康度打平时**账户剩余积分多者优先**。
+
+        **为什么在途插在到期额度之前**：到期/健康度是**静态**指标，按它们排出的
+        次序是确定的——所有并发请求会算出同一个最优号并全部压上去（实测
+        codebuddy_intl 六个号健康度同为 100、余额 440~470，排序退化到最后一键
+        「余额多者」，2 小时里一个号吃了 180+ 次、其余基本闲置；上游把它按
+        账号限流时整池跟着不可用）。在途数把「正在被占用的号」排到后面，并发
+        自动摊到空闲号（满载后仍按原链选，等价于 round-robin）；而**顺序**请求
+        在途恒为 0，不受影响，仍按到期/健康度选。免费档压过在途：省下的真金
+        白银优先于分摊负载。
+
+        到期额度优先于健康度：快过期的先用掉，避免白丢；但免费优先又压过
+        到期额度——省下的真金白银比「几百积分快过期先用」值钱（CodeBuddy 36h
+        窗口到期积分实测峰值 ~400，而免费渠道跑一条中等回复就省几十积分、
+        长会话累计破百）。两级窗口按字典序比较，主窗口打平（含都为 0）时才轮到
+        次窗口，再打平才比健康度。剩余积分只作健康度的**打平键**，不会越级把低
+        健康度的高余额号顶上去（健康度是「剩余/总量」比例，101% 也只是 100，
+        同比例下多留些余额以备后用）。主窗口 ≤0 视为关闭整套到期排序（次窗口
+        一并归零，见 `expiry_windows`），此时退回「在途 + 健康度」排序。
 
         模型级冷却的过滤由调用方在候选集上完成（executor._select）：
         每个候选要按**自己所属上游**的原始模型名查冷却表，选号器不掌握
@@ -244,6 +291,7 @@ class Scheduler:
         chosen = sorted(
             pinned or pool,
             key=lambda c: (_free_first_rank(c, free_present),
+                           c.inflight,
                            -c.expiry_credits(now, primary),
                            -c.expiry_credits(now, secondary),
                            _rank(c.health), -(_health_value(c.health)),
@@ -264,7 +312,8 @@ class Scheduler:
     # ------------------------------------------------------------ 结果反馈
 
     def note_error(self, candidate: Candidate, kind: ErrKind, now: int, *,
-                   model: str | None = None) -> ErrorOutcome:
+                   model: str | None = None,
+                   retry_at: int | None = None) -> ErrorOutcome:
         """按错误分类更新冷却/禁用状态。
 
         DEAD    → 硬禁用
@@ -276,22 +325,38 @@ class Scheduler:
                            其中 CONCURRENCY 用固定短冷却，不翻倍
                           账号级冷却出现时清空模型级条目（防豁免泄漏）
         REQUEST → 零动作：不是账号的问题，换号但绝不惩罚凭证
+
+        `retry_at` 是上游 `Retry-After` 解析出的恢复时刻（epoch 秒，见
+        `provider.base.parse_retry_after`）。命中时用 `clamp_retry_at` 双端
+        钳制后**覆盖**本次冷却时长（作用域仍是该 ErrKind 自己的：模型级错误
+        只影响该模型）；缺省 / 过去时刻 / 比本地常量还短一律回落常量，行为与
+        历史版本逐字节一致。DEAD / REQUEST 不看它：硬禁用与请求级错误都不是
+        「等一会就恢复」。
         """
         if kind is ErrKind.REQUEST:
             return ErrorOutcome(err_count=candidate.err_count)
         if kind is ErrKind.DEAD:
             return ErrorOutcome(disabled=True, err_count=0)
         if kind is ErrKind.CREDIT:
-            return ErrorOutcome(cooling_until=next_credit_reset(now), err_count=0)
+            return ErrorOutcome(
+                cooling_until=self._cooling_until(
+                    candidate, kind, now, retry_at,
+                    max(next_credit_reset(now) - now, 0), model),
+                err_count=0)
         if kind is ErrKind.PLAN:
-            return ErrorOutcome(cooling_until=now + self._cooldowns[ErrKind.PLAN],
-                                err_count=0)
+            return ErrorOutcome(
+                cooling_until=self._cooling_until(
+                    candidate, kind, now, retry_at, self._cooldowns[ErrKind.PLAN], model),
+                err_count=0)
         if kind in MODEL_SCOPED_KINDS:
             if not model:
                 # 无模型名可归因（流内错误事件未带 model 等）：退化为账号级软冷却，
                 # 宁可保守也不要写一条影响不到任何选号的孤儿记录
-                return ErrorOutcome(cooling_until=now + self._cooldowns[ErrKind.SOFT],
-                                    err_count=candidate.err_count)
+                return ErrorOutcome(
+                    cooling_until=self._cooling_until(
+                        candidate, kind, now, retry_at,
+                        self._cooldowns[ErrKind.SOFT], None),
+                    err_count=candidate.err_count)
             if kind is ErrKind.BLOCKED:
                 reason = "blocked"
             elif kind is ErrKind.CONCURRENCY:
@@ -311,15 +376,42 @@ class Scheduler:
                             else model_cooldown_duration(hits))
             return ErrorOutcome(err_count=candidate.err_count,
                                 model_cooldowns={model: ModelCooldown(
-                                    cooling_until=now + duration, hits=hits,
-                                    reason=reason)})
+                                    cooling_until=self._cooling_until(
+                                        candidate, kind, now, retry_at, duration, model),
+                                    hits=hits, reason=reason)})
         if kind is ErrKind.SOFT:
-            return ErrorOutcome(cooling_until=now + self._cooldowns[ErrKind.SOFT],
-                                err_count=candidate.err_count)
+            return ErrorOutcome(
+                cooling_until=self._cooling_until(
+                    candidate, kind, now, retry_at,
+                    self._cooldowns[ErrKind.SOFT], model),
+                err_count=candidate.err_count)
         count = candidate.err_count + 1
         if count >= self.err_threshold:
-            return ErrorOutcome(cooling_until=now + self._cooldowns[ErrKind.OTHER], err_count=0)
+            return ErrorOutcome(
+                cooling_until=self._cooling_until(
+                    candidate, kind, now, retry_at,
+                    self._cooldowns[ErrKind.OTHER], model),
+                err_count=0)
         return ErrorOutcome(err_count=count)
+
+    @staticmethod
+    def _cooling_until(candidate: Candidate, kind: ErrKind, now: int,
+                       retry_at: int | None, duration: int,
+                       model: str | None) -> int:
+        """本次冷却截止时刻：本地常量与上游恢复时刻按双端钳制取一。"""
+        until, adopted = clamp_retry_at(retry_at, now, duration)
+        if adopted:
+            # 只在真的采用上游时刻时打一行：普通错误每个都打会把日志刷满
+            logger.info(
+                "采用上游时刻 %s（原常量 %s）：凭证 %s 模型 %s 分类 %s 冷却 %ss",
+                _format_moment(until), _format_moment(now + duration),
+                candidate.credential_id, model or "-", kind.value, until - now)
+        return until
+
+
+def _format_moment(moment: int) -> str:
+    """日志里的时刻：本地时间可读串（epoch 只适合机读，排查时难对表）。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
 
 
 def _rank(health: int | None) -> int:

@@ -26,6 +26,11 @@ def create_router(services: Services) -> APIRouter:
             actor=actor or None, action=action or None,
             since=since or None, before=before or None,
             limit=limit, offset=offset, sort=sort, order=order)
-        return {"events": rows, "actions": list(ACTIONS), "labels": ACTION_LABELS}
+        # total 与 events 同一套过滤条件（见 AuditRepository.count 的说明）
+        total = services.audit.count(
+            actor=actor or None, action=action or None,
+            since=since or None, before=before or None)
+        return {"events": rows, "total": total,
+                "actions": list(ACTIONS), "labels": ACTION_LABELS}
 
     return router

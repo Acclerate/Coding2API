@@ -124,6 +124,30 @@ def test_parse_value_rejects_unknown_key():
         parse_value("app_secret", "x")
 
 
+# ------------------------------------------------------- 上游状态页聚合配置
+
+def test_upstream_status_settings_parse_and_floor(runtime):
+    """两个热更项的类型 / 范围：周期下限 1 分钟，开关是 bool。"""
+    assert parse_value("upstream_status_minutes", "12") == 12
+    assert parse_value("upstream_status_enabled", "off") is False
+    assert runtime.upstream_status_minutes == 5           # 默认 5 分钟
+    assert runtime.upstream_status_enabled is True        # 默认开启
+    with pytest.raises(InvalidSetting, match="不能小于"):
+        parse_value("upstream_status_minutes", "0")
+    with pytest.raises(InvalidSetting, match="期望 int"):
+        parse_value("upstream_status_minutes", "abc")
+    assert HOT_BY_KEY["upstream_status_minutes"].task == "upstream_status"
+    assert HOT_BY_KEY["upstream_status_enabled"].task == "upstream_status"
+
+
+def test_upstream_status_minutes_floor_clamps_stale_override():
+    """旧版写入的 0 被 reload 丢弃、env 值低于 floor 时钳到 floor。"""
+    stale = RuntimeSettings(_base(), MemoryStore({"upstream_status_minutes": "0"}))
+    assert stale.upstream_status_minutes == 5             # 回落 env 默认
+    clamped = RuntimeSettings(_base(UPSTREAM_STATUS_MINUTES=0), MemoryStore())
+    assert clamped.upstream_status_minutes == 1           # 钳到 floor
+
+
 @pytest.mark.parametrize("raw", ["maybe", "", "2"])
 def test_parse_value_rejects_non_boolean(raw):
     with pytest.raises(InvalidSetting):
@@ -448,6 +472,32 @@ def test_put_settings_rejects_non_object_values(admin_app):
     assert client.put("/api/settings", json={}).status_code == 400
 
 
+def test_put_settings_is_audited(admin_app):
+    """配置写入留痕：谁在什么时候把哪几个键改成了什么。
+
+    模型黑名单（「加入黑名单」按钮）与告警 webhook 都走这条接口，改掉却不进
+    审计，事后无法回答「是谁把它关的」。失败的写入（非法值 / 非 admin）不留痕。
+    """
+    app, client = admin_app
+    client.put("/api/settings", json={"values": {"model_blocklist": "glm-*"}})
+    events = app.state.audit.query(action="settings.update")
+    assert len(events) == 1
+    assert events[0]["actor"] == "root"
+    assert events[0]["detail"] == "model_blocklist"
+
+    # 多键一次提交：detail 是排序后的键名清单（不记录值，避免把密钥写进审计）
+    client.put("/api/settings", json={"values": {
+        "model_blocklist": "", "quota_probe_minutes": 5}})
+    details = sorted(event["detail"] for event in
+                     app.state.audit.query(action="settings.update"))
+    assert details == ["model_blocklist", "model_blocklist, quota_probe_minutes"]
+
+    # 非法值在落库前就被拒，不该产生审计
+    assert client.put("/api/settings",
+                      json={"values": {"activity_report_hour": 99}}).status_code == 400
+    assert len(app.state.audit.query(action="settings.update")) == 2
+
+
 def test_put_settings_rejects_invalid_value_with_actionable_message(admin_app):
     _app, client = admin_app
     response = client.put("/api/settings",
@@ -535,6 +585,10 @@ def test_every_hot_setting_is_read_lazily_not_baked_at_startup(admin_app):
     assert runner._growth_interval == 9 * 60        # noqa: SLF001
     assert runner._activity_enabled() is True       # noqa: SLF001
     assert runner._activity._hour == 5              # noqa: SLF001
+    # 上游状态页周期同样现读（装配时传的是 lambda，不是 live() 快照）
+    assert runner._upstream_status_interval == 5 * 60   # noqa: SLF001
+    client.put("/api/settings", json={"values": {"upstream_status_minutes": 11}})
+    assert runner._upstream_status_interval == 11 * 60  # noqa: SLF001
     # 模型黑名单基于生效值重算（不是 Settings 的 cached_property）
     assert runtime.blocklist_patterns == ("foo*",)
     assert app.state.services.settings.blocklist_patterns == ("foo*",)
