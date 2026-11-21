@@ -265,8 +265,9 @@ describe("ModelCatalogPage（模型列表）", () => {
     expect(row).toHaveTextContent("体 53.1");
     // 无分数的行只显示一个 —，不渲染三个
     const plain = screen.getByTestId("model-row-a-model");
-    expect(plain.querySelectorAll("div").length).toBeGreaterThan(0);
     expect(plain).not.toHaveTextContent("智 ");
+    expect(plain).not.toHaveTextContent("编 ");
+    expect(plain).not.toHaveTextContent("体 ");
     // 能力分来源指标卡（与价格同一次抓取）
     expect(screen.getByTestId("model-catalog-page")).toHaveTextContent("能力分来源");
   });
@@ -552,13 +553,28 @@ describe("ModelCatalogPage（模型列表）", () => {
     expect(never).toHaveTextContent("未探过");
   });
 
+  it("探活面板：错误摘要限宽单行截断，hover 看全文", async () => {
+    stubProbePage();
+    renderPage(<ModelCatalogPage />);
+    await settle();
+
+    const error = screen.getByTestId("probe-error-trae-glm-5.2");
+    // 折行会把整列撑宽挤掉操作列，故必须 truncate
+    expect(error.className).toContain("truncate");
+    expect(error).toHaveTextContent("HTTP 404: model not found");
+
+    await userEvent.hover(error);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("HTTP 404: model not found");
+  });
+
   it("探活面板：无记录时给出空态", async () => {
     stubProbePage({ rows: [] });
     renderPage(<ModelCatalogPage />);
     await settle();
 
     expect(screen.getByTestId("model-probe-empty")).toHaveTextContent(
-      "当前没有被负缓存锁住的模型");
+      "当前没有被负缓存锁住的模型，也没有判死 / 探活记录");
   });
 
   it("探活面板：接口失败时给专属错误提示（不影响目录表）", async () => {

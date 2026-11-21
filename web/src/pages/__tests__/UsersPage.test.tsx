@@ -97,6 +97,32 @@ describe("UsersPage", () => {
     await waitFor(() => expect(screen.queryByTestId("activation-link")).not.toBeInTheDocument());
   });
 
+  it("无 Clipboard API（局域网 http）时提示手动复制，不抛 TypeError", async () => {
+    // 非安全上下文：navigator.clipboard 不存在，execCommand 也不可用
+    vi.stubGlobal("navigator", {});
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => false),
+      configurable: true,
+    });
+    stubFetch({
+      "POST /api/users": () => jsonResponse({
+        username: "newbie", role: "viewer", activate_token: "TOK", expires_at: 1_800_000_000,
+      }),
+      "GET /api/users": () => jsonResponse(USERS),
+    });
+    renderPage(<UsersPage />, { username: "root", is_admin: true });
+    await settle();
+    await openCreateUserDialog();
+    await userEvent.type(screen.getByTestId("new-user-name"), "newbie");
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    await screen.findByTestId("activation-link");
+
+    await userEvent.click(screen.getByTestId("copy-activation"));
+    expect(await screen.findByTestId("copy-activation-failed")).toHaveTextContent("请手动");
+    // 没真复制成功就不能显示「已复制」
+    expect(screen.queryByText("已复制")).not.toBeInTheDocument();
+  });
+
   it("创建失败（重名）时给出提示", async () => {
     stubFetch({
       "POST /api/users": () =>
@@ -236,3 +262,49 @@ async function openCreateUserDialog() {
   await userEvent.click(screen.getByTestId("open-create-user-dialog"));
   expect(await screen.findByTestId("create-user-dialog")).toBeInTheDocument();
 }
+
+  it("编辑用户策略：预填现值、提交 PUT 并关闭对话框", async () => {
+    const spy = stubFetch({
+      "PUT /api/users/alice/policy": () => jsonResponse({ ok: true }),
+      "GET /api/users": () => jsonResponse(USERS),
+    });
+    renderPage(<UsersPage />, { username: "root", is_admin: true });
+    await settle();
+
+    await userEvent.click(screen.getByTestId("policy-alice"));
+    const dialog = await screen.findByTestId("user-policy-dialog");
+    expect(dialog).toBeInTheDocument();
+    // 未设过策略时两个字段都是空串（= 不限制）
+    expect(screen.getByTestId("user-policy-models")).toHaveValue("");
+    expect(screen.getByTestId("user-policy-quota")).toHaveValue("");
+
+    await userEvent.type(screen.getByTestId("user-policy-models"), "glm-5.3*");
+    // `{` / `}` 在 userEvent.type 里是修饰符语法，JSON 用 paste 写入
+    await userEvent.click(screen.getByTestId("user-policy-quota"));
+    await userEvent.paste('{"rpm": 5}');
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      const call = spy.mock.calls.find(([, init]) => init?.method === "PUT");
+      expect(call?.[0]).toBe("/api/users/alice/policy");
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        allowed_models: "glm-5.3*", quota: '{"rpm": 5}',
+      });
+    });
+    await waitFor(() => expect(screen.queryByTestId("user-policy-dialog")).not.toBeInTheDocument());
+  });
+
+  it("策略保存失败（配额 JSON 写错）时在对话框内提示", async () => {
+    stubFetch({
+      "PUT /api/users/alice/policy": () =>
+        jsonResponse({ error: { code: "invalid_request", message: "quota 必须是 JSON 对象" } }, 400),
+      "GET /api/users": () => jsonResponse(USERS),
+    });
+    renderPage(<UsersPage />, { username: "root", is_admin: true });
+    await settle();
+
+    await userEvent.click(screen.getByTestId("policy-alice"));
+    await userEvent.type(await screen.findByTestId("user-policy-quota"), "nope");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByTestId("user-policy-error")).toHaveTextContent("保存用户策略失败");
+  });

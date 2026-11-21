@@ -238,7 +238,7 @@ def test_ci_compose_job_builds_fresh_image_with_admin_user():
 
 LAUNCHD_TEMPLATE = ROOT / "deploy" / "launchd" / "com.coding2api.plist"
 FRPC_PLIST_TEMPLATE = ROOT / "deploy" / "launchd" / "com.coding2api.frpc.plist"
-# newsyslog 的日志路径可以来自任一个 launchd 模板（本体 / frpc 隧道）
+# 日志路径来自任一个 launchd 模板（本体 / frpc 隧道），由轮转脚本覆盖
 LAUNCHD_TEMPLATES = (LAUNCHD_TEMPLATE, FRPC_PLIST_TEMPLATE)
 LAUNCHD_AGENTS = Path.home() / "Library" / "LaunchAgents"
 BUILD_WEB = ROOT / "scripts" / "build-web.sh"
@@ -254,8 +254,12 @@ def test_launchd_template_exists_and_is_valid_plist():
         data = plistlib.load(handle)
     assert data["Label"] == "com.coding2api"
     assert data["RunAtLoad"] is True
-    assert data["KeepAlive"] is True
-    # 日志路径必须与本机 plist / newsyslog 规则一致（改一处漏一处最难查）
+    # KeepAlive 必须是条件式：SuccessfulExit=false = 只在非零退出时重拉。
+    # 无条件 true 会让「另一个实例占用 DATA_DIR」（退出码 2）每 10s 重拉一次。
+    keep_alive = data["KeepAlive"]
+    assert isinstance(keep_alive, dict), "KeepAlive 应为条件字典，不能无条件重拉"
+    assert keep_alive["SuccessfulExit"] is False
+    # 日志路径必须与轮转脚本覆盖的一致（改一处漏一处最难查）
     assert data["StandardOutPath"].endswith("logs/launchd.out.log")
     assert data["StandardErrorPath"].endswith("logs/launchd.err.log")
 
@@ -272,7 +276,7 @@ def test_deploy_templates_contain_no_personal_absolute_paths():
     """全仓库不得混入开发机的个人家目录路径（macOS 的 Users、Linux 的 home）。
 
     这类路径只在开发机成立，进仓库后别人无法复现；需要绝对路径的场景
-    （launchd / newsyslog 不展开环境变量）改用 __PROJECT_ROOT__ 占位符，
+    （launchd 不展开环境变量）改用 __PROJECT_ROOT__ 占位符，
     由 scripts/install-*.sh 在安装时渲染。
     """
     import subprocess
@@ -308,13 +312,6 @@ def test_launchd_install_script_renders_placeholder():
     assert PROJECT_ROOT_TOKEN in body, "脚本必须替换 __PROJECT_ROOT__"
     assert "Library/LaunchAgents" in body
     assert "--uninstall" in body
-
-
-def test_newsyslog_install_script_renders_placeholders():
-    """newsyslog 安装脚本必须同时替换路径与属主占位符。"""
-    body = (ROOT / "scripts" / "install-newsyslog.sh").read_text(encoding="utf-8")
-    assert PROJECT_ROOT_TOKEN in body, "脚本必须替换 __PROJECT_ROOT__"
-    assert LOG_OWNER_TOKEN in body, "脚本必须替换 __LOG_OWNER__"
 
 
 def test_launchd_template_starts_via_wrapper_not_bare_uvicorn():
@@ -467,6 +464,10 @@ def test_describe_probe_failure_handles_timeout_and_unknown():
 NEWSYSLOG = ROOT / "deploy" / "newsyslog" / "coding2api.conf"
 LOGROTATE = ROOT / "deploy" / "logrotate" / "coding2api"
 SYSTEMD_UNIT = ROOT / "deploy" / "systemd" / "coding2api.service"
+# macOS 截断式轮转：newsyslog 只做 rename，会丢日志（见 scripts/rotate-logs.sh）
+ROTATE_SCRIPT = ROOT / "scripts" / "rotate-logs.sh"
+INSTALL_ROTATE = ROOT / "scripts" / "install-logrotate.sh"
+ROTATE_PLIST = ROOT / "deploy" / "launchd" / "com.coding2api.logrotate.plist"
 
 # 部署模板里的占位符（安装脚本渲染成实际值，见 scripts/install-*.sh）。
 # 模板不得写死开发机路径，否则克隆到别处就不可用。
@@ -501,43 +502,231 @@ def _plist_label(template: Path) -> str:
         return str(plistlib.load(handle)["Label"])
 
 
-def test_newsyslog_rule_matches_launchd_plist_paths():
-    """轮转路径必须与 launchd 实际写的文件一致，否则规则永远不生效。"""
-    # 模板对模板：两处用的是同一个 __PROJECT_ROOT__ 占位符，渲染后必须一致。
-    # 路径可能来自任一 launchd 模板（本体或 frpc 隧道），逐个模板查。
-    template = NEWSYSLOG.read_text(encoding="utf-8")
-    plist_templates = "\n".join(t.read_text(encoding="utf-8") for t in LAUNCHD_TEMPLATES)
-    template_paths = [line.split()[0] for line in template.splitlines()
-                      if line.strip() and not line.startswith("#")]
-    assert template_paths, "newsyslog 模板里没有有效条目"
-    for path in template_paths:
-        assert path in plist_templates, f"newsyslog 模板里的 {path} 不在任何 launchd 模板中"
+def test_rotate_script_covers_every_launchd_log_path():
+    """轮转脚本必须覆盖 launchd 实际写的每个日志，否则那个文件会无限涨。
 
-    # 渲染后与本机实际安装的 plist 对齐：只校验「该路径所属的模板已安装」的那些
-    # （例如 frpc 尚未启用时其 plist 不存在，无法对照，跳过而不是误报）。
-    # CI 上两个 plist 都不存在，整段跳过。
-    rendered = _render_template(template)
-    paths = [line.split()[0] for line in rendered.splitlines()
-             if line.strip() and not line.startswith("#")]
-    for launchd_template in LAUNCHD_TEMPLATES:
-        label = _plist_label(launchd_template)
-        installed = LAUNCHD_AGENTS / f"{label}.plist"
-        if not installed.is_file():
-            continue
-        owned = [p for p in paths
-                 if p in _render_template(launchd_template.read_text(encoding="utf-8"))]
-        installed_text = installed.read_text(encoding="utf-8")
-        for path in owned:
-            assert path in installed_text, \
-                f"newsyslog 规则里的 {path} 不在已安装的 {label} plist 中"
-    # 每条规则必须有 7 个字段（路径 属主 权限 份数 大小 时间 标志）
-    for line in rendered.splitlines():
-        if line.strip() and not line.startswith("#"):
-            assert len(line.split()) == 7, f"newsyslog 字段数不对（需 7 列）: {line}"
+    口径：从 launchd 模板取 StandardOutPath / StandardErrorPath，逐个断言
+    scripts/rotate-logs.sh 里有对应的文件名。改名一处漏一处是最难查的坑。
+    """
+    import plistlib
+
+    script = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    covered = 0
+    for template in LAUNCHD_TEMPLATES:
+        with template.open("rb") as handle:
+            data = plistlib.load(handle)
+        for key in ("StandardOutPath", "StandardErrorPath"):
+            path = data.get(key)
+            if not path:
+                continue
+            name = path.rsplit("/", 1)[-1]
+            assert name in script, f"rotate-logs.sh 未覆盖 {name}（来自 {template.name}）"
+            covered += 1
+    assert covered >= 2, "launchd 模板里没有找到日志路径"
+
+
+def test_rotate_script_uses_truncate_not_rename():
+    """macOS 只能截断式轮转：rename 会让进程继续写旧 inode，日志直接丢。
+
+    实测（2026-10-30）：mv app.log app.log.old 后进程仍写 app.log.old，
+    新路径文件不存在；newsyslog 的 flags 只有 B C D G J N U Z，没有
+    copytruncate。所以本项目自建脚本，必须看到「拷贝 → 压缩 → 截断」的顺序。
+    """
+    script = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    code = _shell_code_lines(ROTATE_SCRIPT)
+    # 必须截断当前文件（: > file），不能只 mv/rename
+    assert ": > " in code, "缺少截断步骤（rename 会丢日志）"
+    assert "cp -p" in code, "缺少拷贝步骤（先归档再截断）"
+    assert "bzip2" in code, "缺少压缩步骤"
+    # 截断必须晚于压缩成功：否则压缩失败就把未归档的日志清掉了
+    assert code.index("bzip2 -f") < code.index(": > "), "截断早于压缩成功"
+    # 不得出现 rename 式轮转
+    assert "mv " not in code, "不得使用 mv/rename 轮转"
+    # 轮转目标目录可覆盖：否则测试会把真实 logs/ 轮转掉
+    assert "ROTATE_LOGS_DIR" in script, "缺少 ROTATE_LOGS_DIR 覆盖（测试隔离用）"
+
+
+def test_rotate_script_avoids_platform_specific_stat():
+    """不能依赖 `stat -f %z`：GNU 的 `stat -f` 会**成功**返回文件系统信息。
+
+    CI 在 ubuntu 上真跑本脚本（上面的行为用例），BSD/GNU 差异会直接红。
+    这条与 bash 3.2 兼容性同理：脚本本体只服务 macOS，测试却跨平台。
+    """
+    code = _shell_code_lines(ROTATE_SCRIPT)
+    assert "stat -f" not in code, "BSD 专用的 stat -f 在 GNU 上不报错但结果错"
+    assert "wc -c" in code, "文件大小用 wc -c（两边行为一致）"
+
+
+def test_rotate_script_is_bash32_compatible():
+    """launchd 用 /bin/bash（macOS 自带 3.2），不能用 mapfile / readarray。"""
+    code = _shell_code_lines(ROTATE_SCRIPT)
+    assert "mapfile" not in code, "bash 3.2 没有 mapfile"
+    assert "readarray" not in code, "bash 3.2 没有 readarray"
+    assert "${archives[@]}" not in code, "数组切片在 3.2 上行为不同，用 while read"
+
+
+def test_rotate_plist_schedules_without_keepalive():
+    """定时任务必须跑完即退：KeepAlive 会让它被立刻反复重拉。"""
+    import plistlib
+
+    with ROTATE_PLIST.open("rb") as handle:
+        data = plistlib.load(handle)
+    assert data["Label"] == "com.coding2api.logrotate"
+    assert not data.get("KeepAlive"), "轮转是一次性任务，不能 KeepAlive"
+    assert data.get("RunAtLoad") is False, "登录时不必立刻轮转（阈值未到）"
+    intervals = data.get("StartCalendarInterval")
+    assert intervals, "缺少定时触发"
+    assert len(intervals) >= 2, "至少两个时点，避免只在一个时段轮转"
+    # 走 /bin/bash 而不是 exec 脚本本身：脚本 shebang 用 bash，但显式声明更稳
+    assert data["ProgramArguments"][0] == "/bin/bash"
+    assert data["ProgramArguments"][-1].endswith("scripts/rotate-logs.sh")
+
+
+def test_rotate_install_script_renders_placeholder():
+    """安装脚本必须渲染 __PROJECT_ROOT__ 并写进 LaunchAgents。"""
+    assert INSTALL_ROTATE.is_file()
+    assert INSTALL_ROTATE.stat().st_mode & 0o111, "安装脚本没有执行位"
+    body = INSTALL_ROTATE.read_text(encoding="utf-8")
+    assert PROJECT_ROOT_TOKEN in body
+    assert "Library/LaunchAgents" in body
+    assert "--uninstall" in body
+    assert "launchctl bootstrap" in body and "launchctl bootout" in body
+
+
+def test_newsyslog_rules_removed():
+    """macOS 不再用 newsyslog：它只做 rename，会让服务继续写旧 inode。
+
+    回归护栏——如果有人把 newsyslog 规则加回来，说明又踩回丢日志的坑。
+    """
+    assert not NEWSYSLOG.exists(), "macOS 侧已改用 scripts/rotate-logs.sh，不应再有 newsyslog 规则"
+    assert not (ROOT / "scripts" / "install-newsyslog.sh").exists()
+
+
+def test_launchd_wrapper_warns_about_installed_newsyslog_copy():
+    """本机 /etc 下的残留规则仓库删不掉，启动时必须吼一声。
+
+    仓库侧删干净了（上一用例），但用老脚本装到 /etc 的副本会一直留在本机：
+    它继续 rename 轮转 → 日志静默丢失且无任何报错（2026-11-09 扫日志发现
+    11-07 15:30~11-08 10:29 整整 19h 空白）。只在启动 stderr 提醒，不阻断启动。
+    """
+    code = _shell_code_lines(ROOT / "scripts" / "launchd-server.sh")
+    assert "/etc/newsyslog.d/coding2api.conf" in code
+    assert "sudo rm" in code
+
+
+def test_rotate_script_actually_rotates_in_isolation(tmp_path):
+    """真跑一次：内容归档、当前文件被截断、超额归档被清理。
+
+    **必须用 ROTATE_LOGS_DIR 指到临时目录**：脚本按自身位置解析仓库根，
+    在别的 cwd 里跑也照样作用于真实 logs/（这条坑是 2026-10-30 实际踩过的，
+    当场轮转掉本机日志并误删了 4 份历史归档）。
+    """
+    import subprocess
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    payload = "x" * 4096
+    (logs / "launchd.err.log").write_text(payload, encoding="utf-8")
+    env = {
+        **__import__("os").environ,
+        "ROTATE_LOGS_DIR": str(logs),
+        "ROTATE_MAX_KB": "1",
+        "ROTATE_KEEP": "2",
+    }
+    result = subprocess.run(["bash", str(ROTATE_SCRIPT)], env=env,
+                            capture_output=True, text=True, check=True)
+    assert "已轮转" in result.stdout
+    # 当前文件被截断为空，归档里有完整内容
+    assert (logs / "launchd.err.log").read_text(encoding="utf-8") == ""
+    archives = list(logs.glob("launchd.err.log.*.bz2"))
+    assert len(archives) == 1
+    import bz2
+
+    assert bz2.decompress(archives[0].read_bytes()).decode() == payload
+
+
+def test_rotate_script_dry_run_leaves_files_untouched(tmp_path):
+    """--dry-run 只报告，不归档也不截断。"""
+    import subprocess
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "launchd.err.log").write_text("y" * 4096, encoding="utf-8")
+    env = {
+        **__import__("os").environ,
+        "ROTATE_LOGS_DIR": str(logs),
+        "ROTATE_MAX_KB": "1",
+    }
+    result = subprocess.run(["bash", str(ROTATE_SCRIPT), "--dry-run"], env=env,
+                            capture_output=True, text=True, check=True)
+    assert "[dry-run]" in result.stdout
+    assert (logs / "launchd.err.log").read_text(encoding="utf-8") == "y" * 4096
+    assert not list(logs.glob("*.bz2"))
+
+
+def test_rotate_script_skips_empty_and_small_files(tmp_path):
+    """空文件与未超阈值的文件都不轮转（notifempty / size 语义）。"""
+    import subprocess
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "launchd.err.log").write_text("", encoding="utf-8")
+    (logs / "launchd.out.log").write_text("z" * 512, encoding="utf-8")
+    env = {
+        **__import__("os").environ,
+        "ROTATE_LOGS_DIR": str(logs),
+        "ROTATE_MAX_KB": "10240",
+    }
+    subprocess.run(["bash", str(ROTATE_SCRIPT)], env=env,
+                   capture_output=True, text=True, check=True)
+    assert not list(logs.glob("*.bz2"))
+
+
+def test_rotate_script_prunes_old_archives(tmp_path):
+    """超过 KEEP 的归档按 mtime 倒序清理，只留最近 KEEP 份。"""
+    import subprocess
+    import time
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    # 先造 3 份旧归档，再触发一次轮转（KEEP=2 → 最后应剩 2 份）
+    for index in range(3):
+        archive = logs / f"launchd.err.log.2026010{index + 1}-000000.bz2"
+        archive.write_bytes(b"old")
+        time.sleep(0.01)
+    (logs / "launchd.err.log").write_text("w" * 4096, encoding="utf-8")
+    env = {
+        **__import__("os").environ,
+        "ROTATE_LOGS_DIR": str(logs),
+        "ROTATE_MAX_KB": "1",
+        "ROTATE_KEEP": "2",
+    }
+    subprocess.run(["bash", str(ROTATE_SCRIPT)], env=env,
+                   capture_output=True, text=True, check=True)
+    assert len(list(logs.glob("launchd.err.log.*.bz2"))) == 2
+
+
+def test_rotate_script_rejects_unknown_flag():
+    """未知参数直接退 2，避免拼错的 --dryrun 被当成真跑。"""
+    import subprocess
+
+    result = subprocess.run(["bash", str(ROTATE_SCRIPT), "--nope"],
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "未知参数" in result.stderr
+
+
+def test_systemd_restart_policy_skips_already_running_exit():
+    """systemd 只在失败时重拉：退出码 0（另一实例持锁）不该触发重启循环。
+
+    与 launchd 的 `KeepAlive.SuccessfulExit=false` 同口径。
+    """
+    text = SYSTEMD_UNIT.read_text(encoding="utf-8")
+    assert "Restart=on-failure" in text, "Restart=always 会把「另一实例在跑」也重拉"
 
 
 def test_logrotate_rule_uses_copytruncate():
-    """进程持有 fd（>> 重定向）时 rename 不会让它换文件，必须 copytruncate。"""
+    """Linux 侧：进程持有 fd（>> 重定向）时 rename 不会让它换文件，必须 copytruncate。"""
     text = LOGROTATE.read_text(encoding="utf-8")
     assert "copytruncate" in text
     assert "rotate " in text and "maxsize" in text
@@ -549,7 +738,7 @@ def test_systemd_unit_sends_logs_to_journal():
     text = SYSTEMD_UNIT.read_text(encoding="utf-8")
     assert "StandardOutput=journal" in text
     assert "StandardError=journal" in text
-    assert "ExecStart=" in text and "build_app" in text
+    assert "ExecStart=" in text and "src.main" in text
     # 密钥不得写进 unit（systemctl cat 会暴露给所有用户）
     assert "APP_SECRET=" not in text
 
@@ -566,15 +755,16 @@ def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     from src.main import GRACEFUL_SHUTDOWN_SECONDS
 
     assert GRACEFUL_SHUTDOWN_SECONDS > 0
-    # launchd 与 Docker 都走 src.main:run，flag 由 run() 内部传入，脚本里没有
-    # 这个数字可对；systemd 仍直接跑 uvicorn CLI，必须显式带同一个 flag。
+    # 三条路径（Docker CMD / launchd wrapper / systemd ExecStart）现在统一走
+    # src.main:run，排空时长由 run() 内部传入，任何一处再出现 uvicorn CLI
+    # 就会让数字分裂，且绕过单实例锁。
     text = SYSTEMD_UNIT.read_text(encoding="utf-8")
-    found = _re.search(r"--timeout-graceful-shutdown (\d+)", text)
-    assert found, f"{SYSTEMD_UNIT.name} 缺 --timeout-graceful-shutdown"
-    assert int(found.group(1)) == GRACEFUL_SHUTDOWN_SECONDS, SYSTEMD_UNIT.name
-    # launchd 走 run() 的前提：脚本代码里不得再出现 uvicorn CLI（否则数字又分裂）
+    assert "uvicorn" not in text, "systemd 应走 src.main:run（含单实例锁）"
+    assert "-m src.main" in text, SYSTEMD_UNIT.name
     launchd = _shell_code_lines(ROOT / "scripts" / "launchd-server.sh")
     assert "uvicorn" not in launchd, "launchd 改走 src.main:run 后不应再出现 uvicorn CLI"
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "src.main" in dockerfile and "uvicorn src.main" not in dockerfile
     # Docker：stop_grace_period 是容器给进程的停机窗口，必须 >= 应用排空窗口
     compose = COMPOSE.read_text(encoding="utf-8")
     grace = _re.search(r"stop_grace_period: (\d+)s", compose)
@@ -584,44 +774,23 @@ def test_graceful_shutdown_timeout_consistent_across_entrypoints():
     unit = SYSTEMD_UNIT.read_text(encoding="utf-8")
     stop = _re.search(r"TimeoutStopSec=(\d+)", unit)
     assert stop and int(stop.group(1)) >= GRACEFUL_SHUTDOWN_SECONDS
+    # launchd 的 ExitTimeOut 同理：默认约 20s，短于排空窗口就会 SIGKILL 长流
+    plist = LAUNCHD_TEMPLATE.read_text(encoding="utf-8")
+    exit_timeout = _re.search(r"<key>ExitTimeOut</key>\s*<integer>(\d+)</integer>", plist)
+    assert exit_timeout, f"{LAUNCHD_TEMPLATE.name} 缺 ExitTimeOut"
+    assert int(exit_timeout.group(1)) >= GRACEFUL_SHUTDOWN_SECONDS
 
 
-def test_newsyslog_install_script_is_executable():
-    """安装脚本必须可执行，否则 README 里的用法会失败。"""
-    script = ROOT / "scripts" / "install-newsyslog.sh"
-    assert script.is_file()
-    assert script.stat().st_mode & 0o111, "安装脚本没有执行位"
-    body = script.read_text(encoding="utf-8")
-    assert "/etc/newsyslog.d/" in body      # 装到 newsyslog 会读的目录
-    assert "--uninstall" in body
-
-
-def test_newsyslog_owner_matches_actual_log_owner():
-    """owned:group 必须与文件实际属主一致，否则 newsyslog 会跳过该条目。
-
-    本机日志由 launchd 以当前用户身份写入，规则写成 root:wheel 就永远不会
-    轮转（newsyslog 静默跳过），是很容易埋下的坑。
-    """
-    text = _render_template(NEWSYSLOG.read_text(encoding="utf-8"))
-    entries = [line.split() for line in text.splitlines()
-               if line.strip() and not line.startswith("#")]
-    assert entries
-    for path, owner in ((e[0], e[1]) for e in entries):
-        target = Path(path)
-        if not target.exists():
-            continue                      # 未部署到本机的路径跳过
-        import grp
-        import pwd
-
-        stat = target.stat()
-        actual = f"{pwd.getpwuid(stat.st_uid).pw_name}:{grp.getgrgid(stat.st_gid).gr_name}"
-        assert owner == actual, f"{path} 规则写 {owner}，实际是 {actual}"
+def test_rotate_script_preserves_file_owner():
+    """截断式轮转用 cp -p：属主/权限跟着归档走，不因轮转变成 root 或丢权限。"""
+    code = _shell_code_lines(ROTATE_SCRIPT)
+    assert "cp -p" in code, "必须保留属主与权限（cp -p），否则归档属主错乱"
 
 
 def test_webapp_logging_module_does_not_open_files():
     """应用只写 stderr：不得引入 RotatingFileHandler / FileHandler。
 
-    文件与轮转交给平台（launchd+newsyslog / systemd+journald / docker json-file）。
+    文件与轮转交给平台（launchd+rotate-logs.sh / systemd+journald / docker json-file）。
     应用自己写文件会与平台轮转争抢同一文件，容器里还会写进镜像层重启即丢。
     """
     src = (ROOT / "src" / "webapp" / "logging.py").read_text(encoding="utf-8")
@@ -797,11 +966,26 @@ def test_nginx_read_timeout_covers_longest_conversation():
 
 def test_nginx_body_limit_aligns_with_app_middleware():
     """两侧同值才能让超限统一由应用裁决（否则 nginx 先返回 HTML 形状的 413）。"""
-    from src.webapp.limits import DEFAULT_BODY_LIMIT
+    from src.webapp.limits import BACKUP_UPLOAD_LIMIT, DEFAULT_BODY_LIMIT
 
     text = NGINX_CONF.read_text(encoding="utf-8")
     expected = f"client_max_body_size {DEFAULT_BODY_LIMIT // (1024 * 1024)}m;"
     assert expected in text, f"nginx 上传上限应与应用对齐（{expected}）"
+    # 备份恢复是例外：端点 512MB，nginx 必须单独放宽，否则公网入口下永远 413
+    backup = f"client_max_body_size {BACKUP_UPLOAD_LIMIT // (1024 * 1024)}m;"
+    assert backup in text, f"备份恢复路径的上传上限应与应用对齐（{backup}）"
+
+
+def test_backup_upload_limit_matches_middleware():
+    """端点声明的上限必须真的可达：中间件先裁决，不同值即静默失效。"""
+    from src.api.admin_backups import MAX_UPLOAD_BYTES
+    from src.webapp.limits import BACKUP_UPLOAD_LIMIT, _body_limit
+
+    assert MAX_UPLOAD_BYTES == BACKUP_UPLOAD_LIMIT
+    assert _body_limit("/api/backups/restore") == BACKUP_UPLOAD_LIMIT
+    assert _body_limit("/api/backups/restore/") == BACKUP_UPLOAD_LIMIT
+    # 其余端点不受影响
+    assert _body_limit("/v1/chat/completions") != BACKUP_UPLOAD_LIMIT
 
 
 def test_nginx_uses_domain_placeholder_not_hardcoded_host():
@@ -846,13 +1030,13 @@ def test_frpc_plist_template_is_valid_and_renders():
         "plist 只应注入 token 文件路径，不得注入 token 值"
 
 
-def test_frpc_plist_writes_logs_covered_by_newsyslog():
-    """launchd 写的 frpc 日志必须与 newsyslog 规则一致，否则日志无限增长。"""
+def test_frpc_plist_writes_logs_covered_by_rotate_script():
+    """launchd 写的 frpc 日志必须被轮转脚本覆盖，否则日志无限增长。"""
     plist_text = _render_template(FRPC_PLIST_TEMPLATE.read_text(encoding="utf-8"))
-    newsyslog = NEWSYSLOG.read_text(encoding="utf-8")
+    rotate = ROTATE_SCRIPT.read_text(encoding="utf-8")
     for suffix in ("frpc.out.log", "frpc.err.log"):
         assert f"logs/{suffix}" in plist_text, f"plist 未把日志写到 logs/{suffix}"
-        assert f"logs/{suffix}" in newsyslog, f"newsyslog 缺少 logs/{suffix} 的轮转规则"
+        assert suffix in rotate, f"rotate-logs.sh 缺少 logs/{suffix} 的轮转"
 
 
 def test_frpc_run_resolves_binary_and_execs():
@@ -876,3 +1060,146 @@ def test_install_frpc_renders_placeholders_and_installs_agent():
     assert 'TOKEN_FILE="$ROOT/secrets/frpc-token"' in text
     assert "umask 077" in text, "token 文件必须按 600 落盘"
     assert INSTALL_FRPC.stat().st_mode & 0o111, "安装脚本必须可执行"
+
+
+# ------------------------------------------------- 公网部署（Docker + Caddy 自动 HTTPS）
+#
+# 有公网 IP 的 VPS 用覆盖文件在基础 compose 上叠一个 Caddy 入口：Caddy 终止 TLS、
+# 应用端口只绑回环、证书长期落具名卷。这里锁死的是「改了就出事且 CI 不一定报」
+# 的不变量：回环绑定（不给明文旁路）、ALLOWED_HOSTS 补回环（否则 healthcheck
+# 永远 400 → 应用永远 unhealthy → Caddy 永远不启动）、XFF 覆盖式写入（否则
+# 客户端可伪造来源 IP 绕过 Key 的 allowed_ips）、default_sni（否则 IP 字面量
+# 客户端握手直接失败）。
+
+PUBLIC_COMPOSE = ROOT / "docker-compose.public.yml"
+CADDY_DIR = ROOT / "deploy" / "caddy"
+CADDYFILE = CADDY_DIR / "Caddyfile"
+CADDYFILE_ACME = CADDY_DIR / "tls_acme.caddyfile"
+CADDYFILE_INTERNAL = CADDY_DIR / "tls_internal.caddyfile"
+
+
+def test_public_compose_needs_compose_tls_override_tag():
+    """`!override` 需要 Compose ≥ 2.24；老版本读不懂会直接报错。"""
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert "ports: !override" in text, "替换基础 compose 的端口映射必须用 !override"
+    assert "2.24" in text, "依赖的 Compose 最低版本要写在文件头注释里"
+
+
+def test_public_compose_binds_app_port_to_loopback_only():
+    """应用端口只绑 127.0.0.1：绑 0.0.0.0 会留一条明文 http 旁路。
+
+    TRUST_PROXY=true 后直连还能自带伪造的 X-Forwarded-For 绕过 Key 的
+    allowed_ips，所以这条旁路必须彻底关掉。
+    """
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert '"127.0.0.1:${PORT:-8000}:${PORT:-8000}"' in text
+    bindings = re.findall(r'^\s+-\s+"?([^"\n]*\$\{PORT[^"\n]*)"?$', text, re.MULTILINE)
+    assert bindings, "覆盖文件里应有应用端口映射"
+    assert not [b for b in bindings if b.startswith("0.0.0.0:")], \
+        f"应用端口不得绑 0.0.0.0（明文旁路）: {bindings}"
+
+
+def test_public_compose_trusts_proxy_and_pins_allowed_hosts():
+    """HOST/PORT 重心、ALLOWED_HOSTS 必须显式补域名与回环。
+
+    非空即「完全替换」语义：漏掉域名 → 全站 400 invalid host header；
+    漏掉 127.0.0.1 → 容器 healthcheck 判 400 → 永远 unhealthy，
+    而 Caddy `depends_on: service_healthy` 也就永远不启动。
+    """
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert 'TRUST_PROXY: "true"' in text
+    assert "HOST: 0.0.0.0" in text
+    allowed = re.search(r"^\s+ALLOWED_HOSTS: (.+)$", text, re.MULTILINE)
+    assert allowed, "覆盖文件必须显式覆盖 ALLOWED_HOSTS"
+    value = allowed.group(1)
+    assert "${PUBLIC_DOMAIN:?" in value and "127.0.0.1" in value, value
+
+
+def test_public_compose_does_not_require_acme_email_for_self_signed_mode():
+    """ACME_EMAIL 只在域名模式必填：自签模式（公网 IP）用不到它。
+
+    要求写成 `${ACME_EMAIL:-}`（可空）——写成 `${ACME_EMAIL:?}` 会让「没有域名」
+    的部署也必须编一个邮箱，而 tls_internal 片段根本不引用它。
+    """
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert "${ACME_EMAIL:-}" in text
+    assert "${ACME_EMAIL:?" not in text, "自签模式不该被 ACME_EMAIL 卡住"
+    assert "TLS_MODE: ${TLS_MODE:-acme}" in text, "TLS_MODE 默认必须是 acme"
+
+
+def test_public_compose_requires_public_domain():
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert "${PUBLIC_DOMAIN:?" in text, "缺 PUBLIC_DOMAIN 必须直接失败，不能静默用默认值"
+
+
+def test_public_compose_mounts_whole_caddy_dir_and_cert_volumes():
+    """整个 deploy/caddy 必须挂进去（站点块要按 TLS_MODE import 片段）。"""
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert "./deploy/caddy:/etc/caddy:ro" in text
+    assert "caddy_data:/data" in text and "caddy_config:/config" in text
+    # 证书落具名卷才不随重建重新签发（撞 Let's Encrypt 每周 5 次限额）
+    assert re.search(r"^volumes:\s*$", text, re.MULTILINE)
+
+
+def test_public_compose_waits_for_healthy_app_and_rotates_caddy_logs():
+    text = PUBLIC_COMPOSE.read_text(encoding="utf-8")
+    assert re.search(r"coding2api:\s*\n\s+condition: service_healthy", text), \
+        "Caddy 必须等应用 healthy，否则预热期持续 502"
+    assert 'max-size: "10m"' in text, "Caddy 也要有 json-file 日志上限（默认无上限）"
+    assert 'max-file: "5"' in text
+
+
+def test_caddyfile_hides_metrics_and_streams_sse():
+    text = CADDYFILE.read_text(encoding="utf-8")
+    assert "@metrics path /metrics" in text and "respond @metrics 404" in text
+    assert "flush_interval -1" in text, "不关响应缓冲会让流式首字等到缓冲区满"
+    assert "encode zstd gzip" in text
+
+
+def test_caddyfile_overwrites_forwarded_for_and_proto():
+    """客户端可自带伪造的 X-Forwarded-For：必须覆盖式写入单值。"""
+    text = CADDYFILE.read_text(encoding="utf-8")
+    assert "header_up X-Forwarded-For {http.request.remote.host}" in text
+    assert "header_up X-Forwarded-Proto {scheme}" in text
+
+
+def test_caddyfile_sets_default_sni_for_ip_literal_clients():
+    """浏览器 / curl 对 IP 字面量不发 SNI（RFC 6066 只允许主机名）。
+
+    自签模式（站点是公网 IP）没有 default_sni 就选不出证书，客户端只看到
+    `tlsv1 alert internal error` ——握手直接失败，不是「证书不受信任」。
+    """
+    text = CADDYFILE.read_text(encoding="utf-8")
+    assert "default_sni {$PUBLIC_DOMAIN}" in text
+
+
+def test_caddyfile_selects_tls_snippet_by_mode():
+    text = CADDYFILE.read_text(encoding="utf-8")
+    assert "import /etc/caddy/tls_{$TLS_MODE}.caddyfile" in text
+
+
+def test_caddy_tls_snippets_cover_both_modes():
+    """acme 走 Let's Encrypt、internal 自签；两个片段都要在，且互不越界。"""
+    acme = CADDYFILE_ACME.read_text(encoding="utf-8")
+    internal = CADDYFILE_INTERNAL.read_text(encoding="utf-8")
+    assert "issuer acme" in acme and "email {$ACME_EMAIL}" in acme
+    assert "tls internal" in internal
+    # 片段只该管 TLS，别把站点级指令也塞进来（两处配置必须同源）
+    assert "reverse_proxy" not in acme + internal
+    # internal 片段不得引用 ACME_EMAIL：自签模式没配它，引用就会解析失败
+    assert "{$ACME_EMAIL}" not in internal
+
+
+def test_env_example_documents_public_deploy_knobs():
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in ("PUBLIC_DOMAIN=", "ACME_EMAIL=", "TLS_MODE="):
+        assert name in text, f".env.example 缺少 {name}"
+
+
+def test_ci_validates_public_deploy_in_both_tls_modes():
+    """CI 必须把两种 TLS 模式都 validate 一遍，否则改了片段 CI 也不会报。"""
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "for mode in acme internal" in workflow
+    assert 'TLS_MODE="$mode"' in workflow
+    assert "-v \"$PWD/deploy/caddy:/etc/caddy:ro\"" in workflow
+    assert "TLS_MODE=internal" in workflow, "compose 覆盖文件也要按自签模式拼一遍"

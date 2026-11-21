@@ -12,16 +12,22 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 
-def backup(db_path: Path) -> Path:
+def backup(db_path: Path, *, keep: int = 5) -> Path:
     """写库前备份主库文件到同目录（`.bak-<时间戳>`），失败即中止。
 
     用 SQLite 在线备份 API 而不是复制文件：WAL 模式下直接 copy 主库文件会
     丢掉尚未 checkpoint 的已提交事务。
+
+    `keep` 份保留：这些脚本是一次性运维工具，每跑一次落一份 40MB+ 的快照。
+    早先不清理，本机实测攒到 28 份 / 870MB（同名 `.bak-*` 从不清），
+    首次排障时 `du -sh data` 全是它。按 mtime 倒序只留最近 `keep` 份；
+    `keep <= 0` 表示不清理。清理失败（权限/竞态）不阻断备份本身。
     """
     target = db_path.with_name(f"{db_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
     source = sqlite3.connect(str(db_path))
@@ -33,7 +39,31 @@ def backup(db_path: Path) -> Path:
             destination.close()
     finally:
         source.close()
+    # 备份含全部凭证密文与用户数据，默认 umask(022) 会落成 0644。失败只 warn 不阻断。
+    try:
+        target.chmod(0o600)
+    except OSError as error:
+        print(f"警告：无法把备份 {target} 权限改为 600（{error}）", file=sys.stderr)
+    if keep > 0:
+        _prune_backups(db_path, keep=keep)
     return target
+
+
+def _prune_backups(db_path: Path, *, keep: int) -> None:
+    """只保留最近 `keep` 份 `.bak-*`，按 mtime 倒序（名字带时间戳但 mtime 更稳）。"""
+    try:
+        existing = sorted(
+            db_path.parent.glob(f"{db_path.name}.bak-*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for stale in existing[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
 
 
 class DbAdapter:
@@ -68,3 +98,37 @@ class DbAdapter:
             self._depth = depth
         if depth == 0:
             self._conn.commit()
+
+
+def hour_range(conn, where: str, params: list[object]) -> tuple[int, int] | None:
+    """`where` 命中行覆盖的小时区间（整点对齐、闭区间）；无行返回 None。
+
+    删除失败明细前先取这个区间，`sync_hourly` 只在该区间清孤儿行：区间外的
+    小时**本来就没有明细**（`purge_expired` 删 90 天前明细，小时汇总永久保留），
+    无条件清会把历史汇总一起删掉。
+    """
+    row = conn.execute(
+        f"SELECT MIN(ts), MAX(ts) FROM usage_events WHERE {where}", params).fetchone()
+    if row[0] is None:
+        return None
+    return (int(row[0]) // 3600) * 3600, (int(row[1]) // 3600) * 3600
+
+
+def sync_hourly(conn, hours: tuple[int, int] | None) -> None:
+    """全量重算小时汇总，并清掉 `hours` 区间内已无明细对应的孤儿行。
+
+    `hours` 必须是**本次删除覆盖**的小时区间（见 `hour_range`）；None = 没有
+    待删行，只重算不清孤儿。
+    """
+    from src.stats.collector import StatsCollector
+
+    StatsCollector(DbAdapter(conn)).rollup_hourly()
+    if hours is None:
+        return
+    conn.execute(
+        "DELETE FROM usage_hourly WHERE hour_utc BETWEEN ? AND ? AND NOT EXISTS ("
+        "  SELECT 1 FROM usage_events e"
+        "  WHERE (e.ts / 3600) * 3600 = usage_hourly.hour_utc"
+        "    AND e.username = usage_hourly.username"
+        "    AND e.provider = usage_hourly.provider"
+        "    AND e.model = usage_hourly.model)", hours)

@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # 默认 false：XFF 由客户端可写，直连部署下信它等于白名单形同虚设。
     # 仅在「本服务前面恰好一层受信反代」时开启，届时取 XFF 最后一个条目。
     trust_proxy: bool = False
+    # 受信反代的对端地址（逗号分隔 IP/CIDR）。为空 = 采信任意对端（旧行为，
+    # 仅在服务端口只对反代开放时成立）；非空时只有对端命中白名单才解析 XFF。
+    # 有直连入口（如 docker 把 PORT 发布到 0.0.0.0）时必须显式配这一项，
+    # 否则攻击者可自带 `X-Forwarded-For: <白名单IP>` 绕过 Key 的 allowed_ips。
+    trusted_proxies: str = ""
 
     # 上游（白名单内的地址才可接收真实 Token）
     codebuddy_api_endpoint: str = _CODEBUDDY_CN
@@ -60,10 +65,36 @@ class Settings(BaseSettings):
     zen_api_endpoint: str = "https://opencode.ai"
     zen_allowed_endpoints: str = "https://opencode.ai"
     zen_opencode_version: str = "1.18.0"
+    # 门禁的移动靶部分做成配置（改完重启即生效，无需改代码）：
+    # - 根路径：`/zen/v1`（默认，本仓 2026-10-28 实测 200）或 `/inference/v1`
+    #   （第三方实测称已迁移；两条路径当前都 200，保留可切）；
+    # - 门禁工具名：上游 10-14 收紧后第三方实测要求 `bash,glob,grep,read`
+    #   四件套，本仓仍以两件套通过 —— 冲突未复验，默认不变；
+    # - UA 模板：`{version}` 占位符代入版本号；空 = `opencode/<version>`。
+    zen_api_root: str = "/zen/v1"
+    # 模型清单根（空 = 跟随 zen_api_root）。官方 2.x 端点拆分后对话在
+    # `/inference/openai/v1`、清单在 `/inference/v1`，需要分别配置。
+    zen_models_root: str = ""
+    # 客户端指纹档位：`legacy`（默认，1.x 形态）或 `v2`（2.x 形态：
+    # 4 个 session 副本、client/project 头、b3/traceparent、`<env>` 块）。
+    zen_client_profile: str = "legacy"
+    zen_gate_tools: str = "bash,read"
+    zen_user_agent: str = ""
     # Kilo Gateway 免费层：标准 OpenAI 协议、无门禁、无凭证，端点白名单同样
     # 只为防误配。免费模型由上游 `isFree` 标记识别（见 provider/kilo/client.py）。
     kilo_api_endpoint: str = "https://api.kilo.ai/api/gateway"
     kilo_allowed_endpoints: str = "https://api.kilo.ai/api/gateway"
+    # 小浣熊（商汤）：标准 OpenAI 兼容网关，鉴权是网页会话 JWT（cookie
+    # `xhx_token`）。白名单只为防误配，避免把用户的会话 JWT 发往未授权主机。
+    raccoon_api_endpoint: str = "https://xiaohuanxiong.com"
+    raccoon_allowed_endpoints: str = "https://xiaohuanxiong.com"
+    # WPS 灵犀：桌面端 agent-runtime 通路（三条请求一次对话），鉴权是 WPS 账号
+    # cookie `wps_sid`。白名单同时收主域与 kdocs 回落域——对话面按这两个域
+    # 顺序回落（kdocs 账号的集群在 lingxi.kdocs.cn），漏收会让回落直接 404。
+    lingxi_api_endpoint: str = "https://lingxi.wps.cn"
+    lingxi_allowed_endpoints: str = (
+        "https://lingxi.wps.cn,https://lingxi.kdocs.cn"
+    )
     # Qoder（阿里，COSY 私有协议）：真实账号渠道，端点白名单防止误把带 COSY
     # 签名的请求发往未授权主机。默认取国内版；国际版改这两个值并把国际版域名
     # 一并加入白名单。推理走 gateway.*，额度/登录走 openapi.*。
@@ -74,19 +105,40 @@ class Settings(BaseSettings):
         "https://openapi.qoder.sh,https://api1.qoder.sh"
     )
     # CodeArts（华为云码道 / snap-access 盘古引擎）：AK/SK 签名渠道。白名单
-    # 必须含 snap 引擎（推理/令牌）、STS（refresh）、福利网关（模型/领取/余额）
-    # 与门户（PKCE 授权页）四个主机。
+    # 必须含 snap 引擎（推理/令牌/额度/签到）、STS（refresh）与门户（PKCE
+    # 授权页）三个主机。
     codearts_api_endpoint: str = "https://snap-access.cn-north-4.myhuaweicloud.com"
     codearts_allowed_endpoints: str = (
         "https://snap-access.cn-north-4.myhuaweicloud.com,"
         "https://sts.cn-north-4.myhuaweicloud.com,"
-        "https://opengw.developer.huaweicloud.com,"
         "https://codearts.huaweicloud.com"
     )
+    # officeAce（华为云果办 / AgentArts）：OAuth + 开通校验走**控制面**
+    # `agentarts.{region}.myhuaweicloud.com`；聊天走每账号各自的模型网关
+    # `modelgw-XXXX.officeace.{region}.huaweicloud-agentarts.com`，该地址由
+    # `client-permission-validate` 下发并存在凭证里（每个账号不同），故不在此配置，
+    # 也不进白名单——它不是本服务能写错的值，而是上游签发的。这里只白名单控制面：
+    # 带临时 AK/SK 签名的请求只会发往它。
+    officeace_api_endpoint: str = "https://agentarts.cn-southwest-2.myhuaweicloud.com"
+    officeace_allowed_endpoints: str = (
+        "https://agentarts.cn-southwest-2.myhuaweicloud.com"
+    )
+    # 通用 OpenAI 兼容上游（标准端点，无逆向）：留空 = 不启用该渠道。
+    # 接 Command Code / Kimi Code / MiniMax / 智谱免费档 / 自建 vLLM 等。
+    # base_url 只接受 http(s)；白名单只防误配（凭证是真实 key，发错主机等于泄密）。
+    generic_api_endpoint: str = ""
+    generic_allowed_endpoints: str = ""
+    generic_user_agent: str = ""
+    # 上游没有 `/models` 时的静态模型表（逗号分隔）；留空则只用 `/models`。
+    generic_models: str = ""
     # 按渠道出站代理（启动期项，见 provider/proxy.py）：格式
     # `渠道=代理URL;渠道2=代理URL2`，协议 http/https/socks5/socks5h；留空 = 直连。
     # 代理作用于连接池，运行中改值需重启，故不做热更。
     provider_proxies: str = ""
+    # 出口 IP 粘性（「一号一出口」）：全局代理池，分号分隔；按凭证 id 稳定哈希
+    # 分配，同一凭证重启后仍走同一出口。未配 = 沿用 `PROVIDER_PROXIES`/直连。
+    # 注意：池成员增删会让部分凭证换桶（改池子本身就是要换出口）。
+    credential_proxy_pool: str = ""
 
     # 路由与调度
     # 默认模型：六条渠道都已上架 `deepseek-v4.1-flash`（CB / TRAE / CodeArts /
@@ -128,10 +180,11 @@ class Settings(BaseSettings):
     # 缓存（30 分钟）对齐：再密也不会让 zen 多探活一次，只是白打其余渠道的
     # /models。
     model_catalog_minutes: int = 30
-    # 模型可用性探活周期（分钟）：只探仍被负缓存（「上游无此模型」）的
+    # 模型可用性探活周期（分钟）：探仍被负缓存（「上游无此模型」）与已判死的
     # (渠道, 模型)，一次最小对话。0 = 关闭（默认关闭）：探活会真发上游请求、
     # 消耗额度，是否开启应由部署者按额度余量决定。开启后建议 ≥60 分钟——
-    # 负缓存本身 6h 起步，比它更密只是白耗额度。
+    # 负缓存本身 6h 起步，比它更密只是白耗额度。判死行也靠这条周期复探恢复
+    # （判死即从列表摘掉，没有到期时间）。
     model_probe_minutes: int = 0
     # 成长中心（仅 CodeBuddy 有）：一轮领取的周期，以及是否允许不可逆动作
     # （抽奖/连登兑换/开 Buddy 盲盒/消耗补登卡）。这些动作无法撤销，
@@ -154,13 +207,30 @@ class Settings(BaseSettings):
     # 一堆部署在同一分钟齐刷刷打上游。按「日期 + 时点」记去重键，抖动只改
     # 执行时刻、不改归属，不会让同一时点跑两次。
     checkin_jitter_minutes: int = 0
+    # 跳过签到的渠道（逗号分隔，如 `raccoon,lingxi`）。上游长期停发时用它止损：
+    # 签到任务照常跑、其它渠道不受影响，只把点名的渠道从签到里摘出去。
+    # 与「暂停凭证」不同——`enabled=0` 会连聊天一起停掉，而这里只停签到。
+    checkin_skip_providers: str = ""
+    # 按需登录（小浣熊）：当日没拿到每日积分、且凭证里带了 `phone`/`password`
+    # 时，签到会自己登录一次换新会话（上游只在登录时补发当天 300）。默认关：
+    # 开启等于把账号密码纳入信任面，且脚本化登录的 ToS 灰度更重。每天每凭证
+    # 最多一次，密码被拒即把凭证标成「需重新登录」并停手。
+    raccoon_auto_login: bool = False
     # 服务端日志页（「任务与配置」→ 日志）：进程内环形缓冲的保留行数，
     # 0 = 关闭该页（端点返回 404）。只收本进程 logging 记录，不读文件。
     log_buffer_lines: int = 500
-    # 运维告警：周期评估四类风险，命中即落 alert_events 并可选推送
+    # 日志**持久化**行数（`log_events` 环形表）：进程重启后仍能回看最近的日志，
+    # 也支持按 `request_id` 回溯一次请求。0 = 不落库（只保留上面的内存环）。
+    # 默认 2000 行：SQLite 单表几千行对写延迟无感，够覆盖「昨天出的问题今天查」。
+    log_persist_lines: int = 2000
+    # 运维告警：周期评估七类规则，命中即落 alert_events 并可选推送
     # webhook。webhook 留空 = 只留站内记录、不外推。
     alert_enabled: bool = True
     alert_webhook_url: str = ""
+    # 额外出口：飞书 / Slack 的入站 Webhook 地址（留空 = 不启用）。消息体
+    # 按各自格式单独构造，通用 webhook 仍发完整 JSON + 签名。
+    alert_feishu_webhook_url: str = ""
+    alert_slack_webhook_url: str = ""
     alert_interval_minutes: int = 5         # 评估周期（分钟），下限 1
     alert_silence_minutes: int = 30         # 同一 (规则, 对象) 的静默窗（分钟）
     # 告警迟滞：连续命中 N 轮才告警、连续 M 轮未命中才确认恢复。
@@ -178,6 +248,30 @@ class Settings(BaseSettings):
     alert_error_rate_threshold: float = 0.5
     alert_error_rate_min_requests: int = 20
     alert_error_rate_window_minutes: int = 15
+    # 单 Key 用量暴涨：窗口内某把 Key 的 token 总量越过阈值即告警（0 关闭）。
+    # 这是滥用/泄露信号（Key 被贴到仓库、多人共用），不是上游错误。
+    alert_key_burst_tokens: int = 0
+    alert_key_burst_window_minutes: int = 15
+    # 非工作时段仍有请求：`[start, end)` 为工作时间（本地时区，跨零点合法），
+    # start == end 关闭该规则；非工作时段请求数达到最小样本才告警（0 关闭）。
+    # 刻意不做「多 IP 同 Key」：usage_events 不存 IP（零知识口径），审计里有
+    # IP 但只覆盖登录/写操作，拿它做用量归因不可靠。
+    alert_off_hours_start: int = 0
+    alert_off_hours_end: int = 0
+    alert_off_hours_min_requests: int = 0
+    # 预算分层告警：当月（本地自然月）成本预算，达到 50/80/95/100% 分档告警。
+    # 0 关闭该规则；成本只覆盖可定价明细（未匹配价表的不计入），detail 里给覆盖度。
+    alert_budget_cny: float = 0.0
+    alert_budget_levels: str = "50,80,95,100"
+    # 渠道死亡告警：统计窗内该渠道有流量但**一次都没成功**。0 关闭该规则。
+    # 与错误率互补：officeace 积分耗尽整批回 401，会被 fallback 稀释掉。
+    # 默认开启：20 次请求全失败已足够说明渠道挂了，再少容易误报。
+    alert_channel_dead_min_requests: int = 20
+    alert_channel_dead_window_minutes: int = 60
+    # 签到连续失败告警：同一凭证最近连续 N 轮签到都失败（成功一次即清零）。
+    # 0 关闭。补 task_failed 看不见的「任务跑成功、上游业务返回失败」。
+    alert_checkin_fail_min_streak: int = 3
+    alert_checkin_fail_window_hours: int = 24
     # SQLite 备份后台任务：周期性把主库一致性快照（VACUUM INTO）写进
     # DATA_DIR/backups/，保留最近 BACKUP_KEEP 份。默认每日一次、留 7 份。
     # 备份周期取整日是因为库本身不大（几十 MB 量级），更密只是白占磁盘。
@@ -211,11 +305,29 @@ class Settings(BaseSettings):
     # Kilo 聊天最小间隔：同为匿名免费层（网关级 200 req/h/IP），默认 0。
     # 与 zen 各自独立：两条免费渠道互不排队。
     kilo_chat_min_interval: float = 0
+    # 小浣熊聊天最小间隔：真实账号渠道，上游按**请求频率**限流（实测 6 并发
+    # 即 429 `user_model_rate_limited`），并发上限由 pacer 的 max_concurrency
+    # 兜住（默认 2），不需要额外的最小间隔。
+    raccoon_chat_min_interval: float = 0
+    # WPS 灵犀聊天最小间隔：真实账号渠道，上游按 run 计费且并发未取证，默认 0；
+    # 需要给同一账号限速时调大（run 缓存与单飞已把重复计费压在客户端）。
+    lingxi_chat_min_interval: float = 0
+    # 小浣熊每账号并发上限：实测 5 并发放行、第 6 个 429。取 2 留余量，避免
+    # 与用户其它客户端抢同一账号的并发额度。0 关闭上限。
+    raccoon_max_concurrency: int = 2
     # Qoder 聊天最小间隔：真实账号渠道，上游有账号级频率风控，默认 5s
     # （对齐 CodeBuddy）。与 CB/TRAE/zen/kilo 各自独立，互不排队。
     qoder_chat_min_interval: float = 5
     # CodeArts 聊天最小间隔：真实账号渠道，默认 5s；独立节流器。
     codearts_chat_min_interval: float = 5
+    # officeAce 聊天最小间隔：真实账号渠道（单账号单用户条款），默认 0——
+    # 上游没有像 CodeArts 那样「每 60s 最多 3 会话」的硬限，实测并发下
+    # 直接放行即可；被限流时走伪 200 的 81111/81114（模型级短冷却），
+    # 不需要靠本地节流兜。另有独立节流器，与其余渠道互不排队。
+    officeace_chat_min_interval: float = 0
+    # 通用上游聊天最小间隔：默认 0（不节流）。配置它只用于压低自建网关/官方
+    # API 的 RPM；限流本身由上游 429（SOFT 冷却凭证）表达。可热更。
+    generic_chat_min_interval: float = 0
     # CodeArts 每账号在途并发上限：上游硬限「并发会话数 3」，超限的请求直接
     # 400 TM.00001041 并发超限（实测 77% 失败率的主因）。默认 3 对齐上游；
     # 0 关闭上限（回到「有在途就放行」，会再次击穿）。可热更。
@@ -242,36 +354,60 @@ class Settings(BaseSettings):
     # 原代号的归一键、展示名、展示名的归一键四种写法任一命中即滤——用户照列表
     # 里看到的 `kimi-k3` / `Kimi K3` 写就能生效，老规则按原代号写也仍生效。
     # 覆盖此值时为完全替换（含默认噪音规则），增删请重写全量。
-    # 默认口径（2026-10-19 与线上生效值对齐）：**只展示当前在售的新模型**，
-    # 三类一律滤掉——
-    #   1. 上游内部/代理模型：custom_model_* / *sub*agent* / summary /
-    #      browser_use_* / file_search_agent（chat 报 3003 / 非用户模型）；
+    # 默认口径（2026-10-31 与线上生效值等值，62 条；顺序按来源分组，fnmatch
+    # 无语义差别）：**只展示当前在售的新模型**，四类一律滤掉——
+    #   1. 上游内部/代理模型与自动路由占位：custom_model_* / *sub*agent* /
+    #      summary / browser_use_* / file_search_agent（chat 报 3003 / 非用户模型）；
     #      default 与 codebuddy_intl 的 default-model/fast-model/balanced-model/
     #      primary-model/deep-model、Qoder 的 auto 是各上游的「自动路由」占位。
-    #   2. 已停售/被新一代取代的老模型：glm-4.* / glm-5 / glm-5.0* / glm-5.1 /
-    #      glm-5.2* / glm-5v-* / glm-5-turbo、kimi-k2.*（含 k2.5/2.6/k2-thinking）、
-    #      minimax-m2.5/m2.7/m3、deepseek-v3-* / deepseek-v4-*（v4.1 不受影响）、
-    #      qwen3.7-*、gpt-5.4/5.5、hy3* / hy4-preview、hunyuan-*、
-    #      seed-2.1* / seed-code-pro-* / seed-evolving、qwen3-vl-235b、
-    #      openpangu 之外的开源小模型（nemotron-3* / lfm2* / laguna* /
-    #      north-mini-code / inkling-small / xing4.0-29b-a4 / openrouter-models-router）。
-    #   3. 实测不可用的噪音：glyph-cluster（Kilo 两次 121s 后 408）、
-    #      hunyuan-*（含 hunyuan-image-* 的 400 11103 backend not supported）。
-    # 刻意不加的：deepseek-v4.1-flash / kimi-k3 / glm-5.3* / mimo-v2.6* /
-    #   qwen3.8-max / openpangu-2.0-*（在售主力，2026-10-19 实测正常 chat）。
+    #   2. 已被新一代取代的老模型：glm-4.* / glm-5 / glm-5.0* / glm-5.1 /
+    #      glm-5.2* / glm-5v-* / glm-5-turbo（→ glm-5.3）、kimi-k2.* /
+    #      kimi-k3（→ kimi-k3.1-pro）、minimax-m2.5/m2.7/m3（→ m3.1-flash）、
+    #      deepseek-v3-* / deepseek-v4-*（→ v4.1-flash）、qwen3.7-* / qwen3-* /
+    #      qwen3.6*（→ qwen3.8-max）、gpt-5.4/5.5/5.6*（→ gpt-6-sol / 6.1-sol）、
+    #      hy3* / hy4-preview / hunyuan-*、seed-2.1* / seed-code-pro-* /
+    #      seed-evolving（豆包整族已停售，无后继）、qwen3-vl-235b。
+    #   3. 已下架的免费池与开源小模型：space-bunny（Kilo 已退役）、
+    #      nemotron-3* / lfm2* / laguna* / north-mini-code / inkling-small /
+    #      xing4.0-29b-a4 / glyph-cluster（Kilo 两次 121s 后 408）/
+    #      openrouter-models-router。
+    #   4. 渠道侧测试号与区域/日期快照代号（同一模型已有主名，留着只会让用户
+    #      选中另一个价位）：deepseek-v4.1-flash-0930 / -bnt、glm-5.3-test /
+    #      -zx、kimi-k3-test-1009 / -1019。**逐条登记，不用通用剥日期 / 剥区域
+    #      尾缀**——`deepseek-v4.1-flash-1017` 是另一个价位的快照，仍在售。
+    # 刻意不加的：deepseek-v4.1-flash（含 -1017 / -sg）/ kimi-k3.1-pro /
+    #   glm-5.3*（含 flashx）/ mimo-v2.6* / qwen3.8-max / qwen3.8-flash /
+    #   openpangu-2.0-* / gpt-6-* / grok-4.7 / gemini-3.8-flash（在售）。
+    #   `qwen3.8-flash`（Qoder qfmodel）2026-10-27 实测 chat 成功（63→117 token），
+    #   原先按「400 Execution failed」滤掉的判断已失效，故移出黑名单。
     model_blocklist: str = (
+        # ① 内部 / 代理模型与自动路由占位
         "custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,"
-        "default,seed-code-pro-*,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,"
-        "glm-5.0*,glm-5.1,glm-5v-*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,"
-        "minimax-m2.5,deepseek-v3-*,hunyuan-*,hy3*,deepseek-v4-*,qwen3.7-*,auto,"
-        "nemotron-3-*,glm-5.2*,nemotron-3*,lfm2*,north-mini-code,"
-        "openrouter-models-router,fast,balanced,deep,primary,hy4-preview,"
-        "inkling-small,minimax-m2.7,kimi-k2.*,minimax-m3,gpt-5.4,gpt-5.5,"
-        "laguna*,qwen3-vl-235b,seed-2.1*,xing4.0-29b-a4,glyph-cluster,"
-        "qwen3.8-flash,seed-evolving"
+        "default,fast,balanced,deep,primary,auto,sagitta,aquila,"
+        # ② 已被新一代取代的老模型
+        "glm-4.*,glm-5,glm-5-turbo,glm-5.0*,glm-5.1,glm-5v-*,glm-5.2*,glm.5.2*,"
+        "kimi-k2.*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,kimi-k3,"
+        "minimax-m2.5,minimax-m2.7,minimax-m3,deepseek-v3-*,deepseek-v4-*,"
+        "qwen3.7-*,qwen3-*,qwen3.6*,qwen3-vl-235b,"
+        "gpt-5.4,gpt-5.5,gpt-5.6*,hy3*,hy4-preview,hunyuan-*,"
+        "seed-2.1*,seed-2-1-turbo,doubao-seed-2.1-turbo,seed-code-pro-*,"
+        "seed-evolving,"
+        # ③ 已下架的免费池 / 开源小模型
+        "space-bunny,nemotron-3-*,nemotron-3*,lfm2*,laguna*,north-mini-code,"
+        "inkling-small,xing4.0-29b-a4,glyph-cluster,openrouter-models-router,"
+        # ④ 渠道测试号与区域 / 日期快照代号
+        "deepseek-v4.1-flash-0930,deepseek-v4.1-flash-bnt,"
+        "glm-5.3-test,glm-5.3-zx,kimi-k3-test-1009,kimi-k3-1019"
     )
-    # 诊断：把 /v1 入口的原始请求体落到 data/dumps/（排查客户端差异用）
+    # 诊断：把 /v1 入口的原始请求体落到 data/dumps/（排查客户端差异用）。
+    # 热更项（管理台可开关，改动进审计）；落盘目录 0700、文件 0600、
+    # 保留 200 个且不超过 24h——这是全服务唯一把用户对话写进磁盘的开关。
     dump_request_bodies: bool = False
+    # 全站暂停（kill switch）：所有 API Key 鉴权的 /v1 端点立即返 503，
+    # 管理台与登录保留可用——异常消耗/上游事故时一键止血。热更项。
+    gateway_paused: bool = False
+    # 暂停原因（只进日志与审计，不回显给调用方；留空按「未填原因」记）
+    gateway_pause_reason: str = ""
     # 截断续写：上游以 finish_reason=length 截断时，同凭证自动续写，
     # 最多该次数后收尾；0 关闭。仅 length 触发（其余"空正文/代码块未闭合"
     # 判据经实测无支撑，未实现，见 TECHNICAL.md §3.4）
@@ -289,9 +425,19 @@ class Settings(BaseSettings):
     # 推荐 300。可热更。
     stream_idle_timeout_seconds: float = 0
     # 短冷却「等待续上」（秒）：全池都在短冷却、没有立即可用候选时，若最短的
-    # 剩余冷却不超过该值，则等待后重取一次（而不是直接 503）。0 = 关闭（快速
-    # 失败）。等待期间不占在途租约，避免把并发请求堆成连接洪峰。可热更。
-    short_cooldown_wait_seconds: float = 0
+    # 剩余冷却不超过该值，则等待后重取一次（而不是直接 503）。等待期间不占
+    # 在途租约，避免把并发请求堆成连接洪峰。默认 60：coding agent 收到 503
+    # 只会立刻更密集地重试，原地等一轮比把失败甩给客户端更划算；上限 60 也
+    # 保证慢失败不会超过多数客户端的读超时。0 = 关闭（快速失败）。可热更。
+    short_cooldown_wait_seconds: float = 60
+    # 非流式出口保活（秒）：`stream=false` 的请求在聚合完成前一个字节都不发，
+    # 中间盒（CDN / 反代）的空闲超时会直接切连接。设为 N > 0 时，N 秒内没
+    # 完成就改走 chunked，先吐空白字节再补 JSON 正文——空白是合法 JSON 前导
+    # （RFC 8259 §2 `JSON-text = ws value ws`），解析器照常工作。
+    # 默认 0 = 关闭：本部署 nginx `proxy_read_timeout 3600s` + frp TCP，
+    # 链路上没有短空闲超时，实测 30 天 >60s 的成功请求 1741 个全部成功。
+    # 只有在 CDN 后面（Cloudflare 100s 等）才需要打开，推荐 15。可热更。
+    nonstream_keepalive_seconds: float = 0
     # 单账号在途请求上限（全局，跨渠道）：同一凭证并发达到该值后不再参与选号，
     # 避免把单账号打进上游限流/封号；0 = 不限。租约在请求结束后释放，另有
     # 600s TTL 兜底（见 src/engine/inflight.py）。
@@ -305,6 +451,19 @@ class Settings(BaseSettings):
     context_compress_reserve_tokens: int = 4096
     context_compress_min_keep_messages: int = 4
     context_compress_safety_ratio: float = 0.95
+    # 粘性裁剪：一次裁到预算的 60% 并记住窗口起点，跨轮保持前缀不变，上游
+    # 前缀缓存才能命中（见 engine/sticky_trim.py）。关闭 = 旧行为（每轮按当轮
+    # 预算重算，客户端每轮重发完整历史时只有 system 段可复用）。
+    context_compress_sticky_enabled: bool = True
+    # tool 输出压缩（默认关）：只压 `role=tool` 且超过 max_chars 的纯文本，
+    # 去 ANSI + 折叠连续重复行 + 保留命中错误关键字的行。确定性：同输入同
+    # 输出，不破坏上游前缀缓存。max_chars ≤ 0 视为关闭（防御）。
+    tool_output_compress_enabled: bool = False
+    tool_output_compress_max_chars: int = 8000
+    # 前缀缓存诊断：每个请求往日志写一行载荷指纹（消息数、system/tools 摘要、
+    # 与同凭证同模型上一条请求的最长公共前缀序号、分叉处消息摘要）。只记摘要
+    # 不记正文，用来定位命中率异常时前缀在哪条消息分叉。默认关（INFO 级噪音）。
+    prefix_debug_enabled: bool = False
     # 跨渠道 fallback 链：请求模型在主渠道全部不可用时，按「兼容组」
     # 依次回退到组内其他模型（组内成员自行带上 @渠道 或依赖目录收窄）。
     # 格式 `组名=成员1,成员2;组名2=成员3`；留空 = 不启用（保持原行为）。
@@ -313,9 +472,16 @@ class Settings(BaseSettings):
     # 上游改 id 时只改这里。格式 `对外名=模型@渠道;...`；留空 = 不启用。
     # 与真实对外 id 或自动别名撞车视为配置错误（不静默覆盖）。可热更。
     model_aliases: str = ""
-    # Prometheus 指标出口（GET /metrics）：默认开启。与 /healthz 同口径**不鉴权**，
-    # 指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。可热更。
+    # Prometheus 指标出口（GET /metrics）：默认开启。默认与 /healthz 同口径
+    # **不鉴权**，指标已禁用高基数标签（不含凭证 ID / 用户名）。关闭后端点返回 404。
+    # 对外部署建议同时设置 METRICS_TOKEN（见下），否则任何人都能读到渠道/模型
+    # 清单与凭证池规模。可热更。
     metrics_enabled: bool = True
+    # /metrics 的可选 Bearer 令牌：留空 = 保持公开；配置后抓取方必须带
+    # `Authorization: Bearer <token>`（Prometheus `authorization.credentials`）。
+    # **启动期项**，不进热更表：热更值会落 DB 并被 /api/settings 回显，
+    # 令牌不该出现在管理台页面上。
+    metrics_token: str = ""
     # 请求级结构化日志（logfmt，见 src/webapp/access_log.py）：默认开启。
     # 只记 /api、/v1、/authorize 这些业务请求，每行含 request_id / 路由模板 /
     # 状态码 / 耗时；**不写 query string、请求体、用户名**（脱敏口径见
@@ -334,6 +500,11 @@ class Settings(BaseSettings):
     # 目标 `none` = 删除该键（走渠道默认）。只给机制不给策略：内置默认矩阵
     # 未经上游核实，写了就是编造。可热更。
     reasoning_effort_map: str = ""
+    # 出站隐私脱敏规则（默认空 = 关闭，逐字节不变）：逗号/空格分隔的
+    # `url_credentials` / `email` / `cn_mobile` / `private_ip`。只改**出站副本**
+    # 的 messages 正文与 tools 描述，`request.raw` 与 `tool_calls` 参数不动；
+    # 占位符单向、不做还原。实现见 `engine/privacy.py`。可热更。
+    privacy_rules: str = ""
     # Anthropic 入站 `thinking.budget_tokens` → `reasoning_effort` 的映射
     # （默认空 = 完全不映射，`thinking` 照旧被忽略）。格式
     # `预算:档位,预算:档位,disabled:档位`：`disabled` 匹配 `thinking.type==
@@ -362,9 +533,30 @@ class Settings(BaseSettings):
                      if e.strip())
 
     @cached_property
+    def generic_enabled(self) -> bool:
+        """是否启用通用上游渠道（端点为空的部署不注册这条渠道）。"""
+        return bool(self.generic_api_endpoint.strip())
+
+    @cached_property
     def kilo_allowed(self) -> tuple[str, ...]:
         return tuple(e.strip().rstrip("/") for e in self.kilo_allowed_endpoints.split(",")
                      if e.strip())
+
+    @cached_property
+    def generic_allowed(self) -> tuple[str, ...]:
+        """通用上游白名单；空元组 = 放行任意 http(s)（见校验函数注释）。"""
+        return tuple(e.strip().rstrip("/")
+                     for e in self.generic_allowed_endpoints.split(",") if e.strip())
+
+    @cached_property
+    def raccoon_allowed(self) -> tuple[str, ...]:
+        return tuple(e.strip().rstrip("/")
+                     for e in self.raccoon_allowed_endpoints.split(",") if e.strip())
+
+    @cached_property
+    def lingxi_allowed(self) -> tuple[str, ...]:
+        return tuple(e.strip().rstrip("/")
+                     for e in self.lingxi_allowed_endpoints.split(",") if e.strip())
 
     @cached_property
     def qoder_allowed(self) -> tuple[str, ...]:
@@ -374,6 +566,11 @@ class Settings(BaseSettings):
     @cached_property
     def codearts_allowed(self) -> tuple[str, ...]:
         return tuple(e.strip().rstrip("/") for e in self.codearts_allowed_endpoints.split(",")
+                     if e.strip())
+
+    @cached_property
+    def officeace_allowed(self) -> tuple[str, ...]:
+        return tuple(e.strip().rstrip("/") for e in self.officeace_allowed_endpoints.split(",")
                      if e.strip())
 
     @cached_property
@@ -403,8 +600,31 @@ def validate_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
 
 
 def validate_codebuddy_intl_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
-    """国际站端点白名单校验（防把国内站 Token 发往国际站或反之）。"""
-    return endpoint.strip().rstrip("/") in settings.codebuddy_intl_allowed
+    """国际站端点白名单校验（防把国内站 Token 发往国际站或反之）。
+
+    **白名单本身也校验**：PROPOSAL §2.7「`CODEBUDDY_INTL_ALLOWED_ENDPOINTS`
+    默认只有国际站主机，填国内站启动时报错（跨站发送即凭证泄露）」。
+    只校验「端点在白名单里」不够——把国内站主机**加进**国际站白名单后，
+    端点校验会通过，Token 照样发往国内站（国际站账号的 Token 发到国内站
+    网关 = 跨站泄露）。故白名单里出现国内站主机时一律拒绝。
+    """
+    allowed = settings.codebuddy_intl_allowed
+    if any(_is_codebuddy_cn_host(entry) for entry in allowed):
+        return False
+    return endpoint.strip().rstrip("/") in allowed
+
+
+def _is_codebuddy_cn_host(endpoint: str) -> bool:
+    """该地址是不是国内站主机（`copilot.tencent.com`）。
+
+    比主机名而非整串：配置里可能带路径或端口（`https://copilot.tencent.com:443/`），
+    整串比较会漏判。国际站白名单里出现国内站主机 = 跨站发送，必须拒绝。
+    """
+    text = endpoint.strip()
+    if text.startswith(("http://", "https://")):
+        text = text.split("://", 1)[1]
+    host = text.split("/", 1)[0].split(":", 1)[0].strip().lower()
+    return host == _CODEBUDDY_CN.split("://", 1)[1].lower()
 
 
 def validate_zen_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
@@ -417,6 +637,31 @@ def validate_kilo_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
     return endpoint.strip().rstrip("/") in settings.kilo_allowed
 
 
+def validate_generic_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
+    """通用上游端点校验：白名单为空时只要求 http(s)（用户自己填的上游）。
+
+    之所以允许「白名单为空 = 放行任意 http(s)」：这个渠道的用途就是接任意
+    OpenAI 兼容端点（含内网自建），写死主机等于不让他用。但凭证是真实 API
+    key，所以仍拒绝非 http(s)（`file://` / `gopher://` 之类会让 httpx 出网
+    到非 HTTP 目标）。
+    """
+    text = endpoint.strip().rstrip("/")
+    if not text.startswith(("http://", "https://")):
+        return False
+    allowed = settings.generic_allowed
+    return not allowed or text in allowed
+
+
+def validate_raccoon_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
+    """小浣熊端点白名单校验（防把用户的会话 JWT 发往未授权主机）。"""
+    return endpoint.strip().rstrip("/") in settings.raccoon_allowed
+
+
+def validate_lingxi_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
+    """灵犀端点白名单校验（防把 WPS 登录态 cookie 发往未授权主机）。"""
+    return endpoint.strip().rstrip("/") in settings.lingxi_allowed
+
+
 def validate_qoder_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
     """Qoder 端点白名单校验（防把带 COSY 签名的请求发往未授权主机）。"""
     return endpoint.strip().rstrip("/") in settings.qoder_allowed
@@ -425,6 +670,11 @@ def validate_qoder_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
 def validate_codearts_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
     """CodeArts 端点白名单校验（防把 AK/SK 签名请求发往未授权主机）。"""
     return endpoint.strip().rstrip("/") in settings.codearts_allowed
+
+
+def validate_officeace_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
+    """officeAce 控制面端点白名单校验（防把 AK/SK 签名请求发往未授权主机）。"""
+    return endpoint.strip().rstrip("/") in settings.officeace_allowed
 
 
 def live(value: Any) -> Callable[[], Any]:

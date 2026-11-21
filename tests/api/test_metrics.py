@@ -129,6 +129,41 @@ def test_metrics_without_runner_omits_task_family(tmp_path):
     assert "coding2api_task_failures_total{" not in response.text
 
 
+def test_metrics_token_is_optional_and_enforced_when_set(tmp_path):
+    """空令牌 = 保持公开（与 /healthz 同口径）；设了就必须带对的 Bearer。"""
+    public = build_app(isolated_settings(tmp_path))
+    with TestClient(public) as http:
+        assert http.get("/metrics").status_code == 200
+
+    guarded = build_app(isolated_settings(tmp_path, METRICS_TOKEN="s3cret"))
+    with TestClient(guarded) as http:
+        assert http.get("/metrics").status_code == 401
+        assert http.get("/metrics", headers={
+            "Authorization": "Bearer wrong"}).status_code == 401
+        assert http.get("/metrics", headers={
+            "Authorization": "Basic s3cret"}).status_code == 401
+        ok = http.get("/metrics", headers={"Authorization": "Bearer s3cret"})
+        assert ok.status_code == 200
+        assert "coding2api_credentials" in ok.text
+
+
+def test_metrics_token_header_is_case_insensitive_and_trimmed(tmp_path):
+    """Prometheus 发 `Bearer`，但代理/客户端可能改大小写或带尾随空格。"""
+    app = build_app(isolated_settings(tmp_path, METRICS_TOKEN="tok"))
+    with TestClient(app) as http:
+        response = http.get("/metrics", headers={
+            "Authorization": "bearer   tok   "})
+    assert response.status_code == 200
+
+
+def test_metrics_token_disabled_still_wins(tmp_path):
+    """关闭优先于鉴权：关了就是 404，不暴露「这里有东西但要令牌」。"""
+    app = build_app(isolated_settings(tmp_path, METRICS_ENABLED="false",
+                                      METRICS_TOKEN="tok"))
+    with TestClient(app) as http:
+        assert http.get("/metrics").status_code == 404
+
+
 def test_metrics_enabled_is_hot_updatable(tmp_path):
     """关闭后立即 404、恢复默认后立即 200（无需重启）。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
@@ -141,3 +176,39 @@ def test_metrics_enabled_is_hot_updatable(tmp_path):
         assert http.get("/metrics").status_code == 404
         runtime.reset("metrics_enabled")
         assert http.get("/metrics").status_code == 200
+
+
+def test_render_metrics_latency_and_inflight_families():
+    """延迟/在途两个后加家族：缺省不输出，给了才输出（旧调用方逐字节不变）。"""
+    base = render_metrics(requests=[], tokens=[], credentials={}, errors=[],
+                          task_failures=[])
+    assert "coding2api_latency_ms_avg" not in base
+    assert "coding2api_inflight" not in base
+
+    text = render_metrics(requests=[], tokens=[], credentials={}, errors=[],
+                          task_failures=[],
+                          latency=[("trae", 1234.567, 456.78, 9)],
+                          inflight=3)
+    samples = _samples(text)
+    assert samples['coding2api_latency_ms_avg{provider="trae"}'] == "1234.6"
+    assert samples['coding2api_ttfb_ms_avg{provider="trae"}'] == "456.8"
+    assert samples['coding2api_latency_samples{provider="trae"}'] == "9"
+    assert samples["coding2api_inflight"] == "3"
+    assert "# TYPE coding2api_inflight gauge" in text
+
+
+def test_metrics_latency_skips_provider_without_ok_samples(tmp_path):
+    """没有成功样本的渠道不输出平均值——报 0 会被读成「延迟为零」。"""
+    settings = isolated_settings(tmp_path)
+    app = build_app(settings)
+    collector = app.state.stats_collector
+    collector.record(username="root", provider="trae", model="glm-5.2", ok=True,
+                     input_tokens=7, output_tokens=3, latency_ms=900, ttfb_ms=300)
+    collector.record(username="root", provider="kilo", model="glm-5.2", ok=False,
+                     error_type="rate_limit")
+    with TestClient(app) as client:
+        text = client.get("/metrics").text
+    samples = _samples(text)
+    assert 'coding2api_latency_ms_avg{provider="trae"}' in samples
+    assert 'coding2api_latency_ms_avg{provider="kilo"}' not in samples
+    assert samples["coding2api_inflight"] == "0"

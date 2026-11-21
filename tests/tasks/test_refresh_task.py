@@ -36,6 +36,25 @@ async def test_refresh_task_only_touches_due_credentials(repo):
     assert credentials.credential_data(soon)["bearer_token"] == "NEW"
     assert credentials.credential_data(later)["bearer_token"] == "old"
 
+async def test_refresh_task_skips_paused_credential(repo):
+    """回归 #15：用户软暂停（enabled=0）的凭证不该被预刷新。
+
+    线上症状是任务报告 `failed=1`，而失败者正是早已停用的旧凭证 —— 预刷新
+    白占调度窗口，真实失败被掩盖。
+    """
+    credentials, _db = repo
+    paused = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT", "auth_source": "oauth",
+        "expires_at": 1_000_100})
+    credentials.set_enabled(paused, False)
+    provider = ProbeProvider(refresh_new="NEW")
+    task = RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600,
+                       now=lambda: 1_000_000)
+    report = await task.run_once()
+    assert report.attempted == 0 and report.skipped == 1 and report.failed == 0
+    assert provider.refresh_calls == 0
+    assert credentials.credential_data(paused)["bearer_token"] == "old"
+
 async def test_refresh_task_marks_relogin_required_on_terminal_failure(repo):
     """一次性续期凭据被作废 → 标记「需重新登录」并停止重试。
 
@@ -116,6 +135,24 @@ async def test_refresh_task_isolates_failures(repo):
                        now=lambda: 1)
     report = await task.run_once()
     assert report.failed == 1
+
+
+async def test_refresh_task_failure_log_is_redacted(repo, caplog):
+    """失败日志走 `error_text`：空消息也带类名，且不把上游/凭据原文写进日志。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "t", "refresh_token": "RT", "auth_source": "oauth",
+        "expires_at": 1})
+
+    class Boom(ProbeProvider):
+        async def refresh(self, _data):
+            raise TimeoutError()
+
+    task = RefreshTask(credentials, {"codebuddy": Boom()}, skew_seconds=3600,
+                       now=lambda: 1)
+    with caplog.at_level("WARNING"):
+        assert (await task.run_once()).failed == 1
+    assert any("TimeoutError" in record.getMessage() for record in caplog.records)
 
 async def test_refresh_task_skips_credential_deleted_before_lock(repo):
     """等编辑锁期间凭证被删 → 持锁后重读为 None，记 skipped 而不是崩溃。"""

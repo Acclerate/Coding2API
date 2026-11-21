@@ -19,6 +19,7 @@ import {
  */
 export function SortMenuHead({
   label,
+  unit,
   options,
   activeKey,
   direction,
@@ -27,6 +28,11 @@ export function SortMenuHead({
   testId,
 }: {
   label: string;
+  /**
+   * 单位（如 `tok/s`）。以更小字号缀在列名后，而不是拼进 `label`：
+   * 「速度 tok/s」会把列头撑到 100px 以上，10 列的表里正好挤掉最后一列。
+   */
+  unit?: string;
   /** 子列：[{key: 后端排序键, label: 展示名}]，数组顺序即菜单顺序。 */
   options: { key: string; label: string }[];
   /** 当前排序键；不在 options 里时本列不显示激活态（别的列正在排序）。 */
@@ -52,18 +58,31 @@ export function SortMenuHead({
             className={cn(
               "inline-flex items-center gap-1 rounded-sm transition-colors hover:text-foreground",
               "focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
-              align === "right" && "flex-row-reverse",
               active && "text-foreground",
             )}
           >
+            {/* 右对齐列的箭头放最左：用 flex-row-reverse 会把「速度 + tok/s」也倒过来，
+                读成「tok/s 速度」，故只调换箭头位置。 */}
+            {align === "right" && (
+              <Icon
+                className={cn("size-3.5 shrink-0", active ? "opacity-100" : "opacity-40")}
+                aria-hidden
+              />
+            )}
             {label}
+            {unit && (
+              // 正文最小 12px（MASTER §3「正文最小 12px（text-xs），不得更小」）
+              <span className="text-xs font-normal text-muted-foreground/80">{unit}</span>
+            )}
             {activeOption && (
               <span className="font-normal text-muted-foreground">· {activeOption.label}</span>
             )}
-            <Icon
-              className={cn("size-3.5 shrink-0", active ? "opacity-100" : "opacity-40")}
-              aria-hidden
-            />
+            {align === "left" && (
+              <Icon
+                className={cn("size-3.5 shrink-0", active ? "opacity-100" : "opacity-40")}
+                aria-hidden
+              />
+            )}
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align={align === "right" ? "end" : "start"}>

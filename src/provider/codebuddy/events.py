@@ -7,120 +7,33 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ...engine.sse import SSEFrame
 from ...provider.base import (
     ErrKind,
     Event,
-    EventKind,
-    UpstreamProtocolViolation,
+    UpstreamProtocolViolation,  # noqa: F401 - credential/client 经本模块导入
     Usage,
     body_hint,
     business_codes,
 )
-from ..openai_chunk import first_choice, is_blank_tool_call
+from ..openai_chunk import openai_event, openai_events, payload_of, usage_from_openai
 
 
 def parse_frame(frame: SSEFrame) -> Event | None:
     """单帧 → 中立事件；[DONE] 与无 delta 的帧返回 None。"""
-    if not frame.data:
-        return None
-    if frame.data.strip() == "[DONE]":
-        return None
-    try:
-        payload = json.loads(frame.data)
-    except json.JSONDecodeError as error:
-        raise UpstreamProtocolViolation("unparsable CodeBuddy SSE data") from error
-    if not isinstance(payload, dict):
-        raise UpstreamProtocolViolation("CodeBuddy SSE data is not an object")
-
-    choice = first_choice(payload)
-    delta = choice.get("delta") if choice else None
-    delta = delta if isinstance(delta, dict) else {}
-    finish_reason = choice.get("finish_reason") if choice else None
-
-    tool_calls = delta.get("tool_calls")
-    if isinstance(tool_calls, list):
-        # 上游偶发噪声调用：无 name 且 arguments 为空/{}（客户端聚合后
-        # 显示 "Tool not found"）。正常分片块无 name 但带实际 arguments，
-        # 必须保留。空名噪声整条丢弃。
-        kept = [tc for tc in tool_calls if isinstance(tc, dict) and not is_blank_tool_call(tc)]
-        if kept:
-            return Event(kind=EventKind.TOOL_CALLS, tool_calls=kept)
-
-    content = delta.get("content")
-    if isinstance(content, str) and content:
-        return Event(kind=EventKind.CONTENT, content=content)
-
-    reasoning = delta.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning:
-        return Event(kind=EventKind.REASONING, content=reasoning)
-
-    usage = payload.get("usage")
-    if isinstance(usage, dict):
-        return Event(kind=EventKind.USAGE, usage=_usage(usage))
-
-    if isinstance(finish_reason, str) and finish_reason:
-        return Event(kind=EventKind.FINISH, finish_reason=finish_reason)
-    return None
+    payload = payload_of(frame, "CodeBuddy")
+    return None if payload is None else openai_event(payload, usage=_usage)
 
 
 def parse_all_events(frame: SSEFrame) -> list[Event]:
     """一帧拆成多个事件：带 usage 的收尾帧同时给出 finish_reason 与 usage。"""
-    if not frame.data:
-        return []
-    if frame.data.strip() == "[DONE]":
-        return []
-    try:
-        payload = json.loads(frame.data)
-    except json.JSONDecodeError as error:
-        raise UpstreamProtocolViolation("unparsable CodeBuddy SSE data") from error
-    if not isinstance(payload, dict):
-        raise UpstreamProtocolViolation("CodeBuddy SSE data is not an object")
-
-    events: list[Event] = [e for e in (parse_frame(frame),) if e is not None]
-    has_usage = any(e.kind is EventKind.USAGE for e in events)
-    has_finish = any(e.kind is EventKind.FINISH for e in events)
-    usage = payload.get("usage")
-    if isinstance(usage, dict) and not has_usage:
-        events.append(Event(kind=EventKind.USAGE, usage=_usage(usage)))
-    choice = first_choice(payload)
-    finish_reason = choice.get("finish_reason") if choice else None
-    if isinstance(finish_reason, str) and finish_reason and not has_finish:
-        events.append(Event(kind=EventKind.FINISH, finish_reason=finish_reason))
-    return events
+    return openai_events(frame, "CodeBuddy", usage=_usage)
 
 
 def _usage(raw: dict[str, Any]) -> Usage:
-    def as_int(key: str) -> int | None:
-        value = raw.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    def details_int(details_key: str, key: str) -> int | None:
-        """OpenAI 惯例把这两个字段放在 details 子对象里，顶层同名字段兜底。
-
-        CB 实测顶层 `reasoning_tokens` 恒缺（早先据此误判为「CB 不回思考
-        token」），真值在 `completion_tokens_details`；`cached_tokens` 同构。
-        details 值非法（非数值 / bool）时回落顶层，仍缺则 None。
-        """
-        details = raw.get(details_key)
-        value = details.get(key) if isinstance(details, dict) else None
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        return as_int(key)
-
-    credit = raw.get("credit")
-
-    return Usage(
-        input_tokens=as_int("prompt_tokens"),
-        output_tokens=as_int("completion_tokens"),
-        reasoning_tokens=details_int("completion_tokens_details", "reasoning_tokens"),
-        cached_tokens=details_int("prompt_tokens_details", "cached_tokens"),
-        credit=float(credit) if isinstance(credit, (int, float)) and not isinstance(credit, bool)
-        else None,
-    )
+    return usage_from_openai(raw, credit=True)
 
 
 _MODEL_RATE_LIMIT_CODE = 6004       # 该模型用量超限 → 模型级软冷却
@@ -130,7 +43,16 @@ _MODEL_RATE_LIMIT_CODE = 6004       # 该模型用量超限 → 模型级软冷�
 # saturated」。上游明确要求「switch models」，说明同凭证其他模型可用，
 # 落账号级 SOFT 会让整张凭证 60s 内全部模型一起不可用。
 _MODEL_SATURATED_CODE = 14003
-_MODEL_BLOCKED_CODE = 11102         # 该后端无此模型 → (账号, 模型) 负缓存
+# 「这个号用不了这个模型」→ (账号, 模型) 负缓存。两个业务码同义：
+#   11102 该后端无此模型（上游根本没部署）
+#   11158 套餐不允许：`model [gpt-6-luna] is not allowed for user type
+#         [personal_free_user]`（国际站免费号实测 2026-10-29 10:36 / 10:37）
+# 两者对**当前凭证**的结论完全一样——重试多少次都失败，换号才有意义，且与
+# 账号健康无关（不能落账号级冷却）。此前只认 11102，11158 掉进 `400 其他`
+# 被归成 `invalid_request`，归因面板显示「请求无效」，读起来像客户端参数
+# 写错了（与 2026-10-26 officeAce 81009 同一类误判）。
+# 列表探活（client.filter_available_models）共用本集合，口径不会再漂。
+MODEL_BLOCKED_CODES = frozenset({11102, 11158})
 _CREDITS_EXHAUSTED_CODE = 14018     # 积分耗尽 → 冷却到次日签到
 _PLAN_EXHAUSTED_CODE = 1005         # 权益/套餐耗尽
 # 请求级错误（不是账号的问题）：请求体坏 / 上下文超限 / 图片无效 / 渠道风控。
@@ -138,8 +60,47 @@ _PLAN_EXHAUSTED_CODE = 1005         # 权益/套餐耗尽
 # 拦截：同凭证同时刻换模型即可成功、同 (凭证, 模型) 秒级交替成功/失败、窗口
 # 内自愈，绝不是凭证或模型的问题。归请求级 → 零动作、仅换号重试。
 # （若归 INVALID，executor 会跳过该上游全部凭证、零重试直接 400）
-_REQUEST_LEVEL_CODES = frozenset({11101, 11115, 11128, 11135})
+_REQUEST_LEVEL_CODES = frozenset({11101, 11128, 11135})
+# 11129「工具 schema 不合规」：上游拒收的是**客户端带来的 JSON Schema**，
+# 与凭证/模型无关。400 形态落 INVALID（跳过整家上游、对外 400、绝不冷却），
+# 403 形态也必须拦在 DEAD 之前——一次 schema 错误不该把整池号硬禁用。
+# 2026-11-17 `misakano7545/workbuddy2api-panel` PR #269 实测该码存在，
+# 且紧凑子串 `111290` 会误判，故走 `business_codes` 的完整码比对。
+_TOOL_SCHEMA_CODES = frozenset({11129})
+
+# 403 上也是**请求级**的业务码：渠道/内容风控的另一种 HTTP 形态。
+# 11128 在上游同时存在 400 与 403 两种包装（2026-11-02 抓到的正是
+# `403 {"code":"11-128","msg":"request illegal"}`），而 403 在 CodeBuddy 里
+# 一律判 DEAD——一次命中就把整池好号硬禁用。这里把它拦在 DEAD 之前。
+_FORBIDDEN_REQUEST_CODES = frozenset({11128})
+# 上下文超限（`prompt is too long: 1056943 tokens > 1048576 maximum`）：
+# 处置与请求级错误一致（不罚号、仍换号），但**统计单独成类**——归进
+# `invalid_request` 时归因面板显示「请求无效」，运维会去查参数写法，实际
+# 动作是「精简上下文 / 换长窗口模型」（实测 2026-11-02 23:32 国际站）。
+_CONTEXT_OVERFLOW_CODE = 11115
 _BAD_PARAMS_PHRASE = "unmarshal chat params failed"
+# 供应商过载（`"code":11134`）：整家上游暂时吃不下请求，与**账号**无关。
+# 2026-11-07 `misakano7545/workbuddy2api-panel` 实测：15 分钟内 6 个不同账号
+# 同时命中，且上游同时回 `retry_after`/`retry_policy.retry_after` 引导晚点再来。
+# 判账号级 SOFT 会冷却健康凭证并换号——换到别的号照样 11134（同一家上游），
+# 白烧轮换预算；换号成功后粘性还会漂到新号，上游前缀缓存按账号隔离
+# （实测命中率 97–99% → 0–12%）。故复用排队语义：不罚号、原号等一轮再开。
+_UPSTREAM_BUSY_CODE = 11134
+
+# 账号级风控限制（403 + `"code":11140`「request illegal」）：displayMsg 是
+# `Your account has been restricted due to unusual activity` /
+# 「账号存在异常行为，已被限制使用」，displayTips 引导 SUBMIT_FEEDBACK。
+# 与 session 过期不同：重新登录无效，只能申诉或换号。
+#
+# 业务码与文案分开存：`"11140"` **不做整段正文子串匹配**——request id、时间戳、
+# 用户回显内容里出现这五个数字就会把普通错误判成 RESTRICTED（2h 冷却、两次即
+# 升级整渠道 24h 暂停）。正文只认三语文案（上游点名人类可读文案时给的兜底）。
+_ACCOUNT_RESTRICTED_CODE = 11140
+_ACCOUNT_RESTRICTED_PHRASES: tuple[str, ...] = (
+    "account has been restricted",
+    "账号存在异常行为",
+    "帳號存在異常行為",
+)
 
 
 def classify_status(status: int, body: bytes = b"") -> ErrKind:
@@ -150,7 +111,9 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
 
     * 402 / 14018 → 余额不足（冷却到次日 04:00，等签到恢复）
     * 1005 → 权益耗尽（12h 长冷却）
-    * 11102「该后端无此模型」→ (账号, 模型) 负缓存（400/404 形态）
+    * 11102/11158「该号用不了这个模型」→ (账号, 模型) 负缓存（400/404 形态）
+    * 11134「供应商过载」→ 排队语义：不罚号、原号等一轮再开
+    * 11140「账号被风控限制」→ 账号级长冷却，**当前请求不再换号**
     * 401/403 → session 失效（硬禁用）
     * 404 → 软冷却，不累计错误数
     * 429 + 6004/14003 → 模型级限流（用量超限 / 模型饱和）；429 其他 → 账号级软限流
@@ -162,8 +125,27 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
         return ErrKind.CREDIT
     if _PLAN_EXHAUSTED_CODE in codes:
         return ErrKind.PLAN
-    if status in (400, 404) and _MODEL_BLOCKED_CODE in codes:
+    if _UPSTREAM_BUSY_CODE in codes:
+        # 供应商过载：整家上游吃不下，不是这个号的问题。复用排队语义
+        # （不罚号、原号等一轮再开），理由见 `_UPSTREAM_BUSY_CODE`。
+        return ErrKind.QUEUE
+    if status in (400, 404) and codes & MODEL_BLOCKED_CODES:
         return ErrKind.BLOCKED
+    if status in (400, 403) and codes & _TOOL_SCHEMA_CODES:
+        # 请求形态错误：换号解决不了，但也不能当 DEAD 硬禁用。INVALID 的处置
+        # 是「跳过整家上游 → 全部拒绝才 400」，与本类错误的作用域一致。
+        return ErrKind.INVALID
+    if status >= 400 and _is_account_restricted(body):
+        # 必须拦在 401/403 → DEAD 之前：11140 是上游按账号/IP 拉黑，不是凭据
+        # 失效——判 DEAD 会永久硬禁用并让 executor 逐个号换着撞（实测一次
+        # 请求连打 3 个号全 403，新号 3 分钟后也被封）。
+        return ErrKind.RESTRICTED
+    if status == 403 and codes & _FORBIDDEN_REQUEST_CODES:
+        # 11128 是**渠道/内容风控**（"Illegal API invocation from an unapproved
+        # channel"），同池换号同样被拒，但不是凭据失效。当 DEAD 会硬禁用整池
+        # 好号；2026-11-02 上游把该码改成字符串形态 `{"code":"11-128"}`，漏认
+        # 就是整池阵亡——故这一条与正则放宽配套。
+        return ErrKind.REQUEST
     if status in (401, 403):
         return ErrKind.DEAD
     if status == 404:
@@ -173,6 +155,10 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
                 if _MODEL_RATE_LIMIT_CODE in codes or _MODEL_SATURATED_CODE in codes
                 else ErrKind.SOFT)
     if status == 400:
+        if _CONTEXT_OVERFLOW_CODE in codes:
+            # 上下文超限：处置同请求级错误（不罚号、仍换号），统计单独成类
+            # （见 `_CONTEXT_OVERFLOW_CODE`）。
+            return ErrKind.CONTEXT
         if (codes & _REQUEST_LEVEL_CODES
                 or _BAD_PARAMS_PHRASE in body_hint(body).lower()):
             # 发给上游的 body 有问题：换号也大概率一样，但不罚号（仍轮转试一次）
@@ -180,3 +166,31 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
         # 请求无效（如模型不存在）是客户端错误，冷却凭证只会误伤健康凭证
         return ErrKind.INVALID
     return ErrKind.OTHER
+
+
+def _is_account_restricted(body: bytes) -> bool:
+    """响应体是不是 CodeBuddy 的「账号被风控限制」（11140 / 三语文案）。
+
+    业务码走 `business_codes`（只认 `"code": N` 键值形态）而不是整段正文子串：
+    正文里任何位置出现 `11140` 都算的话，一次普通 400/5xx（body 回显用户内容
+    或带 request id）就会误判 RESTRICTED → 该凭证 2h 冷却、两次即整渠道 24h
+    暂停。文案匹配是上游只给人类可读文案时的兜底，同样不认裸数字。
+    """
+    text = body.decode("utf-8", errors="replace")
+    if _ACCOUNT_RESTRICTED_CODE in business_codes(text):
+        return True
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _ACCOUNT_RESTRICTED_PHRASES)
+
+
+def disabled_reason(body: bytes = b"") -> str:
+    """401/403 响应体 → 硬禁用时展示的可操作原因；识别不到返回空串。
+
+    为什么需要它：`disabled_reason` 原先一律写 "session dead"，而 11140 的
+    真实含义是「账号被上游风控限制」——管理台按 "session dead" 去重新登录
+    只会白折腾，实际动作是提交申诉或换号。这里只回**受控文案**，不拼接上游
+    正文（与 `relogin_required` 同口径）。
+    """
+    if _is_account_restricted(body):
+        return "账号被上游限制（账号异常行为），需提交申诉；重新登录无效"
+    return ""

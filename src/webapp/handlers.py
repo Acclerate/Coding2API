@@ -11,7 +11,9 @@ import logging
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
+from ..api.deps import ServicePaused
 from ..auth.csrf import CsrfRejectedError
 from ..auth.rbac import (
     ForbiddenError,
@@ -64,8 +66,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _no_health(_request, error: NoHealthyCredential):
         # str(error) 由 executor 用受控文案构造（_unavailable_message /
         # _model_cooled_message），只带最后一次错误的受控标识，不含上游正文。
+        response = JSONResponse(
+            status_code=503,
+            content=error_payload(str(error), "no_healthy_credential", 503))
+        # 池内还有会自行恢复的候选时给出最早恢复秒数：缺这个头，OpenAI SDK /
+        # Claude Code 会立即重试，把一次限流放大成请求风暴。
+        if getattr(error, "retry_after", None) is not None:
+            response.headers["Retry-After"] = str(error.retry_after)
+        return response
+
+    @app.exception_handler(ServicePaused)
+    async def _paused(_request, error: ServicePaused):
+        """kill switch：503 + 受控文案。原因只进日志（见 deps._ensure_not_paused），
+        不回显——运维备注可能含事故编号或内部链接。"""
         return JSONResponse(status_code=503,
-                            content=error_payload(str(error), "no_healthy_credential", 503))
+                            content=error_payload(str(error), "service_paused", 503))
 
     @app.exception_handler(NoProviderForModel)
     async def _no_provider(_request, error: NoProviderForModel):
@@ -126,6 +141,20 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=UPSTREAM_ERROR_STATUS,
             content=error_payload("upstream transport failed",
                                   "upstream_unavailable", UPSTREAM_ERROR_STATUS))
+
+    @app.exception_handler(ClientDisconnect)
+    async def _client_disconnected(_request, _error: ClientDisconnect):
+        """读请求体时客户端已断开：不是服务端错误，499 收尾。
+
+        以前 `request.body()` 抛 `ClientDisconnect` 会一路冒泡到
+        ServerErrorMiddleware——落一条 500 + 全量 ASGI Traceback，既刷屏日志，
+        又让「客户端自己取消」混进服务错误统计。499 是网关惯例
+        （nginx「client closed request」），调用方已不在，响应体只为把
+        access log 的状态码记对。
+        """
+        return JSONResponse(status_code=499,
+                            content=error_payload("client disconnected",
+                                                  "client_disconnected", 499))
 
     @app.exception_handler(ThrottledError)
     async def _throttled(_request, _error: ThrottledError):

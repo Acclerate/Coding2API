@@ -6,8 +6,9 @@
 
 同一页还展示 `/api/tasks` 的**后台任务运行态**（进程内）：任务清单与周期来自
 同一份 `HOT_SETTINGS.task` 归属，非任务项按 `HotSetting.group` 归入网关卡组
-（`GATEWAY_GROUPS`）；页面把两者拼成「任务与配置」，每个任务 / 每个网关卡组
-各一个 tab——看周期的人就在看这个任务最近跑得怎么样，分开两页反而要来回跳。
+（`GATEWAY_GROUPS`）；页面把两者拼成「任务与配置」，一级 tab 分「后台任务 /
+网关配置」，任务再按业务分组（`TASK_GROUPS`）二级切换、组内每个任务一个 tab——
+看周期的人就在看这个任务最近跑得怎么样，分开两页反而要来回跳。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from ..auth.rbac import require_admin
 from ..compat.openai.request import InvalidRequest
 from ..runtime_settings import GATEWAY_GROUPS, InvalidSetting
 from ..tasks.runner import UnknownTaskError
+from ..tasks.status import TASK_GROUPS
 from .deps import Services, csrf_protected, principal_from_request, request_ip
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,18 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(str(error)) from error
         keys = ", ".join(sorted(values)) or "(空)"
         logger.info("管理员 %s 更新运行时配置 %s（DB 覆盖 .env）", principal.username, keys)
+        if "dump_request_bodies" in values:
+            # 这是全服务唯一「把用户对话落盘」的开关：开关动作既进审计（下面那条
+            # settings.update 带 keys），也在日志里单独喊一声——排查完没关是运维
+            # 事故，日志里必须一眼可见。
+            logger.warning("管理员 %s 把「请求体诊断落盘」改为 %s（DATA_DIR/dumps 将保存"
+                           "完整请求体，含对话内容）",
+                           principal.username, runtime.get("dump_request_bodies"))
+        if "gateway_paused" in values:
+            # kill switch 的两个方向都要留痕：开启是止血动作，关闭同样要能追到人。
+            logger.warning("管理员 %s 把「网关暂停」改为 %s（原因：%s）",
+                           principal.username, runtime.get("gateway_paused"),
+                           runtime.get("gateway_pause_reason") or "未填原因")
         # 配置写入本身就是一次「谁能改网关行为」的变更，必须留痕：模型黑名单
         # （C3 的一键黑名单按钮也走这条接口）与告警 webhook 被改掉却不进审计，
         # 事后无法回答「是谁把它关的」。
@@ -80,6 +94,9 @@ def create_router(services: Services) -> APIRouter:
         runner = getattr(request.app.state, "task_runner", None)
         return {
             "tasks": runner.task_status() if runner is not None else [],
+            # 任务业务分组随响应下发：前端据此把任务拆成二级 tab，
+            # 不在前端硬编码 key→分组映射（后端加任务/改归属不用动前端）。
+            "groups": [{"value": key, "label": label} for key, label in TASK_GROUPS],
             "server_time": int(time.time()),
         }
 

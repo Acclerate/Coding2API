@@ -66,24 +66,25 @@ def parse_frame(frame: SSEFrame) -> Event | None:
         raise UpstreamProtocolViolation(f"SSE data for {name!r} is not an object")
 
     if name == "output":
-        return _parse_output(payload)
+        return _attach_model(_parse_output(payload), payload)
     if name == "token_usage":
-        return Event(kind=EventKind.USAGE, usage=_parse_usage(payload))
+        return _attach_model(Event(kind=EventKind.USAGE, usage=_parse_usage(payload)),
+                             payload)
     if name == "done":
         reason = payload.get("finish_reason")
         finish = reason if isinstance(reason, str) else None
-        return Event(kind=EventKind.FINISH, finish_reason=finish)
+        return _attach_model(Event(kind=EventKind.FINISH, finish_reason=finish), payload)
     if name == "error":
         code = payload.get("code")
         message = payload.get("message")
         normalized_code = code if isinstance(code, int) and not isinstance(code, bool) else None
-        return Event(
+        return _attach_model(Event(
             kind=EventKind.ERROR,
             error_code=normalized_code,
             error_message=message if isinstance(message, str) else None,
             # 分类在解析时定死（单一来源）；executor 直接消费
             error_kind=classify_error_code(normalized_code),
-        )
+        ), payload)
     # name ∈ KNOWN_EVENT_NAMES，上面分支已穷尽；防御未来新增名字漏写分支
     raise UpstreamProtocolViolation(  # pragma: no cover
         f"unhandled known event {name!r}")
@@ -257,3 +258,34 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
         # 换凭证没用 → 跳过该上游；其余 400 同样按请求无效处理
         return ErrKind.INVALID
     return ErrKind.OTHER
+
+
+def _attach_model(event: Event | None, payload: dict[str, Any]) -> Event | None:
+    """把上游自报的模型名挂到事件上（观测用；缺省保持 None）。"""
+    model = payload.get("model")
+    if event is not None and isinstance(model, str) and model:
+        event.model = model
+    return event
+
+
+# 实测 TRAE 只有元数据帧回显真实模型：`metadata.model`（偶发空串）、
+# `extra_info.model`（真实模型名）、`timing_cost.provider_model_name`。
+# output / done / token_usage 帧都不带 → 由 client 把这里取到的名字贴到后续事件。
+_MODEL_HINT_EVENTS = frozenset({"metadata", "timing_cost", "extra_info"})
+
+
+def frame_model(frame: SSEFrame) -> str | None:
+    """元数据帧里回显的真实模型名；缺帧 / 空串 / 坏 JSON 一律 None。"""
+    if frame.event.strip() not in _MODEL_HINT_EVENTS or not frame.data:
+        return None
+    try:
+        payload = json.loads(frame.data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("model", "provider_model_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

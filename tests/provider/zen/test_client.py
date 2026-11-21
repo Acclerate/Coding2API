@@ -217,19 +217,67 @@ def test_pretty_model_name_plain_numeric_segment():
     assert _pretty_segment("2.5") == "2.5"
     assert _pretty_segment("3") == "3"
 
-async def test_fetch_models_custom_suffix_and_probe_network_error():
-    """后缀可覆盖；探活连接异常按不可用处理。"""
+async def test_fetch_models_probe_network_error_keeps_candidates():
+    """后缀可覆盖；探活连接异常（暂不可判定）→ 保留候选，不清空渠道。"""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == EP_MODELS:
             return httpx.Response(200, json={"data": [
                 {"id": "m1-free"}, {"id": "m2-lite"}]})
         raise httpx.ConnectError("boom")
 
-    with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free model"):
-        await _client(handler, free_suffix="-lite").fetch_models()
+    models = await _client(handler, free_suffix="-lite").fetch_models()
+    assert [m.id for m in models] == ["m2-lite"]
 
-async def test_fetch_models_probe_timeout_is_unavailable(monkeypatch):
-    """探活首字超时按不可用：整体套 `asyncio.timeout`，不拖垮模型列表。"""
+async def test_fetch_models_probe_429_keeps_candidates():
+    """429（匿名免费额度耗尽）属暂不可判定 → 保留候选。
+
+    实测 2026-11-03 匿名探测全线 429：旧口径要求 2xx 会让 Zen 整渠道显示
+    「无模型」，而模型本身并未下架。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+
+    models = await _client(handler).fetch_models()
+    assert [m.id for m in models] == ["a-free"]
+
+async def test_fetch_models_probe_429_does_not_log_warning(caplog):
+    """429 是已知稳态，只记 DEBUG：否则每轮 8 条 WARNING 淹没真问题。
+
+    实测 2026-11-08 一天 224 条 `zen 探活 … 暂不可判定：HTTP 429`，占全部
+    WARNING 的 73%；而 zen 渠道自 10-23 后无流量，纯噪声。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+
+    with caplog.at_level("DEBUG", logger="src.provider.zen.client"):
+        await _client(handler).fetch_models()
+
+    levels = {record.levelname for record in caplog.records
+              if "zen 探活" in record.getMessage()}
+    assert "WARNING" not in levels
+    assert "DEBUG" in levels
+
+async def test_fetch_models_probe_5xx_logs_warning(caplog):
+    """非 429 的暂不可判定（5xx）仍打 WARNING：那才是要人看的信号。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(503, json={"error": {"type": "ServerError"}})
+
+    with caplog.at_level("DEBUG", logger="src.provider.zen.client"):
+        models = await _client(handler).fetch_models()
+
+    assert [m.id for m in models] == ["a-free"]
+    warnings = [record for record in caplog.records
+                if record.levelname == "WARNING" and "zen 探活" in record.getMessage()]
+    assert warnings and "HTTP 503" in warnings[0].getMessage()
+
+async def test_fetch_models_probe_timeout_keeps_candidates(monkeypatch):
+    """探活首字超时按「暂不可判定」保留：不拖垮启动，也不清空渠道。"""
     from src.provider.zen import client as zen_client
 
     monkeypatch.setattr(zen_client, "PROBE_TIMEOUT", 0.01)
@@ -239,8 +287,8 @@ async def test_fetch_models_probe_timeout_is_unavailable(monkeypatch):
             await asyncio.sleep(1)   # 首字过慢，超过 PROBE_TIMEOUT
         return httpx.Response(200, json={"data": [{"id": "slow-free"}]})
 
-    with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free model"):
-        await _client(handler).fetch_models()
+    models = await _client(handler).fetch_models()
+    assert [m.id for m in models] == ["slow-free"]
 
 async def test_fetch_models_reuses_probe_result_within_ttl():
     """判活结果在 models_cache_ttl 内复用：服务层每 300s 重拉列表不会重探上游。"""
@@ -313,12 +361,12 @@ async def test_fetch_models_errors():
     with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free candidates"):
         await _client(no_candidates).fetch_models()
 
-    # 候选都有，但探活全军覆没（上游整体故障）→ 交给上层缓存兜底
+    # 候选都有，但全部被**确定**判死（付费 401 / 下线 400 / 区域 403）→ 抛出让上层缓存兜底
     def all_dead(request: httpx.Request) -> httpx.Response:
         if request.url.path == EP_MODELS:
             return httpx.Response(200, json={"data": [{"id": "a-free"},
                                                       {"id": "b-free"}]})
-        return httpx.Response(500, text="down")
+        return httpx.Response(403, text="not available in your country")
 
     with pytest.raises(zen_events.UpstreamProtocolViolation, match="liveness probe"):
         await _client(all_dead).fetch_models()
@@ -326,8 +374,8 @@ async def test_fetch_models_errors():
 async def test_client_lazy_clients_and_aclose():
     """未注入 client 时惰性创建；aclose 释放两侧连接池。"""
     client = ZenClient()
-    assert client._stream() is client._stream()      # noqa: SLF001 - 惰性复用同一实例
-    assert client._short() is client._short()        # noqa: SLF001
+    assert client._stream is client._stream      # noqa: SLF001 - 惰性复用同一实例
+    assert client._short is client._short        # noqa: SLF001
     await client.aclose()
 
     # 都没创建过：aclose 不报错（两个分支都为 None）

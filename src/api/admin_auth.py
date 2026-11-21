@@ -6,12 +6,17 @@
 
 from __future__ import annotations
 
+import inspect
+import ipaddress
+import logging
 import time
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from ..audit.actions import (
+    ACTION_CREDENTIAL_IMPORT,
     ACTION_LOGIN_FAILURE,
     ACTION_LOGIN_SUCCESS,
     ACTION_USER_PASSWORD_CHANGE,
@@ -21,9 +26,14 @@ from ..auth.session import create_session_token
 from ..auth.users import create_password_hash, verify_password
 from ..compat.openai.request import InvalidRequest
 from ..config import Settings
+from ..provider.base import AuthResult
+from ..provider.trae.callback import login_trace_id
 from ..webapp.security import session_cookie_secure
+from .authorize import PENDING_CALLBACK_TTL_SECONDS
+from .credential_login import save_login_credential
 from .deps import (
     SESSION_COOKIE,
+    Principal,
     Services,
     csrf_protected,
     origin_protected,
@@ -34,10 +44,83 @@ from .deps import (
 MIN_PASSWORD_LENGTH = 8
 ACTIVATION_TTL_SECONDS = 24 * 3600
 
+logger = logging.getLogger(__name__)
 
-def resolve_public_callback_url(settings: Settings) -> str:
-    """PUBLIC_BASE_URL + /authorize（远程部署必须可被浏览器访问）。"""
-    return settings.public_base_url.rstrip("/") + "/authorize"
+
+# 浏览器打不开的基址主机：回环与通配监听。PUBLIC_BASE_URL 默认值就是
+# 127.0.0.1:8000，远程/容器部署忘了改时，回调会跳到**用户自己这台机器**，
+# 浏览器既回不到服务也不报错（issue #21）。
+_LOCALHOST_NAMES = frozenset({"localhost"})
+
+
+def _host_of(authority: str) -> str:
+    """从 `host[:port]` / `scheme://host[:port]/path` 取出小写主机名。"""
+    text = authority.strip().split("://", 1)[-1].split("/", 1)[0]
+    if text.startswith("["):
+        return text.partition("]")[0].lstrip("[").lower()
+    return text.split(":", 1)[0].lower()
+
+
+def _browser_cannot_reach(host: str) -> bool:
+    """回环 / 通配监听：浏览器打开它到不了本服务（或到不了发请求的那个人）。"""
+    if host in _LOCALHOST_NAMES:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:          # 普通域名 / 无效字面量：按可达处理
+        return False
+    return address.is_loopback or address.is_unspecified
+
+
+def _request_origin(request: Request) -> str:
+    """当前请求的浏览器 origin（采信反代/隧道的 X-Forwarded-Proto）。"""
+    proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    if proto not in ("http", "https"):
+        proto = request.url.scheme
+    authority = request.headers.get("host", "") or request.url.netloc
+    return f"{proto}://{authority}"
+
+
+def _record_oauth_import(services: Services, principal: Principal, provider_id: str,
+                         credential_id: str, *, merged: bool = False) -> None:
+    """OAuth 登录落库的审计行（与手工导入 `credential.import` 同一 action）。
+
+    三条 OAuth 路径（poll / 粘贴回调 / `/authorize`）原来都**不写审计**，于是
+    「谁什么时候把号塞进池子」只能从手工导入那一条回答——登录进来的号在审计
+    页上完全消失。这里统一补上，action 与手工导入一致，管理台的「导入凭证」
+    过滤能同时看到两条来源，detail 里区分渠道与「新增 / 重新登录合并」。
+
+    两条分支只差「动作名 + detail」，日志与审计的其余字段一致：合并写一处，
+    以后再改字段不必同时动两段。
+    """
+    action = "重新登录并更新" if merged else "新增"
+    outcome = "合并已有凭证" if merged else "登录"
+    logger.info("管理员 %s 通过 OAuth %s凭证 %s（上游 %s）",
+                principal.username, action, credential_id, provider_id)
+    services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_IMPORT,
+                          target=credential_id,
+                          detail=f"上游 {provider_id}；来源 OAuth {outcome}")
+
+
+def resolve_public_callback_url(settings: Settings,
+                                request: Request | None = None) -> str:
+    """回调基址 + /authorize。
+
+    `PUBLIC_BASE_URL` 是权威值，但它有两个已知的「静默失效」形态：
+    远程部署忘了改（默认 `http://127.0.0.1:8000` 指向用户自己的机器）、
+    docker-compose 只透传了默认值。这两种情况下回调地址由**浏览器**打开，
+    必然是坏的，而用户只会看到「授权完成但没回调」。
+
+    因此基址落在回环/通配主机、而当前请求来自别的主机时，改用请求自身的
+    origin：能打到本服务的那个地址，浏览器同样能打到。请求已通过
+    `host_allowed` 白名单，故这里采信 Host 头不会放大攻击面。
+    """
+    base = settings.public_base_url.rstrip("/")
+    if request is not None and _browser_cannot_reach(_host_of(base)):
+        request_host = _host_of(request.headers.get("host", "") or request.url.netloc)
+        if request_host and not _browser_cannot_reach(request_host):
+            base = _request_origin(request).rstrip("/")
+    return base + "/authorize"
 
 
 def issue_session(response: JSONResponse, services: Services, username: str, *,
@@ -60,6 +143,48 @@ def _record_login(services: Services, *, username: str, ok: bool, ip: str) -> No
         actor=username, action=ACTION_LOGIN_SUCCESS if ok else ACTION_LOGIN_FAILURE,
         ip=ip or None, ok=ok,
         detail="" if ok else "密码错误或用户不存在")
+
+
+async def _complete_callback_paste(services: Services, pending: dict[str, tuple[float, str]],
+                                   username: str, provider_id: str,
+                                   raw_url: str, state: str) -> AuthResult:
+    """callback 轨道（TRAE）的粘贴兑换：按发起人的 pending 登录完成回调。
+
+    与 `/authorize` 的差别只在**入口**：那边是浏览器 302（无鉴权，靠
+    `loginTraceID` 绑定），这边是已鉴权的管理台写请求，因此用会话里的
+    用户名直接定位 pending。仍复用同一条 TTL，且 state 必须与 pending 一致
+    （`/authorize` 是从 pending 里取 state，这边是用户可能贴错链接）。
+
+    粘回来的地址若带 `loginTraceID`，必须与这次登录的 trace 相符——防止
+    用户把另一次登录（另一个浏览器标签）的回调贴进来，把两边的
+    machine/device id 搞混。
+    """
+    provider = services.registry.get(provider_id)
+    completer = getattr(provider, "complete_callback", None)
+    if provider is None or not callable(completer):
+        raise InvalidRequest(
+            f"provider {provider_id!r} does not support callback completion")
+    entry = pending.get(username)
+    if entry is None:
+        raise InvalidRequest(
+            "没有进行中的登录。请回到管理台重新点击「登录」，再把回调地址粘回来。")
+    started_at, pending_state = entry
+    if time.monotonic() - started_at > PENDING_CALLBACK_TTL_SECONDS:
+        pending.pop(username, None)
+        raise InvalidRequest(
+            f"这次登录已超过 {PENDING_CALLBACK_TTL_SECONDS // 60} 分钟有效期，"
+            "请回到管理台重新发起登录。")
+    if state and state != pending_state:
+        raise InvalidRequest(
+            "粘贴的回调地址不属于当前这次登录，请重新发起登录后再粘贴。")
+    pasted_trace = (parse_qs(urlparse(raw_url).query).get("loginTraceID") or [""])[0]
+    machine_id, _, device_id = pending_state.partition(":")
+    if pasted_trace and pasted_trace != login_trace_id(machine_id, device_id):
+        raise InvalidRequest(
+            "粘贴的回调地址不属于当前这次登录，请重新发起登录后再粘贴。")
+    pending.pop(username, None)
+    data = await completer(raw_url, pending_state)
+    return AuthResult(credential_data=data, nickname=str(data.get("nickname") or ""))
 
 
 def create_router(services: Services) -> APIRouter:
@@ -124,6 +249,12 @@ def create_router(services: Services) -> APIRouter:
         """自助改密：当前密码 + 新密码。任意角色可用（首登强制改密也走这里）。
 
         当前密码必须正确：会话被盗时不能直接改密把主人锁在外面。
+
+        **PBKDF2 必须离开事件循环**：`verify_password` / `create_password_hash`
+        各 600k 迭代（实测单次约 45ms，两次近 100ms）。同步调用会独占事件循环
+        ——实测 10 次连续调用期间 1ms 心跳一次都没跑起来，20 并发改密足以让
+        SSE、`/health`、`/v1` 全部排队。登录路径早已用 `throttle.verify`
+        （线程池 + 信号量）躲开这个坑，这里必须同口径。
         """
         current = str(payload.get("current_password") or "")
         new_password = str(payload.get("new_password") or "")
@@ -131,10 +262,20 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(
                 f"new password must be at least {MIN_PASSWORD_LENGTH} characters")
         row = services.user_repo.get(principal.username)
-        if row is None or not verify_password(current, row["password_hash"]):
+        # 复用登录限流器：它同时给出「线程池 + PBKDF2 并发上限」与「猜当前密码
+        # 的失败计数」。后者原先完全缺失——会话被盗后可无限次试当前密码。
+        # 这里可以**先查后验**（登录路径必须后查）：调用方已通过会话认证为该用户，
+        # 用户名窗口只会被他自己或攻击者用同一用户名抬高，与登录同口径接受。
+        throttle = services.login_throttle
+        source_ip = request_ip(request, services.settings)
+        throttle.check(ip=source_ip, username=principal.username)
+        verified = (row is not None and await throttle.verify(
+            verify_password, current, row["password_hash"]))
+        if not verified:
+            throttle.record_failure(ip=source_ip, username=principal.username)
             raise InvalidRequest("current password is incorrect")
-        services.user_repo.set_password(
-            principal.username, create_password_hash(new_password))
+        hashed = await throttle.verify(create_password_hash, new_password)
+        services.user_repo.set_password(principal.username, hashed)
         services.audit.record(actor=principal.username,
                               action=ACTION_USER_PASSWORD_CHANGE,
                               target=principal.username,
@@ -155,13 +296,20 @@ def create_router(services: Services) -> APIRouter:
         require_admin(principal)
         provider_id = str(payload.get("provider") or "")
         if provider_id in services.upstream_auth:
-            session = await services.upstream_auth[provider_id].start(principal.username)
+            oauth = services.upstream_auth[provider_id]
+            # `force_login`（换账号）只有支持它的渠道认：浏览器里还留着上一个
+            # 账号的上游会话时，不先登出就会被云端直接放行成「同一个账号再登
+            # 一遍」，用户点了「新增账号」却始终拿不到另一条凭证。
+            session = (await oauth.start(principal.username,
+                                         force_login=bool(payload.get("force_login")))
+                       if "force_login" in inspect.signature(oauth.start).parameters
+                       else await oauth.start(principal.username))
         else:
             provider = services.registry.get(provider_id)
             builder = getattr(provider, "start_auth", None)
             if not callable(builder):
                 raise InvalidRequest(f"provider {provider_id!r} does not support login")
-            session = builder(resolve_public_callback_url(services.settings))
+            session = builder(resolve_public_callback_url(services.settings, request))
             # 按发起人分键登记待完成回调：单槽全局态会让两个管理员的
             # 并发登录互相覆盖，把 A 的凭证记到 B 名下；按用户名分键后，
             # 同网段的人也无法用自己的 refreshToken 顶掉别人进行中的登录。
@@ -184,47 +332,76 @@ def create_router(services: Services) -> APIRouter:
         result = await oauth.poll(state, principal.username)
         if result is None:
             return {"status": "pending"}
-        # 登录成功：直接落库，绝不在响应里回传 token
-        credential_id = services.credentials.add(
-            provider=provider_id, credential_data=result.credential_data,
+        # 登录成功：直接落库，绝不在响应里回传 token。
+        # 同一上游账号再次登录 = 更新既有凭证，避免池子里出现重复账号。
+        credential_id, merged = await save_login_credential(
+            services, provider_id=provider_id,
+            credential_data=result.credential_data,
             nickname=result.nickname, added_by=principal.username)
+        _record_oauth_import(services, principal, provider_id, credential_id,
+                             merged=merged)
         services.schedule_probe(credential_id)
-        return {"status": "success", "credential_id": credential_id}
+        return {"status": "success", "credential_id": credential_id, "merged": merged}
 
     @router.post("/api/auth/upstream/cancel")
-    async def upstream_auth_cancel(payload: dict,
+    async def upstream_auth_cancel(request: Request, payload: dict,
                                    _csrf: None = Depends(csrf_protected),
                                    principal=Depends(principal_from_request)):
         require_admin(principal)
-        oauth = services.upstream_auth.get(str(payload.get("provider") or ""))
+        provider_id = str(payload.get("provider") or "")
+        state = str(payload.get("state") or "")
+        oauth = services.upstream_auth.get(provider_id)
         if oauth is None:
+            # callback 轨道（TRAE）没有上游轮询会话可取消，但要清掉待完成
+            # 登录，否则取消后它还会挂到 TTL 到期，期间用户重新点「登录」
+            # 会被这条僵尸 pending 抢走（按用户名分键，后写覆盖前写，
+            # 本身不会错记，但残留条目会让「已取消」的假象持续）。
+            pending = request.app.state.pending_callbacks
+            entry = pending.get(principal.username)
+            if (provider_id in services.registry and entry is not None
+                    and (not state or entry[1] == state)):
+                pending.pop(principal.username, None)
+                return {"cancelled": True}
             raise InvalidRequest("provider does not support polling login")
-        cancelled = oauth.store.cancel(str(payload.get("state") or ""), principal.username)
+        cancelled = oauth.store.cancel(state, principal.username)
         return {"cancelled": cancelled}
 
     @router.post("/api/auth/upstream/complete")
-    async def upstream_auth_complete(payload: dict,
+    async def upstream_auth_complete(request: Request, payload: dict,
                                      _csrf: None = Depends(csrf_protected),
                                      principal=Depends(principal_from_request)):
-        """粘贴回调链接完成登录（CodeArts 等回调落不到本服务的渠道）。
+        """粘贴回调链接完成登录（回调落不到本服务、或浏览器打不开回调地址的渠道）。
 
-        用户把门户回跳地址（`http://127.0.0.1:{port}/oauth/callback?code=…`）
-        粘回来，服务端用其中的 code + start 时登记的 PKCE 私钥换 token，
+        两条路：
+
+        - **paste 轨道**（CodeArts 等）：服务端从 start 起就登记了 PKCE/ticket
+          会话，`oauth.complete_callback(url, state, username)` 自己按 state 找。
+        - **callback 轨道**（TRAE）：回调本应 302 回本服务 `/authorize`，但
+          远程 / NAS 部署里 TRAE 侧跳过去常直接「网络错误」，refreshToken 只
+          存在浏览器地址栏里，服务端永远收不到（issue #21 后半段）。用户把
+          那条地址整条粘回来，这里用与 `/authorize` 相同的 pending 绑定换 token。
+
         与 `poll` 一样直接落库、不回传 token。
         """
         require_admin(principal)
         provider_id = str(payload.get("provider") or "")
+        raw_url = str(payload.get("url") or "")
+        state = str(payload.get("state") or "")
         oauth = services.upstream_auth.get(provider_id)
         completer = getattr(oauth, "complete_callback", None)
-        if oauth is None or not callable(completer):
-            raise InvalidRequest(
-                f"provider {provider_id!r} does not support callback completion")
-        result = await completer(str(payload.get("url") or ""),
-                                 str(payload.get("state") or ""), principal.username)
-        credential_id = services.credentials.add(
-            provider=provider_id, credential_data=result.credential_data,
+        if oauth is not None and callable(completer):
+            result = await completer(raw_url, state, principal.username)
+        else:
+            result = await _complete_callback_paste(
+                services, request.app.state.pending_callbacks,
+                principal.username, provider_id, raw_url, state)
+        credential_id, merged = await save_login_credential(
+            services, provider_id=provider_id,
+            credential_data=result.credential_data,
             nickname=result.nickname, added_by=principal.username)
+        _record_oauth_import(services, principal, provider_id, credential_id,
+                             merged=merged)
         services.schedule_probe(credential_id)
-        return {"status": "success", "credential_id": credential_id}
+        return {"status": "success", "credential_id": credential_id, "merged": merged}
 
     return router

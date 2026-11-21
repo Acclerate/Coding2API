@@ -213,12 +213,34 @@ describe("ApiKeysPage", () => {
     );
   });
 
-  it("创建失败时提示检查绑定与白名单格式", async () => {
+  it("创建失败时透出后端的受控原因（不只给通用兜底）", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
         if (init?.method === "POST") {
-          return jsonResponse({ error: { message: "bad" } }, 400);
+          return jsonResponse(
+            { error: { message: "渠道绑定与已有 Key 冲突" } }, 400);
+        }
+        return jsonResponse({ api_keys: [] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await openCreateDialog();
+
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    // 后端写好的受控文案要透出来：裸 catch{} 会把它丢掉，用户只能对着
+    // 「创建失败」猜到底是哪一项不对。
+    expect(await screen.findByText(/渠道绑定与已有 Key 冲突/)).toBeInTheDocument();
+  });
+
+  it("创建失败且后端无可用文案时回落通用兜底", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          // 非受控异常（网络层）：没有可展示的 message
+          throw new TypeError("Failed to fetch");
         }
         return jsonResponse({ api_keys: [] });
       }),
@@ -229,6 +251,34 @@ describe("ApiKeysPage", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "创建" }));
     expect(await screen.findByText(/检查渠道绑定、模型白名单、IP 白名单与到期时间格式/)).toBeInTheDocument();
+  });
+
+  it("无 Clipboard API 时复制一次性 Key 失败会提示手动复制", async () => {
+    vi.stubGlobal("navigator", {});
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => false),
+      configurable: true,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          return jsonResponse({ ...KEY, api_key: "sk-plaintext-value" });
+        }
+        return jsonResponse({ api_keys: [] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await openCreateDialog();
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    await screen.findByTestId("new-key-plaintext");
+
+    const keyCopy = screen.getByTestId("new-key-plaintext").parentElement!.querySelector("button")!;
+    await userEvent.click(keyCopy);
+    // 一次性明文复制失败必须说清楚，否则用户关掉就再也拿不回来
+    expect(await screen.findByTestId("new-key-copy-failed")).toHaveTextContent("请手动");
+    expect(screen.queryByRole("button", { name: "已复制" })).not.toBeInTheDocument();
   });
 });
 
@@ -293,4 +343,12 @@ it("创建 Key 对话框支持 Esc 关闭", async () => {
   await openCreateDialog();
   await userEvent.keyboard("{Escape}");
   expect(screen.queryByTestId("create-key-dialog")).not.toBeInTheDocument();
+});
+
+describe("ApiKeysPage 首启向导深链", () => {
+  it("?new=1 进来直接打开创建对话框", async () => {
+    mockFetch({ "/api/api-keys": { api_keys: [] } });
+    renderPage(<ApiKeysPage />, { username: "root", is_admin: true }, "/?new=1");
+    expect(await screen.findByTestId("create-key-dialog")).toBeInTheDocument();
+  });
 });

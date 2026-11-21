@@ -23,7 +23,7 @@ async def test_provider_classify_import_and_credential_from():
     provider = QoderProvider()
     assert provider.id == "qoder"
     assert provider.classify(402, b"") is ErrKind.CREDIT
-    assert provider.classify(401, b"") is ErrKind.SOFT
+    assert provider.classify(401, b"") is ErrKind.DEAD
     assert provider.classify(429, b"") is ErrKind.MODEL
     imported = provider.import_credential({"token": "t", "uid": "u", "realm": "intl"})
     assert imported["access_token"] == "t" and imported["realm"] == "intl"
@@ -233,3 +233,19 @@ async def test_provider_stream_chat_without_pacer():
     events = [e async for e in provider.stream_chat(cred().to_dict(), {}, "m")]
     assert any(e.kind is EventKind.CONTENT for e in events)
     await provider.aclose()
+
+
+def test_provider_set_web_cookie_only_touches_that_field():
+    """补充 Cookie 不重走归一：老凭证里的未识别字段保持原样（导出可逆）。"""
+    from src.provider.qoder import QoderProvider
+
+    provider = QoderProvider()
+    data = {"access_token": "t", "unknown_field": "keep", "uid": "u"}
+    assert provider.set_web_cookie(data, " sid=1 ") == {
+        "access_token": "t", "unknown_field": "keep", "uid": "u",
+        "web_cookie": " sid=1 ",
+    }
+    # 传入的字典不被就地修改（调用方可能还持有它）
+    assert "web_cookie" not in data
+    # 空串 = 清除
+    assert provider.set_web_cookie({"web_cookie": "x"}, "")["web_cookie"] == ""

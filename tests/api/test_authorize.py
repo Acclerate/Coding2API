@@ -6,6 +6,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request as StarletteRequest
 
 from src.config import Settings
 from src.main import build_app
@@ -116,6 +117,10 @@ def test_authorize_completes_trae_login_end_to_end(tmp_path):
         # 响应与列表都不得泄漏 token
         assert "ACCESS" not in response.text
         assert "data_enc" not in listed[0]
+        # OAuth 回调落库必须留审计（与手工导入同 action）
+        rows = app.state.services.audit.query(action="credential.import", limit=10)
+        assert any(row["target"] == listed[0]["id"]
+                   and "OAuth" in (row["detail"] or "") for row in rows)
 
     # state 已消费，同一回调不可重放
     with TestClient(app) as replay:
@@ -292,7 +297,7 @@ def test_authorize_without_pending_login_still_rejected(tmp_path):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
 
-def test_authorize_rejects_revoked_session(tmp_path, monkeypatch):
+def test_authorize_rejects_revoked_session(tmp_path):
     """签名有效但发起人已禁用：不得完成兑换（与 principal_from_request 同口径）。"""
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
@@ -301,11 +306,29 @@ def test_authorize_rejects_revoked_session(tmp_path, monkeypatch):
         client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
         started = client.post("/api/auth/upstream/start",
                               json={"provider": "trae"}).json()
-        # Cookie 仍有效（签名/过期都 OK），但发起人已被禁用
-        monkeypatch.setattr(app.state.services.users, "is_active", lambda _u: False)
+        # Cookie 仍有效（签名/过期都 OK），但发起人已被禁用（epoch 同步 +1）
+        app.state.user_repo.set_enabled("root", False)
         response = client.get(f"/authorize?refreshToken=RT&state={started['state']}")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_authorize_rejects_when_password_change_required(tmp_path):
+    """首登强制改密期间不得建凭证（deps 的白名单同样没放行这类写路径）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start",
+                              json={"provider": "trae"}).json()
+        # 没有独立的 setter：直接改库（`must_change_password` 不参与 epoch）
+        app.state.user_repo._db.connect().execute(
+            "UPDATE users SET must_change_password = 1 WHERE username = 'root'")
+        app.state.user_repo._db.connect().commit()
+        response = client.get(f"/authorize?refreshToken=RT&state={started['state']}")
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "password change required"
 
 
 def test_dump_request_bodies_writes_file(tmp_path):
@@ -352,3 +375,333 @@ def test_authorize_without_trae_provider_is_rejected(tmp_path):
         response = client.get("/authorize?refreshToken=RT")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+# ---------------------------------------------------------------- 回调可发现性
+# issue #21：「授权完成后不回调，也没报错」。两个成因都在这里固定：
+# 回调基址指向浏览器打不开的主机（默认 127.0.0.1）、回调落在另一条入口而
+# 浏览器不带管理台 Cookie；以及浏览器只拿到 JSON 看不出发生了什么。
+
+
+def _request(host: str, *, scheme: str = "http",
+             xfp: str | None = None) -> StarletteRequest:
+    """构造一个最小 ASGI Request（只用到 host / scheme / 转发头）。"""
+    headers = [(b"host", host.encode())]
+    if xfp is not None:
+        headers.append((b"x-forwarded-proto", xfp.encode()))
+    return StarletteRequest({
+        "type": "http", "method": "GET", "path": "/api/auth/upstream/start",
+        "query_string": b"", "root_path": "", "scheme": scheme,
+        "server": (host.split(":", 1)[0], 8000), "headers": headers,
+    })
+
+
+def test_resolve_callback_url_uses_request_origin_for_unreachable_base():
+    """PUBLIC_BASE_URL 还是默认回环时，回调改用手上这条入口的 origin。
+
+    默认值 http://127.0.0.1:8000 在远程/容器部署里指向**用户自己的机器**，
+    浏览器跳过去连不上，授权完成也回不来。
+    """
+    from src.api.admin_auth import resolve_public_callback_url
+
+    settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                        PUBLIC_BASE_URL="http://127.0.0.1:8000")
+    # 从 LAN 地址打开管理台 → 回调用 LAN 地址
+    assert resolve_public_callback_url(settings, _request("192.168.1.5:8000")) == \
+        "http://192.168.1.5:8000/authorize"
+    # 隧道入口：采信 X-Forwarded-Proto
+    assert resolve_public_callback_url(
+        settings, _request("ai.example.com", xfp="https")) == \
+        "https://ai.example.com/authorize"
+    # 非法 XFP 回落 socket 层协议
+    assert resolve_public_callback_url(
+        settings, _request("ai.example.com", xfp="ftp")) == \
+        "http://ai.example.com/authorize"
+    # 通配监听同样不可达
+    wildcard = Settings(_env_file=None, APP_SECRET=SECRET,
+                        PUBLIC_BASE_URL="http://0.0.0.0:8000")
+    assert resolve_public_callback_url(wildcard, _request("10.0.0.2:8000")) == \
+        "http://10.0.0.2:8000/authorize"
+    # localhost 字面量同理
+    named = Settings(_env_file=None, APP_SECRET=SECRET,
+                     PUBLIC_BASE_URL="http://localhost:8000")
+    assert resolve_public_callback_url(named, _request("10.0.0.2:8000")) == \
+        "http://10.0.0.2:8000/authorize"
+
+
+def test_resolve_callback_url_keeps_configured_base():
+    """本机访问、或显式配了可达基址时，不为请求 origin 让路。"""
+    from src.api.admin_auth import resolve_public_callback_url
+
+    loopback = Settings(_env_file=None, APP_SECRET=SECRET,
+                        PUBLIC_BASE_URL="http://127.0.0.1:8000/")
+    assert resolve_public_callback_url(loopback, _request("127.0.0.1:8000")) == \
+        "http://127.0.0.1:8000/authorize"
+    assert resolve_public_callback_url(loopback, _request("[::1]:8000")) == \
+        "http://127.0.0.1:8000/authorize"
+    explicit = Settings(_env_file=None, APP_SECRET=SECRET,
+                        PUBLIC_BASE_URL="https://gw.example")
+    assert resolve_public_callback_url(explicit, _request("192.168.1.5:8000")) == \
+        "https://gw.example/authorize"
+    # 非回环 IP 基址：本来就是浏览器可达的，不为请求 origin 让路
+    lan_base = Settings(_env_file=None, APP_SECRET=SECRET,
+                        PUBLIC_BASE_URL="http://10.0.0.9:8000")
+    assert resolve_public_callback_url(lan_base, _request("192.168.1.5:8000")) == \
+        "http://10.0.0.9:8000/authorize"
+
+
+def _mock_trae() -> TraeProvider:
+    import httpx as _httpx
+
+    from src.provider.trae.client import TraeClient
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        if request.url.path.endswith("ExchangeToken"):
+            return _httpx.Response(200, json={"Result": {"Token": "ACCESS",
+                                                         "RefreshToken": "RT2"}})
+        return _httpx.Response(200, json={"Result": {"UserID": "u1", "ScreenName": "n"}})
+
+    transport = _httpx.MockTransport(handler)
+    return TraeProvider(client=TraeClient(
+        stream_client=_httpx.AsyncClient(transport=transport, timeout=None),
+        short_client=_httpx.AsyncClient(transport=transport, timeout=None)))
+
+
+def test_authorize_binds_callback_by_trace_without_session_cookie(tmp_path):
+    """回调落在另一条入口时不带管理台 Cookie，靠 loginTraceID 仍能完成。
+
+    同一实例常有 LAN 与隧道两条入口：在 LAN 发起、隧道回调时浏览器不会带
+    LAN 域的会话 Cookie。trace 只出现在发起那次 auth_url 里，足以钉死登录。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
+        trace = login_trace_id(*started["state"].split(":"))
+
+        client.cookies.clear()          # 换一条入口：浏览器没有管理台会话
+        response = client.get(f"/authorize?refreshToken=RT1&loginTraceID={trace}")
+        assert response.status_code == 200, response.text
+        assert response.json()["captured"] is True
+        assert "root" not in app.state.pending_callbacks
+
+    listed = app.state.services.credentials.list_all()
+    assert len(listed) == 1
+    assert listed[0]["added_by"] == "root"      # 归属仍是发起登录的管理员
+
+
+def test_authorize_ignores_malformed_pending_entries_when_matching_trace(tmp_path):
+    """pending 里的 state 损坏（缺 device_id）时按 trace 反查直接跳过。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        app.state.pending_callbacks["root"] = (time.monotonic(), "broken")
+        response = client.get("/authorize?refreshToken=RT&loginTraceID=abc")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_authorize_rejects_expired_pending_login(tmp_path):
+    """pending 超过 TTL：作废并清槽，提示重新发起（不再无限期挂着）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
+        trace = login_trace_id(*started["state"].split(":"))
+        app.state.pending_callbacks["root"] = (time.monotonic() - 601, started["state"])
+        response = client.get(f"/authorize?refreshToken=RT&loginTraceID={trace}")
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "pending TRAE login expired, start a new one"
+    assert "root" not in app.state.pending_callbacks
+
+
+def test_authorize_returns_html_page_for_browser_navigation(tmp_path):
+    """浏览器顶层导航（Accept: text/html）拿到说明页，不是一坨 JSON。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        started = client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
+        trace = login_trace_id(*started["state"].split(":"))
+        response = client.get(
+            f"/authorize?refreshToken=RT1&loginTraceID={trace}",
+            headers={"accept": "text/html,application/xhtml+xml"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "TRAE 登录成功" in response.text
+    assert "可以关闭此页面回到管理台" in response.text
+
+
+def test_authorize_browser_failure_page_states_the_reason(tmp_path):
+    """失败也要有中文原因——「没回调也没报错」的另一半在这里补齐。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    app = build_app(settings)
+    with TestClient(app) as client:
+        # 没有任何登录进行中（且请求不带 trace）
+        response = client.get("/authorize?refreshToken=RT",
+                              headers={"accept": "text/html"})
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("text/html")
+        assert "没有进行中的 TRAE 登录" in response.text
+
+        # 结构化失败：JSON 契约不变
+        json_response = client.get("/authorize?refreshToken=RT")
+        assert json_response.json()["error"]["message"] == "no pending TRAE login in progress"
+
+
+# ---------------------------------------------------------------- 粘贴回调链接
+# issue #21 后半段：NAS / 远程部署里 TRAE 跳回调地址常直接「网络错误」，
+# refreshToken 只在浏览器地址栏里，服务端永远收不到。把那条地址粘回管理台，
+# 由 /upstream/complete 用同一条 pending 完成兑换。
+
+
+def _start_trae_login(app, client) -> dict:
+    client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+    return client.post("/api/auth/upstream/start", json={"provider": "trae"}).json()
+
+
+def test_paste_callback_completes_trae_login(tmp_path):
+    """粘贴整条回调地址 → 换 token → 落库 → pending 消费。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+
+    with TestClient(app) as client:
+        started = _start_trae_login(app, client)
+        trace = login_trace_id(*started["state"].split(":"))
+        response = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae",
+            "url": f"/authorize?refreshToken=RT1&loginTraceID={trace}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "success"
+        assert "root" not in app.state.pending_callbacks
+
+    listed = app.state.services.credentials.list_all()
+    assert len(listed) == 1 and listed[0]["provider"] == "trae"
+    assert listed[0]["added_by"] == "root"
+    # 兑换出的 token 绝不出现在响应里（上面只断言了 status）
+
+
+def test_paste_callback_accepts_explicit_state(tmp_path):
+    """带上发起时的 state 也能完成（前端会一并传回）。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        started = _start_trae_login(app, client)
+        response = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae", "state": started["state"],
+            "url": "/authorize?refreshToken=RT1"})
+    assert response.status_code == 200, response.text
+
+
+def test_paste_callback_requires_pending_login(tmp_path):
+    """没有进行中的登录：直接 400，不给「凭一条链接往池子里塞凭证」的口子。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        response = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae", "url": "/authorize?refreshToken=RT1"})
+    assert response.status_code == 400
+    assert "没有进行中的登录" in response.json()["error"]["message"]
+
+
+def test_paste_callback_rejects_expired_pending(tmp_path):
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        started = _start_trae_login(app, client)
+        app.state.pending_callbacks["root"] = (time.monotonic() - 601, started["state"])
+        response = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae", "url": "/authorize?refreshToken=RT1"})
+    assert response.status_code == 400
+    assert "10 分钟有效期" in response.json()["error"]["message"]
+    assert "root" not in app.state.pending_callbacks
+
+
+def test_paste_callback_rejects_foreign_state_and_trace(tmp_path):
+    """贴错链接（另一次登录的 state / 别人那次登录的 trace）一律拒绝。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        started = _start_trae_login(app, client)
+
+        foreign_state = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae", "state": "m:d", "url": "/authorize?refreshToken=RT1"})
+        assert foreign_state.status_code == 400
+        assert "不属于当前这次登录" in foreign_state.json()["error"]["message"]
+
+        foreign_trace = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae",
+            "url": "/authorize?refreshToken=RT1&loginTraceID=0000000000000000"})
+        assert foreign_trace.status_code == 400
+        # 被拒的粘贴不消费 pending：发起人仍能用正确链接走完
+        assert "root" in app.state.pending_callbacks
+        assert started["state"] in app.state.pending_callbacks["root"][1]
+
+
+def test_paste_callback_requires_provider_support(tmp_path):
+    """registry 里没有该渠道（或没有 complete_callback）→ 400。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={})
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "root", "password": "rootpw"})
+        response = client.post("/api/auth/upstream/complete", json={
+            "provider": "trae", "url": "/authorize?refreshToken=RT1"})
+    assert response.status_code == 400
+    assert "does not support callback completion" in response.json()["error"]["message"]
+
+
+def test_cancel_clears_pending_trae_login(tmp_path):
+    """取消 TRAE 登录会清掉待完成回调，不留僵尸 pending。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        started = _start_trae_login(app, client)
+        assert "root" in app.state.pending_callbacks
+
+        # 贴错 state（另一次登录的）不能清掉当前 pending
+        foreign = client.post("/api/auth/upstream/cancel",
+                              json={"provider": "trae", "state": "m:d"})
+        assert foreign.status_code == 400
+        assert "root" in app.state.pending_callbacks
+
+        response = client.post("/api/auth/upstream/cancel",
+                               json={"provider": "trae", "state": started["state"]})
+        assert response.status_code == 200
+        assert response.json() == {"cancelled": True}
+        assert "root" not in app.state.pending_callbacks
+
+        # 再取消一次：没有 pending 可清，回到「不支持」的 400
+        again = client.post("/api/auth/upstream/cancel",
+                            json={"provider": "trae", "state": started["state"]})
+        assert again.status_code == 400
+
+
+def test_cancel_clears_pending_trae_login_without_state(tmp_path):
+    """不带 state 的取消（前端拿不到 state 时）也清当前发起人的 pending。"""
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings, providers={"trae": _mock_trae()})
+    with TestClient(app) as client:
+        _start_trae_login(app, client)
+        response = client.post("/api/auth/upstream/cancel", json={"provider": "trae"})
+    assert response.status_code == 200
+    assert "root" not in app.state.pending_callbacks
+

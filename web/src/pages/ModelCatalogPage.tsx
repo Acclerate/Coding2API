@@ -26,7 +26,7 @@ import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
-import { ColumnHint } from "../components/Tip";
+import { ColumnHint, LongTextTip } from "../components/Tip";
 import { ToastViewport, useToasts } from "../components/Toast";
 import { useSort } from "../hooks/useSort";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
@@ -200,9 +200,10 @@ function ProbePanel({
   return (
     <Panel title="主动探活">
       <p className="text-xs text-muted-foreground">
-        只探仍被「该后端无此模型」负缓存锁住的 (渠道, 模型)：成功即清负缓存、
-        模型立刻回到池子；上游明确说没这个模型才算失败；额度 / 限流 / 网络一律
-        「无法判定」，不禁用。
+        探两类 (渠道, 模型)：仍被「该后端无此模型」负缓存锁住的，以及已判死的。
+        成功即清负缓存、模型立刻回到池子；上游明确说没这个模型才算失败；额度 /
+        限流 / 网络一律「无法判定」，不禁用。判死即从模型列表摘掉且没有到期时间，
+        复探成功是唯一恢复入口。
       </p>
       {error ? (
         <div data-testid="model-probe-error">
@@ -212,7 +213,7 @@ function ProbePanel({
         <Empty data-testid="model-probe-loading">正在读取探活记录…</Empty>
       ) : rows.length === 0 ? (
         <Empty data-testid="model-probe-empty">
-          当前没有被负缓存锁住的模型，也没有探活记录
+          当前没有被负缓存锁住的模型，也没有判死 / 探活记录
         </Empty>
       ) : (
         <div className="space-y-2">
@@ -277,10 +278,16 @@ function ProbePanel({
                         <span className="text-muted-foreground">未探过</span>
                       )}
                       {row.last_error && (
-                        <div className="max-w-[16rem] text-muted-foreground break-words"
-                             title="最近一次探活的错误摘要（未脱敏前的上游原文已截断）">
-                          {row.last_error}
-                        </div>
+                        // 错误摘要可能很长（上游原文）：限宽单行截断，hover 看全文。
+                        // 不折行是必要的——折行会把整列撑宽，挤掉右侧操作列。
+                        <LongTextTip content={row.last_error}>
+                          <div
+                            className="max-w-[16rem] truncate text-muted-foreground"
+                            data-testid={`probe-error-${key}`}
+                          >
+                            {row.last_error}
+                          </div>
+                        </LongTextTip>
                       )}
                     </TableCell>
                     <TableCell label="操作" className="text-xs">

@@ -13,12 +13,13 @@ from src.api.context import build_context_compressor, context_window_for
 from src.compat.openai.request import ChatRequest
 from src.engine.compress import (
     _content_text,
+    _content_tokens,
     _truncate_content,
     compress_messages,
     estimate_messages,
     estimate_tokens,
 )
-from src.provider.base import Model
+from src.provider.base import Model, Usage
 
 
 def _user(text: str) -> dict:
@@ -66,6 +67,29 @@ def test_content_text_counts_image_url_bytes():
     # 畸形 image_url（缺 url / url 非字符串）记 0，不抛异常
     assert _content_text([{"type": "image_url", "image_url": {"url": 5}}]) == ""
     assert _content_text([{"type": "image_url"}]) == ""
+
+
+def test_content_tokens_counts_images_by_length_without_per_char_loop():
+    """token 估算对图片按长度一次算完（逐字符会在大 base64 上阻塞事件循环）。
+
+    权重取 `_OTHER_WEIGHT`（base64 只含字母数字 `+/=`），与逐字符加权的偏差
+    在纯启发式估算里可忽略；口径仍是「图片计入、不按 0 / 固定占位」。
+    """
+    url = "data:image/png;base64," + "A" * 1000
+    content = [{"type": "text", "text": "看图"},
+               {"type": "image_url", "image_url": {"url": url}}]
+    assert _content_tokens(content) == pytest.approx(estimate_tokens("看图") + 0.25 * len(url))
+    # 与 _message_tokens 的接线：整条消息的估算口径一致
+    assert estimate_messages([_user(content)]) == pytest.approx(
+        estimate_tokens("看图") + 0.25 * len(url))
+    # 畸形 part（缺 url / url 非字符串 / 非 dict / text 非字符串）记 0，不抛异常
+    assert _content_tokens([{"type": "image_url", "image_url": {"url": 5}}]) == 0.0
+    assert _content_tokens([{"type": "image_url"}]) == 0.0
+    assert _content_tokens([{"text": 2}]) == 0.0
+    assert _content_tokens([1]) == 0.0
+    assert _content_tokens("x") == estimate_tokens("x")
+    assert _content_tokens(None) == 0.0
+    assert _content_tokens(5) == estimate_tokens("5")
 
 
 def test_estimate_messages_counts_reasoning_tools_and_ids():
@@ -132,6 +156,15 @@ def test_compress_backfill_keeps_older_small_message_when_it_fits():
     tighter = compress_messages(messages, max_input_tokens=11, reserve_for_output=0,
                                 min_keep_messages=1, safety_ratio=1.0)
     assert tighter == [_user("x" * 40)]          # 只能容下最近一条
+
+
+def test_compress_keeps_only_contiguous_suffix():
+    """保留集合不许带洞：跳过装不下的大消息去捞更老的小消息，前缀就复用不了。"""
+    messages = [_user("small"), _user("b" * 400), _user("new")]
+    result = compress_messages(messages, max_input_tokens=8, reserve_for_output=0,
+                               min_keep_messages=1, safety_ratio=1.0)
+    # 装不下 "b"*400 就停：更老的 "small" 不再被捞进来
+    assert result == [_user("new")]
 
 
 def test_compress_keeps_at_least_min_keep_messages_even_when_over_budget():
@@ -209,11 +242,17 @@ class _CacheStub:
 
 
 class _SettingsStub:
-    def __init__(self, *, enabled=True, reserve=0, min_keep=4, ratio=1.0):
+    def __init__(self, *, enabled=True, reserve=0, min_keep=4, ratio=1.0,
+                 prefix_debug=False, sticky=True, tool_compress=False,
+                 tool_max_chars=8000):
         self.context_compress_enabled = enabled
         self.context_compress_reserve_tokens = reserve
         self.context_compress_min_keep_messages = min_keep
         self.context_compress_safety_ratio = ratio
+        self.context_compress_sticky_enabled = sticky
+        self.prefix_debug_enabled = prefix_debug
+        self.tool_output_compress_enabled = tool_compress
+        self.tool_output_compress_max_chars = tool_max_chars
 
 
 def test_context_window_looks_up_by_normalized_and_raw_name():
@@ -309,6 +348,45 @@ def test_compressor_skips_when_window_unknown_or_messages_missing():
     assert compress2("codebuddy", "m", payload2) is payload2
 
 
+def test_tool_compression_applies_even_when_context_compression_off():
+    """tool 输出压缩与窗口无关：上下文压缩关闭时也要生效（省 token 不复用裁剪）。"""
+    noisy = {"role": "tool", "content": "\x1b[31mfatal\x1b[0m\n" * 200}
+    payload = {"messages": [_user("hi"), noisy]}
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True,
+                              tool_max_chars=100))
+
+    out = compress("codebuddy", "m", payload)
+
+    assert out is not payload
+    assert "\x1b[" not in out["messages"][1]["content"]
+    assert "fatal" in out["messages"][1]["content"]
+    # 入参不被修改
+    assert "\x1b[" in noisy["content"]
+
+
+def test_tool_compression_off_keeps_payload_identity():
+    noisy = {"role": "tool", "content": "fatal\n" * 200}
+    payload = {"messages": [noisy]}
+    compress = build_context_compressor({}, {}, _SettingsStub())
+    assert compress("codebuddy", "m", payload) is payload
+
+
+def test_tool_compression_noop_when_under_threshold():
+    """开关打开但 tool 结果没超阈值：零拷贝返回（不能为此重建 payload）。"""
+    payload = {"messages": [{"role": "tool", "content": "ok"}]}
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True, tool_max_chars=100))
+    assert compress("codebuddy", "m", payload) is payload
+
+
+def test_tool_compression_ignores_non_list_messages():
+    payload = {"messages": "not-a-list"}
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True))
+    assert compress("codebuddy", "m", payload) is payload
+
+
 def test_compressor_under_budget_is_noop():
     messages = [_user("short")]
     cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=100000)}}
@@ -375,6 +453,36 @@ def _big_request():
                        raw={"messages": messages})
 
 
+# --------------------------------------------------------- 粘性裁剪（默认开）
+
+def test_sticky_compressor_keeps_prefix_across_turns():
+    """追加消息后前缀不变——这才是上游缓存能命中的前提。"""
+    cache = {"qoder": {"m": Model(id="m", max_input_tokens=400)}}
+    compress = build_context_compressor(
+        cache, {"qoder": {"m": "m"}}, _SettingsStub(min_keep=1, ratio=1.0, reserve=0))
+    history = [_user(f"{index}-" + "x" * 400) for index in range(20)]
+    first = compress("qoder", "m", {"messages": history})["messages"]
+    second = compress("qoder", "m", {"messages": [*history, _user("next")]})["messages"]
+    assert second[:len(first)] == first
+    assert len(second) == len(first) + 1
+
+
+def test_non_sticky_compressor_rewrites_prefix_every_turn():
+    """对照：关掉粘性就是旧行为——每轮窗口边界都跟着新消息前移。"""
+    cache = {"qoder": {"m": Model(id="m", max_input_tokens=400)}}
+    compress = build_context_compressor(
+        cache, {"qoder": {"m": "m"}},
+        _SettingsStub(min_keep=1, ratio=1.0, reserve=0, sticky=False))
+    history = [_user(f"{index}-" + "x" * 400) for index in range(20)]
+    first = compress("qoder", "m", {"messages": history})["messages"]
+    second = compress("qoder", "m",
+                      {"messages": [*history, _user("y" * 400)]})["messages"]
+    assert second[:len(first)] != first
+
+
+# ------------------------------------------------------------- executor 接线
+
+
 @pytest.mark.asyncio
 async def test_executor_compresses_after_pick_with_provider_window():
     """executor 在选号后按该渠道窗口压缩，上游收到的是压缩后的载荷。"""
@@ -428,3 +536,86 @@ async def test_executor_without_compressor_sends_raw_payload():
         pass
     # 未压缩时上游收到的就是原文 messages（_with_model 只补 model 键的浅拷）
     assert seen[0]["messages"] is request.raw["messages"]
+
+
+# ------------------------------------------------------------ 前缀诊断接线
+
+def test_compressor_logs_trim_when_prefix_debug_enabled(caplog):
+    """压缩每轮裁一条 = 前缀边界每轮前移：诊断开启时必须留下证据。"""
+    messages = [_user("old " * 500), _user("new")]
+    cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=50)}}
+    compress = build_context_compressor(
+        cache, {"codebuddy": {"m": "m"}}, _SettingsStub(min_keep=1, prefix_debug=True))
+    with caplog.at_level("INFO"):
+        compress("codebuddy", "m", {"messages": messages})
+    lines = [line for line in caplog.text.splitlines() if "前缀诊断·压缩" in line]
+    assert len(lines) == 1
+    assert "provider=codebuddy" in lines[0]
+    assert "window=50" in lines[0]
+    assert "messages=2→1" in lines[0]
+
+
+def test_compressor_logs_nothing_when_prefix_debug_disabled(caplog):
+    messages = [_user("old " * 500), _user("new")]
+    cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=50)}}
+    compress = build_context_compressor(
+        cache, {"codebuddy": {"m": "m"}}, _SettingsStub(min_keep=1))
+    with caplog.at_level("INFO"):
+        compress("codebuddy", "m", {"messages": messages})
+    assert "前缀诊断" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_executor_reports_prefix_after_compression():
+    """诊断报告的是**发往上游**的那份载荷（压缩后），不是客户端原文。"""
+    from src.engine.executor import Executor, ExecutorDeps
+    from src.provider.base import Event, EventKind
+
+    reports = []
+
+    class Provider:
+        id = "codebuddy"
+
+        async def stream_chat(self, credential_data, payload, model):
+            yield Event(kind=EventKind.CONTENT, content="ok")
+
+    cache = {"codebuddy": {"m": Model(id="m", max_input_tokens=50)}}
+    compress = build_context_compressor(
+        cache, {"codebuddy": {"m": "m"}}, _SettingsStub(min_keep=1))
+    executor = Executor(ExecutorDeps(
+        providers={"codebuddy": Provider()}, credentials=_FakeCredentials(),
+        scheduler=_Scheduler(), context_compress=compress,
+        prefix_debug=lambda *args: reports.append(args)))
+    async for _frame in executor.stream(_big_request(), username="alice"):
+        pass
+    assert len(reports) == 1
+    credential_id, provider_id, model, payload = reports[0]
+    assert (credential_id, provider_id, model) == ("c1", "codebuddy", "m")
+    assert payload["messages"] == [_user("new")]
+
+
+@pytest.mark.asyncio
+async def test_executor_reports_prefix_on_nonstream_path():
+    """非流式聚合路径同样上报（两条主链各一次，不重复报同一轮）。"""
+    from src.engine.executor import Executor, ExecutorDeps
+    from src.provider.base import Event, EventKind
+
+    reports = []
+
+    class Provider:
+        id = "codebuddy"
+
+        async def stream_chat(self, credential_data, payload, model):
+            yield Event(kind=EventKind.CONTENT, content="ok")
+            yield Event(kind=EventKind.USAGE,
+                        usage=Usage(input_tokens=1, output_tokens=1))
+
+    messages = [_user("old " * 500), _user("new")]
+    request = ChatRequest(model="m", messages=messages, stream=False,
+                          raw={"messages": messages})
+    executor = Executor(ExecutorDeps(
+        providers={"codebuddy": Provider()}, credentials=_FakeCredentials(),
+        scheduler=_Scheduler(), prefix_debug=lambda *args: reports.append(args)))
+    await executor.complete(request, username="alice")
+    assert len(reports) == 1
+    assert reports[0][3]["messages"] is messages

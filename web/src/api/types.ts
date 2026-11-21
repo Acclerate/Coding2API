@@ -12,7 +12,10 @@ export type Provider =
   | "zen"
   | "kilo"
   | "qoder"
-  | "codearts";
+  | "codearts"
+  | "officeace"
+  | "raccoon"
+  | "lingxi";
 
 /** 健康度三态：null = 未探测；-1 = 已耗尽；0-100 = 已知剩余百分比。
  * 展示层把 null 再分成「未探测」（付费渠道探测失败）与「无探测」（zen/kilo
@@ -25,8 +28,13 @@ export interface QuotaPackage {
   name: string;
   total: number;
   used: number;
-  /** 到期 epoch；无到期信息为 null */
+  /** 到期 epoch；无到期信息为 null。CodeArts 为整份套餐到期日，非每笔积分到期日 */
   end: number | null;
+  /** 7 天内即将到期的积分（CodeArts 分项包才给）；上游未提供为 null */
+  expiring?: number | null;
+  /** 该池是否真的可用（缺省视为可用）。小浣熊的充值池被冻结时为 false ——
+   * 「看得见用不了」，与「已用完」不是一回事。 */
+  usable?: boolean;
 }
 
 /** 一条 (凭证, 模型) 级冷却：模型级限流或「该渠道无此模型」负缓存。 */
@@ -53,36 +61,28 @@ export interface Credential {
   pinned: 0 | 1;
   health: Health;
   cooling_until: number | null;
+  /** 冷却来源（ErrKind 值，如 soft/credit/plan/restricted）；null=无冷却或来源未知 */
+  cooling_kind: string | null;
   err_count: number;
   quota_remaining: number | null;
   quota_total: number | null;
-  /** 第二本账（仅 CodeArts 有）：积分＝内置模型计费单位，与每日 token 池并行。
-   *  其余渠道恒 null。健康度只看 quota_remaining；积分到期日由后端并入
-   *  到期阶梯参与选号排序，前端不据此改健康度。 */
-  quota_credits_remaining: number | null;
-  quota_credits_total: number | null;
   /** 仅 CodeBuddy 有周期；TRAE 为 null */
   quota_cycle_end: number | null;
-  /** 调度主窗口（36h）内即将到期的积分（与选号排序第一级同源）；无到期信息的渠道为 null。
-   *  CodeArts 已按账本拆分：此字段是**每日池**那一段，积分账那一段见
-   *  `quota_credits_expiring`。 */
+  /** 调度主窗口（36h）内即将到期的积分（与选号排序第一级同源）；无到期信息的渠道为 null */
   quota_expiring_credits: number | null;
   /** 调度次窗口（7 天）内即将到期的积分（主窗口打平时才参与排序的第二级）；同上 */
   quota_expiring_credits_secondary: number | null;
-  /** 积分账自己的主窗口内到期积分（仅 CodeArts 有，其余渠道 null） */
-  quota_credits_expiring: number | null;
-  /** 积分账自己的次窗口内到期积分（仅 CodeArts 有） */
-  quota_credits_expiring_secondary: number | null;
-  /** 积分账派生的健康度（仅 CodeArts 有，其余渠道 null）。
-   *  **不参与调度**：调度只用 `health`（每日池）；本字段只让「内置」展示组
-   *  的健康度与该组额度列讲同一本账，避免「积分还剩 99%、健康度却 0%」。 */
-  quota_credits_health: Health;
   /** 套餐到期阶梯 [[到期 epoch, 该套餐剩余积分]]，仅 CodeBuddy；TRAE 为 null */
   quota_expiry_ladder: [number, number][] | null;
-  /** 积分账那一段到期阶梯（仅 CodeArts）；其余渠道 null */
-  quota_credits_expiry_ladder: [number, number][] | null;
   /** 额度包明细（含包名，仅供展示）；未探测或上游未提供时为 null */
   quota_packages: QuotaPackage[] | null;
+  /** 网页明细源状态：null=未配置/未知，ok=正常，expired=网页会话失效（仅提示） */
+  web_cookie_state: "ok" | "expired" | null;
+  /**
+   * 账号密码状态（仅小浣熊）：null/undefined=未配置，1=已保存。
+   * 只表示「有没有」，密码本身不回显也不下发。
+   */
+  login_secret?: 1 | null;
   /** 生效中的模型级冷却（模型级限流/负缓存）；无则为空数组 */
   model_cooldowns: ModelCooldown[];
   quota_probed_at: number | null;
@@ -94,12 +94,20 @@ export interface Credential {
   growth_last_run_at: number | null;
   /** 该轮一行中文汇报 */
   growth_last_result: string | null;
+  /**
+   * 今日签到（北京时间自然日）本地审计日志里的最近一条结果；今日无记录为
+   * null（任务未轮到 / 已暂停 / 渠道不支持都算「没有结论」，不是失败）。
+   * 组头据此汇总「已签 / 失败 / 未签」，行内「签到记录」抽屉是同一份数据。
+   */
+  checkin_today?: CheckinEvent | null;
   created_at: number;
   added_by: string | null;
   /** 凭证级限额护栏；null = 未配置（不受限） */
   limits: CredentialLimits | null;
   /** 运维标签（仅列表展示与筛选，不参与调度）；无标签为空数组 */
   tags: string[];
+  /** 调度权重：null = 默认；正数越优先、负数当备用（同健康档内生效） */
+  routing_weight: number | null;
 }
 
 /** 凭证级限额护栏（全部按北京自然日；0/null = 该护栏关闭）。 */
@@ -153,7 +161,7 @@ export interface StatsOverview {
   cached_tokens: number | null;
   /** 渠道可选字段，两边都经常为 null */
   credit: number | null;
-  /** credit 是否为推算值（TRAE 按官方单价、CodeArts 福利模型按每日池 1:1），展示加 ≈ */
+  /** credit 是否为推算值（TRAE 按官方单价折算），展示加 ≈ */
   credit_estimated: boolean;
   /** 成本估算（USD，OpenRouter 刊例价 × token）；无可定价明细时为 null（显示 —） */
   cost_usd: number | null;
@@ -163,6 +171,17 @@ export interface StatsOverview {
   avg_latency_ms: number | null;
   /** 平均首字延迟（TTFB）：请求开始到首个内容帧，接近真实体感延迟 */
   avg_ttfb_ms: number | null;
+  /**
+   * 输出速度（tok/s，总产出）：总输出 token ÷ 生成时间总和（不是逐条平均），
+   * 只用经路由的成功请求里**有输出 token** 的样本（不设输出量下限）；无样本为 null（显示 —）。
+   * 分母已剔除物理上不可测的样本（生成窗口 < 200ms 或单条 > 1000 tok/s。
+   * 无首字数据时回落估算口径并置 tps_estimated（展示加 ≈）。
+   */
+  tps: number | null;
+  /** 输出速度（tok/s，正文）：`output_tokens - reasoning_tokens` ÷ 同一生成时间总和 */
+  tps_visible: number | null;
+  /** tps 是否为估算值（估算分母含首字等待，样本门槛与主口径一致） */
+  tps_estimated: boolean;
 }
 
 /**
@@ -187,6 +206,16 @@ export interface GroupStats {
   avg_latency_ms: number | null;
   /** 平均首字延迟（ms）：ttfb_sum ÷ 成功数，读小时汇总；无成功请求为 null */
   avg_ttfb_ms: number | null;
+  /**
+   * 输出速度（tok/s，总产出）：总输出 token ÷ 生成时间总和，读明细表（仅 90 天）；
+   * 该维度无路由样本时回落估算口径（分母改用端到端耗时，含首字等待）。
+   * 分母已剔除物理上不可测的样本（生成窗口 < 200ms 或单条 > 1000 tok/s）。
+   */
+  tps: number | null;
+  /** 输出速度（tok/s，正文）：`output_tokens - reasoning_tokens` ÷ 同一生成时间总和 */
+  tps_visible: number | null;
+  /** tps 是否为估算值（展示加 ≈）；两个口径都无样本时为 false 且 tps 为 null */
+  tps_estimated: boolean;
   /** P95 耗时（ms）：按成功请求 nearest-rank 取第 ⌈0.95n⌉ 小，读明细表（仅 90 天） */
   p95_latency_ms: number | null;
   /** P95 首字延迟（ms）：同 p95_latency_ms，只数上报过 ttfb 的样本 */
@@ -213,26 +242,56 @@ export interface CredentialStats extends GroupStats {
   credential_name: string | null;
 }
 
-/** 图表指标：请求次数 / token 消耗 / 成本 / 平均耗时 / 平均首字延迟。 */
-export type StatsMetric = "requests" | "tokens" | "cost" | "latency" | "ttfb";
+/** 图表指标：请求次数 / token 消耗 / 成本 / 平均耗时 / 平均首字延迟 / 成功率 / 缓存命中率 / 单请求成本。 */
+export type StatsMetric =
+  | "requests"
+  | "tokens"
+  | "cost"
+  | "latency"
+  | "ttfb"
+  | "success_rate"
+  | "cache_rate"
+  | "cost_per_request";
 
-/** 小时粒度时间序列点（usage_hourly 聚合，跨 model 汇合）。值语义随 metric 变化。 */
+/** 小时粒度时间序列点（usage_hourly 聚合，跨 model 汇合）。值语义随 metric 变化。
+ *
+ *  时间轴是**稠密**的：后端按小时补齐缺失桶（见 `StatsQuery.timeline`），
+ *  因此相邻点的 `hour` 差值恒为 3600。缺失桶的取值按指标语义区分——可加量
+ *  （请求数 / token）补 0，均值与比率补 `null`（前端据此断线，不画成 0）。 */
 export interface TimelinePoint {
   /** UTC 秒，对齐到小时起点 */
   hour: number;
-  /** 各渠道指标值（渠道名为动态键：codebuddy / trae / zen…） */
-  [provider: string]: number;
+  /** 各渠道指标值（渠道名为动态键：codebuddy / trae / zen…）；无样本为 null */
+  [provider: string]: number | null;
 }
 
 /** 按模型趋势：每小时各 Top N 模型的指标值（模型名为动态键）。 */
 export interface ModelTimelinePoint {
   hour: number;
-  [model: string]: number;
+  [model: string]: number | null;
 }
 
 export interface ModelTimelineResponse {
   models: string[];
   points: ModelTimelinePoint[];
+}
+
+/** 分位时序点：某小时的 P50（中位数）与 P95（上界）延迟，读明细表（仅 90 天）。 */
+export interface PercentilePoint {
+  hour: number;
+  /** 该小时 P50；无成功样本为 null（断线） */
+  p50: number | null;
+  /** 该小时 P95；无成功样本为 null（断线） */
+  p95: number | null;
+  /** 该小时的样本条数（0 = 空档），用于标注「样本很少」 */
+  samples: number;
+}
+
+export interface PercentileTimelineResponse {
+  points: PercentilePoint[];
+  metric: "latency" | "ttfb";
+  /** 明细保留期（天）：分位只能覆盖这段窗口 */
+  window_days: number;
 }
 
 /** 逐请求明细（usage_events，仅保留 90 天）。 */
@@ -252,7 +311,7 @@ export interface UsageEventRow {
   output_tokens: number | null;
   cached_tokens: number | null;
   credit: number | null;
-  /** credit 是否为推算值（TRAE 按官方单价、CodeArts 福利模型按每日池 1:1），展示加 ≈ */
+  /** credit 是否为推算值（TRAE 按官方单价折算），展示加 ≈ */
   credit_estimated: number;
   /** 成本估算（USD，OpenRouter 刊例价）；未匹配到定价或未上报 token 时为 null */
   cost_usd: number | null;
@@ -262,6 +321,14 @@ export interface UsageEventRow {
   latency_ms: number | null;
   /** 首字延迟（TTFB）：请求开始到首个内容帧；无帧（如预热失败）时为 null */
   ttfb_ms: number | null;
+  /**
+   * 本条请求的输出速度（tok/s，总产出）：输出 token ÷ 生成时间（耗时 − 首字）。
+   * 与分组表同规则（有输出 token、生成窗口 ≥ 200ms、单条 ≤ 1000 tok/s），但
+   * **不回落估算口径**——逐行没有相邻样本摊平首字等待；不合格时为 null（显示 —）。
+   */
+  tps: number | null;
+  /** 本条请求的正文速度（tok/s）：`输出 − 思考` ÷ 同一生成时间；正文为 0 时 null */
+  tps_visible: number | null;
   /** 请求 ID（与响应头 X-Request-ID 同值）；老库历史行为 null */
   request_id: string | null;
 }
@@ -335,6 +402,10 @@ export interface UserRow {
   created_by: string | null;
   /** 是否有待使用的一次性激活令牌（摘要本身不会下发） */
   pending_activation: boolean;
+  /** 用户级模型白名单（Playground 直连用；fnmatch glob，逗号分隔，'' = 不限制） */
+  allowed_models: string;
+  /** 用户级配额（JSON 文本，'' = 不限制）；用量按用户名聚合 */
+  quota: string;
 }
 
 /** 创建/重置用户时返回：明文令牌只出现这一次。 */
@@ -372,6 +443,78 @@ export interface ActivationDescribe {
   valid: boolean;
 }
 
+/** 渠道 ToS 风险登记（运营判断）：导入对话框展示，不参与调度。 */
+export interface BackupEntry {
+  name: string;
+  size: number;
+  created_at: number;
+}
+
+export interface PendingRestore {
+  filename: string;
+  size: number;
+  uploaded_at: number;
+}
+
+export interface BackupListResponse {
+  backups: BackupEntry[];
+  /** 已上传、等重启生效的恢复文件；没有则为 null */
+  pending: PendingRestore | null;
+}
+
+export interface BatchImportEntry {
+  provider: string;
+  credential: unknown;
+  nickname?: string;
+  tags?: string[];
+}
+
+/** 批量导入结果：下标对应提交数组，前端按行保留失败/跳过项供重试。 */
+export interface BatchImportResult {
+  created: { index: number; id: string; tos: TosRisk }[];
+  skipped: { index: number; reason: string }[];
+  failed: { index: number; reason: string }[];
+}
+
+export interface TosRisk {
+  level: "green" | "gray" | "red";
+  reason: string;
+  basis: string;
+}
+
+/** 账单里的一行（按人 / 按 Key 共用形状；Key 行多 `key_name`）。 */
+export interface BillingRow {
+  username?: string | null;
+  api_key_id?: string;
+  key_name?: string | null;
+  requests: number;
+  ok_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number | null;
+  credit: number | null;
+  cost_usd: number | null;
+  cost_cny: number | null;
+  success_rate?: number | null;
+  [key: string]: unknown;
+}
+
+export interface BillingReport {
+  month: string;
+  start: number;
+  end: number;
+  users: BillingRow[];
+  keys: BillingRow[];
+  totals: {
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_cny: number;
+    cost_usd: number;
+    success_rate: number | null;
+  };
+}
+
 export interface CredentialsResponse {
   credentials: Credential[];
   /** 调度主到期排序窗口（秒）；与列表中各凭证的到期积分同一口径 */
@@ -384,6 +527,8 @@ export interface CredentialsResponse {
   is_admin: boolean;
   /** 凭证写门槛（admin 或 operator）：与后端 require_operator 同口径 */
   is_operator: boolean;
+  /** 渠道 → ToS 风险（green/gray/red + 理由），导入前提示 */
+  tos_risks: Record<string, TosRisk>;
 }
 
 export interface UpstreamAuthStart {
@@ -391,11 +536,16 @@ export interface UpstreamAuthStart {
   state: string;
   auth_url: string | null;
   interval: number | null;
+  /** 回调轨道的落点（后端 PUBLIC_BASE_URL + /authorize）；poll 轨道为 null。
+   * 透出到界面是为了让「回调地址指错主机」这类静默失败可见。 */
+  callback_url?: string | null;
 }
 
 export interface UpstreamAuthPoll {
   status: "pending" | "success";
   credential_id?: string;
+  /** true = 同一上游账号重新登录，已更新既有凭证而非新建。 */
+  merged?: boolean;
 }
 
 /** 后端保证是稳定的机器可读枚举，不是 Python 异常类名。 */
@@ -470,6 +620,24 @@ export interface GrowthEvent {
   trigger: string;
 }
 
+/** 签到审计日志（checkin_events 表一行） */
+export interface CheckinEvent {
+  id: string;
+  credential_id: string;
+  /** 执行时刻（epoch 秒） */
+  ts: number;
+  ok: 0 | 1;
+  /** 1=上游判「今日已签」（已签不算错误） */
+  already: 0 | 1;
+  /** 本次领取积分；上游未给数量时为 null */
+  credit: number | null;
+  /** 上游业务码；无此信息时为 null */
+  code: number | null;
+  message: string;
+  /** auto=定时任务；manual=管理台手动执行 */
+  trigger: string;
+}
+
 /** 变动流水：两次额度探测之间的**净变化**，不是动作归因。 */
 export interface CreditEvent {
   id: string;
@@ -484,7 +652,7 @@ export interface CreditEvent {
   delta: number | null;
   /** observed=两次探测间净变化；sync=首次建立基线（无对照） */
   source: string;
-  /** 账本：pool=每日 token 池（福利模型）；credits=积分账（内置模型） */
+  /** 账本：pool=套餐/每日池余额（CodeArts 之外的渠道）；credits=积分（CodeArts） */
   ledger: string;
 }
 
@@ -565,13 +733,7 @@ export interface ModelInfo {
   /** 上游为该模型配置的默认推理档位（字符串，如 `high` / `medium`；无则为空串/缺失） */
   default_effort?: string;
   /** 多渠道模型才有：按渠道给出倍率与**该渠道实际请求的 key**（raw key 永不改动） */
-  by_provider?: Record<string, { credit_rate?: number; raw_id?: string; benefit?: boolean }>;
-  /**
-   * 福利模型标记（当前只有 CodeArts）：来自「限时免费套餐」目录，走每日
-   * token 池而非积分账、上游不给倍率。单渠道条目读这里；多渠道按
-   * `by_provider.{渠道}.benefit` 分渠道判断（见 providerBenefit）。
-   */
-  benefit?: boolean;
+  by_provider?: Record<string, { credit_rate?: number; raw_id?: string }>;
   /** 能力分（Artificial Analysis 指数）：匹配不到该模型的第三方成绩时整个字段缺失 */
   benchmarks?: ModelBenchmarks;
 }
@@ -676,6 +838,8 @@ export interface RuntimeSetting {
   task: string | null;
   /** task 为 null 时的网关卡组 key（见 SettingsResponse.groups）；task 非空时为 null */
   group: string | null;
+  /** 任务卡片内的分节标题（同一任务内聚合）；null = 不分组 */
+  section: string | null;
 }
 
 /** 网关卡组（后端下发顺序与文案），用于把无任务归属的项拆成一级 tab。 */
@@ -703,6 +867,8 @@ export interface TaskStatus {
   key: string;
   name: string;
   description: string;
+  /** 业务分组 key（见 TasksResponse.groups），页面二级 tab 用 */
+  group: string;
   interval_seconds: number;
   /** 开关类任务（目前只有活跃上报）的当前状态；其余恒为 true */
   enabled: boolean;
@@ -719,6 +885,8 @@ export interface TaskStatus {
 
 export interface TasksResponse {
   tasks: TaskStatus[];
+  /** 任务业务分组（顺序即展示顺序）；空列表 = 无已装配任务 */
+  groups: SettingsGroup[];
   /** 服务端当前时间（epoch 秒）：算「距今多久」用服务端时钟，避免浏览器偏移 */
   server_time: number;
 }

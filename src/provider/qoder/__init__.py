@@ -33,6 +33,7 @@ from ...provider.base import (
     Model,
     Quota,
 )
+from ...tasks.pacer import paced
 from . import events as qoder_events
 from .client import QoderClient, realm_for
 from .credential import QoderCredential, parse_credential
@@ -108,6 +109,16 @@ class QoderProvider:
             return Quota(probed_at=int(time.time()))
         return await self.client.probe_quota(credential)
 
+    def set_web_cookie(self, credential_data: dict, cookie: str) -> dict:
+        """写入/清除网页 Cookie（逐包到期的数据源，见 `client.probe_quota`）。
+
+        只改这一个字段：不重走 `from_dict` 归一，避免把老凭证里未识别的字段
+        丢掉（导出/再导入的可逆性靠这条保证）。空串 = 清除，回到汇总口径。
+        """
+        data = dict(credential_data)
+        data["web_cookie"] = cookie
+        return data
+
     async def list_models(self, credential_data: dict) -> list[Model]:
         return await self.client.fetch_models(
             QoderCredential.from_dict(credential_data))
@@ -116,15 +127,9 @@ class QoderProvider:
                           model: str) -> AsyncIterator[Event]:
         credential = QoderCredential.from_dict(credential_data)
         key = credential_key(credential)
-        if self.pacer is not None:
-            await self.pacer.wait_turn(key)
-        try:
+        async with paced(self.pacer, key):
             async for event in self.client.stream_chat(credential, payload, model):
                 yield event
-        finally:
-            # 并发模式必须归还名额，否则该凭证被当成永远在途而失去节流
-            if self.pacer is not None:
-                self.pacer.release(key)
 
     # ---------------------------------------------------------------- 签到
 

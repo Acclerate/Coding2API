@@ -335,6 +335,31 @@ def test_blocked_webhook_host_covers_literal_and_resolved_paths(monkeypatch):
     assert blocked_webhook_host("https://unresolvable.example/x") is True
 
 
+def test_blocked_webhook_host_covers_non_global_ranges(monkeypatch):
+    """`is_private` 覆盖不到的段必须显式拦，否则是现成的 SSRF 口子。
+
+    `ipaddress.is_private` 对 CGNAT 共享段（100.64.0.0/10）与若干保留段返回
+    False；而这些地址在部分云厂商内是可达的内网（实测 100.100.100.200 能通）。
+    """
+    from src.runtime_settings import blocked_webhook_host
+
+    for url in ("http://100.64.0.1/hook",        # RFC 6598 CGNAT
+                "http://100.100.100.200/hook",   # 实测可达的云内地址
+                "http://198.18.0.1/hook",        # 基准测试段
+                "http://203.0.113.5/hook"):      # 文档段
+        assert blocked_webhook_host(url) is True, url
+
+    # 解析到这些段的域名同样拦
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo",
+                        lambda host, port: [(2, 1, 6, "", ("100.100.100.200", 0))])
+    assert blocked_webhook_host("https://cgnat.example/x") is True
+
+    # 公网地址照常放行（不误伤）
+    monkeypatch.setattr("src.runtime_settings.socket.getaddrinfo",
+                        lambda host, port: [(2, 1, 6, "", ("93.184.216.34", 0))])
+    assert blocked_webhook_host("https://hook.example/a") is False
+
+
 def test_env_webhook_url_is_validated_at_load(tmp_path):
     """env 提供的 ALERT_WEBHOOK_URL 也要过校验（不能只靠运行时失败兜底）。"""
     from src.db.repo import RuntimeSettingsRepository
@@ -347,3 +372,48 @@ def test_env_webhook_url_is_validated_at_load(tmp_path):
     with pytest.raises(InvalidSetting, match="内网/回环/保留"):
         load_runtime_settings(base, RuntimeSettingsRepository(db))
     db.close()
+
+
+def test_feishu_and_slack_urls_share_webhook_validation(tmp_path):
+    """新增出口与通用 webhook 同一套 URL 校验，不能成为 SSRF 侧门。"""
+    from src.db.repo import RuntimeSettingsRepository
+    from src.runtime_settings import InvalidSetting, load_runtime_settings
+
+    db = Database(tmp_path / "t2.sqlite3")
+    apply_schema(db.connect())
+    base = Settings(_env_file=None, APP_SECRET=SECRET)
+    runtime = load_runtime_settings(base, RuntimeSettingsRepository(db))
+    for key in ("alert_feishu_webhook_url", "alert_slack_webhook_url"):
+        with pytest.raises(InvalidSetting, match="只支持 http/https"):
+            runtime.set_many({key: "file:///etc/passwd"})
+        with pytest.raises(InvalidSetting, match="内网/回环/保留"):
+            runtime.set_many({key: "http://127.0.0.1/x"})
+        runtime.set_many({key: "https://hooks.example/x"})
+        assert getattr(runtime, key) == "https://hooks.example/x"
+    db.close()
+
+
+def test_window_dead_channels_zero_success_only(repo):
+    """零成功的渠道才报：有任一成功即排除；样本不足也排除。"""
+    _credentials, db = repo
+    stats = StatsCollector(db)
+    # officeace：3 次全失败
+    for offset in (0, 10, 20):
+        stats.record(username="u", provider="officeace", model="m", ok=False,
+                     now=1000 + offset)
+    # codebuddy：失败 2 次 + 成功 1 次 → 有成功，不算死亡
+    stats.record(username="u", provider="codebuddy", model="m", ok=False, now=1000)
+    stats.record(username="u", provider="codebuddy", model="m", ok=False, now=1010)
+    stats.record(username="u", provider="codebuddy", model="m", ok=True, now=1020)
+    # trae：只有 1 次失败 → 样本不足
+    stats.record(username="u", provider="trae", model="m", ok=False, now=1030)
+
+    rows = stats.window_dead_channels(since=1000, min_requests=2)
+    assert [row["provider"] for row in rows] == ["officeace"]
+    assert rows[0]["requests"] == 3
+    # 窗口内的成功时刻会带出来（无成功则为 None）
+    assert rows[0]["last_ok"] is None
+    assert [row["provider"] for row in stats.window_dead_channels(
+        since=1000, min_requests=1)] == ["officeace", "trae"]
+    # 窗口外不计
+    assert stats.window_dead_channels(since=2000, min_requests=1) == []

@@ -2,8 +2,8 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { CredentialsPage } from "../CredentialsPage";
 import {
-  expandCredentialGroups, jsonResponse, makeCredential, mockFetch, renderPage, settle,
-  userEvent,
+  expandCredentialGroups, jsonResponse, makeCredential, renderPage, settle, userEvent,
+  mockCredentialsFetch as mockFetch,
 } from "@/test-utils";
 
 const ADMIN = { username: "root", is_admin: true } as const;
@@ -339,6 +339,24 @@ describe("CredentialsPage 批量运维", () => {
     await userEvent.click(screen.getByTestId("batch-probe"));
     const error = await screen.findByTestId("credentials-error");
     expect(error).toHaveTextContent("operator only");
+  });
+
+  it("网络层异常不把 Failed to fetch 原样丢给用户", async () => {
+    mockFetch({
+      "/api/credentials/batch": () => {
+        // fetch 本身失败（断网 / 反代挂了）走的是 TypeError，没有可展示文案
+        throw new TypeError("Failed to fetch");
+      },
+      "/api/credentials": listBody([makeCredential({ id: "cb1", provider: "codebuddy" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("batch-probe"));
+    const error = await screen.findByTestId("credentials-error");
+    expect(error).toHaveTextContent("批量操作失败");
+    expect(error).not.toHaveTextContent("Failed to fetch");
   });
 
   it("筛选隐藏的行不进入批量动作（选中集合与筛选结果求交）", async () => {

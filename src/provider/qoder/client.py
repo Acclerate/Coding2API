@@ -39,13 +39,14 @@ from ...provider import base
 from ...provider.base import (
     CheckinResult,
     CheckinStatus,
+    ErrKind,
     Event,
     EventKind,
     Model,
     Quota,
     UpstreamTransportError,
 )
-from ...provider.proxy import build_client
+from ..lazy_clients import LazyClients
 from . import events as qoder_events
 from .cosy import CosySession, CosySessionCache, qoder_encode
 from .credential import QoderCredential, merge_refreshed
@@ -69,8 +70,7 @@ logger = logging.getLogger(__name__)
 # 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
 # 经代理链路 10s 会稳定超时；首字等待由 read=None +
 # stream_first_event_timeout_seconds 负责，两者不要混为一谈。
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
-SHORT_TIMEOUT = httpx.Timeout(30.0)
+
 
 # 本区域无签到接口的 HTTP 状态（国际版实测 404；405/410 同义）。活动制与旧接口
 # 共用：两者都不可用才算「本区域无签到」。
@@ -126,6 +126,40 @@ def _openapi_request_id(uid: str) -> str:
     from .cosy import derive_request_id
 
     return derive_request_id(uid)
+
+
+def _normalize_null_content(messages: list[dict[str, Any]]) -> int:
+    """把 `content: null` 归一为空串（返回改写条数）。
+
+    OpenAI 允许「带 tool_calls 的 assistant 把 content 置为 null」，但 Qoder
+    上游不接受：它把这条消息当成「没有内容」而跳过，紧随其后的 `role:"tool"`
+    就成了孤儿，于是以 400 `Messages with role 'tool' must be a response to a
+    preceding message with 'tool_calls'` 拒绝——报文指向 tool 配对，真实原因
+    却是 assistant 的 null content（2026-10-23 实测：同一请求体只把 null 换成
+    `""` 即从 400 变 200，且与 reasoning_content / 并行调用 / 轮数无关）。
+
+    `""` 与 `null` 语义等价（都表示「这条 assistant 没有正文」），对上游是
+    合法形状，所以这里就地归一，不改其他字段。
+    """
+    rewritten = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") not in ("assistant", "tool"):
+            continue
+        if message.get("content", "") is None:
+            message["content"] = ""
+            rewritten += 1
+    return rewritten
+
+
+def _normalize_developer_role(messages: list[dict[str, Any]]) -> int:
+    """把 `role: "developer"` 归一为 `system`（返回改写条数）。
+
+    实现已上收到 `provider.base.normalize_developer_role`（八条渠道共用一份，
+    见那里的实测记录）；这里保留薄封装，避免改动 qoder 内部调用点。
+    """
+    return base.normalize_developer_role(messages)
 
 
 def _drop_orphan_tool_messages(
@@ -186,8 +220,24 @@ def build_chat_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
     messages = json.loads(json.dumps(raw_messages)) if raw_messages is not None else []
     # 非 list 形状（畸形请求）交给上游裁决，不做结构假设
     dropped = 0
+    rewritten = 0
+    developers = 0
     if isinstance(messages, list):
+        # 必须先归一 null content：上游把 content:null 的 assistant 当空消息跳过，
+        # 其后的 tool 结果就成了孤儿并被报成 tool 配对错误（见函数 docstring）
+        rewritten = _normalize_null_content(messages)
+        developers = _normalize_developer_role(messages)
         messages, dropped = _drop_orphan_tool_messages(messages)
+    if developers:
+        # DEBUG：归一属于成功路径（同 null content），不该占 INFO/WARNING
+        logger.debug("Qoder 请求把 %d 条 developer 角色归一为 system", developers)
+    if rewritten:
+        # DEBUG 而非 INFO：这是每请求都可能命中一次的「已自动修复」提示，不是
+        # 故障。实测 Qoder 长会话下每请求都打（7 天 10309 行），占 err.log 的
+        # 19%，把真正的 WARNING 挤出视野。归一是**成功路径**，排障时按需
+        # 打开 DEBUG 即可。
+        logger.debug("Qoder 请求把 %d 条消息的 null content 归一为空串"
+                     "（上游会把它当空消息跳过、再报 tool 配对 400）", rewritten)
     if dropped:
         # 只记条数：正文里可能有用户数据，日志不落消息内容
         logger.warning("Qoder 请求含 %d 条孤立 tool 消息，已丢弃（上游会以 400 拒绝）",
@@ -218,7 +268,7 @@ def build_chat_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
     return body
 
 
-class QoderClient:
+class QoderClient(LazyClients):
     """上游 HTTP 客户端。`host` = openapi（业务），`gateway` = 推理网关。
 
     主机与登录地址可覆盖（测试 / 灰度）；HTTP 客户端可注入 MockTransport。
@@ -246,23 +296,6 @@ class QoderClient:
         self._now = now or (lambda: int(time.time()))
         self._model_cache: dict[str, tuple[float, list[Model]]] = {}
         self._proxy = proxy
-
-    @property
-    def _stream(self) -> httpx.AsyncClient:
-        if self._stream_client is None:
-            self._stream_client = build_client(timeout=STREAM_TIMEOUT, proxy=self._proxy)
-        return self._stream_client
-
-    @property
-    def _short(self) -> httpx.AsyncClient:
-        if self._short_client is None:
-            self._short_client = build_client(timeout=SHORT_TIMEOUT, proxy=self._proxy)
-        return self._short_client
-
-    async def aclose(self) -> None:
-        for client in (self._stream_client, self._short_client):
-            if client is not None:
-                await client.aclose()
 
     # --------------------------------------------------------------- 推理流
 
@@ -331,13 +364,31 @@ class QoderClient:
         if envelope is None:
             return []
         if envelope.status != 200:
-            kind = qoder_events.classify_error_code(envelope.status, envelope.body)
+            # 排队信号必须在分类**之前**拦下：上游把「排队中」包成 403，而
+            # 403 在这里会被 classify_error_code 判成 DEAD 直接硬禁用凭证——
+            # 排队恰恰说明号是好的，只是忙。同时把上游点名的等待秒数带给
+            # executor，它据此在原号上重开（见 executor 的排队重开）。
+            queue_wait = base.parse_queue_hint(envelope.body)
+            if queue_wait is not None:
+                return [Event(kind=EventKind.ERROR, error_code=envelope.status,
+                              error_message=envelope.body[:2000],
+                              error_kind=ErrKind.QUEUE,
+                              retry_after_seconds=queue_wait)]
+            # 信封错误与 HTTP 错误必须同一判据：早先这里直接调
+            # `classify_error_code`，403 不看会话失效标记就判 DEAD——「每日计费
+            # 次数用尽」这类次日自愈的号被硬禁用（实测 2026-10-27 15:39）。
+            kind = qoder_events.classify_status(envelope.status, envelope.body.encode())
             # 200 字符只够看到外层 `"details":"{\"error\":{\"message\":...`——上游把
             # 真实原因嵌在转义的 details 里，截断后根因（如缺哪个 tool_call_id）
             # 永久丢失，排障时等于没打。放宽到 2000。
             return [Event(kind=EventKind.ERROR, error_code=envelope.status,
                           error_message=envelope.body[:2000], error_kind=kind)]
         if envelope.body == "[DONE]":
+            return []
+        # 保活帧：上游发 `body:"null"`（外层 200、内层 JSON null）保活，
+        # 不含内容。丢掉即可，绝不能当协议违规——那会把正常输出打断成
+        # 「流式响应失败」（2026-10-26 实测连续 13 次）。
+        if qoder_events.is_keepalive_body(envelope.body):
             return []
         return qoder_events.parse_inner_chunk(envelope.body)
 
@@ -400,9 +451,43 @@ class QoderClient:
     # ---------------------------------------------------------------- 额度
 
     async def probe_quota(self, credential: QoderCredential) -> Quota:
-        """`GET {openapi}/api/v2/quota/usage`（`userQuota` + `addOnQuota`）。"""
+        """额度探测：优先网页接口（逐包到期），回退 device token 的汇总接口。
+
+        网页账号页的 `/api/v2/me/usages/big_model_credits` 才给 per-package
+        `expires_at`；device token 的 `/api/v2/quota/usage` 只有两桶汇总，顶层
+        `expiresAt` 是周期重置值（实测 9999-12-31），不能当包级到期用。前者
+        需要网页登录 Cookie，且会过期——打不通就静默回退，不影响出号。
+        """
+        if credential.web_cookie:
+            web = await self._probe_web_quota(credential)
+            if web is not None:
+                return web
         data = await self._get_json(f"{self.host}{EP_QUOTA}", credential)
         return qoder_events.parse_quota(data, now=self._now())
+
+    async def _probe_web_quota(self, credential: QoderCredential) -> Quota | None:
+        """网页额度接口；Cookie 失效/形状变化一律返回 None（由调用方回退）。"""
+        config = credential.realm_config()
+        url = f"{config.website}{qoder_events.EP_CREDITS_WEB}"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": credential.web_cookie,
+            "User-Agent": qoder_events.WEB_ACCOUNT_UA,
+            "Origin": config.website,
+            "Referer": config.website + "/account/usage",
+        }
+        try:
+            response = await self._short.get(url, headers=headers)
+            data = await _parse_json_response(response, url)
+        except (base.UpstreamHTTPError, base.UpstreamTransportError,
+                qoder_events.UpstreamProtocolViolation, httpx.HTTPError) as error:
+            # Cookie 会过期（网页会话寿命，不是 token 寿命），上游也可能删接口。
+            # 这里只是「少一份明细」，不是凭证问题：不回写失败、不冷却、不告警，
+            # 回退到汇总接口继续出号。
+            logger.info("qoder 网页额度接口不可用（%s: %s），回退 /quota/usage",
+                        type(error).__name__, error)
+            return None
+        return qoder_events.parse_web_quota(data, now=self._now())
 
     # ---------------------------------------------------------------- 签到
 

@@ -90,8 +90,7 @@ def test_batch_probe_success_path(batch_app):
     assert body["succeeded"] == 2 and body["failed"] == 0
     assert all(row["ok"] for row in body["results"])
     assert body["results"][0]["detail"] == {
-        "probed": True, "remaining": 7, "total": 10, "cycle_end": None,
-        "credits_remaining": None, "credits_total": None}
+        "probed": True, "remaining": 7, "total": 10, "cycle_end": None}
     # 探测是只读语义：不写审计（与单条端点一致）
     assert app.state.audit.query(action="credential.toggle") == []
 
@@ -127,18 +126,23 @@ def test_batch_checkin_failure_keeps_ok_false(batch_app):
     assert body["results"][0]["ok"] is False
     assert body["succeeded"] == 0
 
-def test_batch_checkin_already_checked_in_does_not_schedule(batch_app):
-    """今天已签过：ok=True 但不触发探测（重复签到不发积分）。"""
+def test_batch_checkin_already_checked_in_still_refreshes_quota(batch_app):
+    """今天已签过：ok=True 也要重探测——套餐明细/额度合计要跟着刷新。"""
     app, client = batch_app
     credential_id = _add(app)
-    app.state.executor._deps.providers["codebuddy"] = _StubProvider(
+    stub = _StubProvider(
         checkin=CheckinResult(ok=True, credit=0, already_checked_in=True))
-    before = len(app.state.pending_probes)
+    app.state.executor._deps.providers["codebuddy"] = stub
 
     body = client.post("/api/credentials/batch",
                        json={"action": "checkin", "ids": [credential_id]}).json()
     assert body["results"][0]["detail"]["already_checked_in"] is True
-    assert len(app.state.pending_probes) == before
+    # 即时探测是后台 Task，完成即摘除；看桩被调用而不是看 pending 列表
+    for _ in range(50):
+        if stub.probed:
+            break
+        time.sleep(0.02)
+    assert stub.probed == ["called"]
 
 def test_batch_toggle_sets_explicit_state(batch_app):
     app, client = batch_app
@@ -201,6 +205,31 @@ def test_batch_revive_reports_missing_credential(batch_app):
     assert rows[credential_id]["disabled"] == 0
     events = app.state.audit.query(action="credential.revive")
     assert len(events) == 1 and events[0]["detail"] == "批量 revive：1/2 成功"
+
+def test_batch_revive_force_clears_upstream_cooldown(batch_app):
+    """批量 revive 也支持 `force`：默认保留上游点名的冷却，force 才清。"""
+    import time
+
+    app, client = batch_app
+    credential_id = _add(app)
+    future = int(time.time()) + 3600
+    db = app.state.credentials._db
+    db.connect().execute(
+        "UPDATE credentials SET disabled = 1, cooling_until = ?, cooling_kind = 'soft' "
+        "WHERE id = ?", (future, credential_id))
+    db.connect().commit()
+
+    client.post("/api/credentials/batch",
+                json={"action": "revive", "ids": [credential_id]})
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert rows[credential_id]["disabled"] == 0
+    assert rows[credential_id]["cooling_until"] == future
+
+    client.post("/api/credentials/batch",
+                json={"action": "revive", "ids": [credential_id], "force": True})
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert rows[credential_id]["cooling_until"] is None
+
 
 def test_batch_toggle_resume_writes_enabled_direction(batch_app):
     """批量「取消暂停」（enabled=true）与「暂停」是同一动作，靠审计方向区分。
@@ -319,7 +348,13 @@ def test_batch_upstream_exception_is_contained(batch_app):
     assert "abc123" not in str(body)
 
 def test_batch_non_upstream_exception_is_contained(batch_app):
-    """非探测路径的意外异常（如 checkin 抛错）也逐条兜住，不整批 500。"""
+    """非探测路径的意外异常（如 checkin 抛错）也逐条兜住，不整批 500。
+
+    签到失败现在由 `checkin_credential_once` 收成 `ok=False` 的**正常结果**
+    （见 `src/api/admin_credentials.py`）：上游拒绝是这条凭证的真实答复，
+    不是端点故障。故这里拿到的 detail 是失败结果而非 `action_failed`——
+    两种形态都不整批 500、都不回显上游原文。
+    """
     app, client = batch_app
     credential_id = _add(app)
 
@@ -335,8 +370,35 @@ def test_batch_non_upstream_exception_is_contained(batch_app):
                            json={"action": "checkin", "ids": [credential_id]})
     assert response.status_code == 200
     body = response.json()
-    assert body["results"][0] == {"id": credential_id, "ok": False, "error": "action_failed"}
+    row = body["results"][0]
+    assert row["id"] == credential_id and row["ok"] is False
+    # 失败原因可读，且不回显上游原文（可能带凭证片段）
+    assert row["detail"]["message"] == "签到失败：unknown_error"
     assert "abc123" not in response.text
+
+def test_batch_unexpected_exception_is_contained_per_item(batch_app):
+    """非签到/非探测路径的意外异常逐条兜住：整批仍 200，不回显异常原文。"""
+    app, client = batch_app
+    credential_id = _add(app)
+
+    def boom(_credential_id: str) -> bool:
+        raise RuntimeError("db exploded, secret abc123")
+
+    original = app.state.credentials.set_enabled
+    app.state.credentials.set_enabled = boom
+    try:
+        response = client.post("/api/credentials/batch",
+                               json={"action": "toggle", "ids": [credential_id],
+                                     "enabled": False})
+    finally:
+        app.state.credentials.set_enabled = original
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0] == {"id": credential_id, "ok": False,
+                                  "error": "action_failed"}
+    assert "abc123" not in response.text
+
 
 def test_batch_rejects_viewer(tmp_path):
     """viewer（非 operator）不能批量写：403。"""

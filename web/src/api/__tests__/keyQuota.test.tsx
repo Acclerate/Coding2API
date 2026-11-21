@@ -84,7 +84,15 @@ describe("keyQuota 纯函数", () => {
     expect(usageTodayLabel({ requests: 0, tokens: 0, cost_usd: 0 })).toBe("今日未用");
     expect(usageTodayLabel({ requests: 2, tokens: 30, cost_usd: 0 })).toBe("2 次 · 30 token");
     expect(usageTodayLabel({ requests: 2, tokens: 30, cost_usd: 0.5 }))
-      .toBe("2 次 · 30 token · $0.5000");
+      .toBe("2 次 · 30 token · $0.5");
+  });
+
+  it("usageTodayLabel 格式化大数：请求数千分位、token 紧凑、成本按量级取位数", () => {
+    expect(usageTodayLabel({ requests: 2974, tokens: 365_309_724, cost_usd: 7.4879 }))
+      .toBe("2,974 次 · 3.7亿 token · $7.49");
+    // 小额成本不能被两位小数抹成 $0
+    expect(usageTodayLabel({ requests: 1, tokens: 100, cost_usd: 0.0042 }))
+      .toBe("1 次 · 100 token · $0.0042");
   });
 });
 
@@ -286,5 +294,25 @@ describe("ApiKeysPage 配额 UI", () => {
     await userEvent.click(screen.getByTestId("edit-quota-key_1"));
     await userEvent.click(screen.getByTestId("key-quota-close"));
     expect(screen.queryByTestId("key-quota-dialog")).not.toBeInTheDocument();
+  });
+
+  it("Esc 关闭对话框（焦点管理：MASTER §6「对话框焦点管理与 Esc 关闭」）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "PUT") return jsonResponse({ ok: true });
+        return jsonResponse({ api_keys: [KEY] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("edit-quota-key_1"));
+    expect(screen.getByTestId("key-quota-dialog")).toBeInTheDocument();
+
+    // Esc 关闭：此前这个对话框没接 useDialogFocus，Esc 收不掉它
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByTestId("key-quota-dialog")).not.toBeInTheDocument());
   });
 });

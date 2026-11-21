@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from ...engine.sse import iter_frames
+from ...error_text import error_text
 from ...provider import base
 from ...provider.base import (
     AuthFlow,
@@ -27,8 +28,9 @@ from ...provider.base import (
     Model,
     Quota,
 )
-from ...provider.proxy import build_client
 from ...provider.token_expiry import normalize_epoch
+from ...tasks.pacer import paced
+from ..lazy_clients import LazyClients
 from . import events as trae_events
 from . import pricing
 from .callback import (
@@ -63,8 +65,7 @@ CHECKIN_ATTEMPTS = 2
 # 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
 # 经代理链路 10s 会稳定超时；首字等待由 read=None +
 # stream_first_event_timeout_seconds 负责，两者不要混为一谈。
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
-SHORT_TIMEOUT = httpx.Timeout(30.0)
+
 
 # SOLO 静态模型表（继承 trae2api-web；动态拉取失败时回退）
 STATIC_MODELS: tuple[str, ...] = (
@@ -301,7 +302,7 @@ def oauth_headers() -> dict[str, str]:
     }
 
 
-class TraeClient:
+class TraeClient(LazyClients):
     """上游 HTTP 客户端。host 可覆盖，便于测试。"""
 
     def __init__(
@@ -321,21 +322,6 @@ class TraeClient:
         self._short_client = short_client
         self._proxy = proxy
 
-    def _stream(self) -> httpx.AsyncClient:
-        if self._stream_client is None:
-            self._stream_client = build_client(timeout=STREAM_TIMEOUT, proxy=self._proxy)
-        return self._stream_client
-
-    def _short(self) -> httpx.AsyncClient:
-        if self._short_client is None:
-            self._short_client = build_client(timeout=SHORT_TIMEOUT, proxy=self._proxy)
-        return self._short_client
-
-    async def aclose(self) -> None:
-        for client in (self._stream_client, self._short_client):
-            if client is not None:
-                await client.aclose()
-
     # ------------------------------------------------------------- 聊天流
 
     async def stream_chat(
@@ -344,15 +330,23 @@ class TraeClient:
         """POST llm_utils_chat 并逐事件产出中立 Event。非 2xx 抛 UpstreamHTTPError。"""
         body = prepare_body(payload, model)
         url = f"{self.agent_host}{EP_CHAT}"
-        async with self._stream().stream(
+        async with self._stream.stream(
             "POST", url, json=body, headers=solo_headers(credential),
         ) as response:
             if response.status_code >= 400:
                 raw = await base.read_body_bounded(response)
                 raise UpstreamHTTPError(response.status_code, raw,
                                         **base.retry_hints(response.headers))
+            model_hint: str | None = None
             async for frame in iter_frames(response.aiter_bytes()):
+                # 元数据帧（extra_info 等）回显的真实模型名：贴到后续事件上，
+                # 供 executor 做「静默替换」观测（帧本身无下游语义，不产出事件）
+                hint = trae_events.frame_model(frame)
+                if hint is not None:
+                    model_hint = hint
                 for event in trae_events.parse_all_events(frame):
+                    if event.model is None and model_hint is not None:
+                        event.model = model_hint
                     _fill_estimated_credit(event, model)
                     yield event
 
@@ -399,10 +393,7 @@ class TraeClient:
                 rate = rate_info["data"].get("rate")
                 if isinstance(rate, (int, float)) and not isinstance(rate, bool):
                     credit_rate = float(rate)
-        context_window = config.get("context_window_tokens") or {}
-        max_input = context_window.get("dev") if isinstance(context_window, dict) else None
-        if not isinstance(max_input, int) or isinstance(max_input, bool):
-            max_input = None
+        max_input = _context_window(config)
         return Model(
             id=str(config["config_name"]),
             name=str(display.get("display_name") or ""),
@@ -522,7 +513,7 @@ class TraeClient:
 
     async def _post_json(self, url: str, body: dict[str, Any],
                          headers: dict[str, str]) -> dict[str, Any]:
-        response = await self._short().post(url, json=body, headers=headers)
+        response = await self._short.post(url, json=body, headers=headers)
         if response.status_code >= 400:
             raise UpstreamHTTPError(response.status_code,
                                     await base.read_body_bounded(response))
@@ -554,6 +545,31 @@ def _trae_supports_reasoning(config: dict[str, Any]) -> bool | None:
     if isinstance(effort, dict) and isinstance(effort.get("support_thinking"), bool):
         return effort["support_thinking"]
     return None
+
+
+def _context_window(config: dict[str, Any]) -> int | None:
+    """上下文窗口：取 `max`，缺失或非法时回落 `dev`。
+
+    上游 `context_window_tokens` 是 `{dev, max}` 两档：`max` 是模型真实上限
+    （如 glm-5.3 的 1M、mimo 的 981504），`dev` 是保守档（200k 量级）。
+    只读 `dev` 会让列表里 1M 上下文的模型报 200k，客户端的上下文压缩提前
+    触发，把本可以装下的对话截断。`max` 不大于 `dev` 时没有信息量，按 `dev`。
+    """
+    window = config.get("context_window_tokens")
+    if not isinstance(window, dict):
+        return None
+    dev = _positive_int(window.get("dev"))
+    top = _positive_int(window.get("max"))
+    if top is not None and (dev is None or top > dev):
+        return top
+    return dev
+
+
+def _positive_int(value: Any) -> int | None:
+    """严格正整数：bool / 非 int / ≤0 一律视为缺失。"""
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        return None
+    return value
 
 
 def _pack_name(pack: dict[str, Any]) -> str:
@@ -681,7 +697,7 @@ class TraeProvider:
 
                 self._dynamic_models_blocked_until = time.monotonic() + 300
                 logging.getLogger(__name__).warning(
-                    "TRAE 动态模型拉取失败，回退静态表 5 分钟: %s", error)
+                    "TRAE 动态模型拉取失败，回退静态表 5 分钟: %s", error_text(error))
         # 静态表：重名时 id 用实测大小写，元数据优先取动态结果，
         # 其次取上次成功的动态拉取（负缓存期倍率不丢）
         merged: list[Model] = []
@@ -713,15 +729,9 @@ class TraeProvider:
         """引擎调用入口：dict 凭证 → 上游流 → 中立事件。"""
         credential = TraeCredential.from_dict(credential_data)
         key = _pacer_key(credential)
-        if self.pacer is not None:
-            await self.pacer.wait_turn(key)
-        try:
+        async with paced(self.pacer, key):
             async for event in self.client.stream_chat(credential, payload, model):
                 yield event
-        finally:
-            # 并发模式必须归还名额，否则该凭证被当成永远在途而失去节流
-            if self.pacer is not None:
-                self.pacer.release(key)
 
     async def refresh(self, credential_data: dict) -> dict:
         refreshed = await self.client.refresh_token(TraeCredential.from_dict(credential_data))

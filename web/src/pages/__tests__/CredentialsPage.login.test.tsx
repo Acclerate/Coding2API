@@ -2,7 +2,8 @@ import { screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { CredentialsPage } from "../CredentialsPage";
 import {
-  expandCredentialGroups, jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent,
+  expandCredentialGroups, jsonResponse, makeCredential, renderPage, settle, userEvent,
+  mockCredentialsFetch as mockFetch,
 } from "@/test-utils";
 
 const ADMIN = { username: "root", is_admin: true } as const;
@@ -62,7 +63,7 @@ describe("渠道登录入口", () => {
     expect(screen.getByTestId("checkin-qd")).toBeInTheDocument();
   });
 
-  it("CodeBuddy 国际版无签到活动：探测保留、签到入口隐藏", async () => {
+  it("CodeBuddy 国际无签到活动：探测保留、签到入口隐藏", async () => {
     // 上游 /billing/meter/checkin-activity-status 回 active:false 且活动
     // 字段全空（渠道侧无此活动，非账号级未开启），后端相应把 checkin* 置
     // None，签到按钮必须同步消失——否则就是一个必然失败的出口。
@@ -77,7 +78,7 @@ describe("渠道登录入口", () => {
     expect(screen.queryByTestId("checkin-ci")).not.toBeInTheDocument();
   });
 
-  it("CodeBuddy 国际版有活跃上报入口、无成长中心入口", async () => {
+  it("CodeBuddy 国际有活跃上报入口、无成长中心入口", async () => {
     // 后端 intl.py 只把 growth 置 None，activity 已恢复继承国内站实现
     // （/v2/report 实测可用），前端判定必须跟能力走：写死 codebuddy 会让
     // 国际版明明能跑却看不到菜单项。
@@ -180,6 +181,9 @@ describe("渠道登录入口", () => {
     await openAddDialog();
     await userEvent.click(screen.getByTestId("start-login-trae"));
     expect(await screen.findByTestId("cancel-login-trae")).toBeInTheDocument();
+    // 回调地址一并透出：指错主机时用户能自己看出「跳不回来」的原因
+    expect(screen.getByTestId("credentials-notice"))
+      .toHaveTextContent("http://127.0.0.1:8000/authorize");
 
     // 浏览器授权完成后服务端落库 → 下一次轮询发现凭证变多
     credentialCount = 2;
@@ -189,6 +193,82 @@ describe("渠道登录入口", () => {
       expect(screen.getByTestId("credentials-notice")).toHaveTextContent("登录成功"),
     );
     vi.useRealTimers();
+  });
+
+  it("TRAE 回调超时：提示检查回调地址与 PUBLIC_BASE_URL", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.stubGlobal("open", () => null);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/upstream/start")) {
+          return jsonResponse({
+            flow: "callback",
+            state: "machine:device",
+            auth_url: "https://trae.example/login",
+            interval: null,
+            callback_url: "https://gw.example/authorize",
+          });
+        }
+        return jsonResponse(listBody([makeCredential({ id: "c0" })]));
+      }),
+    );
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await openAddDialog();
+    await userEvent.click(screen.getByTestId("start-login-trae"));
+    await screen.findByTestId("cancel-login-trae");
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 4000);
+    await waitFor(() =>
+      expect(screen.getByTestId("credentials-notice")).toHaveTextContent("授权超时"),
+    );
+    expect(screen.getByTestId("credentials-notice"))
+      .toHaveTextContent("PUBLIC_BASE_URL");
+    vi.useRealTimers();
+  });
+
+  it("TRAE 回调打不开时：粘贴整条回调链接完成登录", async () => {
+    // issue #21 后半段：NAS 部署里 TRAE 跳回调直接「网络错误」，
+    // refreshToken 只在浏览器地址栏，粘回管理台由 /upstream/complete 兑换。
+    vi.stubGlobal("open", () => null);
+    let completed = false;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/upstream/start")) {
+        return jsonResponse({
+          flow: "callback",
+          state: "machine:device",
+          auth_url: "https://trae.example/login",
+          interval: null,
+          callback_url: "http://127.0.0.1:8000/authorize",
+        });
+      }
+      if (url.includes("/upstream/complete")) {
+        completed = String(init?.body).includes("/authorize?refreshToken=RT1");
+        return jsonResponse({ status: "success", credential_id: "cred_new" });
+      }
+      return jsonResponse(listBody([makeCredential({ id: "c0" })]));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await openAddDialog();
+    await userEvent.click(screen.getByTestId("start-login-trae"));
+
+    // 回调轨道同时给出粘贴入口（自动回调仍是主路径）
+    const input = await screen.findByTestId("paste-callback-input");
+    await userEvent.type(input, "/authorize?refreshToken=RT1&loginTraceID=abc");
+    await userEvent.click(screen.getByTestId("paste-callback-submit"));
+
+    expect(await screen.findByTestId("credentials-notice")).toHaveTextContent("登录成功");
+    expect(completed).toBe(true);
+    expect(screen.queryByTestId("paste-callback")).not.toBeInTheDocument();
   });
 
   it("CodeArts 走 paste：展示粘贴框，提交回调链接完成登录", async () => {
@@ -348,7 +428,7 @@ describe("渠道登录入口", () => {
     expect(screen.queryByTestId("checkin-z")).not.toBeInTheDocument();
   });
 
-  it("管理员可一键补回 Kilo Gateway（删除后渠道不丢）", async () => {
+  it("管理员可一键补回 Kilo（删除后渠道不丢）", async () => {
     const spy = mockFetch({
       "/api/credentials": listBody([makeCredential({ id: "cb", provider: "codebuddy" })]),
     });
@@ -358,7 +438,7 @@ describe("渠道登录入口", () => {
     await openAddDialog();
 
     const button = screen.getByTestId("add-kilo");
-    expect(button).toHaveTextContent("添加 Kilo Gateway");
+    expect(button).toHaveTextContent("添加 Kilo");
     expect(button).not.toBeDisabled();
 
     await userEvent.click(button);
@@ -371,10 +451,10 @@ describe("渠道登录入口", () => {
       expect(String(posted?.[1]?.body)).toContain('"kilo"');
     });
     expect(await screen.findByTestId("credentials-notice"))
-      .toHaveTextContent("已添加 Kilo Gateway");
+      .toHaveTextContent("已添加 Kilo");
   });
 
-  it("已有 Kilo Gateway 凭证时按钮禁用，避免重复占位", async () => {
+  it("已有 Kilo 凭证时按钮禁用，避免重复占位", async () => {
     mockFetch({
       "/api/credentials": listBody([makeCredential({ id: "k", provider: "kilo" })]),
     });
@@ -385,7 +465,7 @@ describe("渠道登录入口", () => {
 
     const button = screen.getByTestId("add-kilo");
     expect(button).toBeDisabled();
-    expect(button).toHaveTextContent("Kilo Gateway 已添加");
+    expect(button).toHaveTextContent("Kilo 已添加");
     expect(screen.queryByTestId("credits-k")).not.toBeInTheDocument();
     expect(screen.queryByTestId("probe-k")).not.toBeInTheDocument();
     expect(screen.queryByTestId("checkin-k")).not.toBeInTheDocument();

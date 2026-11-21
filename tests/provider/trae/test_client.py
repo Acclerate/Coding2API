@@ -31,7 +31,8 @@ def _client(handler, **kw) -> TraeClient:
 
 def test_resolve_flat_auto_and_forced():
     assert resolve("glm-5.2", "d").providers == (
-        "codebuddy", "codebuddy_intl", "trae", "zen", "kilo", "qoder", "codearts")
+        "codebuddy", "codebuddy_intl", "trae", "zen", "kilo", "qoder",
+        "codearts", "officeace", "raccoon", "lingxi", "generic")
     assert resolve("", "glm-5.2").model == "glm-5.2"
     assert resolve("auto", "glm-5.2").model == "glm-5.2"
     assert resolve(None, "glm-5.2").model == "glm-5.2"
@@ -89,6 +90,39 @@ async def test_client_fetch_models_and_quota():
     quota = await client.fetch_quota(TraeCredential(access_token="a"))
     assert models == [Model(id="glm-5.2", name="GLM")]
     assert quota.remaining == 70 and quota.total == 100
+
+async def test_client_fetch_models_context_window_prefers_max():
+    """上下文窗口取 `max`（真实上限），缺失/非法/不大于 dev 时回落 `dev`。
+
+    只读 `dev` 会让 1M 上下文的模型报 200k，客户端据此提前压缩上下文。
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"config_info_list": [
+            {"config_name": "glm-5.3",
+             "context_window_tokens": {"dev": 200000, "max": 1000000}},
+            {"config_name": "mimo",
+             "context_window_tokens": {"dev": 200000, "max": 981504}},
+            # max 不大于 dev → 没有信息量，按 dev
+            {"config_name": "flat",
+             "context_window_tokens": {"dev": 200000, "max": 200000}},
+            # max 非法 → 回落 dev
+            {"config_name": "bad-max",
+             "context_window_tokens": {"dev": 128000, "max": "1M"}},
+            # 只有 max
+            {"config_name": "max-only",
+             "context_window_tokens": {"max": 400000}},
+            # max 为 bool（int 子类，必须排除）
+            {"config_name": "bool-max",
+             "context_window_tokens": {"dev": 64000, "max": True}},
+            # max 非正
+            {"config_name": "zero-max",
+             "context_window_tokens": {"dev": 64000, "max": 0}},
+        ]})
+
+    models = await _client(handler).fetch_models(TraeCredential(access_token="a"))
+    assert [m.max_input_tokens for m in models] == [
+        1000000, 981504, 200000, 128000, 400000, 64000, 64000]
+
 
 async def test_client_fetch_models_metadata():
     """倍率 / 上下文窗口 / 推理能力透传。"""
@@ -309,8 +343,8 @@ async def test_post_json_surfaces_http_and_non_json_errors():
 
 async def test_client_lazy_and_close_paths():
     client = TraeClient()
-    assert client._stream() is client._stream()
-    assert client._short() is client._short()
+    assert client._stream is client._stream
+    assert client._short is client._short
     await client.aclose()
 
 async def test_provider_import_classify_and_models():
@@ -491,3 +525,41 @@ async def test_client_stream_chat_fills_estimated_credit():
     usage = next(e.usage for e in events if e.kind is EventKind.USAGE)
     assert usage.credit is not None
     assert usage.credit_estimated is True
+
+
+async def test_client_stamps_metadata_model_hint_on_later_events():
+    """extra_info 回显的真实模型名贴到后续 usage / finish 事件（观测用）。"""
+    sse = (
+        'event: metadata\ndata: {"model":""}\n\n'
+        'event: output\ndata: {"response":"hi","reasoning_content":"","tool_calls":null}\n\n'
+        'event: extra_info\ndata: {"model":"glm-5.2-real","input_token":1}\n\n'
+        'event: token_usage\ndata: {"prompt_tokens":1,"completion_tokens":1}\n\n'
+        'event: done\ndata: {"finish_reason":"stop"}\n\n'
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=sse)
+
+    events = [e async for e in _client(handler).stream_chat(
+        TraeCredential(access_token="a"), {"messages": []}, "glm-5.2")]
+    content = next(e for e in events if e.kind is EventKind.CONTENT)
+    usage = next(e for e in events if e.kind is EventKind.USAGE)
+    finish = next(e for e in events if e.kind is EventKind.FINISH)
+    # 内容帧在 extra_info 之前，拿不到提示
+    assert content.model is None
+    # extra_info 之后的事件都带上真实模型名
+    assert usage.model == "glm-5.2-real"
+    assert finish.model == "glm-5.2-real"
+
+
+async def test_provider_model_failure_log_includes_type_when_message_empty(caplog):
+    """裸 `TimeoutError` 消息为空 → 回退日志仍要带类名，不能只剩「: 」。"""
+    class _Client:
+        async def fetch_models(self, _credential):
+            raise TimeoutError()
+
+    provider = TraeProvider(client=_Client())
+    with caplog.at_level("WARNING", logger="src.provider.trae.client"):
+        models = await provider.list_models({"accessToken": "a", "uid": "u"})
+    assert [m.id for m in models] == list(STATIC_MODELS)
+    assert any("TimeoutError" in record.getMessage() for record in caplog.records)

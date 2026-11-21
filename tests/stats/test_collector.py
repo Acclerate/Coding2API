@@ -119,12 +119,17 @@ def test_stats_retention_and_rollup(stats):
     collector.record(username="u", provider="trae", model="m", ok=True, input_tokens=5,
                      latency_ms=20, now=2000)
     task = RetentionTask(collector, retention_days=90)
-    first = task.run_once()
+    # 周期 rollup 只重算最近窗口（见 ROLLUP_OVERLAP_SECONDS）：本用例的时间戳
+    # 是 1970 年，必须显式给 now，否则窗口外什么都扫不到。
+    first = task.run_once(now=10_000)
     assert first["rolled_up"] >= 1
     rows = query._db.connect().execute(
         "SELECT requests, input_tokens FROM usage_hourly").fetchall()
     assert sum(r["requests"] for r in rows) == 2
-    # 清理：把 now 推到 91 天之后
+    # 显式 now 同样传播给清理：run_once 不得用真实时间聪明地删掉 1970 年明细
+    # （此前会），否则下面「再写一条再清」的计数是两段真实时刻的杂凑。
+    assert collector.purge_expired(90, now=10_000 + 91 * 86400) == 2
+    # 再写一条（同 ts=1000，尚未清理过的新明细）
     collector.record(username="u", provider="trae", model="m", ok=True, now=1000)
     assert collector.purge_expired(90, now=1000 + 91 * 86400) == 1
     # 小时汇总永久保留
@@ -220,6 +225,24 @@ def test_record_publishes_redacted_row_after_commit(stats):
     # 广播的字段集与 /api/stats/events 一致：不含 credential_name（端点按角色补）
     assert "credential_name" not in row
     assert "prompt" not in row and "headers" not in row
+    # 派生速度列也在广播里：本行未带首字数据 → 不可测
+    assert row["tps"] is None and row["tps_visible"] is None
+
+
+def test_record_publishes_per_request_speed(stats):
+    """广播行自带逐请求速度（实时表那一列不查库）：规则与明细端点一致。"""
+    from src.stats.collector import StatsCollector
+
+    published: list[dict] = []
+    collector = StatsCollector(stats[0]._db, on_record=published.append)
+    collector.record(username="u", provider="trae", model="m", ok=True,
+                     output_tokens=1000, reasoning_tokens=750,
+                     latency_ms=6000, ttfb_ms=1000)      # 生成 5.0s：总 200 / 正文 50
+    collector.record(username="u", provider="trae", model="m", ok=False,
+                     error_type="upstream_error", output_tokens=900,
+                     latency_ms=3000, ttfb_ms=1000)      # 失败请求不算
+    assert (published[0]["tps"], published[0]["tps_visible"]) == (200.0, 50.0)
+    assert (published[1]["tps"], published[1]["tps_visible"]) == (None, None)
 
 
 def test_record_without_callback_is_silent(stats):
@@ -241,6 +264,40 @@ def test_record_swallows_publish_failure(stats):
     assert stats[1].overview(username="u")["requests"] == 1
 
 
+def test_record_notifies_paid_snapshot_after_commit(stats):
+    """每写一行明细就失效实测扣费快照：否则新观测要等 600s TTL 才生效。
+
+    目录 x0 数据烧额度的窗口正是这段延迟——`invalidate()` 的 docstring 承诺
+    「刚写完一条明细的调用方用」，装配点必须真的接上。
+    """
+    from src.stats.collector import StatsCollector
+
+    calls: list[int] = []
+    collector = StatsCollector(stats[0]._db, on_write=lambda: calls.append(1))
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert calls == [1, 1]
+
+
+def test_record_swallows_paid_snapshot_failure(stats):
+    """快照失效失败同样不能影响统计写入。"""
+    from src.stats.collector import StatsCollector
+
+    def boom():
+        raise RuntimeError("invalidate exploded")
+
+    collector = StatsCollector(stats[0]._db, on_write=boom)
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert stats[1].overview(username="u")["requests"] == 1
+
+
+def test_record_notifies_paid_snapshot_writer_is_optional(stats):
+    """未装配 `on_write`（脚本 / 老装配）：写入照常，不报错。"""
+    collector, query = stats
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert query.overview(username="u")["requests"] == 1
+
+
 def test_record_publishes_normalized_model_and_error_type(stats):
     """广播的是**归一后**的值（与明细表一致），不是调用方原始入参。"""
     from src.stats.collector import StatsCollector
@@ -251,3 +308,37 @@ def test_record_publishes_normalized_model_and_error_type(stats):
                      error_type="not-controlled")
     assert published[0]["model"] == "unknown"
     assert published[0]["error_type"] is None
+
+
+def test_window_key_usage_groups_by_key_and_orders_by_tokens(stats):
+    """按 Key 告警的数据源：只统计带 Key 的明细，token 降序。"""
+    from src.request_context import set_api_key_id
+
+    collector, _query = stats
+    for key_id, tokens in (("k1", 10), ("k1", 30), ("k2", 999), (None, 5000)):
+        set_api_key_id(key_id)
+        try:
+            collector.record(username=f"u-{key_id}", provider="trae", model="m",
+                             ok=True, input_tokens=tokens, output_tokens=0)
+        finally:
+            set_api_key_id(None)
+    rows = collector.window_key_usage(since=0)
+    assert [row["api_key_id"] for row in rows] == ["k2", "k1"]
+    assert rows[1]["tokens"] == 40
+    assert rows[1]["requests"] == 2
+    # 窗口外不返回（since 取未来）
+    assert collector.window_key_usage(since=int(time.time()) + 3600) == []
+
+
+def test_window_cost_sums_known_hours(stats):
+    """预算告警的数据源：窗口内成本求和 + 可定价小时数。"""
+    collector, _query = stats
+    collector.record(username="u", provider="trae", model="deepseek-v4.1-flash",
+                     ok=True, input_tokens=100, output_tokens=10)
+    collector.rollup_hourly()
+    spent, known, hours = collector.window_cost(since=0)
+    assert spent >= 0
+    assert hours == 1
+    assert known in (0, 1)          # 价表未装配时 cost 为 NULL → known=0
+    # 窗口外（未来）→ 全 0，不是 None
+    assert collector.window_cost(since=int(time.time()) + 3600) == (0.0, 0, 0)

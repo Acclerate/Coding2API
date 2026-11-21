@@ -80,6 +80,35 @@ def test_repo_account_cooldown_clears_model_entries(repo):
     assert db.connect().execute(
         "SELECT COUNT(*) AS c FROM credential_model_cooldowns").fetchone()["c"] == 0
 
+
+def test_repo_low_threshold_error_keeps_existing_cooldown(repo):
+    """低于阈值的 OTHER 错误（cooling_until=None）不得抹掉已有账号级冷却。
+
+    `note_error` 对低于阈值的 OTHER 返回 `ErrorOutcome(err_count=count)`，
+    `cooling_until` 是 None。原实现无条件 `SET cooling_until = ?`，于是两个
+    并发请求落在同一凭证时，后到的这次会把前一次刚写入的 RESTRICTED/SOFT
+    冷却（2h~7d）擦成 NULL，账号立刻回池继续撞上游风控。
+    """
+    credentials, db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_error(cid, ErrorOutcome(cooling_until=7200, err_count=1))
+    credentials.save_error(cid, ErrorOutcome(cooling_until=None, err_count=1))
+    row = db.connect().execute(
+        "SELECT cooling_until, err_count FROM credentials WHERE id = ?",
+        (cid,)).fetchone()
+    assert row["cooling_until"] == 7200      # 冷却保留
+    assert row["err_count"] == 1             # 计数照常更新
+
+
+def test_repo_new_cooldown_overwrites_older(repo):
+    """显式给冷却时照常覆盖（COALESCE 只拦 None，不影响正常升级）。"""
+    credentials, db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_error(cid, ErrorOutcome(cooling_until=7200, err_count=1))
+    credentials.save_error(cid, ErrorOutcome(cooling_until=9999, err_count=0))
+    assert db.connect().execute(
+        "SELECT cooling_until FROM credentials WHERE id = ?", (cid,)).fetchone()[0] == 9999
+
 def test_repo_save_success_clears_blocked_only(repo):
     """成功清除 negative cache，但不清 6004 模型级限流（对齐上游重置）。"""
     from src.engine.scheduler import ModelCooldown
@@ -115,6 +144,56 @@ def test_repo_revive_and_delete_clear_model_cooldowns(repo):
     assert credentials.delete(cid) is True
     assert db.connect().execute(
         "SELECT COUNT(*) AS c FROM credential_model_cooldowns").fetchone()["c"] == 0
+
+def test_repo_revive_keeps_upstream_cooldown_unless_forced(repo):
+    """`revive` 保留「上游点名恢复时刻」的冷却，`force=True` 才清。
+
+    回归 2026-11-03 12:22–12:23：管理员连续三次批量恢复 zen 凭证，每次都在
+    恢复的同时顺手解掉刚写入的 429 冷却（上游已点名到次日 08:00），下一次
+    请求立刻再撞一次同一个 429。本地冷却（`cooling_kind` 为 NULL / other）
+    照旧清除，与补列前行为一致。
+    """
+    credentials, _db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    future = int(time.time()) + 3600
+    credentials.save_error(cid, ErrorOutcome(
+        cooling_until=future, cooling_kind=ErrKind.SOFT.value, err_count=0))
+
+    assert credentials.revive(cid) is True
+    row = credentials.candidates()[0]
+    assert row.disabled is False
+    assert row.cooling_until == future            # 上游冷却被保留
+
+    assert credentials.revive(cid, force=True) is True
+    assert credentials.candidates()[0].cooling_until is None
+
+def test_repo_revive_clears_local_cooldown_and_missing_credential(repo):
+    """本地冷却（cooling_kind NULL / other）在恢复时一并清掉；不存在的凭证返回 False。"""
+    credentials, _db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_error(cid, ErrorOutcome(
+        cooling_until=int(time.time()) + 3600, cooling_kind=ErrKind.OTHER.value))
+
+    assert credentials.revive(cid) is True
+    assert credentials.candidates()[0].cooling_until is None
+    assert credentials.revive("cred_missing") is False
+
+def test_repo_account_cooling_kind_is_recorded_and_purged(repo):
+    """账号级冷却写入来源标签；过期回收时标签一起清掉（避免陈旧来源误导 revive）。"""
+    credentials, _db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    past = int(time.time()) - 10
+    credentials.save_error(cid, ErrorOutcome(
+        cooling_until=past, cooling_kind=ErrKind.CREDIT.value))
+    row = _db.connect().execute(
+        "SELECT cooling_kind FROM credentials WHERE id = ?", (cid,)).fetchone()
+    assert row["cooling_kind"] == ErrKind.CREDIT.value
+
+    assert credentials.purge_expired_account_cooldowns() == 1
+    row = _db.connect().execute(
+        "SELECT cooling_kind, cooling_until FROM credentials WHERE id = ?",
+        (cid,)).fetchone()
+    assert row["cooling_until"] is None and row["cooling_kind"] is None
 
 def test_repo_purges_only_expired_model_cooldowns(repo):
     from src.engine.scheduler import ModelCooldown
@@ -153,6 +232,40 @@ def test_retention_task_purges_expired_model_cooldowns(repo):
     # 不传 credentials（旧调用方）时不报错，计数为 0
     assert RetentionTask(collector).run_once()["expired_coolings"] == 0
 
+def test_retention_task_clears_expired_account_cooldown(repo):
+    """账号级冷却过期后置 NULL：否则陈旧值会永久留在库里。
+
+    选号用 `cooling_until > now` 判断，过期值不挡凭证，但管理台列表下发的是
+    原始值——一条几周前的冷却会让该行在「冷却」维度排序失真。
+    """
+    credentials, _db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    now = int(time.time())
+    credentials.save_error(cid, ErrorOutcome(cooling_until=now - 10, err_count=0))
+    assert credentials.candidates()[0].cooling_until == now - 10
+
+    collector = StatsCollector(_db)
+    report = RetentionTask(collector, credentials=credentials).run_once()
+    assert report["expired_account_coolings"] == 1
+    assert credentials.candidates()[0].cooling_until is None
+    # 再跑一轮：已经没有过期值，计数归零（幂等）
+    assert RetentionTask(collector, credentials=credentials).run_once()[
+        "expired_account_coolings"] == 0
+
+def test_retention_task_keeps_active_account_cooldown(repo):
+    """仍在冷却期内的账号级冷却不能被清掉：清掉等于提前解冻一个被限流的号。"""
+    credentials, _db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    future = int(time.time()) + 3600
+    credentials.save_error(cid, ErrorOutcome(cooling_until=future, err_count=0))
+
+    collector = StatsCollector(_db)
+    report = RetentionTask(collector, credentials=credentials).run_once()
+    assert report["expired_account_coolings"] == 0
+    assert credentials.candidates()[0].cooling_until == future
+    # 未注入凭证仓储时同样不报错
+    assert RetentionTask(collector).run_once()["expired_account_coolings"] == 0
+
 def test_retention_task_prunes_audit_events(repo):
     """留存任务按保留期回收审计流水；未注入时计数为 0（README「审计保留 90 天」）。"""
     from src.db.repo import AuditRepository
@@ -176,3 +289,49 @@ def test_credential_edit_lock_is_reused_per_id(repo):
     assert credentials.edit_lock("cred_a") is first
     assert credentials.edit_lock("cred_b") is not first
     db.close()
+
+def test_save_error_disabled_uses_actionable_reason(repo):
+    """硬禁用优先写 outcome 的可操作原因，缺失才回落 "session dead"。
+
+    管理台直接展示 `disabled_reason`：11140「账号被上游限制」写成 session dead
+    会把人引向「重新登录」，而实际动作是申诉或换号。
+    """
+    credentials, db = repo
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_error(cid, ErrorOutcome(disabled=True,
+                                             disabled_reason="账号被上游限制，需申诉"))
+    row = db.connect().execute(
+        "SELECT disabled, disabled_reason FROM credentials WHERE id = ?", (cid,)).fetchone()
+    assert (row["disabled"], row["disabled_reason"]) == (1, "账号被上游限制，需申诉")
+
+    other = credentials.add(provider="codebuddy", credential_data={"bearer_token": "u"})
+    credentials.save_error(other, ErrorOutcome(disabled=True))
+    row = db.connect().execute(
+        "SELECT disabled_reason FROM credentials WHERE id = ?", (other,)).fetchone()
+    assert row["disabled_reason"] == "session dead"
+
+def test_cool_provider_cools_whole_channel_without_disabling(repo):
+    """渠道级冷却：同渠道所有号一起推后，但不写 disabled（到期自动回来）。
+
+    11140 这类账号/IP 级风控不是单号问题，逐个号冷却挡不住下一个请求换号继续
+    撞；同时绝不能落 disabled——那是人工状态，会把「等上游解除」变成「必须有人
+    去点恢复」。
+    """
+    credentials, db = repo
+    first = credentials.add(provider="codebuddy_intl", credential_data={"bearer_token": "t"})
+    second = credentials.add(provider="codebuddy_intl", credential_data={"bearer_token": "u"})
+    other = credentials.add(provider="codebuddy", credential_data={"bearer_token": "v"})
+    # 已有更晚冷却的号不能被渠道级暂停缩短
+    far = int(time.time()) + 30 * 86400
+    db.connect().execute("UPDATE credentials SET cooling_until = ? WHERE id = ?", (far, second))
+    db.connect().commit()
+
+    until = int(time.time()) + 24 * 3600
+    assert credentials.cool_provider("codebuddy_intl", until=until) == 1
+
+    rows = {row["id"]: row for row in db.connect().execute(
+        "SELECT id, disabled, cooling_until FROM credentials").fetchall()}
+    assert rows[first]["cooling_until"] == until
+    assert rows[second]["cooling_until"] == far          # 更晚的冷却不被缩短
+    assert rows[other]["cooling_until"] is None          # 其它渠道不受影响
+    assert all(row["disabled"] == 0 for row in rows.values())

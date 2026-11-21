@@ -89,6 +89,18 @@ def test_grouping_is_partitioned_between_tasks_and_gateway_groups():
             assert item.group in group_keys, item.key
 
 
+def test_sections_only_inside_task_cards():
+    """卡片内分节只用于任务项；告警 21 项必须有节标题，否则又变回一长列。"""
+    for item in HOT_SETTINGS:
+        if item.section is not None:
+            assert item.task is not None, item.key
+            assert item.section.strip(), item.key
+    alert_sections = [item.section for item in HOT_SETTINGS if item.task == "alert"]
+    assert alert_sections == [
+        "基础与迟滞"] * 8 + ["规则阈值"] * 6 + ["单 Key 与时段"] * 5 + \
+        ["月度预算"] * 2 + ["渠道与签到"] * 4
+
+
 # ------------------------------------------------------------ 值解析与校验
 
 def test_parse_value_parses_each_supported_kind():
@@ -553,6 +565,7 @@ def test_every_hot_setting_is_read_lazily_not_baked_at_startup(admin_app):
         "activity_report_hour": 5,
         "conversation_sticky_seconds": 99,
         "model_blocklist": "foo*",
+        "privacy_rules": "email,cn_mobile",
     }})
 
     # Executor 侧：默认模型每次请求现读
@@ -589,6 +602,8 @@ def test_every_hot_setting_is_read_lazily_not_baked_at_startup(admin_app):
     assert runner._upstream_status_interval == 5 * 60   # noqa: SLF001
     client.put("/api/settings", json={"values": {"upstream_status_minutes": 11}})
     assert runner._upstream_status_interval == 11 * 60  # noqa: SLF001
+    # 出站隐私脱敏：装配传的是 lambda，改完下一请求即生效
+    assert deps.privacy_rules() == "email,cn_mobile"
     # 模型黑名单基于生效值重算（不是 Settings 的 cached_property）
     assert runtime.blocklist_patterns == ("foo*",)
     assert app.state.services.settings.blocklist_patterns == ("foo*",)

@@ -103,9 +103,11 @@ def test_eviction_drops_expired_first_then_oldest():
     ("metadata", "conversation_id"),
     ("metadata", "conversationId"),
     ("metadata", "prompt_cache_key"),
+    ("metadata", "session_id"),
     ("top", "conversation_id"),
     ("top", "conversationId"),
     ("top", "prompt_cache_key"),
+    ("top", "session_id"),
 ])
 def test_explicit_key_sources(container, key):
     from src.engine.affinity import explicit_key
@@ -120,6 +122,9 @@ def test_explicit_key_priority_and_container_order():
     # conversation_id 优先于 conversationId / prompt_cache_key
     assert explicit_key({"conversation_id": "a", "conversationId": "b",
                          "prompt_cache_key": "c"}) == "conversation_id:a"
+    # session_id 是最低优先级：前面任一键存在时不看它
+    assert explicit_key({"prompt_cache_key": "p", "session_id": "s"}) == "prompt_cache_key:p"
+    assert explicit_key({"session_id": "s"}) == "session_id:s"
     # metadata 优先于顶层（同键名）
     assert explicit_key({"metadata": {"conversation_id": "m"},
                          "conversation_id": "t"}) == "conversation_id:m"
@@ -298,6 +303,54 @@ async def test_stream_rotates_off_sticky_credential_and_repins():
     assert provider.served == ["c_z"]
     assert affinity.remembered == ["c_z"]
 
+
+@dataclass
+class RequestError(Exception):
+    """请求级错误（内容风控 / 上下文超限）：与账号无关，但要换号。"""
+
+    def kind(self) -> ErrKind:
+        return ErrKind.REQUEST
+
+
+@dataclass
+class _RequestFailingProvider:
+    fail_on: str
+
+    async def stream_chat(self, credential_data, payload, model):
+        if credential_data["id"] == self.fail_on:
+            raise RequestError()
+        yield Event(kind=EventKind.CONTENT, content="hi")
+        yield Event(kind=EventKind.USAGE, usage=Usage(input_tokens=1, output_tokens=1))
+        yield Event(kind=EventKind.FINISH, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_request_level_error_keeps_existing_binding():
+    """请求级错误导致换号时，不把对话的粘性永久搬到新号。
+
+    上游前缀缓存按账号隔离（`misakano7545/workbuddy2api-panel` 实测换号后
+    命中 97–99% → 0–12%）：内容风控 / 上下文超限这类错误下一轮大概率不再
+    出现，把 binding 搬走等于白丢缓存。
+    """
+    affinity = FakeAffinity(pinned="c_a")
+    executor = Executor(ExecutorDeps(
+        providers={"trae": _RequestFailingProvider("c_a")},
+        credentials=_repo("c_a", "c_z"),
+        scheduler=Scheduler(), affinity=affinity))
+    await _drain(executor.stream(_request(TURN1), username="alice"))
+    assert affinity.remembered == []          # 绑定保留在 c_a
+
+
+@pytest.mark.asyncio
+async def test_request_level_error_without_existing_binding_still_remembers():
+    """没有旧绑定时照常粘定实际服务的凭证——没有缓存可保，别丢新绑定。"""
+    affinity = FakeAffinity(pinned=None)
+    executor = Executor(ExecutorDeps(
+        providers={"trae": _RequestFailingProvider("c_a")},
+        credentials=_repo("c_a", "c_z"),
+        scheduler=Scheduler(), affinity=affinity))
+    await _drain(executor.stream(_request(TURN1), username="alice"))
+    assert affinity.remembered == ["c_z"]
 
 @pytest.mark.asyncio
 async def test_stream_ignores_sticky_when_credential_cooling():

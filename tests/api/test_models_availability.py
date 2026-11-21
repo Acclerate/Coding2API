@@ -114,6 +114,21 @@ def test_ignores_other_error_types_and_successes(admin_client):
     assert _rows(client)["rows"] == []
 
 
+def test_model_not_found_counts_as_model_level_failure(admin_client):
+    """「上游无此模型」（`model_not_found`）计入模型级失败。
+
+    2026-10-26 起该类从 `invalid_request` 里独立出来（此前被读成「客户端
+    参数写错了」），但**仍属**模型级失败，必须继续进可用性视图。
+    """
+    app, client = admin_client
+    _insert(app, provider="officeace", model="deepseek-v4.1-flash-1017",
+            error_type="model_not_found")
+    rows = _rows(client)["rows"]
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "officeace"
+    assert rows[0]["failures"] == 1
+
+
 def test_window_excludes_old_failures(admin_client):
     app, client = admin_client
     now = int(time.time())
@@ -199,7 +214,8 @@ def test_blocked_matches_normalized_key_and_display_name(admin_client):
 def test_error_types_reported(admin_client):
     """响应里带口径说明，前端不必硬编码「哪几类算下线」。"""
     _app, client = admin_client
-    assert _rows(client)["error_types"] == ["upstream_blocked", "invalid_request"]
+    assert _rows(client)["error_types"] == [
+        "upstream_blocked", "model_not_found", "model_capability", "invalid_request"]
 
 
 # ------------------------------------------------------- 探活结论与人工接管
@@ -297,6 +313,30 @@ def test_probes_shows_manual_row_without_blocked(tmp_path):
     assert rows[0]["manual"] == "manual"
 
 
+def test_probes_hides_blacklisted_models(tmp_path):
+    """命中黑名单的行整条不返回：黑名单是「主动弃用」，不该再去救它。"""
+    app, client = _operator_client(tmp_path)
+    with client:
+        app.state.runtime_settings.set("model_blocklist", "glm-*")
+        _block(app, provider="trae", model="glm-5.3")
+        _block(app, provider="trae", model="kimi-k3")
+        rows = client.get(PROBES).json()["rows"]
+    assert [row["model"] for row in rows] == ["kimi-k3"]
+
+
+def test_probes_hides_blacklisted_manual_row(tmp_path):
+    """只留人工标记、没有负缓存的黑名单行同样滤掉。"""
+    app, client = _operator_client(tmp_path)
+    with client:
+        app.state.runtime_settings.set("model_blocklist", "glm-5.3")
+        app.state.services.model_probes.set_manual(
+            provider="trae", model="glm-5.3", manual="manual")
+        app.state.services.model_probes.set_manual(
+            provider="trae", model="kimi-k3", manual="manual")
+        rows = client.get(PROBES).json()["rows"]
+    assert [row["model"] for row in rows] == ["kimi-k3"]
+
+
 def test_probes_sorted_failed_first_then_until(tmp_path):
     """排序：failed 结论优先，其后按最晚解除时刻降序（最该处理的排最前）。"""
     app, client = _operator_client(tmp_path)
@@ -366,7 +406,10 @@ def test_probe_now_records_failure_without_clearing(tmp_path):
         body = client.post(f"{PROBES}/probe",
                            json={"provider": "trae", "model": "glm-5.3"}).json()
     assert body["state"] == "inconclusive"
-    assert body["error"] == "rate limited"
+    # 落库只留受控分类文案：该 Event 无 error_code，统一归到 "upstream error"；
+    # 上游 error_message 原文只进服务端日志，不回显管理台。
+    assert body["error"] == "upstream error"
+    assert "rate limited" not in body["error"]
     assert len(app.state.services.credentials.blocked_cooldowns()) == 1
 
 

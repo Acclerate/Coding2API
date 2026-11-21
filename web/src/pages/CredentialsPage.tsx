@@ -1,4 +1,5 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import type { ReactNode } from "react";
 import {
   Activity,
@@ -9,11 +10,15 @@ import {
   ChevronRight,
   CircleCheck,
   Coins,
+  Cookie,
   Database,
+  Download,
   Flame,
   Gauge,
   HeartPulse,
+  History,
   Hourglass,
+  KeyRound,
   MoreHorizontal,
   Pin,
   Plus,
@@ -27,6 +32,7 @@ import {
   ToggleLeft,
   Trash2,
   TriangleAlert,
+  Upload,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -42,13 +48,20 @@ import {
   tagOptions,
 } from "../lib/credentialList";
 import type { GroupSort, Ledger } from "../lib/credentialList";
+import { errorText } from "../lib/errors";
 import { api } from "../api/client";
+import { CHECKIN_PROVIDERS } from "../api/providers";
 import { useSessionContext } from "../Layout";
-import { useCredentials, useQueryClient } from "../api/hooks";
+import { useCredentials, usePlaygroundModels, useQueryClient } from "../api/hooks";
 import { PoolOverview } from "../components/PoolOverview";
 import { AddCredentialDialog } from "../components/AddCredentialDialog";
+import { BatchImportDialog } from "../components/BatchImportDialog";
 import { CredentialLimitsDialog } from "../components/CredentialLimitsDialog";
 import { CredentialTagsDialog } from "../components/CredentialTagsDialog";
+import { CredentialWeightDialog } from "../components/CredentialWeightDialog";
+import { CredentialWebCookieDialog } from "../components/CredentialWebCookieDialog";
+import { CredentialLoginSecretDialog } from "../components/CredentialLoginSecretDialog";
+import { groupModelsByProvider, rateLabel, rateSummary } from "../components/ModelPicker";
 import { ToastViewport, useToasts } from "../components/Toast";
 import { ColumnHint, LongTextTip } from "../components/Tip";
 import { PageHeader } from "../components/PageHeader";
@@ -68,13 +81,12 @@ import {
   CREDIT_SOURCE_LABEL,
   creditEventLabel,
   credentialState,
-  credentialHealth,
-  CREDITS_QUOTA_SEMANTICS,
   cooldownRemaining,
   expiringQuotaLabel,
   formatDuration,
   formatNumber,
   formatTime,
+  formatTimeParts,
   hasQuotaProbe,
   healthView,
   modelCooldownLabel,
@@ -86,7 +98,7 @@ import {
   tokenExpiryView,
 } from "../api/display";
 import type { CredentialState, TokenExpiryView } from "../api/display";
-import type { BatchAction, BatchResult, Credential, CreditEvent, GrowthRunResult } from "../api/types";
+import type { BatchAction, BatchResult, CheckinEvent, Credential, CreditEvent, GrowthRunResult } from "../api/types";
 import {
   Badge,
   Button,
@@ -110,13 +122,15 @@ import {
  * 渠道是否支持每日签到。
  *
  * CodeArts 已接入 `/v1/ops/delivery`（此前「上游没有签到接口」的结论
- * 已推翻）。CodeBuddy 国际站（`codebuddy_intl`）**不支持**：上游
- * `/billing/meter/checkin-activity-status` 回 `active: false` 且活动字段全空
- * （渠道侧无此活动，非账号级未开启），后端相应把该渠道的 `checkin*` 置 None，
- * 这里同步隐藏按钮，避免给一个必然失败的操作出口。
+ * 已推翻）。能力清单见 `CHECKIN_PROVIDERS`：CodeBuddy 国际站（`codebuddy_intl`）
+ * **不支持**（上游 `/billing/meter/checkin-activity-status` 回 `active: false`
+ * 且活动字段全空，后端把该渠道的 `checkin*` 置 None）；Zen / Kilo 无签到接口。
+ * 这里同步隐藏按钮与组头汇总，避免给一个必然失败的出口 / 一个永远 0/N 的仪表。
  */
-function supportsCheckin(provider: Credential["provider"]): boolean {
-  return provider !== "codebuddy_intl";
+function supportsCheckin(provider: string): boolean {
+  // 能力清单与后端同源（Zen / Kilo 无签到接口、国际站上游无活动），
+  // 集中定义在 `api/providers.ts`，组头汇总与行内按钮共用一份判定。
+  return CHECKIN_PROVIDERS.has(provider);
 }
 
 /**
@@ -129,7 +143,9 @@ function supportsCheckin(provider: Credential["provider"]): boolean {
  * 而后端其实可以跑（用户报的正是这个错配）。
  */
 function supportsActivity(provider: Credential["provider"]): boolean {
-  return provider === "codebuddy" || provider === "codebuddy_intl";
+  // 小浣熊发设备心跳（网页端真实接口），见 provider/raccoon/activity.py
+  return provider === "codebuddy" || provider === "codebuddy_intl"
+    || provider === "raccoon";
 }
 
 /**
@@ -316,6 +332,7 @@ function GrowthToastContent({ result }: { result: GrowthRunResult }) {
 
 interface Actions {
   revive: (credential: Credential) => void;
+  forceRevive: (credential: Credential) => void;
   toggle: (credential: Credential) => void;
   pin: (credential: Credential) => void;
   remove: (credential: Credential) => void;
@@ -324,28 +341,50 @@ interface Actions {
   growth: (credential: Credential) => void;
   activity: (credential: Credential) => void;
   credits: (credential: Credential, ledger: Ledger) => void;
+  checkinLog: (credential: Credential) => void;
   limits: (credential: Credential) => void;
   tags: (credential: Credential) => void;
+  weight: (credential: Credential) => void;
+  webCookie: (credential: Credential) => void;
+  loginSecret: (credential: Credential) => void;
+  export: (credential: Credential) => void;
 }
 
 export function CredentialsPage() {
   const session = useSessionContext();
   // 默认 created_at 升序（与后端一致）；额度 / 健康度等数值列首点降序
   const { sort, order, toggle } = useSort("created_at", "asc",
-    { health: "desc", quota_remaining: "desc", quota_credits_remaining: "desc",
+    { health: "desc", quota_remaining: "desc",
       token_expires_at: "asc", growth_last_run_at: "desc" });
   // 30s 轮询：冷却倒计时 / token 剩余都是「随时间变化」的观测量，页面停留
   // 时应自动刷新（与 useTasks 同口径）。
-  const { data, isLoading } = useCredentials(session.username, 30_000, sort, order);
+  const { data, isLoading, isError, dataUpdatedAt } =
+    useCredentials(session.username, 30_000, sort, order);
+  // 组头「模型 N 个」：与 Playground / `/v1/models` 同源（只含有可用凭证且过
+  // 当前黑名单的渠道），因此组里「有凭证」与「有模型」是同一口径，不必另算一套。
+  const modelsQuery = usePlaygroundModels();
   const client = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // 添加凭证对话框（登录渠道 / JSON 导入 / 免费层补回都收在里面）
-  const [addOpen, setAddOpen] = useState(false);
+  // `?new=1`：首启向导的深链，进来直接开新增对话框，随后把参数清掉
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [addOpen, setAddOpen] = useState(() => searchParams.get("new") === "1");
+  // 批量导入：多行 JSON / 文件，逐条校验 + 去重，失败行可回填重试
+  const [batchOpen, setBatchOpen] = useState(false);
+  useEffect(() => {
+    if (searchParams.get("new") === "1") setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
   // 限额护栏对话框：一次只编辑一条（存凭证 id，轮询替换列表后仍能取到最新值）
   const [limitsFor, setLimitsFor] = useState<string | null>(null);
   // 标签编辑对话框：同样存 id，取最新快照
   const [tagsFor, setTagsFor] = useState<string | null>(null);
+  // 调度权重对话框：同样存 id，取最新快照
+  const [weightFor, setWeightFor] = useState<string | null>(null);
+  // Qoder 网页 Cookie 对话框：同样存 id，取最新快照
+  const [webCookieFor, setWebCookieFor] = useState<string | null>(null);
+  // 小浣熊账号密码对话框（按需登录用）：同样存 id，取最新快照
+  const [loginSecretFor, setLoginSecretFor] = useState<string | null>(null);
   // 列表筛选：池子一大就没有「找到某个号」的路径，这里收搜索 + 渠道 + 状态 + 标签四件套。
   // 筛选是纯展示层收敛，不改后端排序（后端仍按 sort/order 给全量）。
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
@@ -368,14 +407,22 @@ export function CredentialsPage() {
   const showNotice = (content: ReactNode) => push({ tone: "ok", testId: "credentials-notice", content });
   // 变动流水抽屉：一次只开一个（同一行内展开，不弹层——
   // 表格行本身就是最好的上下文，弹层会遮掉额度列）。`ledger` 记下打开时
-  // 读的是哪本账：内置组读积分账（credits），其余组读每日池（pool），
-  // 换排序重新取数时必须带同一个账本，否则会串到另一本账的流水。
+  // 读的是哪本账（CodeArts 读积分账 credits，其余渠道读 pool，
+  // 见 `providerLedger`），换排序重新取数时必须带同一个账本，否则会串到
+  // 另一本账的流水。
   const [creditEvents, setCreditEvents] = useState<{
     credentialId: string;
     ledger: Ledger;
     events: CreditEvent[];
     sort: string;
     order: string;
+  } | null>(null);
+  // 签到记录抽屉：与变动流水同形（一次只开一个、行内展开）。读的是本地落库的
+  // 审计日志（`checkin_events`），不触发上游请求——凭证据此能回看「上次签到
+  // 几点、领了多少、上游回了什么码」，正是「显示成功却没加积分」类问题的证据。
+  const [checkinLog, setCheckinLog] = useState<{
+    credentialId: string;
+    events: CheckinEvent[];
   } | null>(null);
 
   const credentials = data?.credentials ?? [];
@@ -390,7 +437,12 @@ export function CredentialsPage() {
   const tokenWarning = data?.token_expiry_warning_seconds ?? 0;
   // 写门槛是 admin 或 operator（与后端 require_operator 同口径）；viewer 只读。
   const canWrite = data?.is_operator ?? false;
-  const now = Date.now() / 1000;
+  // now 只在列表刷新成功（30s 轮询出结果）时推进：每次渲染取新值会让下面几个
+  // useMemo 因「输入搜索词 / 勾选」等无关 state 变化而全量重算筛选与分组。
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    setNow(Date.now() / 1000);
+  }, [dataUpdatedAt]);
 
   // 先筛后分组：分组只是把筛选结果按渠道归类，不改变「哪些该出现」。
   const filtered = useMemo(
@@ -408,6 +460,12 @@ export function CredentialsPage() {
     [credentials, now, filters.state],
   );
   const tagCounts = useMemo(() => tagOptions(credentials), [credentials]);
+  // 渠道 → 模型清单（组头展示用）。模型列表与凭证列表各自轮询 / 缓存，取不到时
+  // 为空 Map：组头那块直接不渲染，而不是显示「模型 0 个」（0 会被读成「这渠道没模型」）。
+  const modelsByProvider = useMemo(
+    () => groupModelsByProvider(modelsQuery.data?.data ?? []),
+    [modelsQuery.data],
+  );
   // 选中集合与当前列表求交：凭证被删除 / 轮询后消失时，残留 id 自动失效，
   // 不会出现「批量操作 3 条，其中 1 条已不存在」。用 filtered 而不是 credentials：
   // 筛选后不可见的行不应被批量动作带上（用户看不见就不会预期它被执行）。
@@ -437,6 +495,20 @@ export function CredentialsPage() {
   const tagsCredential = useMemo(
     () => credentials.find((item) => item.id === tagsFor) ?? null,
     [credentials, tagsFor],
+  );
+  const weightCredential = useMemo(
+    () => credentials.find((item) => item.id === weightFor) ?? null,
+    [credentials, weightFor],
+  );
+  // 网页 Cookie 对话框当前编辑的凭证：同上
+  const webCookieCredential = useMemo(
+    () => credentials.find((item) => item.id === webCookieFor) ?? null,
+    [credentials, webCookieFor],
+  );
+  // 账号密码对话框当前编辑的凭证：同上
+  const loginSecretCredential = useMemo(
+    () => credentials.find((item) => item.id === loginSecretFor) ?? null,
+    [credentials, loginSecretFor],
   );
   // 是否有任何筛选生效：决定「N / 总数」计数与「清空」入口是否出现
   const filtering =
@@ -472,7 +544,13 @@ export function CredentialsPage() {
     });
   };
 
-  const refresh = () => client.invalidateQueries({ queryKey: ["admin"] });
+  // 凭证增删 / 暂停会改变「哪些渠道还有可用凭证」，组头的模型清单（与 Playground
+  // 共用的 `playground-models` 缓存）必须一起失效，否则凭证列表刷新了、模型块还
+  // 停在旧数据上（新接入的渠道组头一直空着）。
+  const refresh = () => Promise.all([
+    client.invalidateQueries({ queryKey: ["admin"] }),
+    client.invalidateQueries({ queryKey: ["playground-models"] }),
+  ]);
 
   // 流水抽屉内排序：改排序需重新取数（后端排），并保持方向直觉
   // （时间/数值列首点降序，来源首点升序）。
@@ -489,7 +567,7 @@ export function CredentialsPage() {
         creditEvents.credentialId, creditEvents.ledger, columnKey, order);
       setCreditEvents({ ...creditEvents, events: result.events, sort: columnKey, order });
     } catch (caught) {
-      showError(caught instanceof Error ? caught.message : "流水读取失败");
+      showError(errorText(caught, "流水读取失败"));
     }
   };
 
@@ -500,7 +578,7 @@ export function CredentialsPage() {
       if (successMessage) showNotice(successMessage);
       await refresh();
     } catch (caught) {
-      showError(caught instanceof Error ? caught.message : "操作失败");
+      showError(errorText(caught, "操作失败"));
     } finally {
       setBusy(false);
     }
@@ -538,8 +616,7 @@ export function CredentialsPage() {
       await refresh();
       return true;
     } catch (caught) {
-      showError(caught instanceof Error ? caught.message : "批量操作失败");
-      return false;
+      showError(errorText(caught, "批量操作失败"));
     } finally {
       setBusy(false);
     }
@@ -587,9 +664,15 @@ export function CredentialsPage() {
 
   const actions: Actions = {
     // 会话失效被硬禁用的凭证：重新登录后用「恢复」放回池子，
-    // 不必删除重建（以前只能删除）。
+    // 不必删除重建（以前只能删除）。**保留**上游点名的冷却（限流/余额/
+    // 权益/风控）——清掉只会立刻再撞一次上游；要强制清走「强制恢复」。
     revive: (credential) =>
       void run(() => api.reviveCredential(credential.id), "已恢复该凭证，可参与调度。"),
+    forceRevive: (credential) =>
+      void run(
+        () => api.reviveCredential(credential.id, true),
+        "已强制恢复：上游点名的冷却（限流/余额/权益/风控）也一并清除，请留意可能立刻再撞上游。",
+      ),
     toggle: (credential) =>
       void run(
         () => api.toggleCredential(credential.id, credential.enabled !== 1),
@@ -625,7 +708,7 @@ export function CredentialsPage() {
           }
           await refresh();
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "探测失败");
+          showError(errorText(caught, "探测失败"));
         } finally {
           setBusy(false);
         }
@@ -654,7 +737,7 @@ export function CredentialsPage() {
           }
           await refresh();
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "签到失败");
+          showError(errorText(caught, "签到失败"));
         } finally {
           setBusy(false);
         }
@@ -673,13 +756,13 @@ export function CredentialsPage() {
           });
           await refresh();
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "成长中心执行失败");
+          showError(errorText(caught, "成长中心执行失败"));
         } finally {
           setBusy(false);
         }
       })(),
     // 只读：开关抽屉不写任何状态，因此不复用 run()（那个会刷新列表）。
-    // `ledger` 由调用组给出（内置组＝积分账，其余＝每日池）：两本账必须分开读。
+    // `ledger` 由调用行给出（CodeArts＝积分账，其余＝pool）：两本账必须分开读。
     credits: (credential, ledger) =>
       void (async () => {
         if (creditEvents?.credentialId === credential.id
@@ -694,7 +777,22 @@ export function CredentialsPage() {
             sort: "ts", order: "desc",
           });
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "流水读取失败");
+          showError(errorText(caught, "流水读取失败"));
+        }
+      })(),
+    // 签到记录：读本地落库的审计日志（不发上游请求，故对已失效凭证也能查）。
+    // 与流水同形——再点一次即收起。
+    checkinLog: (credential) =>
+      void (async () => {
+        if (checkinLog?.credentialId === credential.id) {
+          setCheckinLog(null);
+          return;
+        }
+        try {
+          const result = await api.checkinEvents(credential.id);
+          setCheckinLog({ credentialId: credential.id, events: result.events });
+        } catch (caught) {
+          showError(errorText(caught, "签到记录读取失败"));
         }
       })(),
     activity: (credential) =>
@@ -707,7 +805,7 @@ export function CredentialsPage() {
             : `活跃上报失败：${result.message || "未知原因"}`);
           await refresh();
         } catch (caught) {
-          showError(caught instanceof Error ? caught.message : "活跃上报失败");
+          showError(errorText(caught, "活跃上报失败"));
         } finally {
           setBusy(false);
         }
@@ -715,6 +813,29 @@ export function CredentialsPage() {
     // 只开对话框；保存与刷新由对话框自己回调（见 CredentialLimitsDialog）
     limits: (credential) => setLimitsFor(credential.id),
     tags: (credential) => setTagsFor(credential.id),
+    weight: (credential) => setWeightFor(credential.id),
+    // 单条导出：文件内容与「批量导入」的条目同形，可原样再导入。
+    // 只开对话框；保存与探测由对话框/后端负责
+    webCookie: (credential) => setWebCookieFor(credential.id),
+    loginSecret: (credential) => setLoginSecretFor(credential.id),
+    export: (credential) =>
+      void (async () => {
+        try {
+          const { blob } = await api.exportCredential(credential.id);
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download =
+            `coding2api-credential-${credential.provider}-${credential.id}.json`;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          URL.revokeObjectURL(url);
+          showNotice("已导出凭证 JSON（含明文令牌，请妥善保管）");
+        } catch (caught) {
+          showError(errorText(caught, "导出凭证失败"));
+        }
+      })(),
   };
 
   if (isLoading) return <PageSkeleton variant="cards" />;
@@ -734,7 +855,15 @@ export function CredentialsPage() {
           <Notice tone="muted">只读模式：仅管理员与操作员可以导入、启停或删除凭证。</Notice>
         </div>
       )}
-      {credentials.length === 0 && canWrite && (
+      {isError && (
+        <div data-testid="credentials-load-error">
+          <Notice tone="danger">
+            凭证列表加载失败：服务可能暂时不可用或会话已过期。下面显示「没有凭证」
+            是取不到数据，不是真的空池——别据此以为凭证丢了。
+          </Notice>
+        </div>
+      )}
+      {!isError && credentials.length === 0 && canWrite && (
         <div data-testid="first-run-hint">
           <Notice tone="muted">
             还没有凭证。点凭证池右上角「添加凭证」登录渠道账号（CodeBuddy / TRAE /
@@ -769,6 +898,15 @@ export function CredentialsPage() {
             </Button>
             <Button
               size="sm"
+              variant="ghost"
+              data-testid="open-batch-import"
+              disabled={busy}
+              onClick={() => setBatchOpen(true)}
+            >
+              <Upload className="size-4" /> 批量导入
+            </Button>
+            <Button
+              size="sm"
               variant="primary"
               data-testid="open-add-dialog"
               disabled={busy}
@@ -779,7 +917,15 @@ export function CredentialsPage() {
           </div>
         )}
       >
-        {credentials.length === 0 ? (
+        {isError ? (
+          // 加载失败不是「空池」：给出错误态，不显示「还没有凭证」
+          <EmptyState
+            icon={<Database className="size-5" />}
+            title="凭证列表加载失败"
+            description="服务暂时不可用或会话已过期，请稍后重试。"
+            data-testid="credentials-error-state"
+          />
+        ) : credentials.length === 0 ? (
           <EmptyState
             icon={<Database className="size-5" />}
             title="还没有凭证"
@@ -940,11 +1086,14 @@ export function CredentialsPage() {
                     const isCollapsed = !expanded.has(group.key);
                     // 到期积分：以「窗口 + 数字」两个图块呈现，比一行长句更像仪表盘。
                     // 主/次窗口措辞区分开（主窗口 36h 是次窗口 7 天的子集）。
-                    const primaryWindowLabel = `${formatDuration(expiryWindow)}内过期`;
-                    const secondaryWindowLabel = `${formatDuration(expirySecondaryWindow)}内过期`;
-                    // 到期积分按**本组那本账**取：福利组（每日池）用主账字段，内置组
-                    // （积分账）用积分账字段——后端已把两段合并阶梯拆开，各自独立。
-                    // 其余渠道只有一本账，主账字段即其全部到期积分。
+                    // 措辞必须点明「窗口」：它是调度窗口（36h / 7d），不是某笔额度的
+                    // 剩余到期时间——实测「1.5天」被读成倒计时（积分今天到期却显示 1.5 天）。
+                    const primaryWindowLabel =
+                      `${formatDuration(expiryWindow)}窗口内到期`;
+                    const secondaryWindowLabel =
+                      `${formatDuration(expirySecondaryWindow)}窗口内到期`;
+                    // 到期积分按本组那本账取：CodeArts（credits）的到期阶梯与其余渠道（pool）
+// 同源，直接对通用字段求和即可；免费层无额度接口，恒无到期积分。
                     const hasExpiring = (group.expiring ?? 0) > 0;
                     // 次窗口只在**比主窗口多出东西**时才展示：次窗口是主窗口的超集，
                     // 相等就意味着「没有超出 1.5 天窗口的部分」。
@@ -958,28 +1107,47 @@ export function CredentialsPage() {
                     // 列数一变就重算列宽，展开的下一组会整列错位。选择列只在可写
                     // （canWrite）时出现，与 ColumnHeaderRow / Row 的渲染条件严格一致。
                     // canWrite：选择 + 凭证 + 状态 + 额度 + token + 成长 + 操作 = 7；
-                    // viewer：去掉选择与操作两列 = 5。**只读的福利组列数不变**：它仍
-                    // 渲染空的勾选 / 操作格（见 Row 的 readOnly 分支），否则表格 auto
-                    // 布局会把同一张表里其它组整列错位。
+                    // viewer：去掉选择与操作两列 = 5。
                     const columnCount = canWrite ? 7 : 5;
-                    // 只读组（福利）里能写吗：不能。行与列头都按它收窄渲染。
-                    const groupCanWrite = canWrite && !group.readOnly;
                     // 本组是否已全选：决定组头 checkbox 的勾选态。用 group.items
                     // （组内全部行）而不是 filtered，因为组头「全选本渠道」的语义
                     // 就是这一渠道下的所有账号。
                     const groupIds = group.items.map((item) => item.id);
                     const allSelected = groupIds.length > 0
                       && groupIds.every((id) => selected.has(id));
+                    // 本组渠道当前能提供的模型（组头「模型 N 个」+ hover 清单）。
+                    // 取不到模型列表时为空数组，那块整体不渲染。
+                    const groupModels = modelsByProvider.get(group.provider) ?? [];
+                    // 组头顺带给一个「最低倍率」：只看数量看不出这渠道贵不贵，
+                    // 而最低倍率正是「这渠道值不值得优先用」的答案。免费额度
+                    // （rate 0）不参与取最低——渠道里混着 1~2 个免费模型时按字面
+                    // 取最小会显示「最低 免」，读起来像整个渠道免费。
+                    const rateText = rateSummary(groupModels);
                     // 额度合计的进度条：剩余 / 总量（免费层两者皆 null，不出条）
                     const quotaPct =
                       group.remaining !== null && group.total !== null && group.total > 0
                         ? Math.min(100, Math.max(0, (group.remaining / group.total) * 100))
                         : null;
+                    // 今日签到：分母是「该签的号」（暂停 / 硬禁用已由聚合跳过）。
+                    // 渠道本就不支持签到（Zen / Kilo / 国际站）时整块不渲染——
+                    // 永远 0/N 的仪表会被读成「这些号今天漏签了」。
+                    const checkin = group.checkin;
+                    const checkinTotal = checkin.done + checkin.failed + checkin.pending;
+                    const showCheckin = supportsCheckin(group.provider) && checkinTotal > 0;
+                    // 三态配色：有失败先红（那才是要处置的），全签完才绿。
+                    const checkinIconClass = checkin.failed > 0
+                      ? "bg-destructive/12 text-danger-ink ring-1 ring-destructive/25"
+                      : checkin.done === checkinTotal
+                        ? "bg-ok/12 text-ok-ink ring-1 ring-ok/25"
+                        : "bg-background text-muted-foreground ring-1 ring-border/70";
+                    const checkinTitle = checkin.failed > 0
+                      ? `今日签到（北京时间）：已签 ${checkin.done} / ${checkinTotal}，失败 ${checkin.failed}，未签 ${checkin.pending}。失败原因见行内「签到记录」。`
+                      : `今日签到（北京时间）：已签 ${checkin.done} / ${checkinTotal}，未签 ${checkin.pending}（任务未轮到也算未签）。`;
                     return (
                       <Fragment key={group.key}>
                         {/* 组头：折叠时的「渠道仪表盘」——身份 + 状态分布 + 额度合计 +
-                            1.5 天 / 7 天内将过期的积分。每个指标一个带图标的图块，
-                            比一行纯文字更好扫读；点击展开该渠道（默认全折叠）。 */}
+                            1.5 天 / 7 天内将过期的积分 + 今日签到（最右）。每个指标一个带
+                            图标的图块，比一行纯文字更好扫读；点击展开该渠道（默认全折叠）。 */}
                         <TableRow data-testid={`group-${group.key}`}>
                           <TableCell
                             colSpan={columnCount}
@@ -989,18 +1157,13 @@ export function CredentialsPage() {
                                 checkbox 嵌进 button 会形成嵌套交互元素，读屏与键盘
                                 焦点都会打架（点 checkbox 会连带展开/折叠该组）。
                                 只在**会话可写**时渲染（viewer 整张表都没有选择列，组头
-                                也不该多出这一格）；可写会话下只读的福利组仍渲染，但置为
-                                **禁用**——它不承载任何操作，却要占住这一格，否则组头比
-                                其它组少一个前导元素、指标区整体左移，与同表其它组对不齐。 */}
+                                也不该多出这一格）。 */}
                             <div className="flex items-center">
                               {canWrite && (
                                 <span className="pl-3">
                                   <Checkbox
-                                    checked={groupCanWrite && allSelected}
-                                    disabled={!groupCanWrite}
-                                    aria-label={groupCanWrite
-                                      ? `全选 ${group.label} 的账号`
-                                      : `${group.label} 为只读渠道，不可选择`}
+                                    checked={allSelected}
+                                    aria-label={`全选 ${group.label} 的账号`}
                                     data-testid={`group-select-${group.key}`}
                                     onCheckedChange={(checked) =>
                                       toggleGroupSelected(groupIds, checked === true)}
@@ -1012,7 +1175,7 @@ export function CredentialsPage() {
                                 data-testid={`group-toggle-${group.key}`}
                                 aria-expanded={!isCollapsed}
                                 onClick={() => toggleGroup(group.key)}
-                                className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                                className="flex min-w-0 flex-1 cursor-pointer flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
                               >
                               {/* 身份：折叠箭头 + 品牌图标 + 渠道名 + 账号数 */}
                               <span className="flex w-48 shrink-0 items-center gap-2">
@@ -1039,7 +1202,8 @@ export function CredentialsPage() {
                               {/* 指标区：状态 / 额度 / 到期，每个都是「图标 + 标签 + 数值」。
                                   每块**固定宽度**（`w-* shrink-0`），否则内容宽度随渠道变化，
                                   各组的「状态 / 额度 / 到期」起点会各错各的、读起来不成列。
-                                  窄屏放不下时按整块换行，块内仍保持同一套对齐。 */}
+                                  窄屏放不下时按整块换行，块内仍保持同一套对齐。
+                                  （今日签到在右簇，与模型一起贴右，见折叠按钮之后。） */}
                               <span className="flex flex-wrap items-center gap-x-4 gap-y-2">
                                 {/* 状态分布：只列出现过的态，图标语义与行内状态徽章同源 */}
                                 <span className="flex w-40 shrink-0 items-center gap-2">
@@ -1124,7 +1288,7 @@ export function CredentialsPage() {
                                   <span
                                     className="flex w-36 shrink-0 items-center gap-2"
                                     data-testid={`group-${group.key}-expiring`}
-                                    title={`组内各号主窗口（${formatDuration(expiryWindow)}）内将过期的积分合计`}
+                                    title={`组内各号主窗口（${formatDuration(expiryWindow)}）内将到期的积分合计（调度窗口，非单笔到期时刻）`}
                                   >
                                     <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
                                       <Hourglass className="size-3.5" aria-hidden />
@@ -1143,7 +1307,7 @@ export function CredentialsPage() {
                                   <span
                                     className="flex w-36 shrink-0 items-center gap-2"
                                     data-testid={`group-${group.key}-expiring-secondary`}
-                                    title={`组内各号次窗口（${formatDuration(expirySecondaryWindow)}）内将过期的积分合计，含主窗口的部分`}
+                                    title={`组内各号次窗口（${formatDuration(expirySecondaryWindow)}）内将到期的积分合计，含主窗口的部分（调度窗口，非单笔到期时刻）`}
                                   >
                                     <span className="grid size-7 shrink-0 place-items-center rounded-md bg-warn/12 text-warn ring-1 ring-warn/25">
                                       <CalendarClock className="size-3.5" aria-hidden />
@@ -1160,6 +1324,135 @@ export function CredentialsPage() {
                                 )}
                               </span>
                             </button>
+                            {/* 右簇：今日签到 + 模型。两者都贴右，和模型成一对——
+                                「这渠道今天签成功没有、还能打什么模型」是同一类收尾确认，
+                                放在指标区外面还免去它与额度块抢宽度（窄屏时指标区先换行，
+                                右簇始终贴边）。
+                                签到「已签 / 该签」是主数字；失败单独标红——那才是要处置
+                                的东西（失败在 30s 轮询里会随下一轮补签自动回落）。
+                                最近时刻只给 HH:MM，日期对「今天」是冗余的。 */}
+                            <span className="flex shrink-0 items-center">
+                              {showCheckin && (
+                                <span
+                                  className="flex w-40 shrink-0 items-center gap-2 pr-3"
+                                  data-testid={`group-${group.key}-checkin`}
+                                  title={checkinTitle}
+                                >
+                                  <span className={cn(
+                                    "grid size-7 shrink-0 place-items-center rounded-md",
+                                    checkinIconClass,
+                                  )}>
+                                    <CalendarCheck className="size-3.5" aria-hidden />
+                                  </span>
+                                  <span className="min-w-0">
+                                    <span className="block text-[11px] leading-tight text-muted-foreground">
+                                      今日签到
+                                    </span>
+                                    <span className="block truncate text-xs leading-tight font-medium tabular-nums text-foreground">
+                                      {checkin.done}/{checkinTotal}
+                                      {checkin.failed > 0 && (
+                                        <span className="ml-1.5 font-normal text-danger-ink">
+                                          {checkin.failed} 失败
+                                        </span>
+                                      )}
+                                      {checkin.lastAt !== null && (
+                                        <span className="ml-1.5 font-normal text-muted-foreground">
+                                          {formatTimeParts(checkin.lastAt)[1].slice(0, 5)}
+                                        </span>
+                                      )}
+                                    </span>
+                                  </span>
+                                </span>
+                              )}
+                              {/* 本渠道当前能提供的模型：只给数量，全量清单进 hover。
+                                  模型多的渠道有几十条，铺在组头会把这一行撑成十几行；
+                                  而「几个模型、最便宜多少」正是判断这渠道值不值得展开的
+                                  第一信息。清单里每条带**该渠道的**倍率（与模型选择器
+                                  同口径，多渠道模型各渠道倍率不同，不能拿合并值冒充）。
+                                  取不到模型列表时整块不渲染（不显示「0 个」——那会被读成
+                                  这渠道没有模型，实际只是列表还没回来）。
+
+                                  **必须在折叠按钮外面**：它自己是个可聚焦按钮（键盘能
+                                  打开清单），按钮套按钮会让 HTML 解析直接拆掉外层结构。
+
+                                  触屏没有 hover，点击又会被 Radix 的 pointerdown 关掉，
+                                  所以移动端打不开清单（与页面其它 hover 明细同一限制）；
+                                  真要在手机上看，需要换成 Popover（点击开合）。 */}
+                              {groupModels.length > 0 && (
+                                <LongTextTip
+                                  className="w-80 max-w-[min(90vw,20rem)] p-0"
+                                  content={
+                                    <div data-testid={`group-${group.key}-models`}>
+                                      {/* 头部：渠道身份 + 条数，吸顶不随清单滚走——
+                                          几十条模型滚到中段时仍知道「这是哪个渠道的清单」 */}
+                                      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+                                        <ProviderIcon provider={group.provider} size={14} />
+                                        <span className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground">
+                                          {group.label}
+                                        </span>
+                                        <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+                                          {groupModels.length} 个模型
+                                        </span>
+                                      </div>
+                                      {/* 清单：限高内滚（不把弹层顶出视口），行间细分隔线 */}
+                                      <ul className="max-h-64 divide-y divide-border/60 overflow-y-auto">
+                                        {groupModels.map((model) => (
+                                          <li
+                                            key={model.id}
+                                            data-testid={`group-${group.key}-model`}
+                                            className="flex items-baseline justify-between gap-3 px-3 py-1"
+                                          >
+                                            <span className="min-w-0 truncate text-xs text-foreground">
+                                              {model.label}
+                                            </span>
+                                            {/* 倍率做成数值胶囊：等宽数字 + 免费额度单独着色，
+                                                扫一列倍率时数字右对齐、颜色分档一眼可辨 */}
+                                            <span
+                                              className={cn(
+                                                "shrink-0 rounded px-1 text-[11px] font-semibold tabular-nums",
+                                                model.rate === undefined
+                                                  ? "text-muted-foreground"
+                                                  : model.rate === 0
+                                                    ? "bg-ok/12 text-ok-ink"
+                                                    : "bg-muted text-foreground",
+                                              )}
+                                            >
+                                              {model.rate === undefined ? "—" : rateLabel(model.rate)}
+                                            </span>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                      {/* 脚注：口径说明，避免「免 / —」被误读 */}
+                                      <div className="border-t border-border px-3 py-1.5 text-[11px] leading-snug text-muted-foreground">
+                                        倍率＝该渠道的消耗倍率；<span className="text-ok-ink">免</span>＝免费额度，
+                                        — ＝上游未给倍率
+                                      </div>
+                                    </div>
+                                  }
+                                >
+                                  <button
+                                    type="button"
+                                    className="flex w-40 shrink-0 cursor-help items-center gap-2 rounded-md py-2 pr-3 pl-1 text-left focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                                    data-testid={`group-${group.key}-model-count`}
+                                  >
+                                    <span className="grid size-7 shrink-0 place-items-center rounded-md bg-background text-muted-foreground ring-1 ring-border/70">
+                                      <Sparkles className="size-3.5" aria-hidden />
+                                    </span>
+                                    <span className="min-w-0">
+                                      <span className="block text-[11px] leading-tight text-muted-foreground">模型</span>
+                                      <span className="block truncate text-xs leading-tight font-medium tabular-nums text-foreground">
+                                        {groupModels.length} 个
+                                        {rateText !== null && (
+                                          <span className="ml-1 font-normal text-muted-foreground">
+                                            · {rateText}
+                                          </span>
+                                        )}
+                                      </span>
+                                    </span>
+                                  </button>
+                                </LongTextTip>
+                              )}
+                            </span>
                             </div>
                           </TableCell>
                         </TableRow>
@@ -1168,8 +1461,6 @@ export function CredentialsPage() {
                             <ColumnHeaderRow
                               groupKey={group.key}
                               canWrite={canWrite}
-                              readOnly={group.readOnly}
-                              ledger={group.ledger}
                               showGrowth={showGrowth}
                               sort={sort}
                               order={order}
@@ -1179,16 +1470,12 @@ export function CredentialsPage() {
                               <Fragment key={credential.id}>
                                 <Row
                                   credential={credential}
-                                  // 同一凭证在 CodeArts 的两个组各有一行，只读组给
-                                  // testid 加后缀，避免行内 testid 在两组之间撞 id。
-                                  idSuffix={group.readOnly ? "-benefit" : ""}
                                   ledger={group.ledger}
                                   now={now}
                                   expiryWindow={expiryWindow}
                                   expirySecondaryWindow={expirySecondaryWindow}
                                   tokenWarning={tokenWarning}
                                   canWrite={canWrite}
-                                  readOnly={group.readOnly}
                                   showGrowth={showGrowth}
                                   busy={busy}
                                   selected={selected.has(credential.id)}
@@ -1199,10 +1486,8 @@ export function CredentialsPage() {
                                   onConfirmDelete={setConfirmDelete}
                                   actions={actions}
                                 />
-                                {/* 抽屉跟随打开它的那组渲染：同一凭证在福利组也有一行，
-                                    不判组就会在两处各展开一份。福利组本就不给入口。 */}
-                                {!group.readOnly
-                                  && creditEvents?.credentialId === credential.id
+                                {/* 抽屉由调用方渲染成**独立的下一行**（见 TableBody）。 */}
+                                {creditEvents?.credentialId === credential.id
                                   && creditEvents.ledger === group.ledger && (
                                   <TableRow data-testid={`credit-row-${credential.id}`}>
                                     <TableCell colSpan={columnCount} className="p-0">
@@ -1214,6 +1499,18 @@ export function CredentialsPage() {
                                         order={creditEvents.order}
                                         onSort={sortCredits}
                                         onClose={() => actions.credits(credential, creditEvents.ledger)}
+                                      />
+                                    </TableCell>
+                                  </TableRow>
+                                )}
+                                {/* 签到记录抽屉：与流水同为「独立下一行」，一次只开一个。 */}
+                                {checkinLog?.credentialId === credential.id && (
+                                  <TableRow data-testid={`checkin-row-${credential.id}`}>
+                                    <TableCell colSpan={columnCount} className="p-0">
+                                      <CheckinLogDrawer
+                                        credentialId={credential.id}
+                                        events={checkinLog.events}
+                                        onClose={() => actions.checkinLog(credential)}
                                       />
                                     </TableCell>
                                   </TableRow>
@@ -1258,6 +1555,56 @@ export function CredentialsPage() {
         />
       )}
 
+      {canWrite && weightCredential && (
+        <CredentialWeightDialog
+          credential={weightCredential}
+          onClose={() => setWeightFor(null)}
+          onSaved={(message) => {
+            setWeightFor(null);
+            showNotice(message);
+            void refresh();
+          }}
+          onError={(message) => showError(message)}
+        />
+      )}
+
+      {canWrite && loginSecretCredential && (
+        <CredentialLoginSecretDialog
+          credential={loginSecretCredential}
+          onClose={() => setLoginSecretFor(null)}
+          onSaved={(message) => {
+            setLoginSecretFor(null);
+            showNotice(message);
+            void refresh();
+          }}
+          onError={(message) => showError(message)}
+        />
+      )}
+
+      {canWrite && webCookieCredential && (
+        <CredentialWebCookieDialog
+          credential={webCookieCredential}
+          onClose={() => setWebCookieFor(null)}
+          onSaved={(message) => {
+            setWebCookieFor(null);
+            showNotice(message);
+            void refresh();
+          }}
+          onError={(message) => showError(message)}
+        />
+      )}
+
+      {canWrite && batchOpen && (
+        <BatchImportDialog
+          onClose={() => setBatchOpen(false)}
+          onImported={(message) => {
+            showNotice(message);
+            void refresh();
+          }}
+          onNotice={showNotice}
+        />
+      )}
+
       {canWrite && (
         <AddCredentialDialog
           open={addOpen}
@@ -1265,6 +1612,8 @@ export function CredentialsPage() {
           credentialCount={credentials.length}
           hasZen={hasZen}
           hasKilo={hasKilo}
+          lingxiCount={credentials.filter((row) => row.provider === "lingxi").length}
+          tosRisks={data?.tos_risks ?? {}}
           onImported={(message) => {
             setAddOpen(false);
             showNotice(message);
@@ -1284,13 +1633,20 @@ export function CredentialsPage() {
  * 几十行不能挤进单元格。无明细（未探测/上游未提供）时不渲染。
  */
 function PackageLadder({ credential }: { credential: Credential }) {
-  const packages = credential.quota_packages ?? [];
-  if (packages.length === 0) return null;
+  // 已消耗完（剩余 ≤ 0）的包不再展示：它们只是上游按期返回的历史残留，
+  // 既不带可用积分、也不会再被消耗，堆在弹层里只会淹没还有余额的包。
+  const packages = (credential.quota_packages ?? []).filter(
+    (item) => item.total - item.used > 0,
+  );
+  const cookieExpired = credential.web_cookie_state === "expired";
+  if (packages.length === 0 && !cookieExpired) return null;
   // 展示按到期升序：快过期的排最前（无到期信息的排最后）
   const ordered = [...packages].sort(
     (left, right) => (left.end ?? Infinity) - (right.end ?? Infinity),
   );
   return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {packages.length > 0 && (
     <LongTextTip
       // 明细行（包名 + 剩余/总量 + 已用 + 到期）比默认 max-w-sm 宽得多，
       // 用窄弹层会每行折成两三行；这里放宽并禁止折行，超出视口时内层横向滚动。
@@ -1301,19 +1657,41 @@ function PackageLadder({ credential }: { credential: Credential }) {
           // 高度只能按「弹层实际可用的空间」封顶，不能只写 70vh：弹层贴着视口
           // 上/下缘弹出时（几十个包必然超出），radix 的 flip 挪不动就只能把
           // 上半截顶到视口外。available-height 是 radix 算好的可用高度，
-          // 再减掉弹层自身的内边距（py-1.5 上下共 0.75rem），否则仍差这几像素。
-          className="max-h-[min(70vh,calc(var(--radix-tooltip-content-available-height)-0.75rem))] max-w-full overflow-x-auto overflow-y-auto pr-1"
+          // 再减掉弹层自身的内边距（py-2 上下共 1rem），否则仍差这几像素。
+          className="max-h-[min(70vh,calc(var(--radix-tooltip-content-available-height)-1rem))] max-w-full overflow-x-auto overflow-y-auto"
         >
-          <div className="mb-1 font-medium">
-            额度包 {packages.length} 个（按到期先后）
+          <div className="mb-1.5 flex items-baseline justify-between gap-3 border-b border-border pb-1.5">
+            <span className="text-xs font-semibold text-foreground">额度包明细</span>
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+              {packages.length} 个 · 按到期先后
+            </span>
           </div>
-          <ul className="space-y-0.5">
+          <ul className="divide-y divide-border/60">
             {ordered.map((item, index) => (
-              <li key={`${item.name}-${item.end}-${index}`} data-testid={`package-${credential.id}`}>
-                {item.name ? `${item.name}：` : ""}
-                剩 {formatNumber(item.total - item.used)} / {formatNumber(item.total)}
-                {item.used > 0 && `（已用 ${formatNumber(item.used)}）`}
-                · {packageExpiry(item.end)} 到期
+              <li
+                key={`${item.name}-${item.end}-${index}`}
+                data-testid={`package-${credential.id}`}
+                className="py-1 text-xs"
+              >
+                {item.name ? <span className="font-medium text-foreground">{item.name}：</span> : ""}
+                <span className="tabular-nums">剩 {formatNumber(item.total - item.used)} / {formatNumber(item.total)}</span>
+                {item.used > 0 && (
+                  <span className="text-muted-foreground">（已用 {formatNumber(item.used)}）</span>
+                )}
+                <span className="text-muted-foreground"> · {packageExpiry(item.end)} 到期</span>
+                {item.usable === false && (
+                  // 小浣熊的充值池被冻结：额度在，但用不了。与「已用完」分开标
+                  <span className="text-destructive" data-testid={`package-frozen-${credential.id}`}>
+                    {" "}· 已冻结
+                  </span>
+                )}
+                {(item.expiring ?? 0) > 0 && (
+                  // 福利积分按批次到账：同一个「套餐到期日」下仍有更早作废的部分，
+                  // 这个数字是上游唯一给出的「最近要过期多少」。
+                  <span className="text-destructive" data-testid={`package-expiring-${credential.id}`}>
+                    {" "}· 7 天内到期 {formatNumber(item.expiring ?? 0)}
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -1329,6 +1707,17 @@ function PackageLadder({ credential }: { credential: Credential }) {
         套餐 {packages.length} 个
       </Button>
     </LongTextTip>
+      )}
+      {cookieExpired && (
+        <span
+          className="text-xs text-destructive"
+          data-testid={`web-cookie-expired-${credential.id}`}
+          title="网页 Cookie 已失效（控制台会话过期）。点「更多 → 网页 Cookie」重新粘贴即可恢复逐笔明细；额度汇总不受影响。"
+        >
+          网页 Cookie 已失效，请重贴
+        </span>
+      )}
+    </div>
   );
 }
 /** 生效中的模型级冷却（6004 模型限流 / 11102 该账号无此模型）。
@@ -1468,8 +1857,6 @@ function QuotaRing({ pct }: { pct: number }) {
 function ColumnHeaderRow({
   groupKey,
   canWrite,
-  readOnly,
-  ledger,
   showGrowth,
   sort,
   order,
@@ -1477,24 +1864,11 @@ function ColumnHeaderRow({
 }: {
   groupKey: string;
   canWrite: boolean;
-  readOnly: boolean;
-  /** 本组讲哪本账：credits＝积分账（内置组），pool＝每日池（其余） */
-  ledger: Ledger;
   showGrowth: boolean;
   sort: string;
   order: "asc" | "desc";
   toggle: (columnKey: string) => void;
 }) {
-  // 只读组（CodeArts 福利）不承载任何操作：勾选列与操作列都渲染成**空占位格**，
-  // 而不是不渲染——列数必须与其它组严格一致，表格是 auto 布局，少一格会让
-  // 同表其它组整列错位。
-  const writable = canWrite && !readOnly;
-  // 额度列排的是**本组那本账**：内置组按积分账排（与列里显示的数字同源），
-  // 其余按每日池排。两把键都在后端白名单里，未知键会被后端回落默认键。
-  const creditsLedger = ledger === "credits";
-  const quotaColumnKey = creditsLedger ? "quota_credits_remaining" : "quota_remaining";
-  // 健康度列同样按本组那本账排：内置组用积分账派生的健康度
-  const healthColumnKey = creditsLedger ? "quota_credits_health" : "health";
   return (
     <TableRow
       data-testid={`column-header-${groupKey}`}
@@ -1506,13 +1880,13 @@ function ColumnHeaderRow({
       <SortableHead label="凭证" columnKey="nickname" active={sort === "nickname"}
                     direction={order} onToggle={toggle} testId={`sort-${groupKey}-nickname`}
                     hint={<ColumnHint text="昵称；「已指定」＝调度器优先用该凭证（全局唯一）。渠道名与数量在分组标题行。" />} />
-      <SortableHead label="状态 / 健康度" columnKey={healthColumnKey} active={sort === healthColumnKey}
+      <SortableHead label="状态 / 健康度" columnKey="health" active={sort === "health"}
                     direction={order} onToggle={toggle} testId={`sort-${groupKey}-health`}
-                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。CodeArts 内置组按**积分账**算，福利组按每日池算，各与本组额度列同源。" />} />
-      <SortableHead label="额度" columnKey={quotaColumnKey}
-                    active={sort === quotaColumnKey} direction={order}
+                    hint={<ColumnHint text="状态：可用/冷却中/已禁用/已暂停/额度耗尽。已暂停只摘对话流量，签到/刷新/探测照常；冷却中到期恢复。健康度四态：已知百分比/未探测/无探测/已耗尽——未探测＝探测失败或渠道未给额度（可重试）≠已耗尽；无探测＝免费层无额度接口。调度器优先百分比高者，打平比积分。" />} />
+      <SortableHead label="额度" columnKey="quota_remaining"
+                    active={sort === "quota_remaining"} direction={order}
                     onToggle={toggle} testId={`sort-${groupKey}-quota_remaining`}
-                    hint={<ColumnHint text="剩余 / 总量。周期口径按渠道（CodeBuddy 本周期剩余、TRAE 账户剩余递减、CodeArts 每日 token 折算池、zen/kilo 免费层无额度接口）；悬浮额度看口径。CodeArts 内置组显示的是**积分账**（内置模型计费），福利组显示每日 token 池。下箭头展开本组的变动流水。" />} />
+                    hint={<ColumnHint text="剩余 / 总量。周期口径按渠道（CodeBuddy 本周期剩余、TRAE 账户剩余递减、CodeArts 积分余额、zen/kilo 免费层无额度接口）；悬浮额度看口径。下箭头展开本组的变动流水。" />} />
       <SortableHead label="token 剩余" columnKey="token_expires_at"
                     active={sort === "token_expires_at"} direction={order}
                     onToggle={toggle} testId={`sort-${groupKey}-token_expires_at`}
@@ -1530,12 +1904,7 @@ function ColumnHeaderRow({
         <TableHead aria-hidden />
       )}
       {canWrite && (
-        writable ? (
-          <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际版）、指定、暂停/恢复、删除。积分记录在额度列下箭头。" /></span></TableHead>
-        ) : (
-          // 只读组的操作列只留位置，不给列名（没有操作可做，写了反而像能点）
-          <TableHead aria-hidden />
-        )
+        <TableHead className="text-right"><span className="inline-flex items-center gap-1">操作<ColumnHint text="探测/签到：行内常驻。更多操作（⋯）：成长中心（仅 CodeBuddy）、活跃上报（CodeBuddy 与 CodeBuddy 国际）、指定、暂停/恢复、删除。变动流水在额度列下箭头。" /></span></TableHead>
       )}
     </TableRow>
   );
@@ -1543,14 +1912,12 @@ function ColumnHeaderRow({
 
 function Row({
   credential,
-  idSuffix,
   ledger,
   now,
   expiryWindow,
   expirySecondaryWindow,
   tokenWarning,
   canWrite,
-  readOnly,
   showGrowth,
   busy,
   selected,
@@ -1561,17 +1928,13 @@ function Row({
   actions,
 }: {
   credential: Credential;
-  /** 行内 testid 后缀；CodeArts 只读组用 `-benefit`，避免与内置组那行撞 id */
-  idSuffix: string;
-  /** 本行讲哪一本账：credits＝积分账（内置组），pool＝每日池（其余） */
+  /** 本行讲哪一本账：credits＝CodeArts 积分，pool＝其余渠道的套餐/每日池余额 */
   ledger: Ledger;
   now: number;
   expiryWindow: number;
   expirySecondaryWindow: number;
   tokenWarning: number;
   canWrite: boolean;
-  /** 只读组（CodeArts 福利）：只展示额度，勾选 / 操作 / 积分账全部收掉 */
-  readOnly: boolean;
   showGrowth: boolean;
   busy: boolean;
   selected: boolean;
@@ -1581,76 +1944,47 @@ function Row({
   onConfirmDelete: (id: string | null) => void;
   actions: Actions;
 }) {
-  // 能写 = 会话可写 且 本组不是只读组。列数不随之变化（见 ColumnHeaderRow）。
-  const writable = canWrite && !readOnly;
-  // 本行讲哪本账：内置组＝积分账（credits），其余（含福利组）＝每日池（pool）。
-  // 数值、口径说明、流水入口都按它取——两本账在上游是两个独立接口、量级差一个
-  // 数量级，混在一行里会被读成同一本账的两次读数。
+  // 本行讲哪本账由渠道决定（`providerLedger`）：数值、口径说明、流水入口都按
+  // 它取——两本账在上游是两套接口、量级差一个数量级，混在一行里会被读成
+  // 同一本账的两次读数。CodeArts 的额度来自积分接口，其余渠道是套餐口径。
   const creditsLedger = ledger === "credits";
-  const remaining = creditsLedger
-    ? credential.quota_credits_remaining
-    : credential.quota_remaining;
-  const total = creditsLedger ? credential.quota_credits_total : credential.quota_total;
-  // 到期积分按本行那本账取：内置组读积分账字段，其余（含福利组）读主账字段。
-  // 后端已把两段合并阶梯按账本拆开，两组各显各的，互不串账。
+  const remaining = credential.quota_remaining;
+  const total = credential.quota_total;
+  // 到期积分：与额度同源（后端按凭证自己的阶梯算好）。
   const expiring = expiringQuotaLabel(
-    creditsLedger
-      ? credential.quota_credits_expiring
-      : credential.quota_expiring_credits,
-    expiryWindow, "primary", QUOTA_UNIT);
+    credential.quota_expiring_credits, expiryWindow, "primary", QUOTA_UNIT);
   // 次窗口只在**比主窗口多**时才渲染：7 天窗口是 36h 的超集，两块数字相同
   // 说明没有「超出主窗口的部分」，再列一行只是把同一个数字说两遍。它的作用是
   // 解释「36h 内没有到期积分、但一周内会过期」的账号为何仍被优先选中。
   const expiringSecondary = !expiring
     ? expiringQuotaLabel(
-        creditsLedger
-          ? credential.quota_credits_expiring_secondary
-          : credential.quota_expiring_credits_secondary,
+        credential.quota_expiring_credits_secondary,
         expirySecondaryWindow,
         "secondary",
         QUOTA_UNIT,
       )
     : null;
-  // 健康度也按本行那本账取：内置组（积分账）读后端派生的 `quota_credits_health`，
-  // 其余读主账 `health`。两列必须同源，否则会出现「额度积分 99% + 健康度 0%」。
-  const health = healthView(credentialHealth(credential, ledger), credential.provider);
-  const state = credentialState(credential, now, credentialHealth(credential, ledger));
+  const health = healthView(credential.health, credential.provider);
+  const state = credentialState(credential, now);
   const cooldown = cooldownRemaining(credential.cooling_until, now);
   const tokenExpiry = tokenExpiryView(
     credential.token_expires_at, tokenWarning, now, credential.token_issued_at);
 
   // 抽屉由调用方渲染成**独立的下一行**（见 TableBody）：塞进本行的最后一个单元格
   // 只会挤在「操作」列里——同行内的 colSpan 不生效，整行高度会被拉坏。
-  //
-  // testid 带 `idSuffix`：同一凭证在 CodeArts 内置 / 福利两组各有一行，行级
-  // testid 必须唯一，否则 `getByTestId` 会撞到两行。行内其它 testid（标签 /
-  // 限额徽章 / token 到期 / 模型避让）在只读组仍可能与内置组同名，测试里用
-  // `within(row)` 限定作用域即可。
   return (
-    <TableRow data-testid={`row-${credential.id}${idSuffix}`}>
+    <TableRow data-testid={`row-${credential.id}`}>
       {/* 选择格：与 ColumnHeaderRow 的空表头一一对应（列数恒定）。
-          checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。
-          只读组渲染成**禁用** checkbox 而非空占位格：空占位格虽然保住了列数，
-          但这一格的内容宽度与其它组的 checkbox 不同，表格 auto 布局下本行各列
-          起点会与内置组错开；渲染同尺寸的禁用框才能真正对齐。 */}
+          checkbox 只负责勾选，不触发任何行级动作——误点空白处不应产生副作用。 */}
       {canWrite && (
         <TableCell label="选择" className="w-8">
-          {writable ? (
-            <Checkbox
-              checked={selected}
-              disabled={busy}
-              aria-label={`选择 ${credential.nickname || credential.id.slice(0, 12)}`}
-              data-testid={`select-${credential.id}`}
-              onCheckedChange={(checked) => onSelect(credential.id, checked === true)}
-            />
-          ) : (
-            <Checkbox
-              checked={false}
-              disabled
-              aria-label={`${credential.nickname || credential.id.slice(0, 12)} 为只读渠道，不可选择`}
-              data-testid={`select-${credential.id}${idSuffix}`}
-            />
-          )}
+          <Checkbox
+            checked={selected}
+            disabled={busy}
+            aria-label={`选择 ${credential.nickname || credential.id.slice(0, 12)}`}
+            data-testid={`select-${credential.id}`}
+            onCheckedChange={(checked) => onSelect(credential.id, checked === true)}
+          />
         </TableCell>
       )}
       <TableCell label="凭证">
@@ -1712,11 +2046,11 @@ function Row({
               而不是与整行 baseline 对齐（图标按钮没有文字基线，会明显偏低）。 */}
           <span className="inline-flex items-center gap-1">
             <span
-              // 周期语义（本周期剩余 / 账户剩余 / 每日池 / 积分账 / 重置日期）
+              // 周期语义（本周期剩余 / 账户剩余 / 积分余额 / 重置日期）
               // 从独立的第三行收进数字的悬浮说明：同一渠道所有行的这句话几乎
               // 完全一样，逐行复读只是把行高撑高一倍。虚线下划线提示可悬浮。
               className="cursor-help underline decoration-dotted underline-offset-2"
-              title={creditsLedger ? CREDITS_QUOTA_SEMANTICS : quotaSemantics(credential)}
+              title={quotaSemantics(credential)}
             >
               {formatNumber(remaining)} / {formatNumber(total)}
             </span>
@@ -1724,9 +2058,8 @@ function Row({
                 任何余额上下文。下箭头是行内展开语义（非弹层），展开后箭头翻转。
                 仅 admin/operator 可用——接口本身就是该门槛。zen / kilo 免费层没有
                 额度接口、也没有额度探测，流水恒为空，入口只会给出空抽屉，不渲染。
-                只读的福利组同样不渲染：它只展示每日池，不承载任何操作。
-                `ledger` 按本行讲的那本账传（内置组＝积分账），否则会读到另一本账。 */}
-            {writable && hasQuotaProbe(credential.provider) && (
+                `ledger` 按本行讲的那本账传（CodeArts＝积分账），否则会读到另一本账。 */}
+            {canWrite && hasQuotaProbe(credential.provider) && (
               <Button
                 // 项目封装的 Button：variant="default" 即 shadcn 的 outline
                 variant="default"
@@ -1735,8 +2068,8 @@ function Row({
                 aria-expanded={creditsOpen}
                 title={creditsLedger
                   ? "积分流水：积分账两次探测的净变化"
-                  : "额度流水：每日额度池两次探测的净变化"}
-                data-testid={`credits-${credential.id}${idSuffix}`}
+                  : "额度流水：额度两次探测的净变化"}
+                data-testid={`credits-${credential.id}`}
                 onClick={() => actions.credits(credential, ledger)}
                 // 与数字同处一个 inline-flex items-center：图标按钮没有文字基线，
                 // 靠 baseline 对齐会明显偏低。不要再加 translate 微调——按钮
@@ -1752,13 +2085,10 @@ function Row({
             )}
             <ModelCooldownList credential={credential} now={now} />
           </span>
-          {/* 套餐明细：CodeBuddy / TRAE 的权益包与 CodeArts 的积分包都走这里。
-              福利组（只读）不渲染——它的 `quota_packages` 由积分账产生
-              （`parse_credits`），在福利组展示会把内置账的包名带进「只讲每日池」的组。 */}
-          {!readOnly && <PackageLadder credential={credential} />}
+          {/* 套餐明细：CodeBuddy / TRAE 的权益包与 CodeArts 的积分包都走这里。 */}
+          {<PackageLadder credential={credential} />}
         </div>
-        {/* 到期积分：按本行那本账取（内置组＝积分账、其余含福利组＝每日池），
-            后端已把两段合并阶梯拆开，两组各显各的。 */}
+        {/* 到期积分：直接来自后端按凭证自己的阶梯算好的窗口内到期额。 */}
         {expiring && (
           <div className="text-warn" data-testid="quota-expiring">
             {expiring}
@@ -1795,7 +2125,6 @@ function Row({
       {!showGrowth && <TableCell aria-hidden />}
       {canWrite && (
         <TableCell label="操作">
-          {writable ? (
           <div className="flex items-center justify-end gap-1">
             {confirming ? (
               <>
@@ -1867,10 +2196,26 @@ function Row({
                         <Radio className="size-4" /> 活跃上报
                       </DropdownMenuItem>
                     )}
+                    {supportsCheckin(credential.provider) && (
+                      <DropdownMenuItem
+                        onSelect={() => actions.checkinLog(credential)}
+                        title="签到审计日志：最近几次签到的时间/结果/领取积分/上游业务码"
+                      >
+                        <History className="size-4" /> 签到记录
+                      </DropdownMenuItem>
+                    )}
                     <DropdownMenuSeparator />
                     {credential.disabled === 1 && (
                       <DropdownMenuItem onSelect={() => actions.revive(credential)}>
                         <HeartPulse className="size-4" /> 恢复
+                      </DropdownMenuItem>
+                    )}
+                    {credential.disabled === 1 && (
+                      <DropdownMenuItem
+                        onSelect={() => actions.forceRevive(credential)}
+                        title="连上游点名的冷却（限流/余额/权益/风控）一起清除；清除后可能立刻再撞一次上游"
+                      >
+                        <HeartPulse className="size-4" /> 强制恢复
                       </DropdownMenuItem>
                     )}
                     <DropdownMenuItem onSelect={() => actions.toggle(credential)}>
@@ -1889,6 +2234,43 @@ function Row({
                       <Tag className="size-4" />
                       {credential.tags.length ? "编辑标签" : "设置标签"}
                     </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => actions.weight(credential)}
+                      title="只调整同健康档内的选号次序：正数越优先、负数当备用，不会把不可用的号顶上来"
+                    >
+                      <Gauge className="size-4" />
+                      {credential.routing_weight
+                        ? `权重 ${credential.routing_weight}`
+                        : "设置权重"}
+                    </DropdownMenuItem>
+                    {credential.provider === "raccoon" && (
+                      <DropdownMenuItem
+                        onSelect={() => actions.loginSecret(credential)}
+                        title="保存网页端账号密码，用于「按需登录」换新会话（上游只在登录时补发当天每日积分）"
+                      >
+                        <KeyRound className="size-4" /> 账号密码
+                        {credential.login_secret === 1 && (
+                          <span className="text-muted-foreground">（已保存）</span>
+                        )}
+                      </DropdownMenuItem>
+                    )}
+                    {["qoder", "codearts"].includes(credential.provider) && (
+                      <DropdownMenuItem
+                        onSelect={() => actions.webCookie(credential)}
+                        title="写入网页 Cookie 后额度探测改用网页接口，可拿到每个积分包的独立到期日"
+                      >
+                        <Cookie className="size-4" /> 网页 Cookie
+                        {credential.web_cookie_state === "expired" && (
+                          <span className="text-destructive">（已失效）</span>
+                        )}
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuItem
+                      onSelect={() => actions.export(credential)}
+                      title="导出为 JSON（含明文令牌，可原样再导入；操作会记审计）"
+                    >
+                      <Download className="size-4" /> 导出凭证
+                    </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       onSelect={() => onConfirmDelete(credential.id)}
@@ -1901,10 +2283,6 @@ function Row({
               </>
             )}
           </div>
-          ) : (
-            // 只读组的操作列只留位置（列数恒定），与列头一样不放任何内容
-            <span aria-hidden />
-          )}
         </TableCell>
       )}
     </TableRow>
@@ -2005,6 +2383,89 @@ function CreditDrawer({
                 </TableCell>
                 <TableCell label="说明" className="text-xs text-muted-foreground">
                   {CREDIT_SOURCE_LABEL[event.source] ?? event.source}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </Card>
+  );
+}
+
+/**
+ * 签到记录抽屉：同一行内展开，不弹层。
+ *
+ * 数据来自本地落库的 `checkin_events`（每次签到落一行），**不实时查上游**——
+ * 因此对已失效 / 未探测的凭证也能回看历史。像「界面显示签到成功但没加积分」
+ * 这类问题，答案就在这张表里：时间 + 结果 + 领取积分 + 上游业务码。
+ *
+ * 只读：不动上游。手动签到仍在行内的「签到」按钮（本抽屉只是把它记下的结果
+ * 摊开看）。
+ */
+function CheckinLogDrawer({
+  credentialId,
+  events,
+  onClose,
+}: {
+  credentialId: string;
+  events: CheckinEvent[];
+  onClose: () => void;
+}) {
+  return (
+    <Card
+      className="mt-4 gap-0 bg-muted/30 p-3 ring-border/60"
+      data-testid={`checkin-drawer-${credentialId}`}
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <div className="text-sm font-medium">
+          签到记录
+          <span className="ml-2 text-xs text-muted-foreground">
+            本地落库的签到审计日志（定时任务与手动签到都记），保留 90 天
+          </span>
+        </div>
+        <Button size="sm" variant="ghost" onClick={onClose}
+                data-testid="checkin-drawer-close">
+          关闭
+        </Button>
+      </div>
+      {events.length === 0 ? (
+        <Empty data-testid="checkin-drawer-empty">
+          还没有记录。签到（定时或手动）后这里会留下时间、结果与领取积分。
+        </Empty>
+      ) : (
+        <Table data-testid="checkin-drawer-table" cards>
+          <TableHeader>
+            <TableRow>
+              <TableHead>时间</TableHead>
+              <TableHead>结果</TableHead>
+              <TableHead>领取</TableHead>
+              <TableHead>上游码</TableHead>
+              <TableHead>触发</TableHead>
+              <TableHead>说明</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {events.map((event) => (
+              <TableRow key={event.id} data-testid={`checkin-event-${event.id}`}>
+                <TableCell label="时间" className="text-xs">
+                  {formatTime(event.ts)}
+                </TableCell>
+                <TableCell label="结果"
+                            className={`text-xs ${event.ok ? "text-ok" : "text-warn"}`}>
+                  {event.ok ? (event.already ? "今日已签" : "签到成功") : "签到失败"}
+                </TableCell>
+                <TableCell label="领取" className="text-xs tabular-nums">
+                  {event.credit === null ? "—" : `+${formatNumber(event.credit)}`}
+                </TableCell>
+                <TableCell label="上游码" className="text-xs tabular-nums text-muted-foreground">
+                  {event.code === null ? "—" : event.code}
+                </TableCell>
+                <TableCell label="触发" className="text-xs text-muted-foreground">
+                  {event.trigger === "manual" ? "手动" : "定时"}
+                </TableCell>
+                <TableCell label="说明" className="text-xs text-muted-foreground">
+                  {event.message || "—"}
                 </TableCell>
               </TableRow>
             ))}

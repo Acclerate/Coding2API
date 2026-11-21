@@ -18,10 +18,16 @@
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
-from ..engine.compress import compress_messages
+from ..engine.compress import compress_messages, estimate_messages
+from ..engine.prefix_debug import PrefixDebugTracker
+from ..engine.sticky_trim import StickyTrimmer, conversation_key
+from ..engine.tool_output import compress_tool_outputs
+
+logger = logging.getLogger(__name__)
 
 # 渠道实际窗口下限（只用于**压缩预算**，不影响 `/v1/models` 对外宣告）。
 #
@@ -80,7 +86,32 @@ def build_context_compressor(
     请求现读，管理台热更即生效。装配侧（main.py）把它注入
     `ExecutorDeps.context_compress`；executor 在选号后按实际渠道调用。
     """
+    # 粘性裁剪的边界记忆（进程内，按会话+渠道）：压缩闭包每次请求都会调用，
+    # 记忆必须挂在闭包外才能跨轮生效
+    trimmer = StickyTrimmer()
+
     def compress(provider_id: str, model: str, payload: dict) -> dict:
+        if settings.tool_output_compress_enabled:
+            # tool 输出压缩与窗口无关（省的是 token 不是长度），必须在
+            # 「未超限就原样返回」之前做，否则永远等不到触发条件。
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                squashed = compress_tool_outputs(
+                    messages, max_chars=int(settings.tool_output_compress_max_chars))
+                if squashed is not messages:
+                    before = sum(len(m["content"]) for m in messages
+                                 if isinstance(m, dict)
+                                 and isinstance(m.get("content"), str))
+                    after = sum(len(m["content"]) for m in squashed
+                                if isinstance(m, dict)
+                                and isinstance(m.get("content"), str))
+                    # 只在真的压了才记。DEBUG 而非 INFO：长会话里这是**常态**
+                    # 而非异常，实测 1 小时内 749 行、占 err.log 的 19%，把真
+                    # WARNING 挤出视野；验收收益要数字时按需打开 DEBUG 即可。
+                    logger.debug(
+                        "tool 输出压缩 provider=%s model=%s messages=%d 字符 %d→%d",
+                        provider_id, model, len(messages), before, after)
+                    payload = {**payload, "messages": squashed}
         if not settings.context_compress_enabled:
             return payload
         window = context_window_for(cache, aliases, provider_id, model)
@@ -89,16 +120,63 @@ def build_context_compressor(
         messages = payload.get("messages")
         if not isinstance(messages, list):
             return payload
-        compressed = compress_messages(
-            messages,
-            max_input_tokens=window,
-            reserve_for_output=int(settings.context_compress_reserve_tokens),
-            min_keep_messages=int(settings.context_compress_min_keep_messages),
-            safety_ratio=float(settings.context_compress_safety_ratio),
-        )
+        options = {
+            "max_input_tokens": window,
+            "reserve_for_output": int(settings.context_compress_reserve_tokens),
+            "min_keep_messages": int(settings.context_compress_min_keep_messages),
+            "safety_ratio": float(settings.context_compress_safety_ratio),
+        }
+        if settings.context_compress_sticky_enabled:
+            # 粘性裁剪：裁剪边界跨轮保持，前缀不变 → 上游缓存能命中（见
+            # engine/sticky_trim.py）。关闭即退回「每轮都按当轮预算重算」的
+            # 旧行为（客户端每轮重发完整历史时，命中率只有 system 段）
+            outcome = trimmer.compress(
+                conversation_key(provider_id, model, payload), messages, **options)
+            compressed, trimmed = outcome.messages, outcome.trimmed
+            sticky_reason = outcome.reason
+        else:
+            compressed = compress_messages(messages, **options)
+            trimmed = compressed is not messages
+            sticky_reason = "off"
         if compressed is messages:
             return payload
+        # 每次裁剪都会让前缀边界前移一条消息 ⇒ 上游前缀缓存只剩 system 段。
+        # 命中率异常时先看这里：同一条流连续多轮都在裁，就是它把命中打没了。
+        if trimmed and settings.prefix_debug_enabled:
+            logger.info(
+                "前缀诊断·压缩 provider=%s model=%s window=%d messages=%d→%d "
+                "估算=%.0f→%.0f sticky=%s reason=%s",
+                provider_id, model, window, len(messages), len(compressed),
+                estimate_messages(messages), estimate_messages(compressed),
+                settings.context_compress_sticky_enabled, sticky_reason)
         # 不原地改 payload：同一请求可能在轮换/回退里再压一次（另一个渠道、
         # 另一个窗口），必须始终从原文出发，且 affinity 指纹读的是原文
         return {**payload, "messages": compressed}
     return compress
+
+
+def build_prefix_observer(
+        settings: Any,
+        tracker: PrefixDebugTracker | None = None,
+) -> Callable[[str, str, str, dict], None]:
+    """构造 `(credential_id, provider_id, model, payload) → None` 诊断闭包。
+
+    开关现读运行态覆盖层（`prefix_debug_enabled`，默认关）：关闭时每请求只
+    多一次属性读取，不计算任何摘要。`tracker` 可注入（测试固定 LRU 容量）。
+    """
+    state = tracker if tracker is not None else PrefixDebugTracker()
+
+    def observe(credential_id: str, provider_id: str, model: str,
+                payload: dict) -> None:
+        if not settings.prefix_debug_enabled:
+            return
+        # 上游缓存按账号（凭证）归属，模型不同则模板/参数不同，分开记基准
+        report = state.observe(f"{credential_id}\x00{model}", payload)
+        logger.info(
+            "前缀诊断 provider=%s model=%s cred=%s msgs=%d system=%s tools=%s "
+            "tools_changed=%s lcp=%s reusable=%s split=%s",
+            provider_id, model, credential_id, report["messages"],
+            report["system"], report["tools"], report["tools_changed"],
+            report["lcp"], report["reusable"], report["split"])
+
+    return observe

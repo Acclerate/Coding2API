@@ -19,7 +19,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ..config import live
+from ..db.crypto import CredentialDecryptError
 from ..db.repo import CredentialRepository, GrowthRepository
+from ..error_text import error_text
 from ..provider.base import GrowthResult, GrowthStep, StepStatus
 from . import TaskReport
 
@@ -65,21 +67,40 @@ class ActivityTask:
     def _day_key(self) -> str:
         return self._current().strftime("%Y-%m-%d")
 
+    def _prune(self, day: str) -> None:
+        """丢掉非当天的封账记录：键以日期开头，跨天后不可能再命中，
+        长驻进程否则每天每账号各攒一条（无上限）。"""
+        prefix = f"{day}:"
+        self._done_scopes = {key for key in self._done_scopes
+                             if key.startswith(prefix)}
+
     async def run_once(self, *, trigger: str = "auto") -> TaskReport:
         report = TaskReport()
+        day = self._day_key()
+        self._prune(day)                 # 跨天后旧封账记录不再有用
         seen: set[str] = set()
         for candidate in self._credentials.candidates():
-            if candidate.disabled:
+            # 与 growth / 签到 / 刷新同口径：`enabled=0`（用户软暂停）不参与
+            # 活跃上报。且必须早于 `seen` 记录（见 checkin 的同类注释）。
+            if candidate.disabled or not candidate.enabled:
                 report.skipped += 1
                 continue
             provider = self._providers.get(candidate.provider)
-            data = self._credentials.credential_data(candidate.credential_id)
             activity_scope = getattr(provider, "activity_scope", None)
+            # 解不开（APP_SECRET 换过 / 密文损坏）→ 跳过这条凭证：一条坏凭证
+            # 不该让整轮活跃上报失败（早先直接冒泡 → 整轮任务挂掉）。
+            try:
+                data = self._credentials.credential_data(candidate.credential_id)
+            except CredentialDecryptError:
+                logger.error("活跃上报跳过 %s：凭证解密失败（APP_SECRET 是否被更换过？）",
+                             candidate.credential_id)
+                report.skipped += 1
+                continue
             if provider is None or data is None or activity_scope is None:
                 report.skipped += 1
                 continue
             scope = activity_scope(data) or f"credential|{candidate.credential_id}"
-            if f"{self._day_key()}:{scope}" in self._done_scopes:
+            if f"{day}:{scope}" in self._done_scopes:
                 report.skipped += 1                  # 当日已成功，不再调上游
                 continue
             if scope in seen:
@@ -90,13 +111,16 @@ class ActivityTask:
             try:
                 result = await provider.activity(data)
             except Exception as error:  # noqa: BLE001 - 单号失败不拖累其余
+                # 必须走 error_text：裸 `%s` 打 httpx.ConnectError / TimeoutError
+                # 时 str 为空，日志只剩「activity report failed for cred_x: 」，
+                # 分不清是代理抖动还是上游拒绝（同 checkin / quota_probe 口径）。
                 logger.warning("activity report failed for %s: %s",
-                               candidate.credential_id, error)
+                               candidate.credential_id, error_text(error))
                 report.failed += 1
                 continue
             if result.ok:
                 report.succeeded += 1
-                self._done_scopes.add(f"{self._day_key()}:{scope}")
+                self._done_scopes.add(f"{day}:{scope}")
                 self._record(candidate.credential_id, result, trigger)
             else:
                 report.failed += 1

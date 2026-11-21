@@ -4,10 +4,15 @@
 `httpx.ConnectTimeout`——它们没有 `kind()`，此前 `_classify` 返回 None，
 异常直接上抛到 `stream_guarded`，表现为回一帧 `internal_error`、既不换号
 也不冷却、还不记账。本文件锁住修复后的口径：传输层失败 = SOFT。
+
+`ssl.SSLError` 同属这一类但**不是** `httpx.TransportError`（anyio 只转
+`SSLEOFError`），2026-10-25 15:50 经代理的 `record layer failure` 就是这样
+逃出去的，故单列成组用例。
 """
 
 from __future__ import annotations
 
+import ssl
 import time
 
 import httpx
@@ -86,8 +91,32 @@ def test_upstream_transport_error_is_soft():
     assert UpstreamTransportError("x").kind() is ErrKind.SOFT
 
 
-async def test_stream_rotates_and_cools_on_connect_error(repo):
-    """首个凭证 ConnectError → 换号成功，且只有它进入 SOFT 冷却。"""
+def test_is_network_error_includes_proxy_error():
+    """本机代理挂掉走 `httpx.ProxyError`，不是 `ConnectError`。
+
+    漏掉它时这类失败落 `upstream_timeout` 并 SOFT 冷却健康凭证——与
+    「本机网络故障不冷却」的口径直接矛盾（2026-11 实测代理进程退出）。
+    `ConnectTimeout` 仍不算（可能是上游慢），保持原有边界。
+    """
+    from src.engine.executor import _is_network_error
+
+    assert _is_network_error(httpx.ProxyError("proxy connect failed")) is True
+    assert _is_network_error(httpx.ConnectError("connect failed")) is True
+    assert _is_network_error(httpx.ConnectTimeout("timed out")) is False
+    assert _is_network_error(httpx.ReadTimeout("read timed out")) is False
+    assert _is_network_error(None) is False
+    # 包装形态：provider 把根因挂在 __cause__ 上
+    wrapped = UpstreamTransportError("wrapped")
+    wrapped.__cause__ = httpx.ProxyError("proxy down")
+    assert _is_network_error(wrapped) is True
+
+
+async def test_stream_rotates_on_connect_error_without_cooling(repo):
+    """首个凭证 ConnectError（本机 DNS/建连失败）→ 换号成功，但不冷却凭证。
+
+    网络故障不是账号的问题；旧行为按 SOFT 冷却，会让一次 DNS 抖动冷却整池
+    健康号（2026-11-05 睡眠唤醒后实测）。仍然换号重试，所以第二个号能成功。
+    """
     credentials, _db = repo
     # 选号在健康度/余额都相同时按 credential_id 兜底排序，先选哪张不固定：
     # 断言按「第一次实际用的 token」反查凭证，不能假定 first 一定先被选中
@@ -100,11 +129,12 @@ async def test_stream_rotates_and_cools_on_connect_error(repo):
     assert provider.calls == 2
     assert frames[-1] == SSE_DONE
     assert b'"hi"' in b"".join(frames)
-    # 被冷却的只有**实际失败的那张**（第一次调用用的 token 对应的凭证）
+    # 实际失败的那张不冷却、不累计（NETWORK 属于零动作分类）
     failed_id = ids[provider.tokens[0]]
-    assert cooled_ids(credentials) == {failed_id}
-    cooled = next(c for c in credentials.candidates() if c.credential_id == failed_id)
-    assert cooled.err_count == 0          # SOFT 不累计错误数
+    assert cooled_ids(credentials) == set()
+    failed = next(c for c in credentials.candidates() if c.credential_id == failed_id)
+    assert failed.err_count == 0
+    assert failed.cooling_until is None
     assert provider.tokens[1] != provider.tokens[0]
 
 
@@ -151,3 +181,66 @@ async def test_complete_all_transport_errors_raise_no_healthy_credential(repo):
         await executor.complete(complete_request())
     assert provider.calls == 2
     assert len(cooled_ids(credentials)) == 2
+
+
+def _ssl_record_layer_failure() -> ssl.SSLError:
+    """复刻实测异常：TLS record layer failure（anyio 原样上抛，不转 BrokenResource）。
+
+    2026-10-25 15:50 两次 codebuddy_intl 经 7897 代理时就是这个值；它是
+    `OSError` 子类但**不是** `httpx.TransportError`，此前 `_classify` 返回
+    None，异常逃到 `stream_guarded` 变成一帧 `internal_error`。
+    """
+    return ssl.SSLError(1, "[SSL] record layer failure (_ssl.c:2580)")
+
+
+def test_ssl_error_is_not_httpx_transport_error():
+    """前提校验：这条异常必须**不是** TransportError，否则下面的用例测不到修复。"""
+    assert not isinstance(_ssl_record_layer_failure(), httpx.TransportError)
+
+
+async def test_stream_rotates_and_cools_on_ssl_error(repo):
+    """TLS 中断 → 换号重试（不是 internal_error），失败的那张进 SOFT 冷却。"""
+    credentials, _db = repo
+    ids = {token: add_credential(credentials, token) for token in ("first", "second")}
+    executor, provider = build_executor(
+        credentials, [[_ssl_record_layer_failure()], TRAE_GOOD])
+
+    frames = [frame async for frame in executor.stream(stream_request())]
+    joined = b"".join(frames)
+
+    assert provider.calls == 2
+    assert frames[-1] == SSE_DONE
+    assert b'"hi"' in joined
+    assert b"internal_error" not in joined
+    failed_id = ids[provider.tokens[0]]
+    assert cooled_ids(credentials) == {failed_id}
+
+
+async def test_stream_all_ssl_errors_end_with_no_healthy_credential(repo):
+    """全部凭证都 TLS 中断 → no_healthy_credential 终帧，而不是 internal_error。"""
+    credentials, _db = repo
+    add_credential(credentials, "a")
+    add_credential(credentials, "b")
+    executor, provider = build_executor(
+        credentials, [[_ssl_record_layer_failure()]])
+
+    frames = [frame async for frame in executor.stream(stream_request())]
+    joined = b"".join(frames)
+
+    assert provider.calls == 2
+    assert b"no_healthy_credential" in joined
+    assert b"internal_error" not in joined
+
+
+async def test_complete_rotates_on_ssl_error(repo):
+    """非流式：TLS 中断同样走换号重试。"""
+    credentials, _db = repo
+    add_credential(credentials, "first")
+    add_credential(credentials, "second")
+    executor, provider = build_executor(
+        credentials, [[_ssl_record_layer_failure()], TRAE_GOOD])
+
+    result = await executor.complete(complete_request())
+
+    assert provider.calls == 2
+    assert result["choices"][0]["message"]["content"] == "hi"

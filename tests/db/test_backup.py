@@ -12,11 +12,18 @@ import pytest
 from src.db.backup import (
     BACKUP_DIRNAME,
     DEFAULT_KEEP,
+    apply_pending_restore,
     backup_database,
     backup_dir,
+    pending_restore_info,
+    pending_restore_path,
     restore_database,
+    stage_restore,
+    verify_app_database,
     verify_database,
 )
+from src.db.conn import Database
+from src.db.migrate import SCHEMA_VERSION, apply_schema
 
 
 def _seed(db_path: Path, value: str = "hello") -> None:
@@ -259,3 +266,211 @@ def test_restore_cleans_temp_on_write_failure(tmp_path, monkeypatch):
 
 def test_default_keep_is_seven():
     assert DEFAULT_KEEP == 7
+
+
+# ---------------------------------------------------------------- 管理台恢复
+
+
+def _app_db(tmp_path: Path, name: str = "app.sqlite3") -> Path:
+    path = tmp_path / name
+    db = Database(path)
+    apply_schema(db.connect())
+    db.close()
+    return path
+
+
+def test_verify_app_database_accepts_real_schema(tmp_path):
+    verify_app_database(_app_db(tmp_path))
+
+
+def test_verify_app_database_rejects_foreign_sqlite(tmp_path):
+    path = tmp_path / "plain.sqlite3"
+    _seed(path)
+    with pytest.raises(RuntimeError, match="缺少表"):
+        verify_app_database(path)
+
+
+def test_verify_app_database_rejects_newer_schema(tmp_path):
+    path = _app_db(tmp_path)
+    conn = sqlite3.connect(str(path))
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    with pytest.raises(RuntimeError, match="高于本程序支持"):
+        verify_app_database(path)
+
+
+def test_stage_restore_validates_and_writes_pending(tmp_path):
+    source = _app_db(tmp_path)
+    db_path = tmp_path / "main.sqlite3"
+    meta = stage_restore(db_path, source.read_bytes(), filename="../evil.sqlite3",
+                         now=1234)
+    assert meta == {"filename": "evil.sqlite3", "size": source.stat().st_size,
+                    "uploaded_at": 1234}
+    pending = pending_restore_path(db_path)
+    assert pending.is_file()
+    assert pending.stat().st_mode & stat.S_IRWXO == 0
+    assert pending_restore_info(db_path)["filename"] == "evil.sqlite3"
+
+
+def test_stage_restore_rejects_empty_and_corrupt(tmp_path):
+    db_path = tmp_path / "main.sqlite3"
+    with pytest.raises(RuntimeError, match="为空"):
+        stage_restore(db_path, b"")
+    with pytest.raises(RuntimeError):
+        stage_restore(db_path, b"not a database")
+    assert not pending_restore_path(db_path).exists()
+
+
+def test_stage_restore_uses_unique_temp_names(tmp_path):
+    """临时名带随机后缀：两个管理员同时上传时不会互相搬走半截文件。"""
+    source = _app_db(tmp_path)
+    db_path = tmp_path / "main.sqlite3"
+    staging_dir = pending_restore_path(db_path).parent
+    seen: list[str] = []
+
+    from src.db import backup as backup_module
+
+    real_verify = backup_module.verify_app_database
+
+    def spy(path):
+        real_verify(path)
+        seen.append(Path(path).name)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backup_module, "verify_app_database", spy)
+        stage_restore(db_path, source.read_bytes())
+        stage_restore(db_path, source.read_bytes())
+
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert all(name.startswith("pending.sqlite3.") and name.endswith(".uploading")
+               for name in seen)
+    # 中间文件不残留（finally 清理）
+    assert list(staging_dir.glob("*.uploading")) == []
+
+
+def test_prune_rejected_keeps_latest_n(tmp_path):
+    """被拒留档只保留最近 N 份：否则反复上传坏库会累积整库大小的敏感副本。"""
+    from src.db.backup import REJECTED_KEEP, _prune_rejected
+
+    directory = tmp_path / "restore"
+    directory.mkdir()
+    for index in range(REJECTED_KEEP + 2):
+        path = directory / f"pending.sqlite3.rejected-2026010{index}-000000"
+        path.write_bytes(b"x")
+        os.utime(path, (index, index))          # mtime 递增，最后一份最新
+
+    assert _prune_rejected(directory) == 2
+    remaining = sorted(item.name for item in directory.iterdir())
+    assert len(remaining) == REJECTED_KEEP
+    assert remaining[-1].endswith("20260104-000000")
+
+
+def test_prune_rejected_keep_zero_is_noop(tmp_path):
+    from src.db.backup import _prune_rejected
+
+    directory = tmp_path / "restore"
+    directory.mkdir()
+    (directory / "pending.sqlite3.rejected-x").write_bytes(b"x")
+    assert _prune_rejected(directory, keep=0) == 0
+    assert len(list(directory.iterdir())) == 1
+
+
+def test_apply_pending_restore_prunes_rejected_archives(tmp_path):
+    """连续被拒的坏库不会无限堆积（只留 REJECTED_KEEP 份）。"""
+    from src.db.backup import REJECTED_KEEP
+
+    db_path = _app_db(tmp_path, "main.sqlite3")
+    pending = pending_restore_path(db_path)
+    pending.parent.mkdir(parents=True)
+    rejected_dir = pending.parent
+
+    for index in range(REJECTED_KEEP):
+        stale = rejected_dir / f"pending.sqlite3.rejected-old{index}"
+        stale.write_bytes(b"old")
+        os.utime(stale, (index, index))
+
+    pending.write_bytes(b"corrupt")
+    os.utime(pending, (100, 100))
+    assert apply_pending_restore(db_path, now=7) is None
+
+    archives = list(rejected_dir.glob("pending.sqlite3.rejected-*"))
+    assert len(archives) == REJECTED_KEEP
+    # 本次留档在，mtime 最老的旧档被删掉
+    assert (rejected_dir / "pending.sqlite3.rejected-19700101-000007").is_file()
+    assert not (rejected_dir / "pending.sqlite3.rejected-old0").exists()
+
+
+def test_pending_restore_info_falls_back_without_or_with_broken_meta(tmp_path):
+    db_path = tmp_path / "main.sqlite3"
+    assert pending_restore_info(db_path) is None
+    pending = pending_restore_path(db_path)
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"abc")
+    info = pending_restore_info(db_path)  # 没有 meta → 用文件大小/mtime
+    assert info["filename"] == pending.name and info["size"] == 3
+    pending.with_name("pending.json").write_text("{broken", encoding="utf-8")
+    assert pending_restore_info(db_path)["size"] == 3
+
+
+def test_apply_pending_restore_replaces_db_and_keeps_safety_copy(tmp_path):
+    db_path = _app_db(tmp_path, "main.sqlite3")
+    source = _app_db(tmp_path, "source.sqlite3")
+    conn = sqlite3.connect(str(source))
+    conn.execute("CREATE TABLE marker (x TEXT)")
+    conn.execute("INSERT INTO marker VALUES ('restored')")
+    conn.commit()
+    conn.close()
+
+    stage_restore(db_path, source.read_bytes(), now=5)
+    safety = apply_pending_restore(db_path, now=6)
+
+    assert safety is not None and safety.is_file()
+    assert not pending_restore_path(db_path).exists()
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT x FROM marker").fetchone()[0] == "restored"
+    conn.close()
+
+
+def test_apply_pending_restore_rejects_corrupt_without_blocking_start(tmp_path):
+    db_path = _app_db(tmp_path, "main.sqlite3")
+    pending = pending_restore_path(db_path)
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"corrupt")
+
+    assert apply_pending_restore(db_path, now=7) is None
+    assert not pending.exists()
+    rejected = list(pending.parent.glob("pending.sqlite3.rejected-*"))
+    assert len(rejected) == 1
+    # 老库仍在，且能正常打开
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT 1").fetchone()[0] == 1
+    conn.close()
+
+
+def test_pending_restore_info_ignores_non_object_meta(tmp_path):
+    db_path = tmp_path / "main.sqlite3"
+    pending = pending_restore_path(db_path)
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"abc")
+    pending.with_name("pending.json").write_text("[]", encoding="utf-8")
+    info = pending_restore_info(db_path)  # 顶层不是对象 → 回落文件信息
+    assert info["filename"] == pending.name and info["size"] == 3
+
+
+def test_verify_app_database_reports_integrity_failure(tmp_path, monkeypatch):
+    """`PRAGMA integrity_check` 返回非 ok（文件能打开但有逻辑损坏）→ RuntimeError。"""
+    class _Result:
+        def fetchone(self):
+            return ("wrong page type",)
+
+    class _Conn:
+        def execute(self, _sql, *_args):
+            return _Result()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("src.db.backup.sqlite3.connect", lambda *_a, **_k: _Conn())
+    with pytest.raises(RuntimeError, match="完整性校验未通过"):
+        verify_app_database(tmp_path / "x.sqlite3")

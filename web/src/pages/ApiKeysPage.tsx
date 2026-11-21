@@ -1,5 +1,6 @@
 import { Check, ChevronDown, Copy, Gauge, KeyRound, Plus, Share2, Trash2, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { Button as RawButton } from "../components/ui/button";
 import { useApiKeys, usePlaygroundModels, useQueryClient } from "../api/hooks";
@@ -15,6 +16,8 @@ import { buildSections, displayName, modelValue } from "../components/ModelPicke
 import { PROVIDER_LABEL, PROVIDER_ORDER } from "../api/providers";
 import { buildCcSwitchLink, CCSWITCH_TARGETS } from "../lib/ccSwitch";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
+import { copyText } from "../lib/clipboard";
+import { errorText } from "../lib/errors";
 import {
   EMPTY_QUOTA,
   QUOTA_FIELDS,
@@ -38,6 +41,7 @@ import {
   Input,
   Notice,
   Panel,
+  QueryErrorState,
   Select,
   Table,
   TableBody,
@@ -287,10 +291,13 @@ function OpenAIEntry({ apiKey }: { apiKey: string }) {
   const baseUrl = openaiBaseUrl();
   const examples = openaiExamples(baseUrl, apiKey);
   const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const copy = async (label: string, text: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(label);
+    const ok = await copyText(text);
+    setCopied(ok ? label : null);
+    // 局域网 http 部署没有 Clipboard API：明确提示，别让用户以为已复制
+    setCopyFailed(!ok);
   };
 
   return (
@@ -301,6 +308,11 @@ function OpenAIEntry({ apiKey }: { apiKey: string }) {
         onCopy={() => void copy("url", baseUrl)}
         testid="openai-base-url"
       />
+      {copyFailed && (
+        <p className="mt-2 text-xs text-danger" data-testid="openai-copy-failed">
+          浏览器不允许自动复制，请手动选中内容复制。
+        </p>
+      )}
       <ul className="space-y-1 text-xs text-muted-foreground">
         <li>
           {/* 示例默认折叠：点开端点行查看 curl / SDK 调用方式 */}
@@ -345,10 +357,13 @@ function AnthropicEntry({ apiKey }: { apiKey: string }) {
   const baseUrl = anthropicBaseUrl();
   const examples = anthropicExamples(baseUrl, apiKey);
   const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const copy = async (label: string, text: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(label);
+    const ok = await copyText(text);
+    setCopied(ok ? label : null);
+    // 局域网 http 部署没有 Clipboard API：明确提示，别让用户以为已复制
+    setCopyFailed(!ok);
   };
 
   return (
@@ -359,6 +374,11 @@ function AnthropicEntry({ apiKey }: { apiKey: string }) {
         onCopy={() => void copy("url", baseUrl)}
         testid="anthropic-base-url"
       />
+      {copyFailed && (
+        <p className="mt-2 text-xs text-danger" data-testid="anthropic-copy-failed">
+          浏览器不允许自动复制，请手动选中内容复制。
+        </p>
+      )}
       <ul className="space-y-1 text-xs text-muted-foreground">
         <li>
           <EndpointRow method="POST" path={`${baseUrl}/v1/messages`} description="对话补全（流式 / 非流式，SDK 自动拼接路径）" testid="example-details-messages">
@@ -395,10 +415,13 @@ function ModelSelect({
   value,
   onChange,
   testid,
+  id,
 }: {
   value: string;
   onChange: (value: string) => void;
   testid: string;
+  /** 供外层 `Field` 的 htmlFor 关联（读屏报字段名、点 label 聚焦控件）。 */
+  id?: string;
 }) {
   const modelsQuery = usePlaygroundModels();
   const fetched = modelsQuery.data?.data ?? [];
@@ -407,6 +430,7 @@ function ModelSelect({
 
   return (
     <Select
+      id={id}
       value={value}
       data-testid={testid}
       onChange={(event) => onChange(event.target.value)}
@@ -448,9 +472,15 @@ export function CcSwitchImportButtons({
     <div className="space-y-3" data-testid={`${testidPrefix}-import`}>
       <Field
         label="默认模型（可选）"
+        htmlFor={`${testidPrefix}-model-select`}
         hint="留空不写入。Claude Code 无模型名时回落内置列表；非原生模型建议选本服务模型。"
       >
-        <ModelSelect value={model} onChange={setModel} testid={`${testidPrefix}-model`} />
+        <ModelSelect
+          value={model}
+          onChange={setModel}
+          testid={`${testidPrefix}-model`}
+          id={`${testidPrefix}-model-select`}
+        />
       </Field>
       <div className="flex flex-wrap gap-2">
         {CCSWITCH_TARGETS.map((target) =>
@@ -553,7 +583,7 @@ export function ApiKeysPage() {
   const { sort, order, toggle } = useSort("created_at", "asc", { last_used_at: "desc" });
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-  const { data, isLoading, isFetching } = useApiKeys(undefined, sort, order,
+  const { data, isLoading, isError, error: queryError, refetch, isFetching } = useApiKeys(undefined, sort, order,
                                                      pageSize, page * pageSize);
   const client = useQueryClient();
   // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
@@ -578,8 +608,14 @@ export function ApiKeysPage() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   // 创建 Key 收进对话框（低频动作不常驻占屏），由「我的 API Key」右上角触发
-  const [createOpen, setCreateOpen] = useState(false);
+  // `?new=1`：首启向导的深链，进来直接开创建对话框，随后把参数清掉
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [createOpen, setCreateOpen] = useState(() => searchParams.get("new") === "1");
+  useEffect(() => {
+    if (searchParams.get("new") === "1") setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
   // 列表行「导入 CC Switch」对话框：列表只有脱敏 preview，明文由用户自己粘贴
   const [importing, setImporting] = useState<ApiKey | null>(null);
   const [importKey, setImportKey] = useState("");
@@ -610,8 +646,12 @@ export function ApiKeysPage() {
       setQuota({ ...EMPTY_QUOTA });
       setCopied(false);
       await client.invalidateQueries({ queryKey: ["admin"] });
-    } catch {
-      setError("创建失败：请检查渠道绑定、模型白名单、IP 白名单与到期时间格式（配额须为非负数字）");
+    } catch (caught) {
+      // 用 errorText 取后端受控文案（渠道绑定冲突、白名单格式错等都说得出
+      // 具体哪里不对）；只有非受控异常才回落通用兜底。裸 catch{} 会把后端
+      // 已经写好的原因丢掉，用户只能对着「创建失败」猜。
+      setError(errorText(caught,
+        "创建失败：请检查渠道绑定、模型白名单、IP 白名单与到期时间格式（配额须为非负数字）"));
     }
   };
 
@@ -646,8 +686,10 @@ export function ApiKeysPage() {
 
   const copy = async () => {
     if (!created) return;
-    await navigator.clipboard.writeText(created.api_key);
-    setCopied(true);
+    const ok = await copyText(created.api_key);
+    setCopied(ok);
+    // 复制的是一次性明文 Key，失败必须说清楚，否则关掉就再也拿不回来
+    setCopyFailed(!ok);
   };
 
   const closeCreate = () => {
@@ -657,6 +699,7 @@ export function ApiKeysPage() {
     // 否则它会继续留在 OpenAI/Anthropic 接入面板与页面内存里，与「只显示一次」不符。
     setCreated(null);
     setCopied(false);
+    setCopyFailed(false);
   };
 
   const createDialogRef = useDialogFocus<HTMLDivElement>(closeCreate, createOpen);
@@ -667,6 +710,11 @@ export function ApiKeysPage() {
     setImportKey("");
   };
   const importDialogRef = useDialogFocus<HTMLDivElement>(closeImport, importing !== null);
+
+  const closeQuota = () => setEditingQuota(null);
+  // 配额对话框也要焦点管理与 Esc 关闭（MASTER §6「对话框焦点管理与 Esc 关闭」）：
+  // 此前只有「创建」「导入」两个对话框接了 useDialogFocus，配额这个漏了。
+  const quotaDialogRef = useDialogFocus<HTMLDivElement>(closeQuota, editingQuota !== null);
 
   return (
     <div className="space-y-6" data-testid="api-keys-page">
@@ -694,6 +742,13 @@ export function ApiKeysPage() {
       >
         {isLoading ? (
           <PageSkeleton variant="table" rows={4} />
+        ) : isError ? (
+          <QueryErrorState
+            title="API Key 列表加载失败"
+            description={errorText(queryError, "拿不到 API Key 列表，请稍后重试。")}
+            onRetry={() => void refetch()}
+            data-testid="api-keys-error-state"
+          />
         ) : keys.length === 0 ? (
           <EmptyState
             icon={<KeyRound className="size-5" />}
@@ -734,10 +789,10 @@ export function ApiKeysPage() {
                   <TableCell label="渠道" className="text-xs" data-testid={`key-binding-${key.id}`}>
                     {providerBindingLabel(key.provider_binding)}
                   </TableCell>
-                  <TableCell label="到期" className="text-xs" data-testid={`key-expires-${key.id}`}>
+                  <TableCell label="到期" className="text-xs tabular-nums" data-testid={`key-expires-${key.id}`}>
                     {key.expires_at ? formatTime(key.expires_at) : "永不过期"}
                   </TableCell>
-                  <TableCell label="最后使用" className="text-xs">
+                  <TableCell label="最后使用" className="text-xs tabular-nums">
                     {key.last_used_at ? formatTime(key.last_used_at) : "从未使用"}
                   </TableCell>
                   <TableCell label="来源 IP" className="font-mono text-xs" data-testid={`key-ips-${key.id}`}>
@@ -752,7 +807,7 @@ export function ApiKeysPage() {
                   <TableCell label="当日已用" className="text-xs" data-testid={`key-usage-${key.id}`}>
                     {usageTodayLabel(usageTodayOf(key))}
                   </TableCell>
-                  <TableCell label="创建时间" className="text-xs">
+                  <TableCell label="创建时间" className="text-xs tabular-nums">
                     {formatTime(key.created_at)}
                   </TableCell>
                   <TableCell label="操作" className="text-right">
@@ -855,6 +910,11 @@ export function ApiKeysPage() {
                     我已保存
                   </Button>
                 </div>
+                {copyFailed && (
+                  <p className="mt-2 text-xs text-danger" data-testid="new-key-copy-failed">
+                    浏览器不允许自动复制，请手动选中上方 Key 复制后再关闭。
+                  </p>
+                )}
                 {/* 导入按钮与明文 Key 同生命周期：只在这里（对话框开着时）才有可用的深链 */}
                 <div className="mt-4 border-t border-border/70 pt-4">
                   <CcSwitchImportButtons
@@ -951,6 +1011,7 @@ export function ApiKeysPage() {
             aria-modal="true"
             aria-label="设置 Key 配额"
             data-testid="key-quota-dialog"
+            ref={quotaDialogRef}
             onClick={(event) => event.stopPropagation()}
             className="max-h-[90vh] w-full max-w-lg animate-in overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl fade-in-0 zoom-in-95"
           >

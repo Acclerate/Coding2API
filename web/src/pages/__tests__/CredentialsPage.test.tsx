@@ -1,8 +1,11 @@
 import { screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CredentialsPage } from "../CredentialsPage";
 import {
-  expandCredentialGroups, jsonResponse, makeCredential, mockFetch, renderPage, settle, userEvent,
+  expandCredentialGroups, jsonResponse, makeCredential, renderPage, settle, userEvent,
+  // 组头读模型列表：用凭证页专用入口（自动兜底 /api/playground/models），
+  // 而不是全局 DEFAULT_ROUTES —— 全局兜底会掩盖别的页面的漏 mock。
+  mockCredentialsFetch as mockFetch,
 } from "@/test-utils";
 
 const ADMIN = { username: "root", is_admin: true } as const;
@@ -23,6 +26,12 @@ async function openAddDialog() {
   await userEvent.click(screen.getByTestId("open-add-dialog"));
   await screen.findByTestId("add-credential-dialog");
 }
+
+// 导出用例会替换全局 URL（createObjectURL 在 jsdom 缺失）；不在用例末尾
+// 手动恢复的话，后续 describe 的 useSearchParams 会拿到残缺的 URL 构造器。
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("CredentialsPage", () => {
   beforeEach(() => {
@@ -120,15 +129,13 @@ describe("CredentialsPage", () => {
     expect(shown[0]).toHaveTextContent("100 积分将在");
   });
 
-  it("CodeArts 两组的健康度各读各的账本，不与额度列矛盾", async () => {
+  it("CodeArts 单组的健康度与额度列同源，不出现「积分近满却额度耗尽」", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({
           id: "ca", provider: "codearts",
-          // 每日池已耗尽（主账 health=-1、额度 0），积分账几乎满
-          health: -1, quota_remaining: 0, quota_total: 1000,
-          quota_credits_remaining: 13498.72, quota_credits_total: 13500,
-          quota_credits_health: 100,
+          // 单一账本（积分）：额度近满 + 健康度 100%，两者一致
+          health: 100, quota_remaining: 13498.72, quota_total: 13500,
         }),
       ]),
     });
@@ -136,26 +143,22 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    // 福利组（每日池）：额度 0 + 健康度「已耗尽」，两者一致
-    const benefitRow = screen.getByTestId("row-ca-benefit");
-    expect(within(benefitRow).getByText("已耗尽")).toBeInTheDocument();
-    expect(within(benefitRow).getByText("0 / 1,000")).toBeInTheDocument();
-    // 内置组（积分账）：额度近满 + 健康度 100%，不能出现「积分近满却额度耗尽」
-    const internalRow = screen.getByTestId("row-ca");
-    expect(within(internalRow).getByText("100%")).toBeInTheDocument();
-    expect(within(internalRow).getByText("13,498.72 / 13,500")).toBeInTheDocument();
-    expect(within(internalRow).queryByText("已耗尽")).not.toBeInTheDocument();
-    expect(within(internalRow).queryByText("额度耗尽")).not.toBeInTheDocument();
+    const row = screen.getByTestId("row-ca");
+    expect(within(row).getByText("100%")).toBeInTheDocument();
+    expect(within(row).getByText("13,498.72 / 13,500")).toBeInTheDocument();
+    expect(within(row).queryByText("已耗尽")).not.toBeInTheDocument();
+    expect(within(row).queryByText("额度耗尽")).not.toBeInTheDocument();
+    // 不再有第二份（福利 / 内置）重复行
+    expect(screen.queryByTestId("row-ca-benefit")).not.toBeInTheDocument();
   });
 
-  it("CodeArts 两组各显各的到期积分：福利组读每日池、内置组读积分账", async () => {
+  it("CodeArts 单组按通用字段展示本组到期积分（主 / 次窗口）", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({
           id: "ca", provider: "codearts", health: 100,
-          // 主账字段＝每日池那一段；积分账字段＝积分套餐那一段，两者独立下发
           quota_expiring_credits: 999.5,
-          quota_credits_expiring: 40,
+          quota_expiring_credits_secondary: 1500,
         }),
       ]),
     });
@@ -163,19 +166,18 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    // 福利组（每日池）显示主账到期积分；内置组（积分账）显示积分账到期积分
-    const benefit = screen.getByTestId("group-codearts-benefit-expiring");
-    expect(benefit).toHaveTextContent("999.5");
-    const internal = screen.getByTestId("group-codearts-internal-expiring");
-    expect(internal).toHaveTextContent("40");
+    // 一个 CodeArts 组：主窗口读 quota_expiring_credits、次窗口读 secondary
+    expect(screen.getByTestId("group-codearts-expiring")).toHaveTextContent("999.5");
+    expect(screen.getByTestId("group-codearts-expiring-secondary")).toHaveTextContent("1,500");
+    expect(screen.queryByTestId("group-codearts-benefit-expiring")).not.toBeInTheDocument();
   });
 
-  it("CodeArts 福利组无到期积分时只隐藏福利那一块，不影响内置组", async () => {
+  it("CodeArts 无主窗口到期积分时只隐藏主窗口那一块，次窗口仍可见", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({
           id: "ca", provider: "codearts", health: 100,
-          quota_expiring_credits: null, quota_credits_expiring: 40,
+          quota_expiring_credits: null, quota_expiring_credits_secondary: 40,
         }),
       ]),
     });
@@ -183,10 +185,8 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    expect(screen.queryByTestId("group-codearts-benefit-expiring"))
-      .not.toBeInTheDocument();
-    expect(screen.getByTestId("group-codearts-internal-expiring"))
-      .toHaveTextContent("40");
+    expect(screen.queryByTestId("group-codearts-expiring")).not.toBeInTheDocument();
+    expect(screen.getByTestId("group-codearts-expiring-secondary")).toHaveTextContent("40");
   });
 
   it("主窗口为空时展示次窗口（7 天）到期积分，措辞与主窗口区分", async () => {
@@ -205,7 +205,7 @@ describe("CredentialsPage", () => {
     expect(screen.queryByTestId("quota-expiring")).not.toBeInTheDocument();
     const secondary = screen.getAllByTestId("quota-expiring-secondary");
     expect(secondary).toHaveLength(1);
-    expect(secondary[0]).toHaveTextContent("7.0 天内共 140 积分将过期");
+    expect(secondary[0]).toHaveTextContent("7.0 天窗口内共 140 积分将到期");
   });
 
   it("主窗口有数字时不重复渲染次窗口（次窗口是主窗口的超集）", async () => {
@@ -251,9 +251,11 @@ describe("CredentialsPage", () => {
           // 故意逆序 + 一个无到期时间：有到期的按先后排，无到期的排最后
           quota_packages: [
             { name: "签到奖励", total: 150, used: 0, end: day + 200_000 },
-            { name: "福利积分", total: 2000, used: 0, end: day },
+            { name: "福利积分", total: 2000, used: 0, end: day, expiring: 300 },
             { name: "每月登录", total: 500, used: 76.564, end: day + 100_000 },
             { name: "无到期包", total: 100, used: 10, end: null },
+            // 已消耗成 0 的包不展示（也不计入「套餐 N 个」）
+            { name: "已用完包", total: 300, used: 300, end: day + 300_000 },
           ],
         }),
         makeCredential({ id: "tr", provider: "trae", quota_packages: null }),
@@ -273,16 +275,22 @@ describe("CredentialsPage", () => {
     // 数字那侧多包了一层 inline-flex（对齐积分记录图标按钮），所以要上溯一层
     const row = screen.getByTestId("row-cb");
     const quotaSpan = within(row).getByText("62 / 100");
-    expect(quotaSpan.parentElement?.parentElement).toBe(toggle.parentElement);
-    expect(toggle.parentElement).toHaveClass("flex-wrap");
+    // 包明细外面多了一层 flex（失效提示与触发元素并排），两者仍在同一额度容器
+    expect(toggle.parentElement?.parentElement).toBe(quotaSpan.parentElement?.parentElement);
+    expect(toggle.parentElement?.parentElement).toHaveClass("flex-wrap");
 
     await userEvent.hover(toggle);
     const tip = await screen.findByRole("tooltip");
     const items = within(tip).getAllByTestId("package-cb");
     expect(items).toHaveLength(4);
+    // 已消耗成 0 的包被过滤：明细与计数里都不出现
+    expect(within(tip).queryByText(/已用完包/)).not.toBeInTheDocument();
     // 按到期升序：最近到期的「福利积分」排第一，无到期时间的「无到期包」排最后
     expect(items[0]).toHaveTextContent("福利积分");
     expect(items[0]).toHaveTextContent("2,000");
+    // 上游只给「7 天内到期量」：与套餐到期日并排展示，把分批到期的部分说清楚
+    expect(items[0]).toHaveTextContent("7 天内到期 300");
+    expect(items[1]).not.toHaveTextContent("7 天内到期");
     expect(items[1]).toHaveTextContent("每月登录");
     expect(items[1]).toHaveTextContent("已用 76.56");
     expect(items[3]).toHaveTextContent("无到期包");
@@ -311,16 +319,39 @@ describe("CredentialsPage", () => {
     expect(screen.queryByTestId("packages-toggle-empty")).not.toBeInTheDocument();
   });
 
-  it("内置组头条额度是积分账，福利组头条是每日池；其余渠道不渲染积分账", async () => {
+  it("网页 Cookie 失效时在额度包处提示重贴", async () => {
     mockFetch({
       "/api/credentials": listBody([
-        // CodeArts：每日池 + 积分账两本。内置组显示积分账，福利组显示每日池。
+        makeCredential({
+          id: "ca",
+          provider: "codearts",
+          web_cookie_state: "expired",
+          quota_packages: [
+            { name: "福利积分", total: 1000, used: 0, end: null },
+          ],
+        }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    expect(screen.getByTestId("web-cookie-expired-ca")).toHaveTextContent(
+      "网页 Cookie 已失效，请重贴",
+    );
+    // 汇总口径的「套餐 N 个」照常可用，不受失效标记影响
+    expect(screen.getByTestId("packages-toggle-ca")).toHaveTextContent("套餐 1 个");
+  });
+
+  it("CodeArts 单组头条读通用额度字段，口径说明是积分余额", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        // CodeArts：只有一本账（积分），额度直接读通用字段
         makeCredential({
           id: "ca", provider: "codearts",
-          quota_remaining: 900, quota_total: 1000,
-          quota_credits_remaining: 13498.72, quota_credits_total: 13500,
+          quota_remaining: 13498.72, quota_total: 13500,
         }),
-        // TRAE：无积分账，头条就是它自己的账户余额
+        // TRAE：没有积分账，头条就是它自己的账户余额
         makeCredential({ id: "tr", provider: "trae" }),
       ]),
     });
@@ -328,37 +359,31 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    // 内置组：头条直接是积分账（不再是每日池 + 第二行积分）
-    const internal = screen.getByTestId("row-ca");
-    expect(within(internal).getByText("13,498.72 / 13,500")).toBeInTheDocument();
-    expect(within(internal).queryByText("900 / 1,000")).not.toBeInTheDocument();
-    // 口径说明是积分账那份（与每日额度池并行的独立账本）
-    expect(within(internal).getByText("13,498.72 / 13,500")).toHaveAttribute(
-      "title", expect.stringContaining("独立账本"));
-    // 福利组：头条仍是每日池，且看不到积分账
-    const benefit = screen.getByTestId("row-ca-benefit");
-    expect(within(benefit).getByText("900 / 1,000")).toBeInTheDocument();
-    expect(within(benefit).queryByText("13,498.72 / 13,500")).not.toBeInTheDocument();
-    // TRAE 只有一本账，头条是它自己的余额
+    const codearts = screen.getByTestId("row-ca");
+    expect(within(codearts).getByText("13,498.72 / 13,500")).toBeInTheDocument();
+    // 口径说明挂在额度数字的 title 上（CodeArts＝积分余额）
+    expect(within(codearts).getByText("13,498.72 / 13,500")).toHaveAttribute(
+      "title", expect.stringContaining("积分余额"));
+    // TRAE 头条是它自己的余额
     expect(within(screen.getByTestId("row-tr")).getByText("62 / 100")).toBeInTheDocument();
+    // 只有一组 / 一行
+    expect(screen.queryByTestId("row-ca-benefit")).not.toBeInTheDocument();
   });
 
-  it("内置组积分账未探测到（两字段皆 null）时头条显示 —，不冒充每日池", async () => {
+  it("CodeArts 额度未探测到（两字段皆 null）时头条显示 —，不冒充其它数", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({ id: "ca", provider: "codearts",
-                         quota_remaining: 900, quota_total: 1000,
-                         quota_credits_remaining: null, quota_credits_total: null }),
+                         quota_remaining: null, quota_total: null }),
       ]),
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
     await expandCredentialGroups();
 
-    // 内置组讲的是积分账：未探测到就是「— / —」，绝不回落到每日池的 900 / 1,000
-    const internal = screen.getByTestId("row-ca");
-    expect(within(internal).getByText("— / —")).toBeInTheDocument();
-    expect(within(internal).queryByText("900 / 1,000")).not.toBeInTheDocument();
+    // 未探测到就是「— / —」，绝不回落到任何占位数
+    const codearts = screen.getByTestId("row-ca");
+    expect(within(codearts).getByText("— / —")).toBeInTheDocument();
   });
 
   it("积分流水抽屉按组读对应账本（内置＝积分账，其余＝每日池）", async () => {
@@ -369,9 +394,7 @@ describe("CredentialsPage", () => {
           before: null, after: 100, delta: null, source: "sync", ledger: "credits" },
       ] },
       "/api/credentials": listBody([
-        makeCredential({ id: "ca", provider: "codearts",
-                         quota_credits_remaining: 13498.72,
-                         quota_credits_total: 13500 }),
+        makeCredential({ id: "ca", provider: "codearts" }),
         makeCredential({ id: "tr", provider: "trae" }),
       ]),
     });
@@ -398,6 +421,67 @@ describe("CredentialsPage", () => {
     expect(single).not.toHaveTextContent("积分账");
     expect(fetch).toHaveBeenLastCalledWith(
       expect.stringContaining("ledger=pool"), expect.anything());
+  });
+
+  it("签到记录菜单打开审计抽屉：列出结果/领取/上游码，请求 checkin-events", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const checkinUrl = "/api/credentials/cred_1/checkin-events";
+    mockFetch({
+      "/checkin-events": { events: [
+        { id: "chk_1", credential_id: "cred_1", ts: now, ok: 1, already: 0,
+          credit: 1000, code: 0, message: "领取成功", trigger: "manual" },
+        { id: "chk_0", credential_id: "cred_1", ts: now - 60, ok: 0, already: 0,
+          credit: null, code: 40001, message: "尚未到达权益刷新时间", trigger: "auto" },
+        { id: "chk_2", credential_id: "cred_1", ts: now - 120, ok: 1, already: 1,
+          credit: null, code: 0, message: "今日已签到", trigger: "auto" },
+      ] },
+      "/api/credentials": listBody([makeCredential({ id: "cred_1" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "签到记录" }));
+
+    const drawer = await screen.findByTestId("checkin-drawer-cred_1");
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        checkinUrl, expect.anything()));
+    expect(drawer).toHaveTextContent("签到成功");
+    expect(drawer).toHaveTextContent("签到失败");
+    expect(drawer).toHaveTextContent("今日已签");
+    expect(drawer).toHaveTextContent("+1,000");
+    expect(drawer).toHaveTextContent("40001");
+    expect(drawer).toHaveTextContent("尚未到达权益刷新时间");
+    // 触发方式区分定时与手动
+    expect(drawer).toHaveTextContent("手动");
+
+    // 再入口点一次即收起（与流水抽屉同形）
+    await userEvent.click(screen.getByTestId("checkin-drawer-close"));
+    expect(screen.queryByTestId("checkin-drawer-cred_1")).not.toBeInTheDocument();
+  });
+
+  it("签到记录菜单只在支持签到的渠道出现、空历史给出空态", async () => {
+    mockFetch({
+      "/checkin-events": { events: [] },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cred_1", provider: "codebuddy_intl" }),
+        makeCredential({ id: "cred_2", provider: "codebuddy" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    // codebuddy_intl 渠道侧无签到活动 → 不提供入口
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    expect(screen.queryByRole("menuitem", { name: "签到记录" })).not.toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+
+    await userEvent.click(screen.getByTestId("actions-cred_2"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "签到记录" }));
+    expect(await screen.findByTestId("checkin-drawer-empty")).toBeInTheDocument();
   });
 
   it("额度列不再显示「探测于」时间戳", async () => {
@@ -492,6 +576,35 @@ describe("CredentialsPage", () => {
         expect.objectContaining({ method: "POST" }),
       ),
     );
+  });
+
+  it("「强制恢复」连上游点名的冷却一起清除（force=true）", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/revive")) return jsonResponse({ ok: true });
+      return jsonResponse(listBody([
+        makeCredential({
+          id: "cred_1", disabled: 1, disabled_reason: "session dead",
+          cooling_until: 9_999_999_999, cooling_kind: "soft",
+        }),
+      ]));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "强制恢复" }));
+
+    const call = await waitFor(() => {
+      const found = fetchSpy.mock.calls.find(
+        ([input]) => String(input) === "/api/credentials/cred_1/revive",
+      );
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    expect(JSON.parse(String((call[1] as RequestInit).body))).toEqual({ force: true });
   });
 
   it("健康凭证不显示「恢复」入口", async () => {
@@ -757,13 +870,12 @@ describe("CredentialsPage", () => {
     expect(screen.queryByTestId("credentials-toolbar")).not.toBeInTheDocument();
   });
 
-  it("CodeArts 拆成内置（可写）与福利（只读）两组：账号各一次，操作只在可写组", async () => {
+  it("CodeArts 只渲染一个可写组：账号只出现一次，操作齐全", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({
           id: "ca1", provider: "codearts",
-          quota_remaining: 900, quota_total: 1000,
-          quota_credits_remaining: 13498.72, quota_credits_total: 13500,
+          quota_remaining: 13498.72, quota_total: 13500,
         }),
         makeCredential({ id: "tr1", provider: "trae" }),
       ]),
@@ -772,67 +884,45 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    // 切到全站渠道顺序，组顺序才确定（默认按额度排，CodeArts 每日池 900 > TRAE 62）
+    // 切到全站渠道顺序，组顺序才确定（默认按额度排，CodeArts 13,498 > TRAE 62）
     await userEvent.selectOptions(screen.getByTestId("credential-group-sort"), "provider");
 
-    // 组头：CodeArts 两行（内置在前、福利在后），label 带后缀，账号数一致。
-    // 组 key 含连字符，故显式排掉同前缀的指标块（-state- / -quota-pct / -expiring）。
+    // 组头：TRAE 在前、CodeArts 在后，各一行（不再拆内置 / 福利两组）。
+    // 组 key 含连字符，故显式排掉同前缀的指标块（-state- / -quota-pct / -expiring /
+    // -model-count 等），否则它们也会被这条正则匹配进来。
     const headers = screen
       .getAllByTestId(/^group-[a-z-]+$/)
-      .filter((node) => !/-state-|-quota-pct|-expiring|-select-|-toggle-/.test(
+      .filter((node) => !/-state-|-quota-pct|-expiring|-select-|-toggle-|-model|-checkin/.test(
         node.getAttribute("data-testid") ?? ""));
     expect(headers.map((node) => node.getAttribute("data-testid"))).toEqual([
       "group-trae",
-      "group-codearts-internal",
-      "group-codearts-benefit",
+      "group-codearts",
     ]);
-    expect(screen.getByTestId("group-codearts-internal")).toHaveTextContent("CodeArts 内置");
-    expect(screen.getByTestId("group-codearts-benefit")).toHaveTextContent("CodeArts 福利");
-    for (const key of ["codearts-internal", "codearts-benefit"]) {
-      expect(screen.getByTestId(`group-${key}`)).toHaveTextContent("1 个账号");
-    }
+    expect(screen.getByTestId("group-codearts")).toHaveTextContent("CodeArts");
+    expect(screen.getByTestId("group-codearts")).toHaveTextContent("1 个账号");
 
-    // 内置组：全操作 + 勾选 + 积分入口 + 积分账头条 + 套餐明细入口都在。
-    // 头条是**积分账**（内置模型计费），不是福利组的每日池。
-    const internal = screen.getByTestId("row-ca1");
-    expect(within(internal).getByText("13,498.72 / 13,500")).toBeInTheDocument();
-    expect(within(internal).queryByText("900 / 1,000")).not.toBeInTheDocument();
+    // 唯一的 CodeArts 行：全操作 + 勾选 + 流水入口 + 额度头条都在（不再有只读组）。
+    const row = screen.getByTestId("row-ca1");
+    expect(within(row).getByText("13,498.72 / 13,500")).toBeInTheDocument();
     expect(screen.getByTestId("select-ca1")).toBeInTheDocument();
     expect(screen.getByTestId("actions-ca1")).toBeInTheDocument();
     expect(screen.getByTestId("credits-ca1")).toBeInTheDocument();
-    expect(screen.getByTestId("group-select-codearts-internal")).toBeInTheDocument();
+    expect(screen.getByTestId("group-select-codearts")).toBeInTheDocument();
+    // 不再有 -benefit / -internal 那份重复行
+    expect(screen.queryByTestId("row-ca1-benefit")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("row-ca1-internal")).not.toBeInTheDocument();
 
-    // 福利组：只读——每日池照旧，勾选 / 操作 / 积分入口 / 套餐明细全收掉。
-    // 但选择格仍渲染**禁用** checkbox（不是空占位格）：空占位格的内容宽度与
-    // 内置组不同，表格 auto 布局下本行各列起点会与内置组错开。
-    const benefit = screen.getByTestId("row-ca1-benefit");
-    expect(within(benefit).getByText("900 / 1,000")).toBeInTheDocument();
-    expect(within(benefit).queryByText("13,498.72 / 13,500")).not.toBeInTheDocument();
-    const benefitSelect = screen.getByTestId("select-ca1-benefit");
-    expect(benefitSelect).toBeDisabled();
-    expect(screen.queryByTestId("actions-ca1-benefit")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("probe-ca1-benefit")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("credits-ca1-benefit")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("packages-toggle-ca1-benefit")).not.toBeInTheDocument();
-    // 组头全选同样是禁用态（占位对齐，不可勾）
-    expect(screen.getByTestId("group-select-codearts-benefit")).toBeDisabled();
-
-    // 列数恒定：两组的列头 / 数据行 / 组头 colspan 都是 7，否则 auto 布局整列错位
-    for (const key of ["codearts-internal", "codearts-benefit"]) {
-      expect(screen.getByTestId(`column-header-${key}`).children).toHaveLength(7);
-      expect(screen.getByTestId(`group-${key}`).querySelector("td"))
-        .toHaveAttribute("colspan", "7");
-    }
+    // 列数恒定：列头 / 数据行 / 组头 colspan 都是 7，否则 auto 布局整列错位
+    expect(screen.getByTestId("column-header-codearts").children).toHaveLength(7);
+    expect(screen.getByTestId("group-codearts").querySelector("td"))
+      .toHaveAttribute("colspan", "7");
     expect(screen.getByTestId("row-ca1").children).toHaveLength(7);
-    expect(screen.getByTestId("row-ca1-benefit").children).toHaveLength(7);
-    // 福利组的操作列只有占位，不给列名（写了像能点）
-    expect([...screen.getByTestId("column-header-codearts-benefit").children][6])
-      .toBeEmptyDOMElement();
-    expect([...screen.getByTestId("column-header-codearts-internal").children][6])
+    // 可写组的操作列有列名
+    expect([...screen.getByTestId("column-header-codearts").children][6])
       .toHaveTextContent("操作");
   });
 
-  it("只读用户下 CodeArts 同样拆两组，福利组列数仍与其它组一致", async () => {
+  it("只读用户下 CodeArts 仍是单组，列数与其它组一致", async () => {
     mockFetch({
       "/api/credentials": listBody(
         [makeCredential({ id: "ca1", provider: "codearts" })],
@@ -844,14 +934,12 @@ describe("CredentialsPage", () => {
     await settle();
     await expandCredentialGroups();
 
-    // viewer 本来就没有选择 / 操作列，两组都是 5 格（凭证 / 状态 / 额度 / token / 成长占位）
-    for (const key of ["codearts-internal", "codearts-benefit"]) {
-      expect(screen.getByTestId(`column-header-${key}`).children).toHaveLength(5);
-      expect(screen.getByTestId(`group-${key}`).querySelector("td"))
-        .toHaveAttribute("colspan", "5");
-    }
+    // viewer 本来就没有选择 / 操作列，单组是 5 格（凭证 / 状态 / 额度 / token / 成长占位）
+    expect(screen.getByTestId("column-header-codearts").children).toHaveLength(5);
+    expect(screen.getByTestId("group-codearts").querySelector("td"))
+      .toHaveAttribute("colspan", "5");
     expect(screen.getByTestId("row-ca1").children).toHaveLength(5);
-    expect(screen.getByTestId("row-ca1-benefit").children).toHaveLength(5);
+    expect(screen.queryByTestId("row-ca1-benefit")).not.toBeInTheDocument();
   });
 
   it("按渠道分组：组头显示渠道名与数量，行内不再复读渠道名", async () => {
@@ -887,6 +975,198 @@ describe("CredentialsPage", () => {
         }),
       ).not.toBeInTheDocument();
     }
+  });
+
+  it("组头显示今日签到：已签/该签 + 失败数，暂停号不进分母，无签到能力的渠道不渲染", async () => {
+    const checkinToday = (ts: number, ok: 0 | 1) => ({
+      id: `checkin_${ts}`, credential_id: "x", ts, ok, already: 0,
+      credit: null, code: null, message: "", trigger: "auto",
+    });
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy",
+          checkin_today: checkinToday(1_700_000_000, 1) }),
+        makeCredential({ id: "cb2", provider: "codebuddy",
+          checkin_today: checkinToday(1_700_000_060, 0) }),
+        makeCredential({ id: "cb3", provider: "codebuddy" }),      // 今日未签
+        makeCredential({ id: "cb4", provider: "codebuddy", enabled: 0 }), // 暂停
+        makeCredential({ id: "z1", provider: "zen" }),             // 渠道无签到
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    // 折叠态就可见：3 个该签（暂停的不算），1 已签 / 1 失败 / 1 未签
+    const block = screen.getByTestId("group-codebuddy-checkin");
+    expect(block).toHaveTextContent("今日签到");
+    expect(block).toHaveTextContent("1/3");
+    expect(block).toHaveTextContent("1 失败");
+    // 最近一条是失败那条（ts 更大）
+    expect(block.getAttribute("title")).toContain("已签 1 / 3");
+    // 位置：在折叠按钮之外的右簇里（与模型一起贴右），不是指标区的一格
+    const toggle = screen.getByTestId("group-toggle-codebuddy");
+    expect(toggle.contains(block)).toBe(false);
+    expect(toggle.nextElementSibling).toBe(block.parentElement);
+    // Zen 没有签到能力：整块不渲染（不显示永远 0/N 的假仪表）
+    expect(screen.queryByTestId("group-zen-checkin")).not.toBeInTheDocument();
+  });
+
+  it("组头显示该渠道当前能提供的模型数与最低倍率，hover 看逐条倍率", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy" }),
+        makeCredential({ id: "tr1", provider: "trae" }),
+      ]),
+      "/api/playground/models": {
+        object: "list",
+        data: [
+          // 多渠道条目：两个渠道的组头都要算上它，倍率各按自己的渠道取
+          {
+            id: "glm-5.2", name: "GLM 5.2", providers: ["codebuddy", "trae"],
+            by_provider: { codebuddy: { credit_rate: 0.29 }, trae: { credit_rate: 0.5 } },
+          },
+          { id: "kimi-k3", name: "Kimi K3", providers: ["codebuddy"], credit_rate: 0.8 },
+          // 免费额度：0 必须显示成「免」，不能是 x0
+          { id: "free-model", name: "Free Model", providers: ["trae"], credit_rate: 0 },
+        ],
+      },
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    // 折叠态就可见：数量 + 最低倍率（先回答「这渠道贵不贵」）
+    const cbCount = screen.getByTestId("group-codebuddy-model-count");
+    expect(cbCount).toHaveTextContent("2 个");
+    expect(cbCount).toHaveTextContent("最低 x0.29");
+    // 今日签到与模型同处右侧一簇：签到在模型左边，两者一起贴右
+    const cbCheckin = screen.getByTestId("group-codebuddy-checkin");
+    expect(cbCheckin.parentElement).toContainElement(cbCount);
+    expect(
+      cbCheckin.compareDocumentPosition(cbCount) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const trCount = screen.getByTestId("group-trae-model-count");
+    expect(trCount).toHaveTextContent("2 个");
+    // 免费额度不参与取最低：TRAE 有 1 个免费 + 1 个 x0.5，最低写 x0.5 而不是「免」
+    // （按字面取最小会让「有 1 个免费模型」读成整渠道免费）
+    expect(trCount).toHaveTextContent("最低 x0.5");
+
+    // 逐条清单不铺在组头（几十条会把这一行撑爆），hover 才展开
+    expect(screen.queryByTestId("group-codebuddy-models")).not.toBeInTheDocument();
+    await userEvent.hover(cbCount);
+    const tip = await screen.findByTestId("group-codebuddy-models");
+    // 头部：渠道身份 + 条数（条数单独成胶囊，不混进渠道名一句话里）
+    expect(tip).toHaveTextContent("CodeBuddy");
+    expect(tip).toHaveTextContent("2 个模型");
+    const rows = within(tip).getAllByTestId("group-codebuddy-model");
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "GLM 5.2x0.29",
+      "Kimi K3x0.8",
+    ]);
+    // 多行清单走 panel 表面（卡片底 + 描边 + 阴影），不是反色气泡：反色底放大段
+    // 文字会糊成一块，且气泡的箭头会盖住描边留一道缺口
+    expect(tip.closest("[data-slot='tooltip-content']"))
+      .toHaveAttribute("data-surface", "panel");
+    await userEvent.unhover(cbCount);
+
+    // 同一模型在 TRAE 组里显示的是 TRAE 的倍率（0.5，不是 CodeBuddy 的 0.29）
+    await userEvent.hover(trCount);
+    const traeTip = await screen.findByTestId("group-trae-models");
+    const traeRows = within(traeTip).getAllByTestId("group-trae-model");
+    expect(traeRows.map((row) => row.textContent)).toEqual([
+      "Free Model免",
+      "GLM 5.2x0.5",
+    ]);
+    await userEvent.unhover(trCount);
+  });
+
+  it("模型都未给倍率时只显示数量，不造一个「最低」", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "cb1", provider: "codebuddy" })]),
+      "/api/playground/models": {
+        object: "list",
+        data: [{ id: "glm-5.2", name: "GLM 5.2", providers: ["codebuddy"] }],
+      },
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    const count = screen.getByTestId("group-codebuddy-model-count");
+    expect(count).toHaveTextContent("1 个");
+    expect(count).not.toHaveTextContent("最低");
+    // 逐条倍率未知时显示 —（不当 0 读成免费）
+    await userEvent.hover(count);
+    const tip = await screen.findByTestId("group-codebuddy-models");
+    expect(within(tip).getByTestId("group-codebuddy-model")).toHaveTextContent("GLM 5.2—");
+  });
+
+  it("模型列表为空时不显示「模型 0 个」（0 会被读成这渠道没有模型）", async () => {
+    mockFetch({ "/api/credentials": listBody([makeCredential({ id: "cb1", provider: "codebuddy" })]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    expect(screen.queryByTestId("group-codebuddy-model-count")).not.toBeInTheDocument();
+  });
+
+  it("整组都免费时说「全免」，不说「最低 免」", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "zen1", provider: "zen" })]),
+      "/api/playground/models": {
+        object: "list",
+        data: [
+          { id: "a", name: "A", providers: ["zen"], credit_rate: 0 },
+          { id: "b", name: "B", providers: ["zen"], credit_rate: 0 },
+        ],
+      },
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    const count = screen.getByTestId("group-zen-model-count");
+    expect(count).toHaveTextContent("2 个");
+    expect(count).toHaveTextContent("全免");
+    expect(count).not.toHaveTextContent("最低");
+  });
+
+  it("模型块是可聚焦按钮：键盘 Tab 到它就打开清单（不靠 hover）", async () => {
+    mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "cb1", provider: "codebuddy" })]),
+      "/api/playground/models": {
+        object: "list",
+        data: [{ id: "glm-5.2", name: "GLM 5.2", providers: ["codebuddy"], credit_rate: 0.29 }],
+      },
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    const trigger = screen.getByTestId("group-codebuddy-model-count");
+    // 触发器必须是 button 且**不在**折叠按钮里：button 套 button 会被 HTML 解析器
+    // 拆开，键盘也就再也聚焦不到清单
+    expect(trigger.tagName).toBe("BUTTON");
+    expect(trigger.closest("[data-testid^='group-toggle-']")).toBeNull();
+
+    trigger.focus();
+    const tip = await screen.findByTestId("group-codebuddy-models");
+    expect(within(tip).getByTestId("group-codebuddy-model")).toHaveTextContent("GLM 5.2x0.29");
+  });
+
+  it("改完凭证会一并重取模型列表（组头不留在旧数据上）", async () => {
+    const spy = mockFetch({
+      "/api/credentials": listBody([makeCredential({ id: "cred_1", provider: "codebuddy", enabled: 1 })]),
+      "/api/credentials/cred_1/toggle": { ok: true },
+      "/api/playground/models": { object: "list", data: [] },
+    });
+    const modelsCalls = () =>
+      spy.mock.calls.filter(([url]) => String(url).includes("/api/playground/models")).length;
+
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    expect(modelsCalls()).toBe(1);
+
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "暂停" }));
+
+    await waitFor(() => expect(modelsCalls()).toBe(2));
   });
 
   it("组头聚合状态分布与 1.5 / 7 天内将过期的积分，折叠时也读得到", async () => {
@@ -937,26 +1217,26 @@ describe("CredentialsPage", () => {
       .not.toBeInTheDocument();
   });
 
-  it("CodeArts 内置组显示积分账到期积分，福利组显示每日池", async () => {
+  it("CodeArts 单组的行内到期积分读通用字段（与组头同源）", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({
           id: "ca1", provider: "codearts",
           quota_expiring_credits: 3_000,
           quota_expiring_credits_secondary: 9_000,
-          quota_credits_expiring: 120,
-          quota_credits_expiring_secondary: 260,
         }),
       ]),
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
+    await expandCredentialGroups();
 
-    // 后端把两段合并阶梯按账本拆开，两组各读自己那段：福利组＝每日池、内置组＝积分账
-    expect(screen.getByTestId("group-codearts-benefit-expiring")).toHaveTextContent("3,000");
-    expect(screen.getByTestId("group-codearts-internal-expiring")).toHaveTextContent("120");
-    expect(screen.getByTestId("group-codearts-internal-expiring-secondary"))
-      .toHaveTextContent("260");
+    // 行内到期积分与组头同源，都读通用的主窗口字段；
+    // 次窗口是主窗口的超集，主窗口已有数字时行内不重复渲染（见 Row）
+    expect(screen.getByTestId("quota-expiring")).toHaveTextContent("3,000 积分将在");
+    expect(screen.queryByTestId("quota-expiring-secondary")).not.toBeInTheDocument();
+    expect(screen.getByTestId("group-codearts-expiring")).toHaveTextContent("3,000");
+    expect(screen.getByTestId("group-codearts-expiring-secondary")).toHaveTextContent("9,000");
   });
 
   it("组头额度在免费层显示 —（无额度接口，不当成 0）", async () => {
@@ -1001,19 +1281,20 @@ describe("CredentialsPage", () => {
     expect(screen.queryByTestId("column-header-codebuddy")).not.toBeInTheDocument();
   });
 
-  it("组头指标块等宽：各渠道的「状态 / 额度 / 到期」成列对齐", async () => {
+  it("组头指标块等宽：各渠道的「状态 / 签到 / 额度 / 到期」成列对齐", async () => {
     mockFetch({
       "/api/credentials": listBody([
         makeCredential({ id: "cb1", provider: "codebuddy" }),
         // 更长的渠道名 + 更多状态：内容宽度不同，也不该把后面的指标推来推去
         makeCredential({ id: "cb2", provider: "codebuddy", cooling_until: 9_999_999_999 }),
+        makeCredential({ id: "tr1", provider: "trae" }),
         makeCredential({ id: "z", provider: "zen", quota_remaining: null, quota_total: null }),
       ]),
     });
     renderPage(<CredentialsPage />, ADMIN);
     await settle();
 
-    // 身份块与状态 / 额度 / 到期块都用固定宽度（w-* shrink-0），不随内容伸缩——
+    // 身份块与状态 / 签到 / 额度 / 到期块都用固定宽度（w-* shrink-0），不随内容伸缩——
     // jsdom 无排版，用类名锁住这个契约；真实对齐在浏览器里验证。
     const fixedWidths = (provider: string) => {
       const toggle = screen.getByTestId(`group-toggle-${provider}`);
@@ -1028,18 +1309,21 @@ describe("CredentialsPage", () => {
           return match ? [{ cls, width: match[1] }] : [];
         });
     };
-    for (const provider of ["codebuddy", "zen"]) {
+    for (const provider of ["codebuddy", "trae", "zen"]) {
       const fixed = fixedWidths(provider);
-      // 身份 + 状态 + 额度（zen 无到期块）
+      // 身份 + 状态 + 额度（zen 无签到块 / 无到期块）
       expect(fixed.length).toBeGreaterThanOrEqual(3);
       for (const block of fixed) {
         expect(block.cls).toContain("shrink-0");
       }
     }
 
-    // 两个渠道的指标块宽度完全一致（同一套类名），故各组起点对齐
+    // 两个支持签到的渠道指标块宽度完全一致（同一套类名），故各组起点对齐；
+    // zen 没有签到能力，组头不渲染签到块（不显示恒 0/N 的假仪表）
     expect(fixedWidths("codebuddy").map((b) => b.width))
-      .toEqual(fixedWidths("zen").map((b) => b.width));
+      .toEqual(fixedWidths("trae").map((b) => b.width));
+    expect(screen.queryByTestId("group-zen-checkin")).not.toBeInTheDocument();
+    expect(screen.getByTestId("group-trae-checkin")).toBeInTheDocument();
   });
 
   it("组排序：默认「额度从高到低」，可切回渠道顺序，免费层垫底", async () => {
@@ -1099,7 +1383,6 @@ describe("CredentialsPage", () => {
         makeCredential({
           id: "empty", provider: "codearts",
           quota_remaining: 0, quota_total: 100,
-          quota_credits_remaining: 0, quota_credits_total: 100,
         }),
       ]),
     });
@@ -1111,18 +1394,13 @@ describe("CredentialsPage", () => {
     expect(full).toHaveLength(2);
     expect(full[1].getAttribute("stroke-dasharray")).toBeNull();
 
-    // 归零：只剩淡色轨道，不画进度弧（CodeArts 两组各一份组头；内置组看积分账，
-    // 福利组看每日池，两本账都归零才各出一份 0%）
-    const empty = screen.getByTestId("group-codearts-internal-quota-pct")
-      .querySelectorAll("circle");
+    // 归零：只剩淡色轨道，不画进度弧
+    const empty = screen.getByTestId("group-codearts-quota-pct").querySelectorAll("circle");
     expect(empty).toHaveLength(1);
-    expect(screen.getByTestId("group-codearts-benefit-quota-pct")
-      .querySelectorAll("circle")).toHaveLength(1);
 
     expect(screen.getByTestId("group-qoder")).toHaveTextContent("额度合计100%");
-    // 内置组讲积分账，标签是「积分合计」
-    expect(screen.getByTestId("group-codearts-internal")).toHaveTextContent("积分合计0%");
-    expect(screen.getByTestId("group-codearts-benefit")).toHaveTextContent("额度合计0%");
+    // CodeArts 组讲积分账，标签是「积分合计」
+    expect(screen.getByTestId("group-codearts")).toHaveTextContent("积分合计0%");
   });
 
   it("列头迁进展开区：每个展开的渠道各有一份列头，都能触发同一套排序", async () => {
@@ -1503,6 +1781,115 @@ describe("CredentialsPage", () => {
     expect(screen.getByTestId("tags-cred_1")).toBeInTheDocument();
     expect(screen.getByTestId("credential-tag-filter")).toBeInTheDocument();
   });
+
+  it("导出凭证：请求 export 端点并落盘 JSON", async () => {
+    const blobs: string[] = [];
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: () => { blobs.push("blob"); return "blob:x"; },
+      revokeObjectURL: () => undefined,
+    });
+    const fetchSpy = mockFetch({
+      "/export": {
+        provider: "trae", nickname: "主账号", tags: ["生产"],
+        credential: { accessToken: "secret" },
+      },
+      "/api/credentials": listBody([makeCredential({ id: "cred_1", provider: "trae" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "导出凭证" }));
+
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([url]) =>
+        String(url).includes("/api/credentials/cred_1/export"))).toBe(true);
+    });
+    await waitFor(() => expect(blobs).toHaveLength(1));
+    expect(await screen.findByTestId("credentials-notice"))
+      .toHaveTextContent("已导出凭证 JSON");
+  });
 });
 
 
+
+describe("CredentialsPage 首启向导深链", () => {
+  it("?new=1 进来直接打开新增对话框", async () => {
+    mockFetch({ "/api/credentials": listBody([]) });
+    renderPage(<CredentialsPage />, ADMIN, "/?new=1");
+    expect(await screen.findByTestId("add-credential-dialog")).toBeInTheDocument();
+  });
+});
+
+describe("CredentialsPage 批量导入", () => {
+  it("操作员点「批量导入」打开对话框", async () => {
+    mockFetch({ "/api/credentials": listBody([]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await userEvent.click(screen.getByTestId("open-batch-import"));
+    expect(await screen.findByTestId("batch-import-dialog")).toBeInTheDocument();
+  });
+
+  it("只读角色看不到批量导入入口", async () => {
+    mockFetch({ "/api/credentials": listBody([], false) });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    expect(screen.queryByTestId("open-batch-import")).not.toBeInTheDocument();
+  });
+});
+
+  it("设置调度权重：菜单打开对话框并提交 PUT", async () => {
+    const fetchSpy = mockFetch({
+      "/api/credentials/cred_1/weight": { routing_weight: 5 },
+      "/api/credentials": listBody([makeCredential({ id: "cred_1" })]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "设置权重" }));
+    await screen.findByTestId("credential-weight-dialog");
+
+    await userEvent.type(screen.getByTestId("credential-weight-input"), "5");
+    await userEvent.click(screen.getByTestId("credential-weight-save"));
+
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/credentials/cred_1/weight",
+        expect.objectContaining({ method: "PUT", body: JSON.stringify({ weight: 5 }) }),
+      ),
+    );
+  });
+
+  it("已有权重的凭证在菜单里显示当前值", async () => {
+    mockFetch({ "/api/credentials": listBody([makeCredential({ id: "cred_1", routing_weight: -3 })]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cred_1"));
+    expect(screen.getByRole("menuitem", { name: "权重 -3" })).toBeInTheDocument();
+  });
+
+  it("小浣熊行「更多操作」有账号密码入口，已保存时带标记", async () => {
+    mockFetch({
+      "/api/credentials": listBody([
+        makeCredential({ id: "rc", provider: "raccoon", login_secret: 1 }),
+        makeCredential({ id: "cb", provider: "codebuddy" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+
+    await userEvent.click(screen.getByTestId("actions-rc"));
+    expect(await screen.findByText("账号密码")).toBeInTheDocument();
+    expect(screen.getByText("（已保存）")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+
+    // 其它渠道不显示该入口
+    await userEvent.click(screen.getByTestId("actions-cb"));
+    await screen.findAllByRole("menuitem");
+    expect(screen.queryByText("账号密码")).not.toBeInTheDocument();
+  });

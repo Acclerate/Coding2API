@@ -25,6 +25,18 @@ PBKDF2_MAX_ITERATIONS = 1_000_000
 PBKDF2_SALT_BYTES = 16
 PBKDF2_DIGEST_BYTES = 32
 
+# 用户名里禁止的字符（PROPOSAL §6「拒绝含 `:` / 换行的用户名」）。
+#
+# 冒号会截断 users.txt 的 `用户名:hash` 字段；换行/回车会注入额外记录。
+# 放在这里（而不是某个脚本里）是这套规则唯一的家：写 users.txt 的脚本
+# （hash_password.py）与写 DB 的脚本（create_user.py）都必须拒同一批字符，
+# 否则「CLI 建号能过的名字」和「用户文件能写的名字」口径就不一致。
+FORBIDDEN_USERNAME_CHARS = (":", "\n", "\r")
+
+# 会话签发时间与账号创建时间的允许误差（见 `DbUserStore.session_valid`）。
+# 同秒精度 + 测试夹具「先签 Cookie 再启动建号」的正常时序都落在余量内。
+SESSION_CLOCK_SLACK_SECONDS = 60
+
 
 class UsersFileError(RuntimeError):
     """用户文件缺失、格式非法或无有效用户。"""
@@ -135,6 +147,19 @@ class UsersFileStore:
         self._load_if_needed()
 
 
+#: 时序对齐用的 dummy 哈希缓存（见 `_dummy_password_hash`）。
+_DUMMY_HASH_CACHE: list[str] = []
+
+
+def _dummy_password_hash() -> str:
+    """进程内只造一次的 PBKDF2 哈希（随机口令，永远对不上）。"""
+    if not _DUMMY_HASH_CACHE:
+        # lazy 而非模块级：`create_password_hash` 是 600k 迭代（约 45ms），
+        # import 期每进程多付一次可接受，放 import 会拖累所有收集模块的测试。
+        _DUMMY_HASH_CACHE.append(create_password_hash(secrets.token_urlsafe(32)))
+    return _DUMMY_HASH_CACHE[0]
+
+
 class DbUserStore:
     """SQLite 用户存储：DB 是唯一权威源。
 
@@ -149,6 +174,10 @@ class DbUserStore:
     def verify(self, username: str, password: str) -> bool:
         row = self._repo.get(username)
         if row is None or not row["enabled"]:
+            # 不存在 / 被禁用也要完整跑一遍 PBKDF2：600k 迭代实测量级 ~45ms，
+            # 直接 return False 的响应比「存在但密码错」快两个数量级，攻击者
+            # 据此计时即可枚举有效用户名（实测时序差 ~7000×）。
+            verify_password(password, _dummy_password_hash())
             return False
         return verify_password(password, row["password_hash"])
 
@@ -164,6 +193,29 @@ class DbUserStore:
     def session_epoch(self, username: str) -> int | None:
         row = self._repo.get(username)
         return int(row["session_epoch"]) if row else None
+
+    def session_valid(self, username: str, epoch: int,
+                      issued_at: int | None) -> bool:
+        """会话是否仍有效：存在且启用 + epoch 未作废 + 不早于账号创建。
+
+        前两条与原来 `is_active` + `session_epoch ==` 等价。第三条补的是整库
+        重建场景：服务器重置 / 换机后 SQLite 是新的，`session_epoch` 从 0
+        重来；若 `APP_SECRET` 还是旧值，历史 Cookie 的 `ep=0` 会重新匹配新
+        账号，旧浏览器无需重新登录（issue #37）。`iat` 早于当前账号 `created_at`
+        的会话必然是上一个库签发的，直接拒绝。
+
+        `issued_at=None`（升级前的老 Cookie 没有 `iat`）：跳过该项，保持
+        与「缺 ep 按 0 放行」同一平滑口径。留 60s 余量吸收签发与建号同秒 /
+        测试夹具先签 Cookie 再启动建号的正常时序。
+        """
+        row = self._repo.get(username)
+        if row is None or not row["enabled"]:
+            return False
+        if int(row["session_epoch"]) != epoch:
+            return False
+        if issued_at is None:
+            return True
+        return issued_at >= int(row["created_at"] or 0) - SESSION_CLOCK_SLACK_SECONDS
 
     def must_change_password(self, username: str) -> bool:
         row = self._repo.get(username)

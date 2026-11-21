@@ -23,7 +23,9 @@ from .api import (
     admin_alerts,
     admin_audit,
     admin_auth,
+    admin_backups,
     admin_badges,
+    admin_billing,
     admin_credentials,
     admin_keys,
     admin_model_availability,
@@ -35,15 +37,17 @@ from .api import (
     authorize,
     balance,
     chat,
+    gemini,
     logs,
     messages,
     metrics,
     models,
     playground,
     responses,
+    tools,
     usage,
 )
-from .api.context import build_context_compressor
+from .api.context import build_context_compressor, build_prefix_observer
 from .api.deps import Services
 from .auth.throttle import LoginThrottle
 from .benchmarks import (
@@ -61,19 +65,27 @@ from .config import (
     validate_codearts_endpoint_allowed,
     validate_codebuddy_intl_endpoint_allowed,
     validate_endpoint_allowed,
+    validate_generic_endpoint_allowed,
     validate_kilo_endpoint_allowed,
+    validate_lingxi_endpoint_allowed,
+    validate_officeace_endpoint_allowed,
     validate_qoder_endpoint_allowed,
+    validate_raccoon_endpoint_allowed,
     validate_zen_endpoint_allowed,
 )
+from .db.backup import apply_pending_restore
 from .db.conn import Database
-from .db.crypto import CredentialCipher
+from .db.crypto import CredentialCipher, CredentialDecryptError
 from .db.key_usage import KeyUsageRepository
 from .db.limits import LimitsRepository, day_usage
+from .db.log_repo import LogRepository
 from .db.migrate import apply_schema
+from .db.paid_models import PaidModelRepository
 from .db.repo import (
     AlertRepository,
     ApiKeyRepository,
     AuditRepository,
+    CheckinEventRepository,
     CredentialRepository,
     CreditEventRepository,
     GrowthRepository,
@@ -83,23 +95,42 @@ from .db.repo import (
 )
 from .engine.affinity import ConversationAffinity
 from .engine.executor import Executor, ExecutorDeps
+from .engine.half_open import HalfOpenGuard
 from .engine.inflight import InflightGuard
 from .engine.limits import LimitGuard
 from .engine.model_resolver import KNOWN_PROVIDERS, parse_fallback_groups
 from .engine.scheduler import Scheduler
+from .instance_lock import AlreadyRunning, hold_instance_lock
 from .key_quota import KeyQuotaGuard
+from .platform_support import require_supported_platform
 from .provider.codearts import CodeArtsProvider
 from .provider.codearts.client import CodeArtsClient
 from .provider.codearts.oauth import CodeArtsOAuth
 from .provider.codebuddy.client import CodeBuddyClient, CodeBuddyProvider
 from .provider.codebuddy.intl import CodeBuddyIntlProvider
+from .provider.codebuddy.model_access_store import (
+    cache_path as model_access_cache_path,
+)
 from .provider.codebuddy.oauth import CodeBuddyOAuth
+from .provider.generic.client import GenericClient, GenericProvider, split_models
 from .provider.kilo.client import KiloClient, KiloProvider
-from .provider.proxy import parse_provider_proxies
+from .provider.lingxi import LingxiProvider
+from .provider.lingxi.client import LingxiClient
+from .provider.officeace import OfficeAceProvider
+from .provider.officeace.client import OfficeAceClient
+from .provider.officeace.oauth import OfficeAceOAuth
+from .provider.probe_failure import relogin_reason
+from .provider.proxy import (
+    CredentialProxyPool,
+    parse_provider_proxies,
+    parse_proxy_pool,
+    set_proxy_pool,
+)
 from .provider.qoder import QoderProvider
 from .provider.qoder.auth import QoderOAuth
 from .provider.qoder.client import QoderClient
 from .provider.qoder.events import detect_realm_from_domain
+from .provider.raccoon.client import RaccoonClient, RaccoonProvider
 from .provider.trae.client import TraeClient, TraeProvider
 from .provider.zen.client import ZenClient, ZenProvider
 from .runtime_settings import load_runtime_settings
@@ -125,10 +156,17 @@ from .webapp.security import host_allowed, security_middleware
 
 logger = logging.getLogger(__name__)
 
-# SIGTERM 后允许在途请求（含长流）收尾的最长秒数。三处必须一致：
-# 本常量、deploy/systemd 的 TimeoutStopSec、docker-compose 的 stop_grace_period
-# （后者是容器给进程的停机窗口，必须 >= 本值，否则 SIGKILL 会打断排空）。
-GRACEFUL_SHUTDOWN_SECONDS = 30
+# SIGTERM 后允许在途请求（含长流）收尾的最长秒数。四处必须一致：
+# 本常量、deploy/launchd 的 ExitTimeOut、deploy/systemd 的 TimeoutStopSec、
+# docker-compose 的 stop_grace_period（后三者是「平台给进程的停机窗口」，
+# 必须 >= 本值，否则 SIGKILL 会打断排空）。
+#
+# 30s 的来历已不成立：实测 p99 延迟 57.7s、7 天内 27 次请求超过 120s
+# （`usage_events.latency_ms`），30s 窗口下日志留下 38 次
+# `Cancel N running task(s), timeout graceful shutdown exceeded` —— 每次重启
+# 都在硬砍长流请求，统计也落不下来。90s 覆盖到 p99 以上，超过这个量级的
+# 只剩「客户端本来就会断开」的极长会话。
+GRACEFUL_SHUTDOWN_SECONDS = 90
 
 # --------------------------------------------------------------- 向后兼容再导出
 # 这些名字历史上住在 main.py，测试与外部脚本直接 import。真实定义已移到
@@ -211,6 +249,43 @@ def _kilo_endpoint(config: Settings) -> str:
                              allowed_name="KILO_ALLOWED_ENDPOINTS")
 
 
+def _generic_endpoint(config: Settings) -> str:
+    """解析通用上游端点；未配置（或全空白）时返回空串 = 不注册该渠道。
+
+    与其他渠道不同，这里**不强制必填**：留空 = 这个部署不启用通用上游。
+    调用方用返回值判空决定是否注册，不再自己重复判一次（两处判空会漂移，
+    且会让这里的空值分支变成不可达代码）。
+    """
+    if not config.generic_api_endpoint.strip():
+        return ""
+    return _resolve_endpoint(config, attr="generic_api_endpoint",
+                             validator=validate_generic_endpoint_allowed,
+                             env_name="GENERIC_API_ENDPOINT",
+                             allowed_name="GENERIC_ALLOWED_ENDPOINTS",
+                             strip_slash=True)
+
+
+def _raccoon_endpoint(config: Settings) -> str:
+    """解析小浣熊端点并强制白名单校验（防把用户会话 JWT 发往未授权主机）。"""
+    return _resolve_endpoint(config, attr="raccoon_api_endpoint",
+                             validator=validate_raccoon_endpoint_allowed,
+                             env_name="RACCOON_API_ENDPOINT",
+                             allowed_name="RACCOON_ALLOWED_ENDPOINTS")
+
+
+def _lingxi_endpoint(config: Settings) -> str:
+    """解析灵犀端点并强制白名单校验（防把 WPS 登录态发往未授权主机）。
+
+    回落域（`lingxi.kdocs.cn`）不在这里解析：它由客户端的 `bases()` 固定追加，
+    同一份白名单校验（漏收会让回落直接 404）。
+    """
+    return _resolve_endpoint(config, attr="lingxi_api_endpoint",
+                             validator=validate_lingxi_endpoint_allowed,
+                             env_name="LINGXI_API_ENDPOINT",
+                             allowed_name="LINGXI_ALLOWED_ENDPOINTS",
+                             strip_slash=True)
+
+
 def _qoder_host(config: Settings) -> str:
     """解析 Qoder openapi 端点并强制白名单校验。"""
     return _resolve_endpoint(config, attr="qoder_api_endpoint",
@@ -235,6 +310,19 @@ def _codearts_endpoint(config: Settings) -> str:
                              allowed_name="CODEARTS_ALLOWED_ENDPOINTS")
 
 
+def _officeace_endpoint(config: Settings) -> str:
+    """解析 officeAce 控制面端点并强制白名单校验。
+
+    模型网关（每账号一个 `modelgw-*.officeace.*`）不在这里：它是上游
+    `client-permission-validate` 下发的、存在凭证里的值，改不了也写不错。
+    """
+    return _resolve_endpoint(config, attr="officeace_api_endpoint",
+                             validator=validate_officeace_endpoint_allowed,
+                             env_name="OFFICEACE_API_ENDPOINT",
+                             allowed_name="OFFICEACE_ALLOWED_ENDPOINTS",
+                             strip_slash=True)
+
+
 def _seed_free_credential(credentials: CredentialRepository, *, provider: str,
                           nickname: str) -> None:
     """确保池里有一条无凭证渠道的虚拟凭证（幂等）。
@@ -257,7 +345,7 @@ def _seed_zen_credential(credentials: CredentialRepository) -> None:
 
 def _seed_kilo_credential(credentials: CredentialRepository) -> None:
     """确保池里有一条 kilo 虚拟凭证（幂等）。"""
-    _seed_free_credential(credentials, provider="kilo", nickname="Kilo Gateway")
+    _seed_free_credential(credentials, provider="kilo", nickname="Kilo")
 
 
 def _similar_models(name: str, aliases: dict[str, dict[str, str]],
@@ -334,10 +422,16 @@ def _restore_model_list(services) -> None:
 def build_app(settings: Settings | None = None, *, providers: dict | None = None,
               users: object | None = None) -> FastAPI:
     config = settings or load_settings()
+    # 与 `run()` 同一道门禁，覆盖 `uvicorn src.main:build_app --factory` 这条
+    # 生产路径：它不经过 run()，若不拦，Windows 上会绕过单实例锁直接起服务
+    # ——正是 issue #46 说的「升级到保护静默失效」。
+    require_supported_platform()
     # 这里必须配：生产路径是 `uvicorn src.main:build_app --factory`（launchd /
     # 容器 / systemd 均如此），不经过 run()，否则审计等 INFO 日志仍被丢弃。
     # 幂等，测试反复调用 build_app 不会叠加 handler。
     configure_logging(config.log_level)
+    # 管理台上传的待恢复备份在**建连接之前**应用；坏文件只留档、不阻断启动
+    apply_pending_restore(config.db_path)
     db = Database(config.db_path)
     apply_schema(db.connect())
     # 运行时配置覆盖层：热更键读 DB 覆盖值，其余透明委托给 env 快照。
@@ -347,6 +441,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     credentials = CredentialRepository(db, cipher)
     growth_events = GrowthRepository(db)
     credit_events = CreditEventRepository(db)
+    checkin_events = CheckinEventRepository(db)
     api_keys = ApiKeyRepository(db)
     user_repo = UserRepository(db)
     audit = AuditRepository(db)
@@ -379,6 +474,16 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     kilo_pacer = Pacer(lambda: runtime.kilo_chat_min_interval,
                        lambda: runtime.kilo_chat_min_interval,
                        allow_concurrent=True)
+    # 小浣熊独立 pacer：真实账号渠道，上游并发上限约 5（实测第 6 个 429），
+    # 用 max_concurrency 兜住；与其余渠道互不排队。
+    raccoon_pacer = Pacer(lambda: runtime.raccoon_chat_min_interval,
+                          lambda: runtime.raccoon_chat_min_interval,
+                          allow_concurrent=True,
+                          max_concurrency=lambda: runtime.raccoon_max_concurrency)
+    # 灵犀独立 pacer：真实账号渠道（按 run 计费），默认不节流；与其余渠道互不排队。
+    lingxi_pacer = Pacer(lambda: runtime.lingxi_chat_min_interval,
+                         lambda: runtime.lingxi_chat_min_interval,
+                         allow_concurrent=True)
     # Qoder / CodeArts 是真实账号渠道，上游按账号频控；各自独立 pacer，
     # 与其余渠道互不排队（同渠道同凭证共桶、桶内允许并发）。
     qoder_pacer = Pacer(lambda: runtime.qoder_chat_min_interval,
@@ -389,9 +494,24 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                            allow_concurrent=True,
                            max_concurrency=lambda: runtime.codearts_max_concurrency,
                            window_seconds=lambda: runtime.codearts_request_window_seconds)
+    # officeAce 独立 pacer：真实账号渠道（单账号单用户），上游没有 CodeArts
+    # 那种硬并发限，默认不节流；与其余渠道互不排队。
+    officeace_pacer = Pacer(lambda: runtime.officeace_chat_min_interval,
+                            lambda: runtime.officeace_chat_min_interval,
+                            allow_concurrent=True)
+    # 通用上游端点：解析一次，既决定是否注册，也作为客户端 base_url。
+    # 空串 = 本部署不启用该渠道（见 `_generic_endpoint`）。
+    generic_endpoint = _generic_endpoint(config)
+    # 通用上游：用户自行配置的标准端点，默认不节流（上游限流由它自己的 429 表达，
+    # 引擎按 SOFT 冷却凭证）。单桶：一个部署只配一条通用上游。
+    generic_pacer = Pacer(lambda: runtime.generic_chat_min_interval,
+                          lambda: runtime.generic_chat_min_interval,
+                          allow_concurrent=True)
     # 按渠道出站代理：启动期解析一次，装配时注入到各 provider 的
     # httpx client；运行中改值需重启（连接池已建立，见 provider/proxy.py）。
     proxies = parse_provider_proxies(config.provider_proxies, KNOWN_PROVIDERS)
+    # 出口 IP 粘性：池按凭证 id 稳定分配，装配期一次设定（连接池已建，改值需重启）
+    set_proxy_pool(CredentialProxyPool(parse_proxy_pool(config.credential_proxy_pool)))
     registry = providers if providers is not None else {
         "trae": TraeProvider(
             client=TraeClient(proxy=proxies.get("trae")), pacer=chat_pacer),
@@ -408,10 +528,22 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                 # 国际站网关硬性要求首条 system（实测 400/11128），国内站无此要求
                 require_leading_system=True,
                 proxy=proxies.get("codebuddy_intl"),
+                # 国际站指纹：稳定会话 id + 官方版本常量 + 会话/模型头 + JWT uid；
+                # 体走 gzip（官方 CLI 形态）；探活结果落盘，避免重启后 20 连发
+                intl=True,
+                gzip_body=True,
+                access_cache_path=model_access_cache_path(config.data_dir),
             ), pacer=codebuddy_intl_pacer),
         "zen": ZenProvider(
             client=ZenClient(host=_zen_endpoint(config),
                              version=config.zen_opencode_version,
+                             api_root=config.zen_api_root,
+                             models_root=config.zen_models_root,
+                             profile=config.zen_client_profile,
+                             gate_tools=tuple(
+                                 t.strip() for t in config.zen_gate_tools.split(",")
+                                 if t.strip()) or ("bash", "read"),
+                             user_agent=config.zen_user_agent,
                              proxy=proxies.get("zen")),
             pacer=zen_pacer),
         "kilo": KiloProvider(
@@ -427,6 +559,28 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             client=CodeArtsClient(endpoint=_codearts_endpoint(config),
                                   proxy=proxies.get("codearts")),
             pacer=codearts_pacer),
+        "raccoon": RaccoonProvider(
+            client=RaccoonClient(host=_raccoon_endpoint(config),
+                                 proxy=proxies.get("raccoon")),
+            pacer=raccoon_pacer),
+        "lingxi": LingxiProvider(
+            client=LingxiClient(host=_lingxi_endpoint(config),
+                                proxy=proxies.get("lingxi")),
+            pacer=lingxi_pacer),
+        "officeace": OfficeAceProvider(
+            client=OfficeAceClient(cloud_base=_officeace_endpoint(config),
+                                   proxy=proxies.get("officeace")),
+            pacer=officeace_pacer),
+        **(
+            {"generic": GenericProvider(
+                client=GenericClient(
+                    endpoint=generic_endpoint,
+                    user_agent=config.generic_user_agent,
+                    proxy=proxies.get("generic")),
+                static_models=split_models(config.generic_models),
+                pacer=generic_pacer)}
+            if generic_endpoint else {}
+        ),
     }
     # 默认装配路径（生产）才种子无凭证渠道的虚拟凭证：测试注入自定义 registry
     # 时不应凭空多出一条无对应 provider 的凭证行。
@@ -442,7 +596,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 日志环形缓冲（E3）：容量现读热更项 `log_buffer_lines`（0 = 关闭整页）。
     # 这里只建对象；handler 在 lifespan 里按当前值挂/摘，避免每个 build_app
     # 都往 root 上叠一个（测试会反复建 app）。
-    log_buffer = LogBuffer(capacity=lambda: runtime.log_buffer_lines)
+    # 日志落库（E3 持久化）：与内存环共用容量热更项之外的另一条上限。
+    # `LOG_PERSIST_LINES=0` 时只保留内存环（页面照常，重启即清空）。
+    log_repo = LogRepository(db, capacity=lambda: runtime.log_persist_lines)
+    log_buffer = LogBuffer(capacity=lambda: runtime.log_buffer_lines,
+                           persist=log_repo)
     # 模型目录原始表的**同一引用**交给 executor（credit_rate 查询）与 Services
     # （list_models 缓存）——这里先建空 dict，Services 装配时直接挂它
     model_cache: dict[str, dict[str, Any]] = {}
@@ -466,9 +624,15 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             load_catalog_snapshot(config.data_dir))
     except Exception as error:  # noqa: BLE001 - 价表是加速手段，失败不阻断服务
         logger.warning("恢复落盘模型目录失败: %s", error)
+    # 目录 x0 的实测校准：上游改计费不改目录时，用 `usage_events` 里
+    # `credit_estimated=0` 的真实扣费把「免费」纠正成实际倍率，否则免费档
+    # 会一直压过到期积分（见 `db/paid_models.py` 的模块 docstring）。
+    # 先于 StatsCollector 创建：写入回调要 `invalidate()` 它，让「刚观测到的
+    # 真扣费」立刻参与选号，而不是等 600s 快照 TTL。
+    paid_models = PaidModelRepository(db)
     stats_collector = StatsCollector(
         db, prices=lambda: price_table, usd_cny_rate=lambda: runtime.usd_cny_rate,
-        on_record=live_events.publish)
+        on_record=live_events.publish, on_write=paid_models.invalidate)
     # 凭证级限额护栏：配置表 + 当日用量聚合注入 LimitGuard（快照缓存），
     # executor 选号前用它过滤触顶候选；管理台改完 invalidate() 立即生效。
     limits_repo = LimitsRepository(db)
@@ -481,9 +645,15 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 滑动窗口——不落库、重启清零，单进程部署下即精确。
     key_usage = KeyUsageRepository(db)
     key_quota = KeyQuotaGuard(key_usage.for_key)
+    # 用户级配额（Playground 会话直连）：按用户名聚合当日用量——该用户经任何
+    # 入口的流量都计入，否则「你自己 Key 刷爆了但仍能用 Playground 无限调」。
+    user_quota = KeyQuotaGuard(key_usage.for_user)
     # 凭证在途租约：跨渠道的「单账号并发上限」，选号前过滤 + 请求结束释放。
     # 上限现读运行态覆盖层，管理台改完下一请求即生效（无快照，无需 invalidate）。
     inflight_guard = InflightGuard(lambda: runtime.max_inflight_per_credential)
+    # 冷却到期半开探测：到期先放 1 个请求，成功再全量回池（进程内状态，
+    # 重启丢失只会让每个号多探一次）。
+    half_open_guard = HalfOpenGuard()
     executor = Executor(ExecutorDeps(providers=registry, credentials=credentials,
                                      scheduler=Scheduler(
                                          expiry_window=lambda: runtime.quota_expiry_window_seconds,
@@ -519,17 +689,67 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      # 运行态覆盖层，管理台改完下一请求即生效
                                      force_disable_thinking=lambda: runtime.force_disable_thinking,
                                      reasoning_effort_map=lambda: runtime.reasoning_effort_map,
+                                     privacy_rules=lambda: runtime.privacy_rules,
                                      model_aliases=model_aliases,
                                      # 同一份 dict 的引用：模型目录恢复 / 拉取后
                                      # executor 立即可见（倍率查询走它）
                                      model_list_cache=model_cache,
+                                     # 实测扣费校准：目录写 x0 但最近 24h 有真实
+                                     # 扣费的 (渠道, 模型) 按实测均值覆盖，见
+                                     # `Executor._observed_paid_rate`
+                                     paid_models=paid_models.observed_rates,
                                      # 上下文压缩（修订）：选号后按实际服务
                                      # 渠道的窗口裁剪；settings 传运行态覆盖层，
                                      # 开关与四个参数每请求现读（热更）
                                      context_compress=build_context_compressor(
                                          model_cache, model_aliases, runtime),
+                                     # 前缀缓存诊断（默认关）：命中率异常时
+                                     # 在管理台打开，日志里就能看到前缀在哪条
+                                     # 消息分叉、压缩是否每轮都在裁
+                                     prefix_debug=build_prefix_observer(runtime),
                                      limits=limit_guard,
-                                     inflight=inflight_guard))
+                                     inflight=inflight_guard,
+                                     half_open=half_open_guard))
+
+    # 即时额度探测：新增凭证 / OAuth 保存 / 账号切换 / 签到成功后重探测。
+    # 定义在 lifespan 之前：签到任务要在装配时拿到它（签到=积分变化的那一刻，
+    # 等下一轮周期探测会让「套餐明细」和额度合计最多旧一小时）。
+    def schedule_probe(credential_id: str) -> None:
+        """新增凭证 / OAuth 保存 / 账号切换 / 签到后立即重探测（不阻塞响应）。
+
+        周期扫描是 60 分钟一轮，若不等这一轮，刚加进来的凭证在界面上会一直
+        显示「未探测到额度」，调度器也只能把它排在 known 之后。
+        """
+        provider_id = credentials.provider_of(credential_id)
+        provider = registry.get(provider_id or "")
+        # 解不开（APP_SECRET 换过 / 密文损坏）→ 跳过这条凭证，不让后台任务
+        # 因一条坏凭证整轮失败
+        try:
+            data = credentials.credential_data(credential_id)
+        except CredentialDecryptError:
+            return
+        if provider is None or data is None:
+            return
+
+        async def probe() -> None:
+            try:
+                quota = await provider.probe_quota(data)
+            except Exception as error:  # noqa: BLE001 - 探测失败标记为未探测
+                logger.warning("即时额度探测失败 %s: %s", credential_id, error)
+                reason = relogin_reason(provider_id or "", error)
+                if reason:
+                    # 刚导入 / 刚签到的号若已 401，立即停用：否则下一轮调度
+                    # 还会挑中它再撞一次，管理台也要等聊天失败才知道要重贴。
+                    credentials.mark_relogin_required(credential_id, reason)
+                else:
+                    credentials.mark_probe_failed(credential_id)
+                return
+            credentials.save_quota(credential_id, quota)
+
+        # 完成后从列表里摘除：否则长时间运行会无限累积已完成的 Task 对象
+        task = asyncio.create_task(probe())
+        app.state.pending_probes.append(task)
+        task.add_done_callback(lambda done: _forget_task(done, app.state.pending_probes))
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
@@ -595,8 +815,10 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         runner = build_runner(credentials, registry, app_.state.stats_collector, runtime,
                               growth_events=app_.state.growth_events,
                               credit_events=credit_events,
+                              checkin_events=checkin_events,
                               audit=audit,
                               alerts=alerts,
+                              logs=app_.state.services.log_repo,
                               backup=BackupTask(config.db_path,
                                                 keep=lambda: runtime.backup_keep),
                               upstream_status=upstream_status_task,
@@ -604,10 +826,18 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               model_probe_minutes=lambda: runtime.model_probe_minutes,
                               model_catalog=_refresh_channel_models,
                               openrouter_catalog=_refresh_model_catalog,
+                              on_checkin_success=schedule_probe,
                               openrouter_catalog_minutes=(
                                   lambda: runtime.openrouter_catalog_minutes))
         app_.state.task_runner = runner
-        await runner.start()
+        # **首轮探测/刷新放后台**：`start()` 内联 await 的是两个真实的上游网络
+        # 调用（quota_probe 每凭证一个请求、token 预刷新同样出网），最慢十几秒；
+        # 内联会让 lifespan startup 一直不结束 → uvicorn 还没开始 accept，
+        # 容器/launchd 的健康探针在窗口内判 unhealthy（重启循环）。这也与上面
+        # 预热三兄弟「不内联 await」的口径一致。
+        # 关闭期先收尾这个 task 再停循环（见 finally）：否则 stop 先跑，
+        # start 又把周期循环建出来，那些循环没人 cancel。
+        app_.state.task_runner_start_task = asyncio.create_task(runner.start())
         # 预热模型别名表：放后台跑（force 绕过 TTL）。
         # 不内联 await 的原因：zen 免费层探活最慢的模型可占十几秒，内联会让应用
         # 在这段时间里不响应 /health，容器存活探针可能误判；动态拉取失败仅记日志。
@@ -625,6 +855,14 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         try:
             yield
         finally:
+            # **先等 start 收尾**：start 未完成时周期循环多半还没建出来，
+            # 先 stop 是 no-op，随后 start 把循环建出来 → 无人 cancel 的孤儿
+            # 任务带着事件循环跑。start 里的两个 run_once 均在 `_guarded`
+            # 内（异常已吞），这里即使抛 CancelledError 也要继续 stop。
+            start_task = getattr(app_.state, "task_runner_start_task", None)
+            if start_task is not None and not start_task.done():
+                with contextlib.suppress(Exception):
+                    await start_task
             await runner.stop()
             warmup = getattr(app_.state, "model_warmup_task", None)
             if warmup is not None and not warmup.done():
@@ -687,6 +925,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.state.executor = executor
     app.state.stats_collector = stats_collector
     app.state.growth_events = growth_events
+    app.state.checkin_events = checkin_events
     app.state.stats_query = StatsQuery(db)
     # SSE 实时流的订阅中心（与 StatsCollector 的 on_record 同源）
     app.state.live_events = live_events
@@ -710,37 +949,12 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.state.upstream_status = upstream_status_store
 
     # 路由层共享依赖容器（TECHNICAL §2 deps.py）
-    def schedule_probe(credential_id: str) -> None:
-        """新增凭证 / OAuth 保存 / 账号切换 / 签到后立即重探测（不阻塞响应）。
-
-        周期扫描是 60 分钟一轮，若不等这一轮，刚加进来的凭证在界面上会一直
-        显示「未探测到额度」，调度器也只能把它排在 known 之后。
-        """
-        provider_id = credentials.provider_of(credential_id)
-        provider = registry.get(provider_id or "")
-        data = credentials.credential_data(credential_id)
-        if provider is None or data is None:
-            return
-
-        async def probe() -> None:
-            try:
-                quota = await provider.probe_quota(data)
-            except Exception as error:  # noqa: BLE001 - 探测失败标记为未探测
-                logger.warning("即时额度探测失败 %s: %s", credential_id, error)
-                credentials.mark_probe_failed(credential_id)
-                return
-            credentials.save_quota(credential_id, quota)
-
-        # 完成后从列表里摘除：否则长时间运行会无限累积已完成的 Task 对象
-        task = asyncio.create_task(probe())
-        app.state.pending_probes.append(task)
-        task.add_done_callback(lambda done: _forget_task(done, app.state.pending_probes))
-
     services = Services(
         settings=runtime,
         credentials=credentials,
         growth_events=growth_events,
         credit_events=credit_events,
+        checkin_events=checkin_events,
         api_keys=api_keys,
         executor=executor,
         registry=registry,
@@ -753,16 +967,19 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         limit_guard=limit_guard,
         key_quota=key_quota,
         key_usage=key_usage,
+        user_quota=user_quota,
         stats_query=app.state.stats_query,
         login_throttle=app.state.login_throttle,
         live_events=live_events,
         log_buffer=log_buffer,
+        log_repo=log_repo,
         upstream_auth=app.state.upstream_auth,
         model_aliases=model_aliases,
         # executor 拿的就是这一份引用：目录恢复 / 拉取 / TTL 刷新写进来后，
         # 聊天路径的倍率查询立即看到新数据
         model_list_cache=model_cache,
         schedule_probe=schedule_probe,
+        inflight=inflight_guard,
     )
     app.state.services = services
 
@@ -811,12 +1028,14 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(admin_credentials.create_router(services))
     app.include_router(admin_keys.create_router(services))
     app.include_router(admin_settings.create_router(services))
+    app.include_router(admin_backups.create_router(services))
     app.include_router(admin_model_catalog.create_router(services))
     app.include_router(admin_model_availability.create_router(services))
     app.include_router(admin_alerts.create_router(services))
     app.include_router(admin_badges.create_router(services))
     app.include_router(admin_upstream.create_router(services))
     app.include_router(admin_stats.create_router(services))
+    app.include_router(admin_billing.create_router(services))
     app.include_router(admin_users.create_router(services))
     app.include_router(admin_audit.create_router(services))
     # 服务端日志页（E3）：admin-only 只读视图；`log_buffer_lines=0` 时回 404。
@@ -825,6 +1044,8 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(chat.create_router(services))
     app.include_router(responses.create_router(services))
     app.include_router(messages.create_router(services))
+    app.include_router(gemini.create_router(services))
+    app.include_router(tools.create_router(services))
     app.include_router(models.create_router(services))
     app.include_router(balance.create_router(services))
     app.include_router(playground.create_router(services))
@@ -858,7 +1079,8 @@ def _upstream_auth(registry: dict, settings: Settings) -> dict:
 
     CodeBuddy 走设备码轮询（国内站与国际站各一套：endpoint 不同、登录域名不同）；
     Qoder 走设备码 PKCE（区域由 openapi 主机推导）；
-    CodeArts 走门户 ticket 轮询（token 响应直接给临时 AK/SK，无本地回调）。
+    CodeArts 走门户 ticket 轮询（token 响应直接给临时 AK/SK，无本地回调）；
+    officeAce 走云端授权码轮询（回调由云端承接，同样无本地回调）。
     """
     flows: dict = {}
     proxies = parse_provider_proxies(settings.provider_proxies, KNOWN_PROVIDERS)
@@ -872,6 +1094,15 @@ def _upstream_auth(registry: dict, settings: Settings) -> dict:
     if host is not None:
         flows["qoder"] = QoderOAuth(detect_realm_from_domain(host),
                                     proxy=proxies.get("qoder"))
+    officeace = registry.get("officeace")
+    officeace_client = getattr(officeace, "client", None)
+    officeace_login = getattr(officeace_client, "login", None)
+    if officeace_login is not None:
+        # officeAce 走 poll 轨道：授权回调由**云端**承接，服务端只轮询
+        # `/v1/claw/auth/code`。登录流量（每次登录几十次短请求）与聊天流量
+        # 的并发特征完全不同，故用独立连接池；但共用同一个出站代理设置。
+        flows["officeace"] = OfficeAceOAuth(
+            officeace_login, proxy=proxies.get("officeace"))
     codearts = registry.get("codearts")
     client = getattr(codearts, "client", None)
     login = getattr(client, "login", None)
@@ -912,24 +1143,58 @@ def _load_users(*, settings: Settings, user_repo):
 
 def run() -> None:
     """本地启动入口：python -m src.main 或 coding2api 命令。"""
+    import sys
+
     import uvicorn
+
+    # 平台门禁放在最前：单实例锁依赖 flock（POSIX 专有）。放在 load_settings
+    # 之前，是因为「平台不支持」比「APP_SECRET 没配」更根本——在 Windows 上
+    # 应该先看到这一句，而不是被 .env 的必填校验挡住（见 issue #46）。
+    # `SystemExit` 的文案直接进 stderr，不依赖 configure_logging。
+    require_supported_platform()
 
     config = load_settings()
     # 应用日志（审计、上游错误等）在此之前无 handler 会被丢弃
     configure_logging(config.log_level)
-    uvicorn.run(
-        build_app(config), host=config.host, port=config.port,
-        log_level=config.log_level.lower(),
-        # 关掉 uvicorn 自带 access log：请求级留痕已由 RequestLogMiddleware
-        # 覆盖（logfmt，带时间戳与 request_id，可与 usage_events 关联），而
-        # uvicorn 的裸行无时间戳、含完整 query string，只是把同样的请求再写满
-        # 另一个轮转文件。
-        access_log=False,
-        # 收到 SIGTERM 后先停止接受新连接，给在途请求（含长流）最多
-        # GRACEFUL_SHUTDOWN_SECONDS 秒收尾，再强关。默认 None 是无限等，
-        # 配合容器/launchd 的停机超时会变成「卡住直到被 SIGKILL」。
-        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
-    )
+    # 单实例保护必须在 build_app 之前：后者会建库、跑迁移、应用待恢复备份，
+    # 这些写操作在第二个实例上重复执行就是双写（见 src/instance_lock.py）。
+    try:
+        instance_lock = hold_instance_lock(config.data_dir)
+    except AlreadyRunning as error:
+        # **退出码 0 而不是非零**：这是「已经有人在服务」，不是故障。
+        # 三条启动路径的守护策略都是「非零退出才重拉」
+        # （launchd KeepAlive.SuccessfulExit=false、systemd Restart=on-failure、
+        #   compose restart），用非零退出会变回每 10s 一次的重启循环——
+        # 实测 2026-09-19~10-17 刷了 2377 条 `[Errno 48]`，完整 traceback
+        # 把真正的故障挤出视野。真崩溃仍然是非零退出，照样被拉起来。
+        logger.error("%s", error)
+        print(f"启动中止（这不是故障，已有实例在服务）：{error}", file=sys.stderr)
+        return
+    try:
+        uvicorn.run(
+            build_app(config), host=config.host, port=config.port,
+            log_level=config.log_level.lower(),
+            # 关掉 uvicorn 自带 access log：请求级留痕已由 RequestLogMiddleware
+            # 覆盖（logfmt，带时间戳与 request_id，可与 usage_events 关联），而
+            # uvicorn 的裸行无时间戳、含完整 query string，只是把同样的请求再写满
+            # 另一个轮转文件。
+            access_log=False,
+            # 收到 SIGTERM 后先停止接受新连接，给在途请求（含长流）最多
+            # GRACEFUL_SHUTDOWN_SECONDS 秒收尾，再强关。默认 None 是无限等，
+            # 配合容器/launchd 的停机超时会变成「卡住直到被 SIGKILL」。
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+            # **必须关**：uvicorn 自带的 proxy_headers=True 会把对端 ∈
+            # forwarded_allow_ips（默认 127.0.0.1）请求的 `scope["client"]`
+            # 改写成 `X-Forwarded-For` 尾条目——于是「采信不采信 XFF」就轮不到
+            # 应用层的 `TRUST_PROXY` 判定了（nginx/frpc 回源、容器 healthcheck、
+            # 本机 curl 全命中回环）。后果：`TRUST_PROXY=false` 部署下，能连进
+            # 回环端口的调用方自带一个 XFF 头即可伪造来源 IP，绕过 api_keys 的
+            # IP 白名单与登录限流桶。来源解析统一收归 `access.client_ip`：
+            # `TRUST_PROXY` 决定一切，uvicorn 只做搬运。
+            proxy_headers=False,
+        )
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -272,6 +272,35 @@ def test_model_allowlist_blocks_chat_and_responses(client):
     assert responses.status_code == 400
     assert "not allowed" in responses.json()["error"]["message"]
 
+def test_user_model_policy_bounds_chat_and_model_list(client):
+    """管理员按人设的白名单在 /v1 也生效：自签空白名单的 Key 不能越权。
+
+    用户策略（users.allowed_models）此前只在 Playground 判；/v1 只看 Key 自己的
+    白名单，于是用户删掉 Key 白名单即可绕开管理员设的范围。
+    """
+    services = client.app.state.services
+    services.user_repo.set_policy("root", allowed_models="glm-*", quota="")
+    key = _create_key(client)["api_key"]            # Key 自己不设白名单
+    headers = {"Authorization": f"Bearer {key}"}
+
+    chat = client.post("/v1/chat/completions", headers=headers,
+                       json={"model": "kimi-k3", "messages": [{"role": "user",
+                                                               "content": "hi"}]})
+    assert chat.status_code == 400
+    assert chat.json()["error"]["message"].endswith("not allowed for this user")
+
+    # 列表同口径：不放行的模型不该出现在 /v1/models（否则「看得到用不了」）
+    listed = client.get("/v1/models", headers=headers).json()["data"]
+    assert all(item["id"].startswith("glm-") for item in listed)
+
+
+def test_user_model_policy_absent_keeps_key_scope(client):
+    """没有用户策略行时按不限制放行（脏数据不该把出口锁死）。"""
+    key = _create_key(client, allowed_models="glm-*")["api_key"]
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+    assert response.status_code == 200
+
+
 def test_expired_key_is_rejected(client):
     key = _create_key(client, expires_at=1)["api_key"]
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
@@ -424,3 +453,34 @@ def test_http_binding_stream_preflight(tmp_path):
                                    "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 400
     assert "restricted to 'trae'" in response.json()["error"]["message"]
+
+
+def test_client_ip_only_trusts_xff_from_trusted_proxy_peers():
+    """配了受信反代名单后，只有名单内的对端才能让 XFF 生效。
+
+    堵的是「反代旁还有一条直连路径」：那种部署下任何人自带
+    `X-Forwarded-For: <白名单IP>` 就能冒充来源。
+    """
+    packet = "1.2.3.4, 10.0.0.9"
+    # 对端命中名单 → 采信 XFF
+    assert client_ip("127.0.0.1", packet, trust_proxy=True,
+                     trusted_proxies="127.0.0.1/32") == "10.0.0.9"
+    # 对端不在名单（直连攻击者）→ 忽略 XFF，用真实对端
+    assert client_ip("203.0.113.7", packet, trust_proxy=True,
+                     trusted_proxies="127.0.0.1/32") == "203.0.113.7"
+    # 名单为空 = 旧行为（不限制）
+    assert client_ip("203.0.113.7", packet, trust_proxy=True) == "10.0.0.9"
+    # trust_proxy 关闭时名单无用武之地
+    assert client_ip("127.0.0.1", packet, trust_proxy=False,
+                     trusted_proxies="127.0.0.1/32") == "127.0.0.1"
+
+
+def test_client_ip_trusted_proxies_fails_closed_on_bad_input():
+    """名单写坏 / 对端为空 / 对端不是 IP → 一律不采信 XFF。"""
+    packet = "1.2.3.4"
+    assert client_ip("127.0.0.1", packet, trust_proxy=True,
+                     trusted_proxies="garbage") == "127.0.0.1"
+    assert client_ip("", packet, trust_proxy=True,
+                     trusted_proxies="127.0.0.1/32") == ""
+    assert client_ip("not-an-ip", packet, trust_proxy=True,
+                     trusted_proxies="127.0.0.1/32") == "not-an-ip"

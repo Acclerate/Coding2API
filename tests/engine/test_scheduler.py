@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from src.engine.scheduler import (
     BLOCKED_BASE_SECONDS,
     BLOCKED_MAX_SECONDS,
+    CONCURRENCY_BURST_WINDOW_SECONDS,
+    CONCURRENCY_CHAIN_GAP_SECONDS,
+    CONCURRENCY_COOLDOWN_MAX_SECONDS,
     CONCURRENCY_COOLDOWN_SECONDS,
+    CONCURRENCY_LONG_WINDOW_MAX_SECONDS,
     EXPIRY_WINDOW_SECONDS,
     MODEL_COOLDOWN_MAX_SECONDS,
     MODEL_COOLDOWN_SECONDS,
@@ -19,6 +25,7 @@ from src.engine.scheduler import (
     Candidate,
     ModelCooldown,
     Scheduler,
+    concurrency_cooldown_duration,
     next_credit_reset,
 )
 from src.provider.base import (
@@ -27,7 +34,6 @@ from src.provider.base import (
     Event,
     EventKind,
     Quota,
-    credits_health_score,
     health_score,
 )
 
@@ -50,16 +56,6 @@ def test_health_three_states():
     assert health_score(Quota(remaining=50.0, total=100.0)) == 50
     assert health_score(Quota(remaining=150.0, total=100.0)) == 100     # 夹紧
 
-
-def test_credits_health_from_second_ledger():
-    """积分账派生的健康度只服务展示：两字段全缺＝未探测，不判耗尽。"""
-    assert credits_health_score(None, None) is None                     # 积分接口没探到
-    assert credits_health_score(0.0, None) == EXHAUSTED                 # 有余额无数额 → 夹到耗尽
-    assert credits_health_score(13498.72, 13500.0) == 100
-    assert credits_health_score(6750.0, 13500.0) == 50
-    assert credits_health_score(None, 100.0) == 0
-    assert credits_health_score(50.0, 100.0) == 50
-    assert credits_health_score(150.0, 100.0) == 100                    # 夹紧
 
 def test_event_defaults():
     e = Event(kind=EventKind.CONTENT, content="hi")
@@ -289,6 +285,38 @@ def test_note_error_dead_disables():
     out = Scheduler().note_error(cand(), ErrKind.DEAD, NOW)
     assert out.disabled and out.cooling_until is None and out.err_count == 0
 
+def test_note_error_restricted_cools_without_disabling():
+    """账号被上游风控限制（11140）：指数冷却 2h 起、绝不 disabled。
+
+    禁用是不可逆的人工状态，而这类限制由上游自行解除；写成 disabled 就变成
+    「必须有人去点恢复」，还会诱使运维反复 revive 去撞（每次都可能再留记录）。
+    冷却时长按命中次数退避：固定 2h 会让整批同源账号每 2h 被重试一遍，而
+    重复撞击已被封的账号正是上游判「自动化」的证据。
+    """
+    from src.engine.scheduler import RESTRICTED_COOLDOWN_MAX_SECONDS, RESTRICTED_COOLDOWN_SECONDS
+
+    out = Scheduler().note_error(cand(), ErrKind.RESTRICTED, NOW)
+    assert not out.disabled
+    assert out.cooling_until == NOW + RESTRICTED_COOLDOWN_SECONDS
+    assert out.err_count == 1
+    assert out.model_cooldowns is None      # 账号级作用域，不写模型级条目
+
+    # 第二次命中翻倍，逐次翻倍直到 7 天上限
+    second = Scheduler().note_error(cand(err_count=1), ErrKind.RESTRICTED, NOW)
+    assert second.cooling_until == NOW + 2 * RESTRICTED_COOLDOWN_SECONDS
+    assert second.err_count == 2
+    long_hit = Scheduler().note_error(cand(err_count=30), ErrKind.RESTRICTED, NOW)
+    assert long_hit.cooling_until == NOW + RESTRICTED_COOLDOWN_MAX_SECONDS
+
+def test_note_error_restricted_honours_upstream_retry_at_within_cap():
+    """上游给了更晚的恢复时刻就用它，但仍夹在 24h 上界内。"""
+    out = Scheduler().note_error(
+        cand(), ErrKind.RESTRICTED, NOW, retry_at=NOW + 3 * 3600)
+    assert out.cooling_until == NOW + 3 * 3600
+    capped = Scheduler().note_error(
+        cand(), ErrKind.RESTRICTED, NOW, retry_at=NOW + 7 * 24 * 3600)
+    assert capped.cooling_until == NOW + 24 * 3600
+
 def test_note_error_plan_long_cooldown():
     out = Scheduler().note_error(cand(), ErrKind.PLAN, NOW)
     assert out.cooling_until == NOW + PLAN_COOLDOWN_SECONDS and not out.disabled
@@ -369,11 +397,11 @@ def test_model_cooldown_without_model_degrades_to_soft():
     assert out.cooling_until == NOW + SOFT_COOLDOWN_SECONDS
     assert out.model_cooldowns is None
 
-def test_concurrency_cooldown_is_short_and_fixed():
-    """并发打满（TM.00001041）固定短冷却、不翻倍：在途排空即恢复。
+def test_concurrency_cooldown_starts_short_and_escalates_on_chain():
+    """并发打满：首枪 60s，同一条命中链翻倍，封顶 5min。
 
-    一次打满锁 10min（MODEL 基数）太久；60s 覆盖在途排空（实测最大 38s）
-    加余量。重复打满只重 armed，不 escalates。
+    首枪不套 MODEL 的 600s 基数（在途排空实测 9–38s，一次打满锁 10min 太久）；
+    「冷却到期后立刻又被立刻打满」说明上游窗口还没恢复，继续 60s 白撞。
     """
     s = Scheduler()
     out = s.note_error(cand(), ErrKind.CONCURRENCY, NOW, model="deepseek-v4.1-flash")
@@ -383,20 +411,134 @@ def test_concurrency_cooldown_is_short_and_fixed():
     assert CONCURRENCY_COOLDOWN_SECONDS == 60
     # 模型级条目不得顺带写账号级冷却
     assert out.cooling_until is None and not out.disabled
-    # 重复打满：hits 累计（可观测），时长仍固定、不翻倍
+    # 到期后立刻又被打满（gap 0 ≤ 240s）：命中链延续，时长翻倍
     again = s.note_error(
         _with_model_cooldown(cand(), "deepseek-v4.1-flash", cooling_until=NOW,
                              hits=1, reason="concurrency"),
         ErrKind.CONCURRENCY, NOW, model="deepseek-v4.1-flash")
     entry = again.model_cooldowns["deepseek-v4.1-flash"]
-    assert (entry.cooling_until, entry.hits) == (NOW + CONCURRENCY_COOLDOWN_SECONDS, 2)
-    # hits 很大也不翻倍封顶
+    assert (entry.cooling_until, entry.hits) == (NOW + 2 * CONCURRENCY_COOLDOWN_SECONDS, 2)
+    # hits 很大时封顶，不能无限翻倍
     huge = s.note_error(
         _with_model_cooldown(cand(), "deepseek-v4.1-flash", cooling_until=NOW,
                              hits=99, reason="concurrency"),
         ErrKind.CONCURRENCY, NOW, model="deepseek-v4.1-flash")
     assert huge.model_cooldowns["deepseek-v4.1-flash"].cooling_until == (
-        NOW + CONCURRENCY_COOLDOWN_SECONDS)
+        NOW + CONCURRENCY_COOLDOWN_MAX_SECONDS)
+
+def test_concurrency_chain_covers_five_minute_gaps():
+    """间隔 5min 内仍算同一条链：raccoon 实测 151–300s 的 41 个间隔要能被覆盖。
+
+    首枪冷却 60s，`CONCURRENCY_CHAIN_GAP_SECONDS=240` 等价于「相邻命中间隔
+    ≤300s」。用 90s 门槛时这批全部漏掉（122 个间隔只覆盖 38 个）。
+    """
+    s = Scheduler()
+    assert CONCURRENCY_CHAIN_GAP_SECONDS == 240
+    stale = _with_model_cooldown(
+        cand(), "m", cooling_until=NOW - CONCURRENCY_CHAIN_GAP_SECONDS,
+        hits=1, reason="concurrency")
+    out = s.note_error(stale, ErrKind.CONCURRENCY, NOW, model="m")
+    entry = out.model_cooldowns["m"]
+    assert (entry.hits, entry.cooling_until) == (
+        2, NOW + 2 * CONCURRENCY_COOLDOWN_SECONDS)
+
+def test_concurrency_burst_second_credential_escalates_to_cap():
+    """整组打满：同 (provider, model) 第二个不同凭证在窗口内再命中 → 封顶档。
+
+    raccoon 实测 14 波三凭证同秒 429：第一个号按首枪 60s 冷却，第二、三个号
+    若也各自 60s，会在一分钟内再被选上、逐个白撞。爆出 burst 后直接升封顶
+    （raccoon 是长窗口渠道，封顶 30min；其余渠道 5min）。
+    """
+    s = Scheduler()
+    first = s.note_error(
+        cand("a", provider="raccoon"), ErrKind.CONCURRENCY, NOW, model="m")
+    assert (first.model_cooldowns["m"].cooling_until
+            == NOW + CONCURRENCY_COOLDOWN_SECONDS)
+    # 第二个不同凭证：整组信号 → 封顶
+    second = s.note_error(
+        cand("b", provider="raccoon"), ErrKind.CONCURRENCY, NOW + 5, model="m")
+    entry = second.model_cooldowns["m"]
+    assert (entry.cooling_until, entry.hits) == (
+        NOW + 5 + CONCURRENCY_LONG_WINDOW_MAX_SECONDS, 3)
+    # 第三个不同凭证同样升封顶
+    third = s.note_error(
+        cand("c", provider="raccoon"), ErrKind.CONCURRENCY, NOW + 6, model="m")
+    assert (third.model_cooldowns["m"].cooling_until
+            == NOW + 6 + CONCURRENCY_LONG_WINDOW_MAX_SECONDS)
+    # 不同 provider 不构成整组信号，走首枪（且按该渠道自己的封顶：默认 5min）
+    other = s.note_error(
+        cand("d", provider="trae"), ErrKind.CONCURRENCY, NOW + 5, model="m")
+    assert (other.model_cooldowns["m"].cooling_until
+            == NOW + 5 + CONCURRENCY_COOLDOWN_SECONDS)
+
+
+def test_concurrency_long_window_provider_caps_at_thirty_minutes():
+    """长窗口渠道（raccoon）的封顶是 30min：实测恢复中位数 1522s。
+
+    156 次 `user_model_rate_limited` 到同凭证下次成功的间隔：10% 分位 231s、
+    中位数 1522s、75% 分位 2530s，只有 22/156 在 5min 内恢复。5min 封顶会每
+    5 分钟白撞一波；30min 才落在实测恢复量级内。
+    """
+    s = Scheduler()
+    assert CONCURRENCY_LONG_WINDOW_MAX_SECONDS == 1800
+    # hits=5 → 60s<<4 = 960s，还没到顶
+    mid = s.note_error(
+        _with_model_cooldown(cand("a", provider="raccoon"), "m",
+                             cooling_until=NOW, hits=4, reason="concurrency"),
+        ErrKind.CONCURRENCY, NOW, model="m")
+    assert mid.model_cooldowns["m"].cooling_until == NOW + 960
+    # hits=6 → 1920s，封顶 1800s
+    capped = s.note_error(
+        _with_model_cooldown(cand("a", provider="raccoon"), "m",
+                             cooling_until=NOW, hits=5, reason="concurrency"),
+        ErrKind.CONCURRENCY, NOW, model="m")
+    assert capped.model_cooldowns["m"].cooling_until == NOW + (30 * 60)
+    # 默认渠道仍是 5min 封顶
+    assert (concurrency_cooldown_duration(6) == CONCURRENCY_COOLDOWN_MAX_SECONDS
+            == 300)
+    assert concurrency_cooldown_duration(6, "raccoon") == 1800
+
+
+def test_concurrency_burst_same_credential_stays_chain():
+    """同一凭证重复命中不是整组信号：走命中链，不升封顶。"""
+    s = Scheduler()
+    s.note_error(cand("a", provider="raccoon"), ErrKind.CONCURRENCY, NOW, model="m")
+    again = s.note_error(
+        _with_model_cooldown(cand("a", provider="raccoon"), "m",
+                             cooling_until=NOW + CONCURRENCY_COOLDOWN_SECONDS,
+                             hits=1, reason="concurrency"),
+        ErrKind.CONCURRENCY, NOW + 5, model="m")
+    entry = again.model_cooldowns["m"]
+    assert (entry.hits, entry.cooling_until) == (
+        2, NOW + 5 + 2 * CONCURRENCY_COOLDOWN_SECONDS)
+
+
+def test_concurrency_burst_window_expiry_starts_new_round():
+    """窗口过去后再被第二个凭证打满 = 新一轮，不算整组，走首枪。"""
+    s = Scheduler()
+    s.note_error(cand("a", provider="raccoon"), ErrKind.CONCURRENCY, NOW, model="m")
+    late = s.note_error(
+        cand("b", provider="raccoon"),
+        ErrKind.CONCURRENCY, NOW + CONCURRENCY_BURST_WINDOW_SECONDS + 1, model="m")
+    assert (late.model_cooldowns["m"].cooling_until
+            == NOW + CONCURRENCY_BURST_WINDOW_SECONDS + 1
+            + CONCURRENCY_COOLDOWN_SECONDS)
+
+
+def test_concurrency_chain_breaks_after_idle_gap():
+    """冷却过去久了再打满算新的一轮：hits 归 1，时长回落到 60s。
+
+    `hits` 只增不减，若不做链判定，任何一次偶发打满都会把该凭证永久
+    抬到封顶 5 分钟。
+    """
+    s = Scheduler()
+    stale = _with_model_cooldown(
+        cand(), "m", cooling_until=NOW - CONCURRENCY_CHAIN_GAP_SECONDS - 1,
+        hits=7, reason="concurrency")
+    out = s.note_error(stale, ErrKind.CONCURRENCY, NOW, model="m")
+    entry = out.model_cooldowns["m"]
+    assert (entry.hits, entry.cooling_until) == (
+        1, NOW + CONCURRENCY_COOLDOWN_SECONDS)
 
 def test_concurrency_cooldown_reason_switch_resets_hits():
     """原因切换重新计数：MODEL 6004 的 hits 不能带到并发短冷却里。"""
@@ -442,6 +584,12 @@ def test_note_error_request_kind_is_zero_action():
     assert (out.cooling_until, out.err_count, out.disabled) == (None, 2, False)
     assert out.model_cooldowns is None
 
+def test_note_error_network_kind_is_zero_action():
+    """本机 DNS/连接失败不是凭证的问题：不能冷却，否则网络抖动会清空整池。"""
+    out = Scheduler().note_error(cand(err_count=2), ErrKind.NETWORK, NOW)
+    assert (out.cooling_until, out.err_count, out.disabled) == (None, 2, False)
+    assert out.model_cooldowns is None
+
 def test_note_error_credit_cools_until_next_4am():
     """余额不足：冷却到次日签到时刻，而不是固定 12h。"""
     out = Scheduler().note_error(cand(), ErrKind.CREDIT, NOW)
@@ -455,12 +603,28 @@ def test_note_error_credit_cools_until_next_4am():
     (23, 1),
 ])
 def test_next_credit_reset_boundaries(hour, expected_offset_days):
-    local = time.localtime(NOW)
-    today_4am = int(time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
-                                 4, 0, 0, 0, 0, -1)))
+    # 04:00 是**北京时间**（与签到日界同源），断言也必须按北京时区算：
+    # 用 time.localtime/mktime 在 TZ≠CN 的机器上会整体偏 8 小时。
+    local = datetime.fromtimestamp(NOW, ZoneInfo("Asia/Shanghai"))
+    today_4am = int(local.replace(hour=4, minute=0, second=0,
+                                  microsecond=0).timestamp())
     now_at_hour = today_4am + (hour - 4) * 3600
     expected = today_4am + expected_offset_days * 86400
     assert next_credit_reset(now_at_hour) == expected
+
+
+def test_next_credit_reset_ignores_process_timezone(monkeypatch):
+    """进程 TZ 改成 UTC 也不偏移：上游按北京时间重置。"""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        # 北京时间 2026-09-21 03:00 = UTC 2026-09-20 19:00
+        moment = int(datetime(2026, 9, 21, 3, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+        assert next_credit_reset(moment) == int(
+            datetime(2026, 9, 21, 4, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 def test_select_skips_model_cooled_credential_when_filtered():
     """端到端：调用方按模型过滤后，被冷却的凭证不再被选中，换模型仍最优。"""
@@ -473,3 +637,50 @@ def test_select_skips_model_cooled_credential_when_filtered():
     # 同一份候选换模型：a 的模型级冷却不生效，健康度更高者胜出
     usable = [c for c in (cooled_a, b) if c.is_selectable(NOW, "kimi-k2")]
     assert s.select(usable, set(), NOW) == "a"
+
+
+# ---------------------------------------------------------------- 管理员权重
+
+
+def test_select_weight_reorders_within_health_tier():
+    """同健康档内高权重优先：压过到期积分与在途分摊。"""
+    pool = [
+        cand("hot", health=90, routing_weight=50),
+        cand("expiring", health=90, expiry_ladder=[(NOW + 600, 500.0)]),
+        cand("busy", health=90, routing_weight=50, inflight=3),
+    ]
+    # hot 与 busy 同权重，退到原链按在途少者（hot 0 < busy 3）
+    assert Scheduler().select(pool, set(), NOW) == "hot"
+    # 高权重仍然压过「到期积分多」：busy(50) > expiring(0)
+    assert Scheduler().select([c for c in pool if c.credential_id != "hot"],
+                              set(), NOW) == "busy"
+    # 权重打平才退回原链：到期积分多者优先
+    tied = [cand("a", health=90, routing_weight=5),
+            cand("b", health=90, routing_weight=5,
+                 expiry_ladder=[(NOW + 600, 500.0)])]
+    assert Scheduler().select(tied, set(), NOW) == "b"
+
+
+def test_select_negative_weight_ranks_last_in_tier():
+    """负权重 = 备用号：同档内排最后，哪怕它到期积分最多。"""
+    pool = [cand("normal", health=90),
+            cand("standby", health=90, routing_weight=-10,
+                 expiry_ladder=[(NOW + 600, 999.0)])]
+    assert Scheduler().select(pool, set(), NOW) == "normal"
+
+
+def test_select_weight_never_crosses_health_tier():
+    """权重不是准入条件：exhausted / unknown 号即使权重拉满也不能越过 known。"""
+    pool = [cand("known", health=60),
+            cand("dead", health=EXHAUSTED, routing_weight=1000),
+            cand("unknown", health=None, routing_weight=1000)]
+    assert Scheduler().select(pool, set(), NOW) == "known"
+    assert Scheduler().select([pool[1], pool[2]], set(), NOW) == "unknown"
+
+
+def test_select_without_weight_keeps_existing_order():
+    """全默认（None/0）时排序与补该列前一致：到期积分仍压过健康度。"""
+    pool = [cand("steady", health=95),
+            cand("burn", health=10, expiry_ladder=[(NOW + 600, 100.0)]),
+            cand("zero", health=99, routing_weight=0)]
+    assert Scheduler().select(pool, set(), NOW) == "burn"

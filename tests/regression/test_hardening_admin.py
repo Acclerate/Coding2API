@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from pathlib import Path
+import time
 
 import httpx
 import pytest
@@ -218,6 +218,28 @@ def test_revive_credential_endpoint(client):
 def test_revive_unknown_credential_is_400(client):
     assert client.post("/api/credentials/cred_missing/revive").status_code == 400
 
+
+def test_revive_keeps_upstream_cooldown_unless_forced(client):
+    """默认「恢复」保留上游点名的冷却；`force=true` 才清除（见 repo.revive）。"""
+    created = client.post("/api/credentials", json={
+        "provider": "codebuddy", "credential": {"token": "t"}}).json()["id"]
+    db = client.app.state.credentials._db
+    future = int(time.time()) + 3600
+    db.connect().execute(
+        "UPDATE credentials SET disabled = 1, cooling_until = ?, cooling_kind = 'soft' "
+        "WHERE id = ?", (future, created))
+    db.connect().commit()
+
+    client.post(f"/api/credentials/{created}/revive")
+    row = db.connect().execute("SELECT disabled, cooling_until FROM credentials "
+                               "WHERE id = ?", (created,)).fetchone()
+    assert row["disabled"] == 0 and row["cooling_until"] == future
+
+    client.post(f"/api/credentials/{created}/revive", json={"force": True})
+    row = db.connect().execute("SELECT cooling_until FROM credentials "
+                               "WHERE id = ?", (created,)).fetchone()
+    assert row["cooling_until"] is None
+
 # ------------------------------------------------------------- #24 429
 
 
@@ -419,15 +441,48 @@ def test_dump_request_body_trims_to_keep_limit(tmp_path):
     remaining = list((tmp_path / "dumps").glob("*.json"))
     assert 0 < len(remaining) <= chat.DUMP_KEEP_FILES
 
-def test_dump_request_body_survives_unwritable_dir(tmp_path, monkeypatch):
-    """诊断落盘失败不影响聊天请求。"""
+def test_dump_request_body_survives_unwritable_dir(tmp_path):
+    """诊断落盘失败不影响聊天请求（路径不可用 → OSError 被吞掉）。
+
+    `DATA_DIR/dumps` 已被占成普通文件时 `mkdir` 抛 `FileExistsError`：诊断失败
+    绝不能把请求带崩，也不能向外抛任何异常。
+    """
     from src.api import chat
 
-    def boom(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(Path, "write_text", boom)
+    (tmp_path / "dumps").write_text("not a directory", encoding="utf-8")
     chat.dump_request_body(tmp_path, {"a": 1})      # 不应抛异常
+    assert (tmp_path / "dumps").is_file()
+
+
+def test_dump_files_are_owner_only_and_expire_after_a_day(tmp_path):
+    """请求体含完整对话：目录 0700、文件 0600；条数没超也要按 24h 过期清理。"""
+    import os
+    import time as _time
+
+    from src.api import chat
+
+    chat.dump_request_body(tmp_path, {"messages": [{"role": "user", "content": "hi"}]})
+    dump_dir = tmp_path / "dumps"
+    written = list(dump_dir.glob("*.json"))
+    assert len(written) == 1
+    assert dump_dir.stat().st_mode & 0o777 == 0o700
+    assert written[0].stat().st_mode & 0o777 == 0o600
+
+    # 老版本建过 0755 的目录：下一次落盘必须把它收紧（mkdir 的 mode 只影响新建）
+    dump_dir.chmod(0o755)
+    chat.dump_request_body(tmp_path, {"a": 1})
+    assert dump_dir.stat().st_mode & 0o777 == 0o700
+
+    # 条数没超，但超过 24h 的文件也要被清掉（按 mtime 判）
+    fresh = sorted(dump_dir.glob("*.json"))[-1]
+    old = dump_dir / "0000000000001.json"
+    old.write_text("old", encoding="utf-8")
+    _time.sleep(0)
+    os.utime(old, (0, 0))                    # mtime 归零 = 远超 24h
+    chat.dump_request_body(tmp_path, {"b": 2})
+    remaining = {item.name for item in dump_dir.glob("*.json")}
+    assert old.name not in remaining
+    assert fresh.name in remaining
 
 def test_dump_request_body_trims_ignoring_unlink_errors(tmp_path, monkeypatch):
     """淘汰旧文件时遇到错误不抛出（suppress 分支）。"""
@@ -489,14 +544,18 @@ def test_correct_password_not_blocked_by_username_window(app_client_and_settings
                            json={"username": "root", "password": "rootpw"})
     assert response.status_code == 200
 
-def test_transport_windows_rejects_when_global_cap_reached():
-    """全局窗口满时哈希前即拒（全局分支）。"""
-    from src.auth.throttle import LoginThrottle, ThrottledError, ThrottleLimits
+def test_transport_windows_ignores_global_cap():
+    """全局窗口满**不**在哈希前拒绝（改为仅观测）。
+
+    该窗口跨来源共享：按它拒绝等于给未认证攻击者一个「一次打满、全站登不上」
+    的开关——管理台是唯一止血入口，修复通道不能一起被关掉。
+    """
+    from src.auth.throttle import LoginThrottle, ThrottleLimits
 
     throttle = LoginThrottle(ThrottleLimits(max_global=1, max_per_ip=99, max_per_user=99))
     throttle.record_failure(ip="9.9.9.9", username="ghost")
-    with pytest.raises(ThrottledError):
-        throttle.check_transport_windows(ip="1.2.3.4")
+    throttle.check_transport_windows(ip="1.2.3.4")      # 不抛
+    throttle.check(ip="1.2.3.4", username="alice")      # 不抛
 
 def test_transport_windows_pass_within_limits():
     from src.auth.throttle import LoginThrottle, ThrottleLimits

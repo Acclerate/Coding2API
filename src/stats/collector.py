@@ -18,6 +18,7 @@ from typing import Any
 
 from ..pricing import PriceTable, estimate_cost_usd, to_cny
 from ..request_context import get_api_key_id, get_request_id
+from .query import row_speed
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +26,30 @@ CONTROLLED_ERROR_TYPES = frozenset({
     # 实际会写入的取值（与 executor / api 层的 error_type 一一对应）：
     #   client_disconnect  — 客户端中途断开（executor.stream）
     #   credential_unavailable — session 失效（_error_type_for(DEAD)）
+    #   account_restricted — 账号被上游风控限制（_error_type_for(RESTRICTED)）
     #   invalid_request    — 请求无效（_record_invalid）
+    #   model_not_found   — 上游明确说「没有这个模型」（_error_type_for(BLOCKED)）
     #   no_healthy_credential — 无可用凭证（executor 耗尽轮换）
     #   model_unavailable     — 耗尽轮换但候选全部只因**该模型**的模型级
     #                            冷却不可用（_exhaust_error_type；换个模型即可用）
-    #   rate_limit         — 权益耗尽（_error_type_for(PLAN)）
+    #   rate_limit         — 权益/额度耗尽（_error_type_for(PLAN/CREDIT/MODEL/
+    #                        CONCURRENCY/QUEUE)）或上游限流（SOFT）
+    #   context_overflow   — 上下文超限（11115 prompt too long）
+    #   model_capability   — 模型不支持该请求形态（CodeArts 001001020 not multimodal）
+    #   upstream_timeout   — 链路层瞬态（连接超时 / 读超时 / TLS 中断；只看异常类型）
+    #   network_error      — 本机 DNS/连接失败（ConnectError/gaierror，连上游之前）
     #   upstream_error / upstream_protocol — 其它上游失败
     #   upstream_first_event_timeout — 出帧前上游不吐首个数据事件（A1）
     #   upstream_idle_timeout        — 已出帧后上游停止吐数据（A1）
+    #   truncated_stream             — 流正常关闭但没走到终态（不冷却凭证，只留痕）
     "client_disconnect", "credential_unavailable",
-    "invalid_request", "no_healthy_credential", "model_unavailable",
-    "rate_limit", "upstream_error", "upstream_protocol",
+    "account_restricted",
+    "invalid_request", "model_not_found", "no_healthy_credential",
+    "model_unavailable", "context_overflow", "model_capability",
+    "rate_limit", "upstream_error", "upstream_protocol", "upstream_timeout",
+    "network_error",
     "upstream_first_event_timeout", "upstream_idle_timeout",
+    "truncated_stream",
 })
 MAX_MODEL_LENGTH = 64
 
@@ -83,7 +96,8 @@ class StatsCollector:
     def __init__(self, db, *,
                  prices: Callable[[], Mapping[str, tuple[float, float, float]]] | None = None,
                  usd_cny_rate: Callable[[], float] | None = None,
-                 on_record: Callable[[dict[str, Any]], None] | None = None) -> None:
+                 on_record: Callable[[dict[str, Any]], None] | None = None,
+                 on_write: Callable[[], None] | None = None) -> None:
         """`prices` / `usd_cny_rate` 是零参取值器（热更：每写一条现读当前价表
         与汇率）。两者都缺省为 None = 不估算成本（既有测试与老装配保持原行为，
         cost 两列恒为 NULL）。
@@ -92,11 +106,17 @@ class StatsCollector:
         供 `GET /api/stats/events/stream` 的 SSE 实时流）。回调拿到的是**已脱敏**
         的行字典（与 `/api/stats/events` 同一字段集，另带 rowid），且异常被吞
         ——统计写入绝不能因为一个订阅者出问题而失败。
+
+        `on_write` 是「任何一行落库后」的零参通知（装配时接
+        `PaidModelRepository.invalidate`）：实测扣费校准的快照 TTL 是 600s，
+        不失效的话「刚观测到上游真扣费」要等 10 分钟才影响选号，而这正是
+        目录 x0 数据烧额度的窗口。异常同样吞掉。
         """
         self._db = db
         self._prices = prices
         self._usd_cny_rate = usd_cny_rate
         self._on_record = on_record
+        self._on_write = on_write
         # 进程内「失败请求 × 原因」计数（供 /metrics 的 errors_total）。
         # 为什么不落库、不读明细表：① usage_hourly 没有 error_type 维度；
         # ② usage_events 只留 90 天，用它算 `_total` 会让计数器随裁剪**下降**
@@ -202,7 +222,20 @@ class StatsCollector:
             # 事务内拿 rowid，提交后再广播：订阅者拿到的是「已落库」的行，
             # 与随后刷新 `/api/stats/events` 看到的是同一条（含 rowid 游标）。
             rowid = cursor.lastrowid
+        self._invalidate_paid_snapshot()
         self._notify(rowid, event)
+
+    def _invalidate_paid_snapshot(self) -> None:
+        """通知「实测扣费」快照作废（未装配 / 出问题都不影响写入）。
+
+        放在事务提交之后：快照查询要读到这一行才有意义。
+        """
+        if self._on_write is None:
+            return
+        try:
+            self._on_write()
+        except Exception as error:  # noqa: BLE001 - 快照失效失败不能影响统计写入
+            logger.warning("实测扣费快照失效失败: %s", error)
 
     def _notify(self, rowid: int | None, event: UsageEvent) -> None:
         """把刚写入的明细推给实时流订阅者（未装配 / 出问题都不影响写入）。
@@ -213,6 +246,12 @@ class StatsCollector:
         """
         if self._on_record is None:
             return
+        # `tps` / `tps_visible` 是派生列（库里不存）：实时流行在广播点就地算，
+        # 规则与 /api/stats/events 的 SQL 列同源（`row_speed`）。
+        visible_tps, total_tps = row_speed(
+            ok=event.ok, output_tokens=event.output_tokens,
+            reasoning_tokens=event.reasoning_tokens,
+            latency_ms=event.latency_ms, ttfb_ms=event.ttfb_ms)
         payload = {
             "rowid": rowid,
             "id": event.id,
@@ -233,6 +272,9 @@ class StatsCollector:
             "cost_cny": event.cost_cny,
             "latency_ms": event.latency_ms,
             "ttfb_ms": event.ttfb_ms,
+            # 逐请求速度（派生列，见 `_notify` 开头）：与明细端点同规则
+            "tps": total_tps,
+            "tps_visible": visible_tps,
             "request_id": event.request_id,
         }
         try:
@@ -299,6 +341,67 @@ class StatsCollector:
             "COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed "
             "FROM usage_events WHERE ts >= ?", (since,)).fetchone()
         return int(row["requests"] or 0), int(row["failed"] or 0)
+
+    def window_dead_channels(self, *, since: int,
+                            min_requests: int) -> list[dict[str, Any]]:
+        """近窗口内「有流量但一次都没成功」的渠道，供渠道死亡告警。
+
+        判据是**零成功**而不是错误率：officeace 2026-11-08 积分耗尽后回的是
+        流内 401，请求记录 `ok=0`；同类故障也可能整批走 fallback 而完全不落在
+        本渠道的 `ok=1` 上。按错误率算会被 `failed/requests` 的高阈值稀释，
+        而「这个渠道在当前窗口内一次都没成功」是一个不会误判的信号。
+
+        `min_requests` 过滤掉样本过少的渠道（一次失败就报警等于噪声）。返回
+        `[{provider, requests, last_ok}]`，`last_ok` 供文案说明「多久没成功」。
+        """
+        rows = self._db.connect().execute(
+            "SELECT provider, COUNT(*) AS requests, "
+            "COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) AS ok_count, "
+            "MAX(CASE WHEN ok = 1 THEN ts END) AS last_ok "
+            "FROM usage_events WHERE ts >= ? GROUP BY provider",
+            (since,)).fetchall()
+        return [
+            {"provider": row["provider"], "requests": int(row["requests"] or 0),
+             "last_ok": int(row["last_ok"]) if row["last_ok"] is not None else None}
+            for row in rows
+            if int(row["requests"] or 0) >= max(1, min_requests)
+            and int(row["ok_count"] or 0) == 0
+        ]
+
+    def window_key_usage(self, *, since: int,
+                         limit: int = 50) -> list[dict[str, Any]]:
+        """近窗口内按 API Key 聚合的用量（token 降序），供「单 Key 暴涨」告警。
+
+        只统计带 `api_key_id` 的明细：Cookie 会话（Playground）没有 Key，
+        按 Key 告警对它们无意义。`tokens` 是输入+输出之和，缺字段按 0 计
+        （上游未上报时不给假数据，0 就是 0）。`limit` 只捞最重的几个 Key——
+        告警不需要全量列表，全量在按 Key 统计页。
+        """
+        rows = self._db.connect().execute(
+            "SELECT api_key_id, username, COUNT(*) AS requests, "
+            "COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0)"
+            " AS tokens "
+            "FROM usage_events WHERE ts >= ? AND api_key_id IS NOT NULL "
+            "GROUP BY api_key_id, username ORDER BY tokens DESC LIMIT ?",
+            (since, max(1, limit))).fetchall()
+        return [{"api_key_id": row["api_key_id"], "username": row["username"],
+                 "requests": int(row["requests"] or 0),
+                 "tokens": int(row["tokens"] or 0)} for row in rows]
+
+    def window_cost(self, *, since: int) -> tuple[float, int, int]:
+        """近窗口成本（人民币）：`(已花费, 可定价小时数, 总小时数)`。
+
+        读小时汇总（永久保留，与统计页同口径）。后两项给告警文案用：成本只
+        覆盖「匹配到 OpenRouter 刊例价 + 当时汇率」的明细，未定价模型是 0 贡献，
+        覆盖率低时预算告警会偏乐观——detail 里写明覆盖情况，不假装准确。
+        """
+        row = self._db.connect().execute(
+            "SELECT COALESCE(SUM(cost_cny_sum), 0) AS spent, "
+            "COALESCE(SUM(CASE WHEN cost_known > 0 THEN 1 ELSE 0 END), 0) AS known, "
+            "COUNT(*) AS hours "
+            "FROM usage_hourly WHERE hour_utc >= ?", (since,)).fetchone()
+        return (float(row["spent"] or 0), int(row["known"] or 0),
+                int(row["hours"] or 0))
 
     def error_totals(self) -> list[tuple[str, str, int]]:
         """进程内「渠道 × 失败原因」累计计数（稳定排序）。

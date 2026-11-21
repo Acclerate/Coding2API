@@ -10,25 +10,40 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import time
 
 import httpx
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 
 from ..audit.actions import (
     ACTION_CREDENTIAL_DELETE,
+    ACTION_CREDENTIAL_EXPORT,
     ACTION_CREDENTIAL_IMPORT,
     ACTION_CREDENTIAL_LIMITS,
+    ACTION_CREDENTIAL_LOGIN_SECRET,
     ACTION_CREDENTIAL_PIN,
     ACTION_CREDENTIAL_REVIVE,
     ACTION_CREDENTIAL_SWITCH_ACCOUNT,
     ACTION_CREDENTIAL_TAGS,
     ACTION_CREDENTIAL_TOGGLE,
+    ACTION_CREDENTIAL_WEB_COOKIE,
+    ACTION_CREDENTIAL_WEIGHT,
 )
 from ..auth.rbac import require_operator
 from ..compat.openai.request import InvalidRequest
-from ..provider.base import GrowthResult, GrowthStep, StepStatus
+from ..engine.limits import day_start
+from ..provider.base import CheckinResult, GrowthResult, GrowthStep, StepStatus
+from ..provider.login_identity import (
+    MANUAL_MERGE_PROVIDERS,
+    login_identities_for,
+)
+from ..provider.probe_failure import relogin_reason
+from ..provider.tos import tos_for
+from ..request_context import credential_scope
 from ..sorting import sort_rows
 from ..tags import parse_tags
 from .deps import Services, csrf_protected, principal_from_request
@@ -52,6 +67,24 @@ BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive"})
 # 探测/签到都会真的出网，没有上限时前端一个「全选」就能把整池凭证的请求
 # 同时排进事件循环。
 BATCH_MAX_IDS = 200
+
+# 批量导入上限：每条都要解密去重 + 写库 + 入队探测，允许无上限等于允许一次
+# 请求里塞几千次数据库写。100 条覆盖正常「换号」场景，又不会把事件循环占死。
+BATCH_IMPORT_MAX_ITEMS = 100
+
+# 网页 Cookie 的最大长度：正常一条 Qoder 会话 Cookie 几百字符，1 万已远超；
+# 上限只为拦住误粘贴整段请求头/文件内容，不做格式校验（Cookie 结构随上游变）。
+WEB_COOKIE_MAX_LENGTH = 10_000
+
+# 账号密码的长度上限：只为拦住误粘贴（整段 JSON / 文件），不做格式校验——
+# 手机号形态由上游登录接口裁决（见 provider/raccoon/login.py 的归一）。
+LOGIN_PHONE_MAX_LENGTH = 32
+LOGIN_PASSWORD_MAX_LENGTH = 128
+
+# 调度权重范围：正数越优先、负数越靠后，0 = 默认。上限只为拦住误输入，
+# 不参与归一化（同档内按数值稳定排序）。
+WEIGHT_MIN = -1000
+WEIGHT_MAX = 1000
 
 # 批量的在途并发上限。后台任务用 Pacer 严格串行化上游请求，但那是跨任务
 # 节流；批量端点由操作员手动触发，若完全串行则 50 个号要等几分钟才返回。
@@ -163,9 +196,17 @@ async def probe_credential_once(credentials, provider, data, credential_id: str)
     把 Python 类名当 reason 吐给用户。
     """
     try:
-        quota = await provider.probe_quota(data)
+        with credential_scope(credential_id):
+            quota = await provider.probe_quota(data)
     except Exception as error:  # noqa: BLE001 - 探测失败 → unknown，不当作 0
-        credentials.mark_probe_failed(credential_id)
+        # DEAD（401）已经是确定性结论：和聊天路径一样硬禁用，管理台直接显示
+        #「重新粘贴 Cookie」，而不是停留在「未探测到额度」继续被调度。
+        login_reason = relogin_reason(
+            credentials.provider_of(credential_id) or "", error)
+        if login_reason:
+            credentials.mark_relogin_required(credential_id, login_reason)
+        else:
+            credentials.mark_probe_failed(credential_id)
         reason = describe_probe_failure(error)
         logger.info("额度探测失败 %s: %s", credential_id, reason)
         # detail 只在**服务端日志**里带上游原文（可能是 2048 字的响应体摘要）；
@@ -174,18 +215,45 @@ async def probe_credential_once(credentials, provider, data, credential_id: str)
         return {"probed": False, "reason": reason}
     credentials.save_quota(credential_id, quota)
     return {"probed": True, "remaining": quota.remaining, "total": quota.total,
-            "cycle_end": quota.cycle_end,
-            # 第二本账（CodeArts 积分）：其余渠道恒 None，前端据此隐藏该行
-            "credits_remaining": quota.credits_remaining,
-            "credits_total": quota.credits_total}
+            "cycle_end": quota.cycle_end}
 
 
 async def checkin_credential_once(credentials, provider, data, credential_id: str,
-                                  schedule_probe) -> dict:
-    """签到一条凭证，返回对外响应体（单条与批量共用）。"""
-    result = await provider.checkin(data)
-    if result.ok and not result.already_checked_in:
-        schedule_probe(credential_id)      # 只有真签到了才会发积分
+                                  schedule_probe, checkin_events) -> dict:
+    """签到一条凭证，返回对外响应体（单条与批量共用）。
+
+    **上游失败是正常结果，不是异常**：账号被禁用 / 登录过期 / 限流都是上游
+    对这条凭证的真实答复，直接抛出去会变成 ASGI 500 + 一整屏 traceback
+    （实测 2026-10-26 14:47 管理台点「签到」回 500，前端只弹「签到失败」，
+    看不出是账号被禁用）。这里把异常收成 `ok=False` + 可读 message：
+    前端本来就按 `ok` / `message` 渲染（见 `CredentialsPage` 的 checkin 分支），
+    批量端点也不必再单独兜一次。
+
+    `checkin_events` 是签到审计日志仓储：成功/失败/已签都落一行（trigger=manual），
+    逐次结果落库后，管理台「签到记录」才能回答「这个号上次签到是什么时候、
+    领了多少、上游回了什么」。
+    """
+    try:
+        with credential_scope(credential_id):
+            result = await provider.checkin(data)
+    except Exception as error:  # noqa: BLE001 - 上游失败 → 失败结果，非 500
+        reason = describe_probe_failure(error)
+        logger.info("签到失败 %s: %s", credential_id, reason)
+        # detail 只进服务端日志：上游原文可能回显凭证片段
+        logger.info("签到失败详情 %s: %s", credential_id, str(error)[:200])
+        checkin_events.record(
+            credential_id=credential_id,
+            result=CheckinResult(ok=False, message=f"签到失败：{reason}"),
+            trigger="manual")
+        return {"ok": False, "credit": None, "code": None,
+                "message": f"签到失败：{reason}", "already_checked_in": False,
+                "status": None}
+    if result.ok:
+        # 签到成功就会改变额度（领到积分 / 确认今日已发）：立刻重探测一次，
+        # 套餐明细与额度合计不必等下一轮周期探测。`already_checked_in` 也照样
+        # 重探——它同样意味着「上游那边有积分了」。
+        schedule_probe(credential_id)
+    checkin_events.record(credential_id=credential_id, result=result, trigger="manual")
     # already_checked_in 必须透传：前端靠它区分「刚签到」与「今天已签过」
     return {"ok": result.ok, "credit": result.credit, "code": result.code,
             "message": result.message,
@@ -237,9 +305,17 @@ def create_router(services: Services) -> APIRouter:
         # 限额配置按凭证附带（缺行 = null = 不受限）：管理台据此显示护栏与
         # 编辑入口；吊销/未配置的渠道不额外占字段。
         limits_map = services.limits.map()
+        # 今日签到：组头要「一眼确认签没签成功」，故按凭证附带本地审计日志里
+        # **今天（北京时间）最近一条**结果。不发上游请求——30s 轮询不该为几十个
+        # 号各打一次签到场，也不看 HTTP 200，只看落库的结论（与「签到记录」
+        # 抽屉同一份数据）。今日无记录 = 缺席（任务未轮到 / 暂停 / 渠道不支持），
+        # 不是失败。
+        checkin_today = services.checkin_events.latest_since(
+            day_start(int(time.time())))
         for row in rows:
             record = limits_map.get(row["id"])
             row["limits"] = record.as_dict() if record is not None else None
+            row["checkin_today"] = checkin_today.get(row["id"])
         return {"credentials": rows,
                 "expiry_window_seconds": window,
                 "expiry_secondary_window_seconds": secondary,
@@ -250,57 +326,169 @@ def create_router(services: Services) -> APIRouter:
                 "is_admin": principal.is_admin,
                 # 凭证写门槛（admin 或 operator）：前端据此决定是否显示
                 # 导入/启停/删除等写操作，与后端 require_operator 同一口径。
-                "is_operator": principal.is_operator}
+                "is_operator": principal.is_operator,
+                # 渠道 ToS 风险登记（green/gray/red + 理由）：导入对话框在管理员
+                # 选渠道时直接展示，避免「加完号才发现是灰区」。只做提示与审计，
+                # 不参与调度、不阻断导入（红线渠道本就没接）。
+                "tos_risks": {pid: tos_for(pid).as_dict() for pid in registry}}
+
+    def prepare_import(item: dict) -> tuple[str, dict, list[str]]:
+        """校验一条导入项 → (渠道, 标准化后的凭证, 标签)。
+
+        单条与批量导入共用：映射失败（渠道不认识模型/字段）、标签非法都在这里
+        收敛成 400 文案，批量端点只需带上下标即可。
+        """
+        provider_id = str(item.get("provider") or "")
+        if provider_id not in registry:
+            raise InvalidRequest(f"unknown provider {provider_id!r}")
+        credential_data = registry[provider_id].import_credential(
+            item.get("credential") or {})
+        try:
+            # 导入时可选带标签（列表页「添加」对话框不填即为空）
+            tags = parse_tags(item.get("tags"))
+        except ValueError as error:
+            raise InvalidRequest(str(error)) from error
+        return provider_id, credential_data, tags
+
+    def register_import(provider_id: str, credential_data: dict, tags: list[str],
+                        nickname: str, principal) -> dict:
+        """落库 + 审计 + 探测入队；返回凭证 id、ToS 风险与是否就地合并。
+
+        `MANUAL_MERGE_PROVIDERS`（灵犀 / 小浣熊）没有 OAuth 轨道，手工导入就是
+        它们的「重新登录」：`uid` 相同的凭据必须更新既有行而不是新增。否则同
+        一个账号重登一次就多一条重复凭证，旧行的会话已被新登录顶掉、只能等
+        下一次 401 才被硬禁用；小浣熊还会把同一账号当两个号并发（额度/积分
+        双份统计，且绕过节流器按账号算的并发上限）。
+        """
+        merged = False
+        credential_id = ""
+        if provider_id in MANUAL_MERGE_PROVIDERS:
+            target = login_identities_for(provider_id, credential_data)
+            existing = credentials.find_login_credential(
+                provider_id,
+                lambda data: login_identities_for(provider_id, data),
+                target) if target else None
+            if existing is not None:
+                merged = credentials.merge_login_credential(
+                    existing, credential_data, nickname)
+                if merged:
+                    credential_id = existing
+        if not merged:
+            credential_id = credentials.add(provider=provider_id,
+                                            credential_data=credential_data,
+                                            nickname=nickname,
+                                            added_by=principal.username, tags=tags)
+        logger.info("管理员 %s %s凭证 %s（上游 %s）", principal.username,
+                    "更新" if merged else "新增", credential_id, provider_id)
+        risk = tos_for(provider_id)
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_IMPORT,
+                              target=credential_id,
+                              detail=f"上游 {provider_id}；合规={risk.level}（{risk.reason}）")
+        if risk.level != "green":
+            # 灰区不是每次都能被管理员看到（列表页「添加」可能走批量脚本），
+            # 日志留一条，事后能回答「这号当时知不知道是灰区」
+            logger.warning("导入 %s 凭证 %s：ToS 评级 %s —— %s",
+                           provider_id, credential_id, risk.level, risk.reason)
+        schedule_probe(credential_id)
+        # 灵犀：同一浏览器登录新账号会顶掉旧会话。新号导入后顺手复探其它
+        # 灵犀凭证——只有探测确认 401 才硬禁用，不用「新登录＝旧号必死」
+        # 的猜测误伤同时有效的多账号（例如各自独立浏览器配置导出的 Cookie）。
+        if provider_id == "lingxi":
+            for candidate in credentials.candidates(providers=["lingxi"]):
+                if (candidate.credential_id != credential_id
+                        and candidate.enabled and not candidate.disabled):
+                    schedule_probe(candidate.credential_id)
+        return {"id": credential_id, "tos": risk.as_dict(), "merged": merged}
 
     @router.post("/api/credentials")
     async def import_credential(payload: dict,
                                 _csrf: None = Depends(csrf_protected),
                                 principal=Depends(principal_from_request)):
         require_operator(principal)
-        provider_id = str(payload.get("provider") or "")
-        if provider_id not in registry:
-            raise InvalidRequest(f"unknown provider {provider_id!r}")
-        credential_data = registry[provider_id].import_credential(
-            payload.get("credential") or {})
-        try:
-            # 导入时可选带标签（列表页「添加」对话框不填即为空）
-            tags = parse_tags(payload.get("tags"))
-        except ValueError as error:
-            raise InvalidRequest(str(error)) from error
-        credential_id = credentials.add(provider=provider_id,
-                                        credential_data=credential_data,
-                                        nickname=str(payload.get("nickname") or ""),
-                                        added_by=principal.username, tags=tags)
-        logger.info("管理员 %s 新增凭证 %s（上游 %s）", principal.username, credential_id,
-                    provider_id)
-        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_IMPORT,
-                              target=credential_id, detail=f"上游 {provider_id}")
-        schedule_probe(credential_id)
-        return {"id": credential_id}
+        provider_id, credential_data, tags = prepare_import(payload)
+        return register_import(provider_id, credential_data, tags,
+                               str(payload.get("nickname") or ""), principal)
+
+    @router.post("/api/credentials/batch-import")
+    async def batch_import_credentials(payload: dict,
+                                       _csrf: None = Depends(csrf_protected),
+                                       principal=Depends(principal_from_request)):
+        """批量导入：逐条校验，坏条目只进 failed、不连累其他条目。
+
+        去重口径 = 同渠道且解密后内容完全一致（批内重复 + 与库里已有凭证
+        重复都跳过）。返回带下标的 created/skipped/failed，前端据此原样
+        保留失败行供重试。
+        """
+        require_operator(principal)
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise InvalidRequest("items must be a non-empty array")
+        if len(items) > BATCH_IMPORT_MAX_ITEMS:
+            raise InvalidRequest(f"一次最多导入 {BATCH_IMPORT_MAX_ITEMS} 条")
+        created: list[dict] = []
+        skipped: list[dict] = []
+        failed: list[dict] = []
+        seen: set[str] = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                failed.append({"index": index, "reason": "entry must be an object"})
+                continue
+            try:
+                provider_id, credential_data, tags = prepare_import(item)
+            except InvalidRequest as error:
+                failed.append({"index": index, "reason": str(error)})
+                continue
+            fingerprint = (
+                f"{provider_id}:"
+                + json.dumps(credential_data, sort_keys=True, ensure_ascii=False)
+            )
+            if fingerprint in seen or credentials.has_same_credential(
+                    provider_id, credential_data):
+                skipped.append({"index": index, "reason": "duplicate"})
+                continue
+            seen.add(fingerprint)
+            row = register_import(provider_id, credential_data, tags,
+                                  str(item.get("nickname") or ""), principal)
+            created.append({"index": index, **row})
+        logger.info("管理员 %s 批量导入：成功 %d，跳过 %d，失败 %d",
+                    principal.username, len(created), len(skipped), len(failed))
+        return {"created": created, "skipped": skipped, "failed": failed}
 
     @router.post("/api/credentials/{credential_id}/toggle")
     async def toggle_credential(credential_id: str, payload: dict,
                                 _csrf: None = Depends(csrf_protected),
                                 principal=Depends(principal_from_request)):
         require_operator(principal)
-        if not credentials.set_enabled(credential_id, bool(payload.get("enabled", True))):
+        # 类型必须严格是布尔：`bool("false") is True`，收到字符串会把「停用」
+        # 静默执行成「启用」（写操作语义反转），管理员看不到任何报错。
+        enabled = payload.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise InvalidRequest("enabled must be a boolean")
+        if not credentials.set_enabled(credential_id, enabled):
             raise InvalidRequest("credential not found")
         logger.info("管理员 %s 开关凭证 %s -> %s", principal.username, credential_id,
-                    payload.get("enabled", True))
+                    enabled)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_TOGGLE,
                               target=credential_id,
-                              detail=f"enabled={bool(payload.get('enabled', True))}")
+                              detail=f"enabled={enabled}")
         return {"ok": True}
 
     @router.post("/api/credentials/{credential_id}/revive")
-    async def revive_credential(credential_id: str,
+    async def revive_credential(credential_id: str, payload: dict | None = None,
                                 _csrf: None = Depends(csrf_protected),
                                 principal=Depends(principal_from_request)):
-        """解除硬禁用/冷却，让重新登录后的凭证回到池子。"""
+        """解除硬禁用，让重新登录后的凭证回到池子。
+
+        `force=True`（可选请求体字段）才连带清除**上游点名恢复时刻**的冷却
+        （限流 / 余额 / 权益 / 风控）：默认保留，否则刚解除禁用就会立刻再撞一次
+        上游同一个 429。默认清除只影响本地冷却（见 `repo.revive`）。
+        """
         require_operator(principal)
-        if not credentials.revive(credential_id):
+        force = bool((payload or {}).get("force"))
+        if not credentials.revive(credential_id, force=force):
             raise InvalidRequest("credential not found")
-        logger.info("管理员 %s 恢复了凭证 %s", principal.username, credential_id)
+        logger.info("管理员 %s 恢复了凭证 %s（force=%s）",
+                    principal.username, credential_id, force)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_REVIVE,
                               target=credential_id)
         return {"ok": True}
@@ -332,6 +520,33 @@ def create_router(services: Services) -> APIRouter:
         record = services.limits.get(credential_id)
         return {"limits": record.as_dict() if record is not None else None}
 
+    @router.put("/api/credentials/{credential_id}/weight")
+    async def set_credential_weight(credential_id: str, payload: dict,
+                                    _csrf: None = Depends(csrf_protected),
+                                    principal=Depends(principal_from_request)):
+        """设置调度权重（`null` = 恢复默认）。
+
+        只影响选号顺序，不改变可调度性：同一健康分档内权重高者优先，档外
+        次序不变（exhausted / unknown 仍垫底）。改完立即生效——选号每轮都从
+        库里读候选，没有需要失效的缓存。
+        """
+        require_operator(principal)
+        weight = payload.get("weight")
+        if weight is not None:
+            if isinstance(weight, bool) or not isinstance(weight, int):
+                raise InvalidRequest("weight must be an integer or null")
+            if not WEIGHT_MIN <= weight <= WEIGHT_MAX:
+                raise InvalidRequest(
+                    f"weight must be within [{WEIGHT_MIN}, {WEIGHT_MAX}]")
+        if not credentials.set_routing_weight(credential_id, weight):
+            raise InvalidRequest("credential not found")
+        label = "（默认）" if weight is None else str(weight)
+        logger.info("管理员 %s 设置凭证 %s 调度权重: %s",
+                    principal.username, credential_id, label)
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_WEIGHT,
+                              target=credential_id, detail=label)
+        return {"routing_weight": weight}
+
     @router.put("/api/credentials/{credential_id}/tags")
     async def set_credential_tags(credential_id: str, payload: dict,
                                   _csrf: None = Depends(csrf_protected),
@@ -354,16 +569,118 @@ def create_router(services: Services) -> APIRouter:
                               target=credential_id, detail=",".join(tags) or "（清空）")
         return {"tags": tags}
 
+    @router.put("/api/credentials/{credential_id}/web-cookie")
+    async def set_web_cookie(credential_id: str, payload: dict,
+                             _csrf: None = Depends(csrf_protected),
+                             principal=Depends(principal_from_request)):
+        """写入/清除网页 Cookie（逐包/逐笔到期数据源）。
+
+        Qoder：device token 打不通网页额度接口；CodeArts：AK/SK 签名打不通
+        控制台 portal。只有网页登录会话能拿到「哪笔积分什么时候过期」。
+        Cookie 属于凭证数据（加密落库），不进返回体、不进审计 detail。空串 =
+        清除，额度探测回退到汇总接口口径。
+        """
+        require_operator(principal)
+        cookie = payload.get("cookie")
+        if not isinstance(cookie, str):
+            raise InvalidRequest("cookie must be a string")
+        cookie = cookie.strip()
+        if len(cookie) > WEB_COOKIE_MAX_LENGTH:
+            raise InvalidRequest(
+                f"cookie too long (max {WEB_COOKIE_MAX_LENGTH} characters)")
+        # 与 RefreshTask / 签到自动登录的「读 → await → 整份覆写」互斥：
+        # `save_credential_data` 是整份覆盖，不加锁时后写者会用旧快照把
+        # 刚轮换的 token（或刚设置的 cookie）回滚掉；一次性 refresh_token
+        # 场景下还会让凭证直接失效。锁内重读 data，别用锁外那份。
+        async with credentials.edit_lock(credential_id):
+            provider, data = provider_for(
+                credential_id, "set_web_cookie",
+                error="credential does not support web cookie")
+            credentials.save_credential_data(
+                credential_id, provider.set_web_cookie(data, cookie))
+            # 新 Cookie 的有效性以下一轮探测为准：先清掉旧状态，避免「刚粘贴仍显示
+            # 已失效」；清除 Cookie 时同样回到无状态。
+            credentials.set_web_cookie_state(credential_id, None)
+        logger.info("管理员 %s 设置凭证 %s 网页 Cookie: %s",
+                    principal.username, credential_id,
+                    "已设置" if cookie else "已清除")
+        services.audit.record(actor=principal.username,
+                              action=ACTION_CREDENTIAL_WEB_COOKIE,
+                              target=credential_id,
+                              detail="已设置" if cookie else "已清除")
+        schedule_probe(credential_id)
+        return {"ok": True}
+
+    @router.put("/api/credentials/{credential_id}/login-secret")
+    async def set_login_secret(credential_id: str, payload: dict,
+                               _csrf: None = Depends(csrf_protected),
+                               principal=Depends(principal_from_request)):
+        """写入/清除按需登录用的手机号与密码（小浣熊）。
+
+        为什么需要入口：上游只在「当天第一次网页登录」时补发每日积分，而
+        `refresh` 换不出新会话，所以服务要能自己登录一次（见
+        `tasks/checkin.py` 的按需登录）。那种登录需要账号密码，光靠重新导入
+        整条 token 才能带上它太笨重——这里让运营就地填写。
+
+        账号密码属于凭证数据（加密落库），**绝不回显**、不进审计 detail；
+        两个都留空 = 清除（按需登录随之停用，签到回落到「需人工重登」提示）。
+        """
+        require_operator(principal)
+        phone = payload.get("phone")
+        password = payload.get("password")
+        if not isinstance(phone, str) or not isinstance(password, str):
+            raise InvalidRequest("phone and password must be strings")
+        phone = phone.strip()
+        # 密码不 strip：尾部空格可能是密码的一部分（用户自己决定）
+        if not phone and not password:
+            cleared = True
+        elif not phone or not password:
+            raise InvalidRequest(
+                "phone and password must be set together (or both empty to clear)")
+        else:
+            cleared = False
+        if len(phone) > LOGIN_PHONE_MAX_LENGTH:
+            raise InvalidRequest(
+                f"phone too long (max {LOGIN_PHONE_MAX_LENGTH} characters)")
+        if len(password) > LOGIN_PASSWORD_MAX_LENGTH:
+            raise InvalidRequest(
+                f"password too long (max {LOGIN_PASSWORD_MAX_LENGTH} characters)")
+        # 同 set_web_cookie：整份覆写必须与刷新任务互斥，锁内重读 data。
+        async with credentials.edit_lock(credential_id):
+            provider, data = provider_for(
+                credential_id, "set_login_secret",
+                error="credential does not support login secret")
+            # 走 `save_credential_data`：它同一事务里刷新 `login_secret` 派生标记
+            # （清除时 phone/password 为空 → 标记回 NULL），不必单独维护一份状态。
+            credentials.save_credential_data(
+                credential_id, provider.set_login_secret(data, phone, password))
+        logger.info("管理员 %s 设置凭证 %s 账号密码: %s",
+                    principal.username, credential_id,
+                    "已清除" if cleared else "已保存")
+        services.audit.record(actor=principal.username,
+                              action=ACTION_CREDENTIAL_LOGIN_SECRET,
+                              target=credential_id,
+                              detail="已清除" if cleared else "已保存")
+        return {"ok": True, "login_secret": 0 if cleared else 1}
+
     @router.post("/api/credentials/pin")
     async def pin_credential(payload: dict,
                              _csrf: None = Depends(csrf_protected),
                              principal=Depends(principal_from_request)):
         require_operator(principal)
         pin = payload.get("credential_id")
-        credentials.set_pinned(pin)
+        # 类型收口：非字符串直接 400。放任 dict/list 进 set_pinned 会走到
+        # sqlite3 的参数绑定 → ProgrammingError → 500（客户端输入不该是 5xx）。
+        # None = 取消指定（合法），其余必须是字符串。
+        if pin is not None and not isinstance(pin, str):
+            raise InvalidRequest("credential_id must be a string or null")
+        # 存在性校验：不存在的 id 会被 set_pinned 的「先清全部 pin」顺带解除
+        # 其它凭证的指定，而端点仍回 200——管理员以为已指定，实则把指定清空了。
+        if not credentials.set_pinned(pin):
+            raise InvalidRequest("credential not found")
         logger.info("管理员 %s 固定凭证 %s", principal.username, pin)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_PIN,
-                              target=pin if isinstance(pin, str) else None,
+                              target=pin,
                               detail=f"pinned={pin!r}")
         return {"ok": True}
 
@@ -394,7 +711,8 @@ def create_router(services: Services) -> APIRouter:
         require_operator(principal)
         provider, data = provider_for(credential_id, "checkin")
         return await checkin_credential_once(credentials, provider, data,
-                                             credential_id, schedule_probe)
+                                             credential_id, schedule_probe,
+                                             services.checkin_events)
 
     @router.post("/api/credentials/batch")
     async def batch_credentials(payload: dict,
@@ -429,6 +747,8 @@ def create_router(services: Services) -> APIRouter:
         if len(ids) > BATCH_MAX_IDS:
             raise InvalidRequest(f"too many credentials (max {BATCH_MAX_IDS})")
         enabled = bool(payload.get("enabled", True))
+        # force 只对 revive 有效：清掉「上游点名恢复时刻」的冷却（见 repo.revive）
+        force_revive = bool(payload.get("force"))
         semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
 
         async def run_one(credential_id: str) -> dict:
@@ -438,7 +758,7 @@ def create_router(services: Services) -> APIRouter:
                         return {"id": credential_id, "ok": False, "error": "credential not found"}
                     return {"id": credential_id, "ok": True}
                 if action == "revive":
-                    if not credentials.revive(credential_id):
+                    if not credentials.revive(credential_id, force=force_revive):
                         return {"id": credential_id, "ok": False, "error": "credential not found"}
                     return {"id": credential_id, "ok": True}
                 # probe / checkin 会真的出网：在途上限只约束这两类动作。
@@ -452,7 +772,8 @@ def create_router(services: Services) -> APIRouter:
                                 "detail": detail}
                     provider, data = provider_for(credential_id, "checkin")
                     detail = await checkin_credential_once(
-                        credentials, provider, data, credential_id, schedule_probe)
+                        credentials, provider, data, credential_id, schedule_probe,
+                        services.checkin_events)
                     return {"id": credential_id, "ok": bool(detail["ok"]), "detail": detail}
             except InvalidRequest as error:
                 # 凭证不存在 / 渠道不支持该能力：可预期的逐条失败，原因直接可读
@@ -494,6 +815,45 @@ def create_router(services: Services) -> APIRouter:
             error="credential does not support checkin status")
         return {"status": await provider.checkin_status(data)}
 
+    @router.get("/api/credentials/{credential_id}/checkin-events")
+    async def checkin_events_history(credential_id: str, limit: int = 20,
+                                     principal=Depends(principal_from_request)):
+        """签到审计日志：最近几次签到的时间/结果/领取积分/上游业务码（倒序）。
+
+        与 `GET .../checkin`（实时查上游活动状态）不同：这里读的是**本地落库的
+        历史**，回答「这个号上次签到是什么时候、领了多少、上游回了什么」，
+        不触发任何上游请求，故对已失效凭证也能查到过去记录。
+        """
+        require_operator(principal)
+        if services.credentials.provider_of(credential_id) is None:
+            raise InvalidRequest("credential not found")
+        return {"events": services.checkin_events.recent(credential_id, limit=limit)}
+
+    @router.get("/api/credentials/{credential_id}/export")
+    async def export_credential(credential_id: str,
+                                principal=Depends(principal_from_request)):
+        """单条凭证导出（JSON）：与「批量导入」的条目同形，可原样再导入。
+
+        导出**明文凭证**，因此只对 admin/operator 开放，并落一条
+        `credential.export` 审计（谁把哪个号的令牌带出了系统）。响应带
+        `Content-Disposition` 便于浏览器直接存文件，`no-store` 防中间层缓存。
+        """
+        require_operator(principal)
+        entry = services.credentials.export_entry(credential_id)
+        if entry is None:
+            raise InvalidRequest("credential not found")
+        services.audit.record(actor=principal.username,
+                              action=ACTION_CREDENTIAL_EXPORT,
+                              target=credential_id,
+                              detail=f"上游 {entry['provider']}")
+        logger.info("管理员 %s 导出凭证 %s（上游 %s）", principal.username,
+                    credential_id, entry["provider"])
+        return JSONResponse(entry, headers={
+            "Content-Disposition":
+                f'attachment; filename="coding2api-credential-{credential_id}.json"',
+            "Cache-Control": "no-store",
+        })
+
     @router.get("/api/credentials/{credential_id}/growth")
     async def growth_history(credential_id: str, limit: int = 20,
                              principal=Depends(principal_from_request)):
@@ -509,7 +869,7 @@ def create_router(services: Services) -> APIRouter:
                             principal=Depends(principal_from_request)):
         """变动流水：两次额度探测之间的净变化（倒序）。
 
-        `ledger` 选账本：`pool`（默认）＝每日 token 池，`credits`＝积分账。
+        `ledger` 选账本：`pool`（默认）＝套餐/每日池余额，`credits`＝CodeArts 积分。
         两本账量级与语义都不同，必须分开读，混在一起会被当成同一本账的连续
         读数。未知取值由仓储回落 `pool`（与老库默认列值一致）。
 

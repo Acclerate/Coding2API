@@ -254,95 +254,41 @@ class TaskRunner:
         `run_once` 自身返回 None，记 no-op。
         """
         specs: list[_LoopSpec] = [
-            _LoopSpec(
-                "quota_probe",
-                lambda: self._quota_probe.run_once(),
-                lambda: self._interval_seconds("quota_probe"),
-            ),
-            _LoopSpec(
-                "refresh",
-                self._refresh.run_once,
-                lambda: self._interval_seconds("refresh"),
-            ),
-            _LoopSpec(
-                "retention",
-                self._sync_retention,
-                lambda: self._interval_seconds("retention"),
-            ),
+            self._spec("quota_probe", lambda: self._quota_probe.run_once()),
+            self._spec("refresh", self._refresh.run_once),
+            self._spec("retention", self._sync_retention),
             # 签到：留空时点 = 全天每 10 分钟一轮；有配置时点时仍按 10 分钟醒
             # 一次，由 `due()` 自己判定是否落在抖动窗口内。**不能**把周期改成
             # 「按最大时点间隔算」——服务恰在两个时点之间重启会直接漏签，而
             # 10 分钟空转的代价只是读一次配置（与 activity 的取舍同理）。
-            _LoopSpec(
-                "checkin", self._sync_checkin, lambda: self._interval_seconds("checkin")
-            ),
+            self._spec("checkin",
+                       ((lambda: self._sync_checkin(manual=True)) if manual
+                        else self._sync_checkin)),
         ]
         if self._growth is not None:
-            specs.append(
-                _LoopSpec(
-                    "growth",
-                    self._sync_growth,
-                    lambda: self._interval_seconds("growth"),
-                )
-            )
+            specs.append(self._spec("growth", self._sync_growth))
         if self._activity is not None:
-            activity = (
-                (lambda: self._sync_activity(manual=True))
-                if manual
-                else self._sync_activity
-            )
-            specs.append(
-                _LoopSpec(
-                    "activity", activity, lambda: self._interval_seconds("activity")
-                )
-            )
+            activity = ((lambda: self._sync_activity(manual=True)) if manual
+                        else self._sync_activity)
+            specs.append(self._spec("activity", activity))
         if self._model_catalog is not None:
-            specs.append(
-                _LoopSpec(
-                    "model_catalog",
-                    self._model_catalog,
-                    lambda: self._interval_seconds("model_catalog"),
-                )
-            )
+            specs.append(self._spec("model_catalog", self._model_catalog))
         if self._model_probe is not None:
-            specs.append(
-                _LoopSpec(
-                    "model_probe",
-                    self._sync_model_probe,
-                    lambda: self._interval_seconds("model_probe"),
-                )
-            )
+            specs.append(self._spec("model_probe", self._sync_model_probe))
         if self._openrouter_catalog is not None:
-            specs.append(
-                _LoopSpec(
-                    "openrouter_catalog",
-                    self._openrouter_catalog,
-                    lambda: self._interval_seconds("openrouter_catalog"),
-                )
-            )
+            specs.append(self._spec("openrouter_catalog", self._openrouter_catalog))
         if self._alert is not None:
-            specs.append(
-                _LoopSpec(
-                    "alert", self._sync_alert, lambda: self._interval_seconds("alert")
-                )
-            )
+            specs.append(self._spec("alert", self._sync_alert))
         if self._backup is not None:
-            specs.append(
-                _LoopSpec(
-                    "backup",
-                    self._sync_backup,
-                    lambda: self._interval_seconds("backup"),
-                )
-            )
+            specs.append(self._spec("backup", self._sync_backup))
         if self._upstream_status is not None:
-            specs.append(
-                _LoopSpec(
-                    "upstream_status",
-                    self._sync_upstream_status,
-                    lambda: self._interval_seconds("upstream_status"),
-                )
-            )
+            specs.append(self._spec("upstream_status", self._sync_upstream_status))
         return specs
+
+    def _spec(self, key: str,
+              runner: Callable[[], Awaitable[object]]) -> _LoopSpec:
+        """拼一条循环描述：周期取值器统一走 `_interval_seconds`（热更现读）。"""
+        return _LoopSpec(key, runner, lambda: self._interval_seconds(key))
 
     async def run_task(self, key: str) -> dict[str, Any]:
         """手动运行一个后台任务一轮，返回该任务的最新运行态。
@@ -366,11 +312,21 @@ class TaskRunner:
         _ok, ran = await self._run_guarded(spec.runner, TASK_BY_KEY[key].name, key=key)
         return {**self._task_item(key), "ran": ran, "busy": False}
 
+    @staticmethod
+    def _require(task: object | None, label: str) -> Any:
+        """取已装配的任务对象；未装配时显式报错（而不是静默 no-op）。
+
+        这类失败只可能来自装配错误（可选任务未接线却出现在清单里），
+        必须让 `_guarded` 记成失败而不是「未运行」。
+        """
+        if task is None:
+            raise RuntimeError(f"{label} task not configured")
+        return task
+
     async def _sync_growth(self) -> object:
         """成长中心一轮：领礼物 / 派 Buddy / 任务 / 补登 / 兑换 / 抽奖 / 盲盒。"""
-        if self._growth is None:
-            raise RuntimeError("growth task not configured")
-        return await self._growth.run_once()
+        task = self._require(self._growth, "growth")
+        return await task.run_once()
 
     async def _sync_activity(self, *, manual: bool = False) -> object:
         """活跃上报：仅启用且处于配置小时窗口内才执行，成功凭证当日封账。
@@ -378,25 +334,22 @@ class TaskRunner:
         「是否启用」每轮现读：关掉再打开不需要重启，也不必重建循环。
         `manual=True`（管理台「立即运行」）绕过时点窗口：手动就是立刻跑。
         """
-        if self._activity is None:
-            raise RuntimeError("activity task not configured")
+        task = self._require(self._activity, "activity")
         if not self._activity_enabled():
             return None
         if not manual and not self._activity.due():
             return None
-        return await self._activity.run_once()
+        return await task.run_once()
 
-    async def _sync_checkin(self) -> object:
+    async def _sync_checkin(self, *, manual: bool = False) -> object:
         """签到一轮：有配置时点时只在窗口内跑，留空则全天每 10 分钟一轮。
 
         成功凭证当日封账（run_once 内跳过），失败凭证继续重试。
-        关闭时每轮现读开关（no-op），管理台「任务与配置」页显示为停用。
+        `manual=True`（管理台「立即运行」）绕过时点窗口：手动就是立刻跑。
         """
-        if not self._checkin_enabled():
+        if not manual and not self._checkin.due():
             return None
-        if not self._checkin.due():
-            return None
-        return await self._checkin.run_once()
+        return await self._checkin.run_once(trigger="manual" if manual else "auto")
 
     async def _sync_retention(self) -> object:
         """明细清理：整表 GROUP BY / DELETE 是同步 SQLite，放线程池跑。
@@ -413,11 +366,10 @@ class TaskRunner:
         「模型探活周期」填上即生效，不必重启。关着时返回 None，`_guarded`
         不记运行态——页面显示「未运行」，而不是「刚跑过」。
         """
-        if self._model_probe is None:
-            raise RuntimeError("model probe task not configured")
+        task = self._require(self._model_probe, "model probe")
         if int(self._model_probe_minutes()) <= 0:
             return None
-        return await self._model_probe.run_once()
+        return await task.run_once()
 
     async def _sync_alert(self) -> object:
         """运维告警一轮：评估四类规则、静默去重后落库 + 推送。
@@ -425,18 +377,16 @@ class TaskRunner:
         是否启用每轮现读：AlertTask.run_once 关着时返回 None，
         `_guarded` 不记运行态——页面显示「未运行」，而不是「刚跑过」。
         """
-        if self._alert is None:
-            raise RuntimeError("alert task not configured")
-        return await self._alert.run_once()
+        task = self._require(self._alert, "alert")
+        return await task.run_once()
 
     async def _sync_backup(self) -> object:
         """数据库备份一轮：VACUUM INTO 是同步磁盘 IO，放线程池跑。
 
         直接在事件循环里执行会卡住所有并发请求（库越大越久）。
         """
-        if self._backup is None:
-            raise RuntimeError("backup task not configured")
-        return await asyncio.to_thread(self._backup.run_once)
+        task = self._require(self._backup, "backup")
+        return await asyncio.to_thread(task.run_once)
 
     async def _sync_upstream_status(self) -> object:
         """上游状态页一轮：并发抓全部源并原子替换内存快照。
@@ -444,9 +394,8 @@ class TaskRunner:
         是否启用每轮现读：任务关着时 `run_once` 返回 None，`_guarded` 不记
         运行态——页面显示「未运行」，而不是「刚跑过」。
         """
-        if self._upstream_status is None:
-            raise RuntimeError("upstream status task not configured")
-        return await self._upstream_status.run_once()
+        task = self._require(self._upstream_status, "upstream status")
+        return await task.run_once()
 
     async def _loop(
         self,
@@ -554,6 +503,7 @@ class TaskRunner:
             "key": spec.key,
             "name": spec.name,
             "description": spec.description,
+            "group": spec.group,
             "interval_seconds": self._interval_seconds(spec.key),
             "enabled": self._task_enabled(spec.key),
             "running": spec.key in self._running,
@@ -566,43 +516,41 @@ class TaskRunner:
         }
 
     def _interval_seconds(self, key: str) -> float:
-        if key == "quota_probe":
-            return self._quota_interval
-        if key == "refresh":
-            return self._refresh_interval
-        if key == "checkin":
-            # 留空（旧行为）= 10 分钟醒一次即可；配了时点则必须 1 分钟醒一次——
-            # 抖动=0 时窗口只有「恰好那一分钟」，10 分钟周期会大概率整天落空。
-            # 醒来只是读一次配置 + 比较几个整数，代价可忽略。
-            return self._checkin_interval
-        if key == "growth":
-            return self._growth_interval
-        if key == "activity":
-            return float(self._activity_interval)
-        if key == "model_catalog":
-            return self._model_catalog_interval
-        if key == "model_probe":
-            return self._model_probe_interval
-        if key == "openrouter_catalog":
-            return self._openrouter_catalog_interval
-        if key == "alert":
-            return self._alert_interval
-        if key == "backup":
-            return self._backup_interval
-        if key == "upstream_status":
-            return self._upstream_status_interval
-        return self._retention_interval
+        """按 key 取当前生效周期（秒）。property 是唯一真源，这里只做派发。"""
+        getter = self._interval_getters().get(key)
+        return float(getter()) if getter is not None else self._retention_interval
+
+    def _interval_getters(self) -> dict[str, Callable[[], float]]:
+        """key → 周期 property 的派发表。
+
+        与 `_task_enabled` 分开维护：周期是每个任务必有的一项，开关只有
+        activity / alert / upstream_status 三个可关。用字典而非 if-chain，
+        新增任务时漏接线会直接落进 `_interval_seconds` 的兜底分支（保留期），
+        而不是静默返回别的任务的周期。
+        """
+        return {
+            "quota_probe": lambda: self._quota_interval,
+            "refresh": lambda: self._refresh_interval,
+            "retention": lambda: self._retention_interval,
+            "checkin": lambda: self._checkin_interval,
+            "growth": lambda: self._growth_interval,
+            "activity": lambda: self._activity_interval,
+            "model_catalog": lambda: self._model_catalog_interval,
+            "model_probe": lambda: self._model_probe_interval,
+            "openrouter_catalog": lambda: self._openrouter_catalog_interval,
+            "alert": lambda: self._alert_interval,
+            "backup": lambda: self._backup_interval,
+            "upstream_status": lambda: self._upstream_status_interval,
+        }
 
     def _task_enabled(self, key: str) -> bool:
-        if key == "activity":
-            return bool(self._activity_enabled())
-        if key == "alert":
-            return bool(self._alert_enabled())
-        if key == "checkin":
-            return bool(self._checkin_enabled())
-        if key == "upstream_status":
-            return bool(self._upstream_status_enabled())
-        return True
+        """任务是否启用；只有三个可关的任务需要现读开关，其余恒 True。"""
+        getter = {
+            "activity": self._activity_enabled,
+            "alert": self._alert_enabled,
+            "upstream_status": self._upstream_status_enabled,
+        }.get(key)
+        return True if getter is None else bool(getter())
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -629,24 +577,19 @@ def _as_report(result: object) -> dict[str, Any]:
     return {"result": repr(result)}
 
 
-def build_runner(
-    credentials,
-    providers: dict,
-    stats_collector,
-    config,
-    growth_events=None,
-    credit_events=None,
-    audit=None,
-    model_catalog: Callable[[], Awaitable[object]] | None = None,
-    openrouter_catalog: Callable[[], Awaitable[object]] | None = None,
-    openrouter_catalog_minutes: int | Callable[[], int] = 1440,
-    alerts=None,
-    backup: BackupTask | None = None,
-    upstream_status: UpstreamStatusTask | None = None,
-    model_probe: ModelProbeTask | None = None,
-    model_probe_minutes: int | Callable[[], int] = 0,
-    status: TaskStatusStore | None = None,
-) -> TaskRunner:
+def build_runner(credentials, providers: dict, stats_collector, config,
+                 growth_events=None, credit_events=None, checkin_events=None, audit=None,
+                 logs=None,
+                 model_catalog: Callable[[], Awaitable[object]] | None = None,
+                 openrouter_catalog: Callable[[], Awaitable[object]] | None = None,
+                 openrouter_catalog_minutes: int | Callable[[], int] = 1440,
+                 alerts=None,
+                 backup: BackupTask | None = None,
+                 upstream_status: UpstreamStatusTask | None = None,
+                 model_probe: ModelProbeTask | None = None,
+                 model_probe_minutes: int | Callable[[], int] = 0,
+                 status: TaskStatusStore | None = None,
+                 on_checkin_success: Callable[[str], None] | None = None) -> TaskRunner:
     """按配置装配后台任务（Pacer 由两个 provider 共享）。
 
     growth_events 为 None 时（老调用方/测试）不装配成长中心任务：没有落库目标
@@ -654,6 +597,9 @@ def build_runner(
 
     credit_events 同理：为 None 时保留流水清理不启用（表仍会随探测增长，
     但不影响功能；生产路径总是传入）。
+
+    checkin_events 同理：为 None 时签到不落审计日志、也不清理该表（老调用方与
+    测试保持原行为）；生产路径总是传入。
 
     audit 同理：为 None 时不清理审计流水（表仍会随登录/写操作增长；
     生产路径总是传入）。
@@ -707,50 +653,56 @@ def build_runner(
     status_store = status or TaskStatusStore()
     alert = None
     if alerts is not None:
-        alert = AlertTask(
-            credentials,
-            alerts,
-            stats_collector,
-            task_status=status_store,
-            enabled=lambda: config.alert_enabled,
-            webhook_url=lambda: config.alert_webhook_url,
-            pool_ready_min=lambda: config.alert_pool_ready_min,
-            task_failures=lambda: config.alert_task_failures,
-            token_expiry_hours=lambda: config.alert_token_expiry_hours,
-            error_rate_threshold=lambda: config.alert_error_rate_threshold,
-            error_rate_min_requests=lambda: config.alert_error_rate_min_requests,
-            error_rate_window_minutes=lambda: config.alert_error_rate_window_minutes,
-            silence_minutes=lambda: config.alert_silence_minutes,
-            for_ticks=lambda: config.alert_for_ticks,
-            clear_ticks=lambda: config.alert_clear_ticks,
-            app_secret=lambda: config.app_secret,
-        )
+        alert = AlertTask(credentials, alerts, stats_collector,
+                          task_status=status_store,
+                          enabled=lambda: config.alert_enabled,
+                          webhook_url=lambda: config.alert_webhook_url,
+                          feishu_url=lambda: config.alert_feishu_webhook_url,
+                          slack_url=lambda: config.alert_slack_webhook_url,
+                          pool_ready_min=lambda: config.alert_pool_ready_min,
+                          task_failures=lambda: config.alert_task_failures,
+                          token_expiry_hours=lambda: config.alert_token_expiry_hours,
+                          error_rate_threshold=lambda: config.alert_error_rate_threshold,
+                          error_rate_min_requests=lambda: config.alert_error_rate_min_requests,
+                          error_rate_window_minutes=lambda: config.alert_error_rate_window_minutes,
+                          key_burst_tokens=lambda: config.alert_key_burst_tokens,
+                          key_burst_window_minutes=lambda: config.alert_key_burst_window_minutes,
+                          off_hours_start=lambda: config.alert_off_hours_start,
+                          off_hours_end=lambda: config.alert_off_hours_end,
+                          off_hours_min_requests=lambda: config.alert_off_hours_min_requests,
+                          budget_cny=lambda: config.alert_budget_cny,
+                          budget_levels=lambda: config.alert_budget_levels,
+                          channel_dead_min_requests=(
+                              lambda: config.alert_channel_dead_min_requests),
+                          channel_dead_window_minutes=(
+                              lambda: config.alert_channel_dead_window_minutes),
+                          checkin_fail_min_streak=(
+                              lambda: config.alert_checkin_fail_min_streak),
+                          checkin_fail_window_hours=(
+                              lambda: config.alert_checkin_fail_window_hours),
+                          checkins=checkin_events,
+                          silence_minutes=lambda: config.alert_silence_minutes,
+                          for_ticks=lambda: config.alert_for_ticks,
+                          clear_ticks=lambda: config.alert_clear_ticks,
+                          app_secret=lambda: config.app_secret)
     return TaskRunner(
         quota_probe=QuotaProbeTask(credentials, providers, pacer),
-        checkin=CheckinTask(
-            credentials,
-            providers,
-            pacer=pacer,
-            times=lambda: config.checkin_times,
-            jitter_minutes=lambda: config.checkin_jitter_minutes,
-        ),
+        checkin=CheckinTask(credentials, providers, pacer=pacer,
+                            events=checkin_events,
+                            times=lambda: config.checkin_times,
+                            jitter_minutes=lambda: config.checkin_jitter_minutes,
+                            skip_providers=lambda: config.checkin_skip_providers,
+                            auto_login=lambda: config.raccoon_auto_login,
+                            on_success=on_checkin_success),
         growth=growth,
         activity=activity,
-        refresh=RefreshTask(
-            credentials,
-            providers,
-            skew_seconds=config.refresh_skew_hours * 3600,
-            now=lambda: int(time.time()),
-            pacer=pacer,
-        ),
-        retention=RetentionTask(
-            stats_collector,
-            credentials=credentials,
-            credit_events=credit_events,
-            audit=audit,
-            alerts=alerts,
-            growth_events=growth_events,
-        ),
+        refresh=RefreshTask(credentials, providers, skew_seconds=config.refresh_skew_hours * 3600,
+                            now=lambda: int(time.time()), pacer=pacer),
+        retention=RetentionTask(stats_collector, credentials=credentials,
+                                credit_events=credit_events,
+                                checkin_events=checkin_events, audit=audit,
+                                alerts=alerts, growth_events=growth_events,
+                                logs=logs),
         quota_probe_minutes=lambda: config.quota_probe_minutes,
         refresh_interval_minutes=lambda: config.refresh_interval_minutes,
         growth_interval_minutes=lambda: config.growth_interval_minutes,

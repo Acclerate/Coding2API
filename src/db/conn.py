@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
+
+from ..security.private_files import secure_dir, secure_file
 
 PRAGMAS = (
     "PRAGMA journal_mode = WAL",
@@ -20,7 +21,7 @@ PRAGMAS = (
 
 
 class Database:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, strict_permissions: bool = True) -> None:
         # 线程本地必须按实例隔离：模块级变量会让不同 Database 共用同一连接
         self._local = threading.local()
         # 所有线程建过的连接都登记在这里：`close()` 要能一次收干净。只关「当前
@@ -33,13 +34,29 @@ class Database:
         # 任何线程下次 `connect()` 都会自动拿到新连接，而不是踩到已关闭的旧句柄。
         self._generation = 0
         self.path = str(path)
+        self._strict_permissions = strict_permissions
         parent = Path(self.path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
             # 库内是凭证密文 + 明文用量/审计/用户名：目录不对同机其他用户开放。
-            # chmod 失败（共享目录、他人属主）不阻断启动。
-            with suppress(OSError):
-                os.chmod(parent, 0o700)
+            # 校验失败默认**阻断启动**（issue #45 的口径）：这是运维能修的确定
+            # 问题，不是需要降级的不确定状态。旁路场景（测试替身、只读运维脚本
+            # 打开别人的库）可显式传 `strict_permissions=False` 放宽。
+            secure_dir(parent, strict=strict_permissions)
+        # 库文件本身也要收紧：父目录 0700 只挡住「遍历」，而文件由 sqlite3 按
+        # umask 创建（实测默认 0644），同机其他用户仍可直接读整库。
+        self._secure_files()
+
+    def _secure_files(self) -> None:
+        """把库文件（含 WAL/SHM 边车）收成 0600；不存在则跳过。
+
+        每次建连都调一次：WAL/SHM 由 SQLite 在首次写入时创建，那一刻才出现，
+        只有建连后收紧才能覆盖到。chmod 幂等，重复调用无副作用。
+        """
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(f"{self.path}{suffix}")
+            if target.exists():
+                secure_file(target, strict=self._strict_permissions)
 
     def connect(self) -> sqlite3.Connection:
         """返回当前线程的专属连接（同线程复用）。"""
@@ -56,6 +73,9 @@ class Database:
             self._local.generation = self._generation
             with self._lock:
                 self._conns.append(conn)
+            # 新库就是在这里被 sqlite3 建出来的（权限随 umask，实测 0644），
+            # WAL/SHM 也在首个写事务里出现，所以建连后再收紧一次。
+            self._secure_files()
         return conn
 
     def close(self) -> None:

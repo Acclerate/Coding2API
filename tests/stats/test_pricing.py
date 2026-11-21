@@ -77,6 +77,24 @@ def test_estimate_cost_usd_missing_output_uses_zero():
                              cached_tokens=None) == pytest.approx(1.0)
 
 
+def test_estimate_cost_usd_channel_variants_use_base_model_price():
+    """渠道分发代号（OfficeAce 的 `-0930`、CodeBuddy 国际站的 `-sg`）按同一个
+    `deepseek-v4.1-flash` 刊例价算，不再显示 `—`。
+
+    价表里没有这两个 id，靠 `model_match` 的显式等价规则命中基础模型；另一个
+    方向的反例是 OpenRouter 的 `-1017` 快照——它有自己的价位，**不能**被剥尾
+    归到基础模型上。
+    """
+    table = {"deepseek-v4.1-flash": (0.03552, 0.12, 0.03552)}
+    base = estimate_cost_usd(table, "deepseek-v4.1-flash", input_tokens=1000,
+                             output_tokens=100, cached_tokens=0)
+    for model in ("deepseek-v4.1-flash-0930", "deepseek-v4.1-flash-sg"):
+        assert estimate_cost_usd(table, model, input_tokens=1000, output_tokens=100,
+                                 cached_tokens=0) == base
+    assert estimate_cost_usd(table, "deepseek-v4.1-flash-1017", input_tokens=1000,
+                             output_tokens=100, cached_tokens=0) is None
+
+
 def test_to_cny_falls_back_on_invalid_rate():
     assert to_cny(1.0, 6.7) == pytest.approx(6.7)
     assert to_cny(1.0, 0) == 1.0          # 非正 → 1:1
@@ -215,6 +233,29 @@ def test_query_model_timeline_cost_unpriced_is_none(collector_query):
                      input_tokens=100, output_tokens=0, now=hour)
     result = query.model_timeline(username="u", metric="cost")
     assert result["points"][0]["unpriced"] is None
+
+
+def test_query_timeline_cost_per_request(collector_query):
+    """单请求成本 = 已定价成本 ÷ 请求数（先聚合后相除）；无可定价明细给 None。"""
+    collector, query, _db = collector_query
+    hour = 1_699_999_200                    # 整点，与小时桶对齐
+    # 两条可定价（各 1M 输入 = 1 USD = 6.7 CNY）+ 一条不可定价
+    for offset in (0, 1):
+        collector.record(username="u", provider="trae", model="glm-5.2", ok=True,
+                         input_tokens=1_000_000, output_tokens=0, now=hour + offset)
+    collector.record(username="u", provider="trae", model="unpriced", ok=True,
+                     input_tokens=1_000_000, output_tokens=0, now=hour + 2)
+    points = query.timeline(username="u", metric="cost_per_request")
+    # 成本只算可定价部分（13.4 CNY），请求数 3 → 4.466667
+    assert points[0]["trae"] == pytest.approx(13.4 / 3, rel=1e-4)
+
+    # 全部不可定价 → None（不是 0 元）
+    other_hour = hour + 3600
+    collector.record(username="u", provider="trae", model="unpriced", ok=True,
+                     input_tokens=100, output_tokens=0, now=other_hour)
+    points = query.timeline(username="u", metric="cost_per_request",
+                            since=other_hour)
+    assert points[0]["trae"] is None
 
 
 def test_collector_rollup_preserves_cost(collector_query):

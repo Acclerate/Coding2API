@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Copy, KeyRound, Plus, RefreshCw, UserRoundCheck, UserRoundX, X } from "lucide-react";
+import { Check, Copy, KeyRound, Plus, RefreshCw, SlidersHorizontal, UserRoundCheck, UserRoundX, X } from "lucide-react";
 import { api, ApiError } from "../api/client";
 import { formatTime } from "../api/display";
 import { useSessionContext } from "../Layout";
@@ -13,6 +13,8 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
 import { DEFAULT_PAGE_SIZE } from "../lib/constants";
+import { copyText } from "../lib/clipboard";
+import { errorText } from "../lib/errors";
 import {
   Badge,
   Button,
@@ -21,6 +23,7 @@ import {
   Input,
   Notice,
   Panel,
+  QueryErrorState,
   Select,
   Table,
   TableBody,
@@ -39,10 +42,13 @@ function TokenCard({
   onDismiss: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const link = `${window.location.origin}/activate?token=${encodeURIComponent(issued.activate_token)}`;
   const copy = async () => {
-    await navigator.clipboard.writeText(link);
-    setCopied(true);
+    const ok = await copyText(link);
+    setCopied(ok);
+    // 局域网 http 部署没有 Clipboard API：必须明说，否则用户以为已经复制走
+    setCopyFailed(!ok);
   };
   return (
     <Panel title={`${issued.username} 的激活链接`}>
@@ -65,6 +71,11 @@ function TokenCard({
           我已转交
         </Button>
       </div>
+      {copyFailed && (
+        <p className="mt-2 text-xs text-danger" data-testid="copy-activation-failed">
+          浏览器不允许自动复制，请手动选中上方链接复制。
+        </p>
+      )}
     </Panel>
   );
 }
@@ -75,8 +86,8 @@ export function UsersPage() {
     { created_at: "desc", enabled: "desc" });
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-  const { data, isLoading, isFetching } = useUsers(session.username, sort, order,
-                                                   pageSize, page * pageSize);
+  const { data, isLoading, isError, error: queryError, refetch, isFetching } =
+    useUsers(session.username, sort, order, pageSize, page * pageSize);
   const [username, setUsername] = useState("");
   const [role, setRole] = useState<Role>("viewer");
   const [issued, setIssued] = useState<ActivationIssued | null>(null);
@@ -87,6 +98,14 @@ export function UsersPage() {
   const createDialogRef = useDialogFocus<HTMLDivElement>(
     () => setCreateOpen(false),
     createOpen,
+  );
+  // 策略对话框：当前编辑的用户（null = 关闭）+ 两个可编辑字段
+  const [policyUser, setPolicyUser] = useState<UserRow | null>(null);
+  const [policyModels, setPolicyModels] = useState("");
+  const [policyQuota, setPolicyQuota] = useState("");
+  const policyDialogRef = useDialogFocus<HTMLDivElement>(
+    () => setPolicyUser(null),
+    policyUser !== null,
   );
 
   const create = useUserMutation(
@@ -104,6 +123,12 @@ export function UsersPage() {
   );
   const resetPassword = useUserMutation(
     (args: { username: string }) => api.resetUserPassword(args.username),
+    session.username,
+  );
+  // 用户级策略（Playground 直连的模型白名单 + 配额）
+  const setPolicy = useUserMutation(
+    (args: { username: string; allowedModels: string; quota: string }) =>
+      api.setUserPolicy(args.username, args.allowedModels, args.quota),
     session.username,
   );
 
@@ -181,6 +206,32 @@ export function UsersPage() {
     }
   };
 
+  const openPolicy = (user: UserRow) => {
+    setError(null);
+    setPolicyModels(user.allowed_models ?? "");
+    setPolicyQuota(user.quota ?? "");
+    setPolicyUser(user);
+  };
+
+  const submitPolicy = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!policyUser) return;
+    setError(null);
+    setBusy(policyUser.username);
+    try {
+      await setPolicy.mutateAsync({
+        username: policyUser.username,
+        allowedModels: policyModels.trim(),
+        quota: policyQuota.trim(),
+      });
+      setPolicyUser(null);
+    } catch (caught) {
+      report(caught, "保存用户策略失败：配额需为 JSON 对象（如 {\"daily_requests\": 200}）。");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="space-y-6" data-testid="users-page">
       <PageHeader
@@ -221,6 +272,13 @@ export function UsersPage() {
       >
         {isLoading ? (
           <PageSkeleton variant="table" rows={6} />
+        ) : isError ? (
+          <QueryErrorState
+            title="用户列表加载失败"
+            description={errorText(queryError, "拿不到用户列表，请稍后重试。")}
+            onRetry={() => void refetch()}
+            data-testid="users-error-state"
+          />
         ) : users.length === 0 ? (
           <EmptyState
             icon={<KeyRound className="size-5" />}
@@ -290,11 +348,21 @@ export function UsersPage() {
                   <TableCell label="创建者" className="text-xs text-muted-foreground">
                     {user.created_by ?? "引导导入"}
                   </TableCell>
-                  <TableCell label="创建时间" className="text-xs">
+                  <TableCell label="创建时间" className="text-xs tabular-nums">
                     {formatTime(user.created_at)}
                   </TableCell>
                   <TableCell label="操作" className="text-right">
                     <span className="inline-flex gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy === user.username}
+                        data-testid={`policy-${user.username}`}
+                        onClick={() => openPolicy(user)}
+                      >
+                        <SlidersHorizontal className="mr-1 size-3.5" />
+                        策略
+                      </Button>
                       <Button
                         size="sm"
                         variant="ghost"
@@ -347,6 +415,83 @@ export function UsersPage() {
         角色：{ROLE_LABELS.admin} 可管理用户与配置；{ROLE_LABELS.operator}{" "}
         可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码会立即令其所有会话失效。
       </Notice>
+
+      {policyUser && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm"
+          onClick={() => setPolicyUser(null)}
+        >
+          <div
+            ref={policyDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="用户策略"
+            data-testid="user-policy-dialog"
+            onClick={(event) => event.stopPropagation()}
+            className="max-h-[90vh] w-full max-w-lg animate-in overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl fade-in-0 zoom-in-95"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <SlidersHorizontal className="size-4 text-muted-foreground" />
+                {policyUser.username} 的策略
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="关闭"
+                data-testid="user-policy-close"
+                onClick={() => setPolicyUser(null)}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+            <form onSubmit={submitPolicy} className="space-y-3">
+              <Notice tone="muted">
+                只约束该用户在 Playground 的会话直连（不约束其 API Key）：没设过策略时
+                任何登录用户都能直调任意模型，绕过 Key 的模型白名单与配额。
+              </Notice>
+              <Field label="模型白名单（逗号分隔，留空不限制）" htmlFor="user-policy-models">
+                <Input
+                  id="user-policy-models"
+                  value={policyModels}
+                  data-testid="user-policy-models"
+                  placeholder="例如 glm-5.3*,deepseek-v4.1-flash"
+                  autoComplete="off"
+                  onChange={(event) => setPolicyModels(event.target.value)}
+                />
+              </Field>
+              <Field label="配额（JSON 对象，留空不限制）" htmlFor="user-policy-quota">
+                <Input
+                  id="user-policy-quota"
+                  value={policyQuota}
+                  data-testid="user-policy-quota"
+                  placeholder={'例如 {"daily_requests": 200, "rpm": 5}'}
+                  autoComplete="off"
+                  onChange={(event) => setPolicyQuota(event.target.value)}
+                />
+              </Field>
+              <p className="text-xs text-muted-foreground">
+                配额项与 Key 一致：daily_requests / daily_tokens / daily_cost_usd /
+                rpm / tpm / max_concurrency。用量按用户名聚合——该用户经由任何入口的
+                流量都计入。
+              </p>
+              {error && (
+                <div data-testid="user-policy-error" role="alert">
+                  <Notice tone="danger">{error}</Notice>
+                </div>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="ghost" onClick={() => setPolicyUser(null)}>
+                  取消
+                </Button>
+                <Button type="submit" variant="primary" disabled={setPolicy.isPending}>
+                  保存
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {createOpen && (
         <div

@@ -84,6 +84,21 @@ async def test_with_keepalive_passes_frames_through_when_fast():
 
     assert [f async for f in with_keepalive(fast(), interval=5)] == [b"a", b"b"]
 
+
+@pytest.mark.asyncio
+async def test_with_keepalive_uses_protocol_specific_frame():
+    """心跳帧随出口协议走：Anthropic 的 ping 事件替换默认注释帧。"""
+    ping = b'event: ping\ndata: {"type": "ping"}\n\n'
+
+    async def slow():
+        await asyncio.sleep(0.05)
+        yield b"data: x\n\n"
+
+    frames = [f async for f in with_keepalive(slow(), interval=0.01,
+                                              keepalive_frame=ping)]
+    assert ping in frames
+    assert SSE_COMMENT not in frames
+
 @pytest.mark.asyncio
 async def test_stream_disconnect_records_usage():
     """客户端断开时把已知用量记账（client_disconnect），不再静默丢弃。
@@ -167,8 +182,8 @@ async def test_stream_disconnect_after_done_records_success():
 async def test_stream_success_then_tail_disconnect_not_double_recorded():
     """成功路径已记账后，收尾阶段的断开不再重复记账。
 
-    上游未发 FINISH 时 executor 补发 [DONE]（finish()），正常成功记录
-    先行产生；若客户端此时断开，断连分支不得再记第二条。
+    上游发 FINISH 后 executor 收尾成帧；若客户端在 [DONE] 之后断开，
+    断连分支不得再记第二条。
     """
     from src.engine.executor import Executor, ExecutorDeps
 
@@ -181,6 +196,7 @@ async def test_stream_success_then_tail_disconnect_not_double_recorded():
         async def stream_chat(self, credential_data, payload, model):
             yield Event(kind=EventKind.CONTENT, content="a")
             yield Event(kind=EventKind.CONTENT, content="b")
+            yield Event(kind=EventKind.FINISH, finish_reason="stop")
 
     executor = Executor(ExecutorDeps(
         providers={"trae": Provider()}, credentials=_FakeCredentials(),

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 # 采信的入站 X-Request-ID 字符集：可见 ASCII 里去掉空格与引号类，长度 1-128。
@@ -79,6 +81,37 @@ def get_api_key_id() -> str | None:
     return _api_key_id.get()
 
 
+# 当前请求使用的凭证 id（credentials.id）。executor 在每次调用上游前设置：
+# 出站代理按凭证分配（「一号一出口」，见 `provider/proxy.py`），provider 层
+# 读它选连接池。**只由 engine 层设置**（凭证来自调度器，不是客户端输入）。
+# 后台任务（探活/签到）也会设置——同一个账号的探活与推理走同一出口才一致。
+_credential_id: ContextVar[str | None] = ContextVar("credential_id", default=None)
+
+
+def set_credential_id(value: str | None) -> None:
+    """在当前上下文设置凭证 id；None = 复原（回落到渠道级代理）。"""
+    _credential_id.set(value)
+
+
+def get_credential_id() -> str | None:
+    """读当前上下文的凭证 id；无请求上下文（或虚拟凭证）返回 None。"""
+    return _credential_id.get()
+
+
+@contextmanager
+def credential_scope(credential_id: str | None) -> Iterator[None]:
+    """临时把当前凭证设为 `credential_id`，退出时**还原**（不写成 None）。
+
+    用于后台任务与管理台单条动作：循环里逐条设置，退出后不能把外层（如批量
+    端点自己在用的默认出口）误清成空。`token` 还原是 contextvar 的标准做法。
+    """
+    token = _credential_id.set(credential_id)
+    try:
+        yield
+    finally:
+        _credential_id.reset(token)
+
+
 # 入站请求头带来的会话标识（E1）：客户端（Codex / Claude Code / opencode 等）
 # 用 `x-session-id` 这类头声明「这是同一段对话」，比消息前缀兜底可靠得多。
 # 与 request_id 同一套纪律：**入站头是客户端可写输入**，按白名单字符集与长度
@@ -86,12 +119,20 @@ def get_api_key_id() -> str | None:
 # 里的显式键），不会影响模型、路由或鉴权。
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
-# 接受的头名，按优先级排列。前三个是 opencode / Codex 生态实际在用的写法，
-# 后两个是 conversation_id 的头形式（部分客户端把它放头里）。
+# 接受的头名，按优先级排列。前三个是 opencode / Codex 生态实际在用的写法；
+# `x-claude-code-session-id` 是 Claude Code 2.1.x 起的会话头（body 只有
+# `metadata.user_id` 的 JSON 串，粘性只能靠它，否则退化到「消息前缀」兜底，
+# 上下文被压缩/裁剪后就断粘）；`thread-id` / `session-id` 是 **Codex 2026 起
+# 的现行写法**（openai/codex#22193：官方只发连字符形式，下划线别名已被移除
+# ——部分代理拒收 `_`）；后两个是 conversation_id 的头形式（部分客户端把它
+# 放头里）。带前缀的 `x-session-id` 仍排第一：语义更具体，且历史客户端一直在用。
 SESSION_ID_HEADERS: tuple[bytes, ...] = (
     b"x-session-id",
     b"x-opencode-session",
     b"x-session-affinity",
+    b"x-claude-code-session-id",
+    b"thread-id",
+    b"session-id",
     b"conversation-id",
     b"conversation_id",
 )

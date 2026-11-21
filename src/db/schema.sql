@@ -9,6 +9,7 @@
 -- 注：不建 checkins / model_cache 表——签到去重由 CheckinTask 的当日作用域
 -- 集合实现（上游 status 为准）；模型列表是「进程内 TTL 缓存 + DATA_DIR 落盘
 -- 快照（model_catalog.json）」，不占表（见 src/api/model_catalog.py）。
+-- 签到**审计日志**是另一回事，见 `checkin_events`（只增不改、不参与去重）。
 
 -- 用户建表：users.txt（PBKDF2）降级为「引导输入」，启动时一次性导入，
 -- 之后 DB 是唯一权威源。ADMIN_USERNAMES env 降级为「引导期角色来源 + 防锁死
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     preview       TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     last_used_at  INTEGER,
-    -- 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 七渠道 | ''=自动）与来源 IP
+    -- 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 九渠道 | ''=自动）与来源 IP
     -- 白名单（逗号分隔 IP/CIDR，''=不限制）。空值即老库/未设置时的原行为。
     provider_binding TEXT NOT NULL DEFAULT '',
     allowed_ips   TEXT NOT NULL DEFAULT '',
@@ -41,7 +42,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE TABLE IF NOT EXISTS credentials (
     id               TEXT PRIMARY KEY,
-    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（七渠道）
+    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（九渠道）
     nickname         TEXT NOT NULL DEFAULT '',
     data_enc         BLOB NOT NULL,          -- Fernet 加密的凭证 JSON
     enabled          INTEGER NOT NULL DEFAULT 1,   -- 用户软开关
@@ -50,15 +51,22 @@ CREATE TABLE IF NOT EXISTS credentials (
     pinned           INTEGER NOT NULL DEFAULT 0,   -- 手动指定当前凭证
     health           INTEGER,                      -- NULL=unknown；0-100=known；-1=exhausted
     cooling_until    INTEGER,
+    -- 冷却来源（ErrKind 值：soft / credit / plan / restricted / other / ...）：
+    -- 上游点名的恢复时刻属于「等一会就好」，人工 revive 不该顺手解掉。
+    -- NULL = 无冷却或老库未回填（按「本地冷却」处理，revive 照旧清除）。
+    cooling_kind     TEXT,
     err_count        INTEGER NOT NULL DEFAULT 0,
     quota_remaining  REAL,
     quota_total      REAL,
     quota_cycle_end  INTEGER,                      -- 最早到期 epoch；渠道无此信息为 NULL
     quota_expiry_ladder TEXT,                      -- 到期阶梯 JSON [[epoch, 剩余积分]]；无到期信息为 NULL
-    quota_packages   TEXT,                      -- 额度包明细 JSON [{"name","total","used","end"}]，仅展示
-    quota_credits_remaining REAL,               -- 第二本账（CodeArts 积分）：内置模型计费，与 token 池并行；其余渠道 NULL
-    quota_credits_total     REAL,               -- 同上，积分总量
-    quota_credits_expiry_ladder TEXT,           -- 积分账到期阶梯 JSON [[epoch, 剩余积分]]（仅 CodeArts，展示用）；其余渠道 NULL
+    quota_packages   TEXT,                      -- 额度包明细 JSON [{"name","total","used","end","expiring"}]，仅展示
+    web_cookie_state TEXT,                      -- 网页明细源状态：NULL=未配置/未知，ok=正常，expired=会话失效（仅提示）
+    -- 账号密码状态（仅小浣熊按需登录用）：NULL=未配置，1=已保存。
+    -- 只存「有没有」，账号密码本身在 data_enc 里（导出时被剔除），
+    -- 故列表页能显示「已保存」而不必解密任何凭据。
+    login_secret INTEGER,
+    routing_weight   INTEGER,                   -- 调度权重：NULL/0=默认；正数越大越先被选中（仅管理员显式偏好）
     quota_probed_at  INTEGER,
     token_expires_at INTEGER,                   -- access token 到期 epoch；NULL=老库未回填，0=未知
     token_issued_at  INTEGER,                   -- access token 签发 epoch（JWT iat）：进度条满量程与「最后续期」
@@ -124,6 +132,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(username, ts);
+-- `idx_usage_request`（失败归因按 request_id 关联成功行）不在这里建：
+-- request_id 是老库后补的列，`executescript` 先于补列执行会报
+-- "no such column"，只能走 `migrate.py` 的 `_MIGRATION_INDEXES`。
 
 CREATE TABLE IF NOT EXISTS usage_hourly (
     hour_utc      INTEGER NOT NULL,
@@ -167,6 +178,29 @@ CREATE TABLE IF NOT EXISTS growth_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_growth_cred_ts ON growth_events(credential_id, ts);
+
+-- 每日签到运行记录（checkin_events）：每次对一条凭证执行签到就落一行。
+--
+-- 为什么落库：签到「界面显示成功却加不到积分」是实测过的用户反馈，而任务报告
+-- 只有聚合计数（attempted/succeeded/failed/skipped），事后无法回答「这个号昨天
+-- 几点签的、领了多少、上游回了什么码」。故按凭证逐次记一行，保留期与请求明细
+-- 一致（RetentionTask 清理）。
+-- 只存汇总：不落上游原始响应体（可能回显凭证片段）。
+-- 与已删除的 `checkins` 表无关：那张表是**去重**用（现由 CheckinTask 当日作用域
+-- 集合承担），本表是**审计日志**，只增不改、不参与去重。
+CREATE TABLE IF NOT EXISTS checkin_events (
+    id             TEXT PRIMARY KEY,
+    credential_id  TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    ok             INTEGER NOT NULL,
+    already        INTEGER NOT NULL DEFAULT 0,   -- 上游判「今日已签」（已签不算错误）
+    credit         REAL,                         -- 本次领取积分（可缺）
+    code           INTEGER,                      -- 上游业务码（可缺）
+    message        TEXT NOT NULL DEFAULT '',     -- 一行中文/上游文案
+    trigger        TEXT NOT NULL DEFAULT 'auto'  -- auto=定时 | manual=管理台手动
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkin_cred_ts ON checkin_events(credential_id, ts);
 
 -- 变动流水：额度探测写回时比对余额，每本账各增记一条。
 --
@@ -227,6 +261,9 @@ CREATE INDEX IF NOT EXISTS idx_model_cooling_until
 -- `state`：ok（探活成功）/ failed（上游明确不认这个模型）/ inconclusive
 -- （额度、限流、网络等与模型无关的失败——**绝不能**据此禁用）。
 -- `manual`：人工接管标记（非空 = 跳过自动探活），见 src/api/admin_model_availability.py。
+-- `failed` 时该 (渠道, 模型) 会被模型列表摘掉（**不看**同渠道的
+-- `credential_model_cooldowns` 是否仍生效）；恢复靠复探成功（`ModelProbeTask`
+-- 每轮探 failed 行），隐藏没有到期时间，见 src/api/models.py::merged_entries。
 CREATE TABLE IF NOT EXISTS model_probes (
     provider      TEXT NOT NULL,
     model         TEXT NOT NULL,
@@ -277,7 +314,16 @@ CREATE TABLE IF NOT EXISTS users (
     activation_expires_at INTEGER,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL,
-    created_by           TEXT                     -- 建号者用户名；引导导入为 NULL
+    created_by           TEXT,                    -- 建号者用户名；引导导入为 NULL
+    -- 用户级策略（仅约束**管理台 Playground** 的会话直连，不影响该用户的 API Key）：
+    -- 没有这两列时，viewer 用会话 Cookie 直调任意模型就绕过了 Key 的模型白名单与
+    -- 配额——管理台是「人能进门」的地方，出站策略必须按人再判一次。
+    -- allowed_models：fnmatch glob，逗号分隔，'' = 不限制（与 api_keys 同语法）。
+    allowed_models       TEXT NOT NULL DEFAULT '',
+    -- quota：JSON 文本，'' = 不限制；结构见 src/key_quota.py（当日请求/token/成本、
+    -- rpm/tpm/并发）。用量按**用户名**聚合：该用户经由任何入口（含自己的 Key）
+    -- 产生的用量都计入，配额语义是「这个人一天能用多少」，不是「这把 Key」。
+    quota                TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_role_enabled ON users(role, enabled);
@@ -302,8 +348,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor, ts);
 
--- 运维告警事件：后台周期评估四类风险（池耗尽 / 任务连续失败 / token
--- 临近到期 / 上游错误率骤升），命中即落一行，供管理台「站内告警记录」回看。
+-- 运维告警事件：后台周期评估七类规则（池耗尽 / 任务连续失败 / token
+-- 临近到期 / 上游错误率骤升 / 单 Key 用量暴涨 / 非工作时段 / 预算分层），
+-- 命中即落一行，供管理台「站内告警记录」回看。
 --
 -- 为什么落库而不是像 TaskStatusStore 只留内存：告警的价值恰在「错过的那段
 -- 时间发生了什么」——夜里池子耗尽、某任务连挂几轮，运维醒来要能看见，而
@@ -330,3 +377,20 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_scope ON alert_events(rule, scope);
 -- 注：resolved_at 上的索引不在这里，因为它引用的列本身是迁移补的
 -- （见 src/db/migrate.py 的 _MIGRATION_INDEXES）——老库执行到本脚本时该列
 -- 尚未补上，CREATE INDEX 会 no such column。新库由迁移循环统一建。
+
+-- 日志环形表（E3 持久化）：进程重启后仍能回看「刚刚发生了什么」。
+-- 与 audit_events 的区别：这里是**运维视图**（路由 / 上游错误文案 / 请求 ID），
+-- 不是合规流水；每行写入前已过 `redact_or_drop` 脱敏，命中敏感形态整行丢弃。
+-- 容量由 `LOG_PERSIST_LINES` 控制（0 = 不落库，只保留内存环），超出时按
+-- `seq` 从旧到新删除——保留最近 N 行而不是按时间，重启前后口径一致。
+CREATE TABLE IF NOT EXISTS log_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,           -- epoch 秒（整数：够排障，省空间）
+    level      TEXT NOT NULL,              -- DEBUG / INFO / WARNING / ERROR
+    logger     TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    request_id TEXT                        -- 无请求上下文（后台任务）时为 NULL
+);
+
+-- 按 request_id 回溯一次请求的全部日志（`GET /api/logs?request_id=…`）
+CREATE INDEX IF NOT EXISTS idx_log_events_request_id ON log_events(request_id);

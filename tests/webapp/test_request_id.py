@@ -172,6 +172,24 @@ def test_middleware_resets_api_key_id_after_request():
     assert get_api_key_id() is None
 
 
+def test_middleware_resets_request_id_after_request():
+    """request_id 随请求结束复原：超时存活的子任务不能继承旧 ID 写统计。"""
+    from src.request_context import get_request_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/rid")
+    async def rid():
+        from src.request_context import set_request_id
+        set_request_id("stale-after-this")
+        return {"rid": get_request_id()}
+
+    with TestClient(app) as client:
+        assert client.get("/rid").json() == {"rid": "stale-after-this"}
+    assert get_request_id() is None
+
+
 def test_middleware_resets_api_key_id_even_when_handler_raises():
     from src.request_context import get_api_key_id, set_api_key_id
 
@@ -248,6 +266,44 @@ def test_session_id_from_headers_prefers_earlier_header_names():
     assert session_id_from_headers([(b"X-Session-Id", b"mixed")]) == "mixed"
 
 
+def test_session_id_from_headers_accepts_codex_hyphenated_headers():
+    """Codex 自 2026 起只发 `thread-id` / `session-id`（openai/codex#22193）。"""
+    from src.request_context import session_id_from_headers
+
+    assert session_id_from_headers([(b"thread-id", b"t-1")]) == "t-1"
+    assert session_id_from_headers([(b"session-id", b"s-1")]) == "s-1"
+    # 带前缀的 x-session-id 语义更具体，仍排第一
+    assert session_id_from_headers([(b"thread-id", b"t"), (b"session-id", b"s"),
+                                    (b"x-session-id", b"x")]) == "x"
+    # thread-id 比 session-id / conversation-id 更具体，两者都在时选它
+    assert session_id_from_headers([(b"session-id", b"s"),
+                                    (b"thread-id", b"t")]) == "t"
+    assert session_id_from_headers([(b"conversation-id", b"c"),
+                                    (b"thread-id", b"t")]) == "t"
+    # 头名大小写不敏感
+    assert session_id_from_headers([(b"Thread-Id", b"mixed")]) == "mixed"
+
+
+def test_session_id_from_headers_accepts_claude_code_session_header():
+    """Claude Code 2.1.x 只在头 `X-Claude-Code-Session-Id` 里给会话标识。
+
+    body 只剩 `metadata.user_id` 的 JSON 串，不收这个头就只能靠「消息前缀」
+    兜底，上下文被压缩/裁剪后粘性会断。
+    """
+    from src.request_context import session_id_from_headers
+
+    assert session_id_from_headers(
+        [(b"x-claude-code-session-id", b"cc-1")]) == "cc-1"
+    assert session_id_from_headers(
+        [(b"X-Claude-Code-Session-Id", b"cc-2")]) == "cc-2"
+    # 更具体的 x-session-id 仍然优先
+    assert session_id_from_headers([
+        (b"x-claude-code-session-id", b"cc"), (b"x-session-id", b"x")]) == "x"
+    # Codex 的 thread-id 排在它之后
+    assert session_id_from_headers([
+        (b"thread-id", b"t"), (b"x-claude-code-session-id", b"cc")]) == "cc"
+
+
 def test_session_id_from_headers_skips_invalid_and_returns_none():
     from src.request_context import session_id_from_headers
 
@@ -275,5 +331,7 @@ def test_middleware_sets_and_clears_session_id():
     with _TestClient(app) as client:
         response = client.get("/sess", headers={"x-session-id": "abc-123"})
         assert response.json()["session"] == "abc-123"
+        # Codex 现行写法（连字符形式）同样经中间件进入 contextvar
+        assert client.get("/sess", headers={"thread-id": "t-9"}).json()["session"] == "t-9"
         # 复原：下一个请求不带头时读不到上一次的值
         assert client.get("/sess").json()["session"] is None

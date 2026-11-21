@@ -312,36 +312,41 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByText("没有匹配的模型")).toBeInTheDocument();
   });
 
-  it("福利模型（CodeArts 每日池）在渠道徽章打「福」标，多渠道只标该渠道", async () => {
-    const BENEFIT_MODELS = {
+  it("渠道徽章只渲染渠道名与倍率，福标已随渠道重构移除", async () => {
+    const CHANNEL_MODELS = {
       object: "list",
       data: [
         {
           id: "deepseek-v4.1-flash", object: "model", owned_by: "Coding2API",
           providers: ["codearts", "trae"],
           by_provider: {
-            codearts: { raw_id: "deepseek-v4.1-flash", benefit: true },
+            codearts: { raw_id: "deepseek-v4.1-flash" },
             trae: { raw_id: "deepseek-v4.1-flash", credit_rate: 0.08 },
           },
         },
         {
-          id: "benefit-only", object: "model", owned_by: "Coding2API",
-          providers: ["codearts"], benefit: true,
+          id: "codearts-only", object: "model", owned_by: "Coding2API",
+          providers: ["codearts"],
         },
       ],
     };
-    mockFetch({ "/api/playground/models": BENEFIT_MODELS });
+    mockFetch({ "/api/playground/models": CHANNEL_MODELS });
     renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
     await waitForModelLoaded();
 
-    // 多渠道：只有 codearts 那侧打「福」标（trae 侧不打）
+    // 多渠道：两侧渠道徽章只渲染渠道名（trae 侧带倍率），不再有「福」标
     const dual = screen.getByTestId("model-option-deepseek-v4.1-flash");
-    expect(within(dual).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
-    expect(within(dual).queryByTestId("channel-benefit-trae")).not.toBeInTheDocument();
+    expect(within(dual).getByTestId("channel-pill-codearts")).toHaveTextContent("CodeArts");
+    expect(within(dual).getByTestId("channel-pill-trae")).toHaveTextContent("TRAE");
+    expect(within(dual).getByTestId("channel-pill-trae")).toHaveTextContent("x0.08");
+    expect(dual).not.toHaveTextContent("福");
+    expect(dual.querySelector('[data-testid^="channel-benefit-"]')).not.toBeInTheDocument();
 
-    // 单渠道福利：顶层 benefit 也打「福」标
-    const single = screen.getByTestId("model-option-benefit-only@codearts");
-    expect(within(single).getByTestId("channel-benefit-codearts")).toHaveTextContent("福");
+    // 单渠道 CodeArts：同样只有渠道名与（可选的）倍率
+    const single = screen.getByTestId("model-option-codearts-only@codearts");
+    expect(within(single).getByTestId("channel-pill-codearts")).toHaveTextContent("CodeArts");
+    expect(single).not.toHaveTextContent("福");
+    expect(single.querySelector('[data-testid^="channel-benefit-"]')).not.toBeInTheDocument();
   });
 
   it("免费模型（x0）的倍率块显示「免」，单渠道当前选择条不打自动路由标", async () => {
@@ -360,7 +365,12 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
 
     const current = screen.getByTestId("model-current");
     expect(current).toHaveTextContent("kilo-auto/free");
-    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免");
+    const pill = within(current).getByTestId("channel-pill-kilo");
+    expect(pill).toHaveTextContent("免");
+    // 单渠道把徽章拆成「渠道｜倍率」两段（左右不同底色），不是一个胶囊里
+    // 再套一个倍率小块
+    expect(pill.children).toHaveLength(2);
+    expect(pill.children[1]).toHaveTextContent("免");
     // 单渠道模型不显示「自动路由」标
     expect(current).not.toHaveTextContent("自动路由");
   });
@@ -390,7 +400,7 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByTestId("provider-pin-trae")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("provider-pin-trae"));
     expect(screen.getByTestId("provider-pin-trae")).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("model-current")).toHaveTextContent("已强制 TRAE");
+    expect(screen.getByTestId("model-current-pinned")).toHaveTextContent("TRAE");
 
     await fillPromptAndSend("hi");
     const chat = calls.find((item) => item.url.includes("/api/playground/chat/completions"));
@@ -755,6 +765,32 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     }
   });
 
+  it("当前选择条分三栏：当前选择 | 渠道 | 强制，强制栏有选择才出现", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const current = screen.getByTestId("model-current");
+    const [identityCol, channelCol] = Array.from(current.children) as HTMLElement[];
+    // 渠道控件不与身份挤同一栏：渠道多时只在自己栏内折行
+    expect(channelCol).toContainElement(screen.getByTestId("provider-pin"));
+    expect(identityCol).not.toContainElement(screen.getByTestId("provider-pin"));
+    expect(identityCol).toHaveTextContent("glm-5.2");
+    // 自动路由：没有强制栏（有选择才显示，不留空位）
+    expect(screen.queryByTestId("model-current-pinned")).not.toBeInTheDocument();
+    expect(current.children).toHaveLength(2);
+
+    await userEvent.click(screen.getByTestId("provider-pin-trae"));
+    // 强制后多出第三栏，内容是「强制 + 渠道名」，不与前两栏混在一起
+    const pinnedCol = screen.getByTestId("model-current-pinned");
+    expect(current.children).toHaveLength(3);
+    expect(current.children[2]).toBe(pinnedCol);
+    expect(pinnedCol).toHaveTextContent("强制");
+    expect(pinnedCol).toHaveTextContent("TRAE");
+    expect(identityCol).not.toHaveTextContent("强制");
+    expect(channelCol).not.toHaveTextContent("强制");
+  });
+
   it("请求进行中再次提交被忽略，不重复发请求", async () => {
     let release: () => void = () => {};
     const pending = new Promise<void>((resolve) => {
@@ -801,5 +837,60 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     await fillPromptAndSend("hi");
     expect(screen.getByTestId("playground-error")).toHaveTextContent("温度需在 0–1000 之间");
     expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(false);
+  });
+});
+describe("PlaygroundPage 图片附件", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("选图后以 image_url 块随请求发送，并可移除", async () => {
+    const spy = mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const file = new File([new Uint8Array([137, 80, 78, 71])], "shot.png",
+                          { type: "image/png" });
+    await userEvent.upload(screen.getByTestId("playground-image-input"), file);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("playground-image-preview")).toHaveLength(1));
+
+    await fillPromptAndSend("这是什么");
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    const call = spy.mock.calls.find(([url]) => String(url).includes("/api/playground/chat"));
+    const body = JSON.parse(String((call?.[1] as RequestInit).body));
+    const content = body.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content[0]).toEqual({ type: "text", text: "这是什么" });
+    expect(content[1].type).toBe("image_url");
+    expect(content[1].image_url.url.startsWith("data:image/png;base64,")).toBe(true);
+
+    fireEvent.click(screen.getByTestId("playground-remove-image"));
+    await waitFor(() =>
+      expect(screen.queryAllByTestId("playground-image-preview")).toHaveLength(0));
+  });
+
+  it("没有图片时 content 仍是纯字符串（旧行为逐字节不变）", async () => {
+    const spy = mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await fillPromptAndSend("hi");
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    const call = spy.mock.calls.find(([url]) => String(url).includes("/api/playground/chat"));
+    const body = JSON.parse(String((call?.[1] as RequestInit).body));
+    expect(body.messages[0].content).toBe("hi");
+  });
+
+  it("超过 4 张拒绝并提示", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const files = Array.from({ length: 5 }, (_, index) =>
+      new File([new Uint8Array([1])], `p${index}.png`, { type: "image/png" }));
+    await userEvent.upload(screen.getByTestId("playground-image-input"), files);
+    await waitFor(() =>
+      expect(screen.getByText(/最多 4 张图片/)).toBeInTheDocument());
   });
 });

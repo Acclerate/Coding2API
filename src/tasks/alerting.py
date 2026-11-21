@@ -8,6 +8,9 @@
    severity=warning。
 3. **token 临近到期**：某凭证的 access token 剩余时间落在窗口内。severity=warning。
 4. **上游错误率骤升**：统计窗内失败占比超过阈值且样本数足够。severity=warning。
+5. **单 Key 用量暴涨**：统计窗内某把 Key 的 token 总量越过阈值（泄露/共用信号）。
+6. **非工作时段请求**：工作时间区间之外的请求数达到最小样本。
+7. **预算分层**：当月成本达到预算的 50/80/95/100% 档；只报最高档，100% 为 critical。
 
 投递（用户选的「Webhook + 站内」）：
 - **站内**：每条命中落 `alert_events`，管理台「站内告警记录」回看（重启不丢）。
@@ -66,8 +69,9 @@ _WEBHOOK_TIMEOUT = 10.0
 _WEBHOOK_TOTAL_BUDGET = 15.0
 
 # 外发 webhook 的 detail 里需要脱敏的字段：`nickname` 是用户自定义标签，
-# 实践中常填邮箱 / 手机号，站内记录留原文、外发一律打码（同源问题）。
-_PII_DETAIL_KEYS = ("nickname",)
+# 实践中常填邮箱 / 手机号；`api_key_id` / `username` 是内部标识 + 账号名。
+# 站内记录留原文，外发一律打码（同源问题）。
+_PII_DETAIL_KEYS = ("nickname", "username", "api_key_id")
 _PII_MASK = "***"
 
 SEVERITY_CRITICAL = "critical"
@@ -112,11 +116,12 @@ def _redact_webhook_error(error: Exception) -> str:
 
 
 def _public_detail(detail: dict[str, Any]) -> dict[str, Any]:
-    """外发 webhook 的 detail：把 PII 字段打码，站内记录不受影响。
+    """外发 webhook 的 detail：把 PII/内部标识打码，站内记录不受影响。
 
-    `nickname` 是用户自填标签，实践中常是邮箱/手机号。站内 `alert_events`
-    属本机管理面，保留原文便于定位；一旦外发到第三方（Slack/飞书群）就该
-    最小化，非空值一律替换为掩码，空值保持空串以免多出噪声字段。
+    `nickname` 是用户自填标签（常是邮箱/手机号），`username` / `api_key_id`
+    是账号名与内部标识。站内 `alert_events` 属本机管理面，保留原文便于定位；
+    一旦外发到第三方（Slack/飞书群）就该最小化，非空值一律替换为掩码，
+    空值保持空串以免多出噪声字段。
     """
     public = dict(detail)
     for key in _PII_DETAIL_KEYS:
@@ -170,6 +175,14 @@ class Alert:
                 message = message.replace(secret, _PII_MASK)
         return message
 
+    def public_scope(self) -> str:
+        """外发 scope：同上打码。`key_burst` 的 scope 就是 api_key_id 原文。"""
+        scope = self.scope
+        for secret in self.pii:
+            if secret:
+                scope = scope.replace(secret, _PII_MASK)
+        return scope
+
 
 def _humanize(seconds: int) -> str:
     """剩余秒数 → 人类可读（小时/分钟），用于告警文案。"""
@@ -178,6 +191,45 @@ def _humanize(seconds: int) -> str:
     if seconds >= 60:
         return f"{seconds // 60} 分钟"
     return f"{seconds} 秒"
+
+
+def month_start(now: int) -> int:
+    """本地时区当月起点（epoch 秒）：预算按自然月结算，与账单页同口径。"""
+    tm = time.localtime(now)
+    return int(time.mktime((tm.tm_year, tm.tm_mon, 1, 0, 0, 0, 0, 0, -1)))
+
+
+def parse_levels(raw: str) -> tuple[int, ...]:
+    """`"50,80,95,100"` → `(50, 80, 95, 100)`；非法项丢弃、去重、升序、限 1..100。
+
+    预算分层是运营参数，写错不该让告警任务崩：解析失败按空处理（= 该规则
+    不生效），由设置页的校验兜住正常入口。100 以上不设层（超支仍算 100%）。
+    """
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            level = int(part)
+        except ValueError:
+            continue
+        if 1 <= level <= 100:
+            values.add(level)
+    return tuple(sorted(values))
+
+
+def in_off_hours(hour: int, start: int, end: int) -> bool:
+    """`hour` 是否落在「非工作时段」；`start == end` 表示该规则关闭。
+
+    跨零点写法（如 22 → 7）合法：`hour >= start or hour < end`。区间是
+    **半开** `[start, end)`，与项目里其他时间窗口径一致。
+    """
+    if start == end:
+        return False
+    if start < end:
+        return not (start <= hour < end)
+    return not (hour >= start or hour < end)
 
 
 def evaluate_alerts(
@@ -189,6 +241,16 @@ def evaluate_alerts(
     error_counts: tuple[int, int],
     error_rate_threshold: float,
     error_rate_min_requests: int,
+    key_usage: list[dict[str, Any]] | None = None,
+    key_burst_tokens: int = 0,
+    off_hours: bool = False,
+    off_hours_min_requests: int = 0,
+    budget_cny: float = 0.0,
+    budget_spent: float = 0.0,
+    budget_levels: tuple[int, ...] = (),
+    dead_channels: list[dict[str, Any]] | None = None,
+    checkin_failures: list[dict[str, Any]] | None = None,
+    checkin_fail_min_streak: int = 0,
 ) -> list[Alert]:
     """按四类规则把信号快照判成告警列表（纯函数，不碰 IO）。
 
@@ -198,6 +260,15 @@ def evaluate_alerts(
     - `failing_tasks`：`(key, name, streak)`，调用方已按阈值过滤。
     - `expiring`：`[{id, nickname, token_expires_at, ...}]`，已按窗口过滤。
     - `error_counts`：`(requests, failed)`，窗口口径由调用方给定。
+    - `key_usage`：`[{api_key_id, username, requests, tokens}]`，按 Key 聚合。
+    - `off_hours`：调用方按本地时钟算好的「当前是否非工作时段」；纯函数不碰
+      时钟，测试可以任意构造。
+    - `budget_*`：当月成本预算与已花费（调用方按月起点聚合）。只报**已达成的
+      最高层**——低层在高一层触发时自然不再命中，由迟滞状态机写成「已恢复」，
+      避免 50/80/95/100 四条同时挂着。
+    - `dead_channels`：窗口内零成功的渠道（调用方已按最小样本过滤）。
+    - `checkin_failures`：签到连续失败凭证（调用方已按最小连续轮数过滤，
+      纯函数再按 `checkin_fail_min_streak` 兜一次，0 = 关闭）。
     """
     alerts: list[Alert] = []
 
@@ -249,6 +320,97 @@ def evaluate_alerts(
                         "rate": round(rate, 4), "threshold": error_rate_threshold},
             ))
 
+    # 单 Key 用量暴涨：窗口内总 token 越过阈值。**不是**错误，是滥用/泄露信号
+    # （Key 被贴到公共仓库、多人共用一把 Key）。阈值 0 关闭。
+    if key_burst_tokens > 0:
+        for row in key_usage or ():
+            tokens = int(row.get("tokens") or 0)
+            if tokens < key_burst_tokens:
+                continue
+            alerts.append(Alert(
+                rule="key_burst", severity=SEVERITY_WARNING,
+                scope=row.get("api_key_id") or "unknown",
+                message=(f"API Key 在统计窗内消耗 {tokens} token"
+                         f"（{row.get('requests', 0)} 次请求，用户 "
+                         f"{row.get('username') or '-'}，阈值 {key_burst_tokens}）"),
+                detail={"api_key_id": row.get("api_key_id"),
+                        "username": row.get("username"),
+                        "tokens": tokens,
+                        "requests": int(row.get("requests") or 0),
+                        "threshold": key_burst_tokens},
+                # message 里内嵌用户名、scope 就是 api_key_id：两处外发都要打码
+                # （detail 由 `_public_detail` 按同一份键表处理）。
+                pii=tuple(str(value) for value in
+                          (row.get("username"), row.get("api_key_id")) if value),
+            ))
+
+    # 非工作时段仍有请求：可能是定时任务/自动化，也可能是 Key 被外部使用。
+    # 只报「窗口内请求数达到最小样本」的次数，避免个别重试就报警。
+    requests_total, _failed = error_counts
+    if off_hours and off_hours_min_requests > 0 and requests_total >= off_hours_min_requests:
+        alerts.append(Alert(
+            rule="off_hours", severity=SEVERITY_WARNING, scope="pool",
+            message=(f"非工作时段仍有 {requests_total} 次请求"
+                     f"（阈值 {off_hours_min_requests}）"),
+            detail={"requests": requests_total,
+                    "threshold": off_hours_min_requests},
+        ))
+
+    # 预算分层：50/80/95/100%。只报当前达到的最高层；100%（含超支）为 critical。
+    if budget_cny > 0 and budget_levels and budget_spent > 0:
+        percent = budget_spent / budget_cny * 100
+        reached = [level for level in budget_levels if percent >= level]
+        if reached:
+            level = max(reached)
+            alerts.append(Alert(
+                rule="budget",
+                severity=SEVERITY_CRITICAL if level >= 100 else SEVERITY_WARNING,
+                scope=f"budget_{level}",
+                message=(f"当月成本已达预算的 {percent:.0f}%"
+                         f"（¥{budget_spent:.2f} / ¥{budget_cny:.2f}，"
+                         f"触发 {level}% 档）"),
+                detail={"level": level, "percent": round(percent, 2),
+                        "spent_cny": round(budget_spent, 4),
+                        "budget_cny": budget_cny},
+            ))
+
+    # 渠道死亡：窗口内该渠道有流量但**一次都没成功**（零成功，不看错误率）。
+    # 2026-11-08 officeace 积分耗尽后 8 小时无成功、raccoon 签到 5 天全失败，
+    # 现有规则一条都没报——error_rate 被 fallback 稀释，task_failed 只看任务
+    # 连续失败（签到「跑成功但业务失败」不算）。
+    for row in dead_channels or ():
+        provider = str(row.get("provider") or "")
+        requests = int(row.get("requests") or 0)
+        last_ok = row.get("last_ok")
+        silence = ("从未成功过" if last_ok is None else
+                   "最近一次成功是 "
+                   f"{time.strftime('%m-%d %H:%M', time.localtime(int(last_ok)))}")
+        alerts.append(Alert(
+            rule="channel_dead", severity=SEVERITY_CRITICAL, scope=provider,
+            message=(f"渠道 {provider} 在统计窗内 {requests} 次请求全部失败"
+                     f"（{silence}）"),
+            detail={"provider": provider, "requests": requests,
+                    "last_ok": last_ok},
+        ))
+
+    # 签到连续失败：同一凭证最近连续 N 轮签到都是失败（中间成功一次即清零）。
+    # 与 task_failed 的区别：签到任务本身「跑成功了」，是上游业务返回失败
+    # （如 raccoon「今日积分尚未发放」），任务级计数永远看不见。
+    for row in checkin_failures or ():
+        streak = int(row.get("streak") or 0)
+        if checkin_fail_min_streak <= 0 or streak < checkin_fail_min_streak:
+            continue
+        credential_id = str(row.get("credential_id") or "")
+        alerts.append(Alert(
+            rule="checkin_failing", severity=SEVERITY_WARNING,
+            scope=credential_id,
+            message=(f"凭证 {credential_id} 连续 {streak} 轮签到失败："
+                     f"{row.get('message') or '未知原因'}"),
+            detail={"credential_id": credential_id, "streak": streak,
+                    "message": row.get("message") or "",
+                    "threshold": checkin_fail_min_streak},
+        ))
+
     return alerts
 
 
@@ -276,12 +438,26 @@ class AlertTask:
         task_status: TaskStatusStore,
         enabled: Callable[[], bool] = lambda: True,
         webhook_url: Callable[[], str] = lambda: "",
+        feishu_url: Callable[[], str] = lambda: "",
+        slack_url: Callable[[], str] = lambda: "",
         pool_ready_min: Callable[[], int] = lambda: 1,
         task_failures: Callable[[], int] = lambda: 3,
         token_expiry_hours: Callable[[], int] = lambda: 24,
         error_rate_threshold: Callable[[], float] = lambda: 0.5,
         error_rate_min_requests: Callable[[], int] = lambda: 20,
         error_rate_window_minutes: Callable[[], int] = lambda: 15,
+        key_burst_tokens: Callable[[], int] = lambda: 0,
+        key_burst_window_minutes: Callable[[], int] = lambda: 15,
+        off_hours_start: Callable[[], int] = lambda: 0,
+        off_hours_end: Callable[[], int] = lambda: 0,
+        off_hours_min_requests: Callable[[], int] = lambda: 0,
+        budget_cny: Callable[[], float] = lambda: 0.0,
+        budget_levels: Callable[[], str] = lambda: "50,80,95,100",
+        channel_dead_min_requests: Callable[[], int] = lambda: 0,
+        channel_dead_window_minutes: Callable[[], int] = lambda: 60,
+        checkin_fail_min_streak: Callable[[], int] = lambda: 0,
+        checkin_fail_window_hours: Callable[[], int] = lambda: 24,
+        checkins: Any = None,
         silence_minutes: Callable[[], int] = lambda: 30,
         for_ticks: Callable[[], int] = lambda: DEFAULT_FOR_TICKS,
         clear_ticks: Callable[[], int] = lambda: DEFAULT_CLEAR_TICKS,
@@ -295,12 +471,27 @@ class AlertTask:
         self._task_status = task_status
         self._enabled = enabled
         self._webhook_url = webhook_url
+        self._feishu_url = feishu_url
+        self._slack_url = slack_url
         self._pool_ready_min = pool_ready_min
         self._task_failures = task_failures
         self._token_expiry_hours = token_expiry_hours
         self._error_rate_threshold = error_rate_threshold
         self._error_rate_min_requests = error_rate_min_requests
         self._error_rate_window_minutes = error_rate_window_minutes
+        self._key_burst_tokens = key_burst_tokens
+        self._key_burst_window_minutes = key_burst_window_minutes
+        self._off_hours_start = off_hours_start
+        self._off_hours_end = off_hours_end
+        self._off_hours_min_requests = off_hours_min_requests
+        self._budget_cny = budget_cny
+        self._budget_levels = budget_levels
+        self._channel_dead_min_requests = channel_dead_min_requests
+        self._channel_dead_window_minutes = channel_dead_window_minutes
+        self._checkin_fail_min_streak = checkin_fail_min_streak
+        self._checkin_fail_window_hours = checkin_fail_window_hours
+        # 签到审计仓储（CheckinEventRepository）：只读取连续失败，None 时跳过该规则。
+        self._checkins = checkins
         self._silence_minutes = silence_minutes
         self._for_ticks = for_ticks
         self._clear_ticks = clear_ticks
@@ -332,6 +523,32 @@ class AlertTask:
         ]
         window_minutes = max(0, self._error_rate_window_minutes())
         expiring_seconds = max(0, self._token_expiry_hours()) * 3600
+        # 渠道死亡窗口独立于错误率窗：渠道挂掉通常是小时级，15 分钟太短。
+        dead_minutes = max(0, self._channel_dead_window_minutes())
+        dead_min_requests = max(0, self._channel_dead_min_requests())
+        dead_channels = (
+            self._stats.window_dead_channels(
+                since=now - dead_minutes * 60, min_requests=dead_min_requests)
+            if dead_minutes > 0 and dead_min_requests > 0 else [])
+        # 签到连续失败：窗口按小时（一天 24 轮自动重试已足够暴露问题）。
+        fail_hours = max(0, self._checkin_fail_window_hours())
+        fail_min_streak = max(0, self._checkin_fail_min_streak())
+        checkin_failures = (
+            self._checkins.consecutive_failures(
+                min_streak=fail_min_streak, since=now - fail_hours * 3600)
+            if self._checkins is not None and fail_min_streak > 0
+            and fail_hours > 0 else [])
+        # 单 Key 暴涨用**自己的**窗口（与错误率窗口解耦：错误率看几分钟，
+        # 用量暴涨看十几分钟到一小时更合理）。
+        burst_minutes = max(0, self._key_burst_window_minutes())
+        key_usage = (self._stats.window_key_usage(since=now - burst_minutes * 60)
+                     if self._key_burst_tokens() > 0 and burst_minutes > 0 else [])
+        start, end = self._off_hours_start(), self._off_hours_end()
+        off_hours = in_off_hours(time.localtime(now).tm_hour, start, end)
+        # 预算按自然月（本地）：月初成本归零 → 上月的预算告警自然恢复
+        budget_cny = max(0.0, self._budget_cny())
+        budget_spent = (self._stats.window_cost(since=month_start(now))[0]
+                        if budget_cny > 0 else 0.0)
         alerts = evaluate_alerts(
             pool=self._credentials.pool_counts(now),
             pool_ready_min=self._pool_ready_min(),
@@ -341,6 +558,16 @@ class AlertTask:
                 since=now - window_minutes * 60),
             error_rate_threshold=self._error_rate_threshold(),
             error_rate_min_requests=self._error_rate_min_requests(),
+            key_usage=key_usage,
+            key_burst_tokens=self._key_burst_tokens(),
+            off_hours=off_hours,
+            off_hours_min_requests=self._off_hours_min_requests(),
+            budget_cny=budget_cny,
+            budget_spent=budget_spent,
+            budget_levels=parse_levels(self._budget_levels()),
+            dead_channels=dead_channels,
+            checkin_failures=checkin_failures,
+            checkin_fail_min_streak=fail_min_streak,
         )
         return await self._dispatch(alerts, now)
 
@@ -429,22 +656,16 @@ class AlertTask:
         只等单次超时；总预算再兜一层，防止 `_post` 的自建 client 路径
         （其 timeout 是每请求的）在地址很多时累积超时。
         """
-        urls = [u.strip() for u in self._webhook_url().split(",") if u.strip()]
-        if not urls:
+        targets = self._targets(alert, status, now)
+        if not targets:
             return False, None
-        resolved = status == "resolved"
-        payload = {
-            "service": "coding2api", "rule": alert.rule, "severity": alert.severity,
-            "scope": alert.scope, "status": status,
-            "message": (f"已恢复：{alert.public_message()}" if resolved
-                        else alert.public_message()),
-            "detail": _public_detail(alert.detail), "ts": now,
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        signature = sign_webhook_body(self._app_secret(), body)
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*(self._deliver_one(url, body, signature) for url in urls)),
+                asyncio.gather(*(
+                    self._deliver_one(url, body,
+                                      sign_webhook_body(self._app_secret(), body))
+                    for url, body in targets
+                )),
                 timeout=_WEBHOOK_TOTAL_BUDGET,
             )
         except TimeoutError:
@@ -453,6 +674,40 @@ class AlertTask:
             return False, "TimeoutError: webhook delivery budget exceeded"
         errors = [error for error in results if error is not None]
         return (not errors), (errors[0] if errors else None)
+
+    def _targets(self, alert: Alert, status: str, now: int) -> list[tuple[str, bytes]]:
+        """本轮全部投递目标 → [(地址, 预序列化 body)]。
+
+        通用 webhook 发完整 JSON（带签名，收端可复算）；飞书 / Slack 各自只认
+        自己的格式，故按渠道单独构造。不同渠道 body 不同、签名逐 body 计算，
+        签名仍覆盖实际发送的字节。未配置任何渠道时返回空列表（仅站内记录）。
+        """
+        resolved = status == "resolved"
+        message = (f"已恢复：{alert.public_message()}" if resolved
+                   else alert.public_message())
+        targets: list[tuple[str, bytes]] = []
+        for url in (item.strip() for item in self._webhook_url().split(",")):
+            if not url:
+                continue
+            payload = {
+                "service": "coding2api", "rule": alert.rule,
+                "severity": alert.severity, "scope": alert.public_scope(),
+                "status": status,
+                "message": message,
+                "detail": _public_detail(alert.detail), "ts": now,
+            }
+            targets.append((url, json.dumps(payload, ensure_ascii=False).encode("utf-8")))
+        feishu = self._feishu_url().strip()
+        if feishu:
+            # 飞书自定义机器人文本消息；不带 detail（可能含内部标识）
+            targets.append((feishu, json.dumps(
+                {"msg_type": "text", "content": {"text": f"Coding2API · {message}"}},
+                ensure_ascii=False).encode("utf-8")))
+        slack = self._slack_url().strip()
+        if slack:
+            targets.append((slack, json.dumps(
+                {"text": f"Coding2API · {message}"}, ensure_ascii=False).encode("utf-8")))
+        return targets
 
     async def _deliver_one(self, url: str, body: bytes, signature: str) -> str | None:
         """投递单个地址；失败只记日志并返回脱敏后的错误串，不抛出。

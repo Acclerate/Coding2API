@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import hmac
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -60,11 +62,16 @@ def render_metrics(
     credentials: dict[str, int],
     errors: list[tuple[str, str, int]],
     task_failures: list[tuple[str, int]],
+    latency: list[tuple[str, float, float, int]] | None = None,
+    inflight: int | None = None,
 ) -> str:
     """把各数据源的聚合结果渲染成 Prometheus text 格式（纯函数）。
 
     每个指标家族输出 `# HELP` + `# TYPE` + 样本行；样本次序由调用方保证稳定
     （数据源查询已排序），这里不再重排，保持输出可复现。
+
+    `latency` / `inflight` 为后加的可选输入：缺省时不输出对应家族（旧调用方
+    与测试逐字节不变）。
     """
     lines: list[str] = []
 
@@ -85,11 +92,31 @@ def render_metrics(
             lines.append(_sample(f"{PREFIX}tokens_total",
                                  [("provider", provider), ("type", kind)], value))
 
+    if latency:
+        # 平均值而非直方图：桶边界会随渠道/模型差异失真（见 StatsQuery 同函数注释）
+        lines.append(f"# HELP {PREFIX}latency_ms_avg 成功请求的平均端到端延迟（毫秒）。")
+        lines.append(f"# TYPE {PREFIX}latency_ms_avg gauge")
+        lines.append(f"# HELP {PREFIX}ttfb_ms_avg 成功请求的平均首字延迟（毫秒）。")
+        lines.append(f"# TYPE {PREFIX}ttfb_ms_avg gauge")
+        lines.append(f"# HELP {PREFIX}latency_samples 参与平均值的成功请求数。")
+        lines.append(f"# TYPE {PREFIX}latency_samples gauge")
+        for provider, avg_latency, avg_ttfb, samples in latency:
+            labels = [("provider", provider)]
+            lines.append(_sample(f"{PREFIX}latency_ms_avg", labels, round(avg_latency, 1)))
+            lines.append(_sample(f"{PREFIX}ttfb_ms_avg", labels, round(avg_ttfb, 1)))
+            lines.append(_sample(f"{PREFIX}latency_samples", labels, samples))
+
     lines.append(f"# HELP {PREFIX}credentials 凭证池健康计数（四态互斥，与 /healthz 同口径）。")
     lines.append(f"# TYPE {PREFIX}credentials gauge")
     for state in _CREDENTIAL_STATES:
         lines.append(_sample(f"{PREFIX}credentials", [("state", state)],
                              int(credentials.get(state, 0))))
+
+    if inflight is not None:
+        # 在途是瞬时值：排障时「卡住」表现为它持续不降，比看日志快
+        lines.append(f"# HELP {PREFIX}inflight 当前在途请求数（凭证租约合计）。")
+        lines.append(f"# TYPE {PREFIX}inflight gauge")
+        lines.append(_sample(f"{PREFIX}inflight", [], int(inflight)))
 
     lines.append(f"# HELP {PREFIX}upstream_errors_total 进程内累计失败请求数"
                  "（按渠道 / 失败原因；重启归零）。")
@@ -107,17 +134,41 @@ def render_metrics(
     return "\n".join(lines) + "\n"
 
 
+def _token_matches(header: str, expected: str) -> bool:
+    """Bearer 头校验（恒时比较；前缀大小写不敏感，Prometheus 发 `Bearer`）。
+
+    编码成 bytes：`hmac.compare_digest` 对含非 ASCII 的 `str` 会抛 TypeError，
+    而这里的输入完全来自外部请求头。
+    """
+    prefix = "bearer "
+    if not header.lower().startswith(prefix):
+        return False
+    supplied = header[len(prefix):].strip()
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
 def create_router(services: Services) -> APIRouter:
     router = APIRouter()
 
     @router.get("/metrics", include_in_schema=False)
     async def metrics(request: Request):
-        """Prometheus 抓取端点。**不鉴权**——与同样裸暴露的 `/healthz` 同口径，
-        且指标已禁用高基数标签（只有渠道 / 模型 / 状态等有限集合）。"""
+        """Prometheus 抓取端点。
+
+        默认**不鉴权**——与同样裸暴露的 `/healthz` 同口径，且指标已禁用高基数
+        标签（只有渠道 / 模型 / 状态等有限集合）。但端点会暴露渠道与模型清单、
+        凭证池四态计数，对外部署可设 `METRICS_TOKEN` 收口：配置后必须带
+        `Authorization: Bearer <token>`（缺失或错误一律 401，不回显差在哪）。
+        """
         if not bool(services.settings.metrics_enabled):
             return JSONResponse(status_code=404,
                                 content=error_payload("metrics disabled",
                                                       "invalid_request", 404))
+        token = str(services.settings.metrics_token or "")
+        if token and not _token_matches(
+                request.headers.get("authorization", ""), token):
+            return JSONResponse(status_code=401,
+                                content=error_payload("metrics unauthorized",
+                                                      "unauthorized", 401))
         stats = request.app.state.stats_collector
         runner = getattr(request.app.state, "task_runner", None)
         # 只报**已装配**的任务（与 /api/tasks 同源）：未装配的 key 恒 0 会
@@ -132,6 +183,10 @@ def create_router(services: Services) -> APIRouter:
             credentials=services.credentials.pool_counts(),
             errors=stats.error_totals(),
             task_failures=task_failures,
+            latency=services.stats_query.metrics_provider_latency(),
+            # 在途从调度器的租约跟踪器现读：它是「卡住」的唯一实时信号
+            inflight=(services.inflight.total()
+                      if services.inflight is not None else 0),
         )
         return Response(content=text, headers={"Content-Type": CONTENT_TYPE})
 
