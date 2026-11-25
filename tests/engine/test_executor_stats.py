@@ -14,8 +14,10 @@ from tests.helpers.events import GOOD_EVENTS
 def _disabled_outcome():
     from src.engine.scheduler import Candidate, Scheduler
 
-    return Scheduler().note_error(Candidate(credential_id="c", provider="codebuddy"),
-                                  ErrKind.DEAD, 0)
+    return Scheduler().note_error(
+        Candidate(credential_id="c", provider="codebuddy"), ErrKind.DEAD, 0
+    )
+
 
 class RecordingCollector:
     def __init__(self) -> None:
@@ -26,6 +28,7 @@ class RecordingCollector:
         if self.boom:
             raise RuntimeError("stats backend down")
         self.events.append(fields)
+
 
 def _exec_with_stats(repo_tuple, script, collector, **kw):
     credentials, _db = repo_tuple
@@ -55,10 +58,17 @@ def _exec_with_stats(repo_tuple, script, collector, **kw):
     streaming = Streaming()
     if streaming.probe is not None:
         streaming.probe_quota = streaming.probe
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": streaming}, credentials=credentials,
-        scheduler=Scheduler(**kw), default_model="glm-5.2", stats=collector))
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": streaming},
+            credentials=credentials,
+            scheduler=Scheduler(**kw),
+            default_model="glm-5.2",
+            stats=collector,
+        )
+    )
     return executor
+
 
 async def test_stream_records_success_with_usage_and_username(repo):
     credentials, _db = repo
@@ -68,9 +78,12 @@ async def test_stream_records_success_with_usage_and_username(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="alice"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    ):
         pass
 
     event = collector.events[-1]
@@ -80,6 +93,7 @@ async def test_stream_records_success_with_usage_and_username(repo):
     assert event["reasoning_tokens"] == 3
     assert event["latency_ms"] is not None
     assert event["ttfb_ms"] is not None
+
 
 async def test_client_disconnect_records_full_usage_fields(repo):
     """断连记账必须与成功路径同款字段（修复：额度护栏可绕过）。
@@ -93,17 +107,27 @@ async def test_client_disconnect_records_full_usage_fields(repo):
     collector = RecordingCollector()
     usage = Usage(11, 22, 3, 5, 1.5, True)
     executor = _exec_with_stats(
-        repo, [[Event(kind=EventKind.CONTENT, content="hi"),
+        repo,
+        [
+            [
+                Event(kind=EventKind.CONTENT, content="hi"),
                 Event(kind=EventKind.USAGE, usage=usage),
-                Event(kind=EventKind.CONTENT, content="more")]], collector)
+                Event(kind=EventKind.CONTENT, content="more"),
+            ]
+        ],
+        collector,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
-    stream = executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-        username="alice")
-    await anext(stream)          # content
-    await anext(stream)          # usage 已缓冲后的 content
+    stream = executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    )
+    await anext(stream)  # content
+    await anext(stream)  # usage 已缓冲后的 content
     await stream.aclose()
 
     event = collector.events[-1]
@@ -126,15 +150,26 @@ async def test_post_frame_failure_records_full_usage_fields(repo):
             return ErrKind.SOFT
 
     executor = _exec_with_stats(
-        repo, [[Event(kind=EventKind.CONTENT, content="part"),
+        repo,
+        [
+            [
+                Event(kind=EventKind.CONTENT, content="part"),
                 Event(kind=EventKind.USAGE, usage=Usage(7, 4, 2, 1, 0.75, False)),
-                Soft()]], collector, max_rotate=1)
+                Soft(),
+            ]
+        ],
+        collector,
+        max_rotate=1,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="alice"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    ):
         pass
 
     event = collector.events[-1]
@@ -154,29 +189,45 @@ async def test_stream_without_finish_frame_records_truncated_stream(repo):
     客户端仍收到收尾帧。
     """
     credentials, _db = repo
-    credential_id = credentials.add(provider="codebuddy",
-                                    credential_data={"bearer_token": "t"})
+    credential_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "t"}
+    )
     collector = RecordingCollector()
     executor = _exec_with_stats(
-        repo, [[Event(kind=EventKind.CONTENT, content="hi"),
-                Event(kind=EventKind.USAGE, usage=Usage(11, 22, 3))]], collector)
+        repo,
+        [
+            [
+                Event(kind=EventKind.CONTENT, content="hi"),
+                Event(kind=EventKind.USAGE, usage=Usage(11, 22, 3)),
+            ]
+        ],
+        collector,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
-    frames = [frame async for frame in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-        username="alice")]
+    frames = [
+        frame
+        async for frame in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            ),
+            username="alice",
+        )
+    ]
 
     event = collector.events[-1]
     assert event["ok"] is False and event["error_type"] == "truncated_stream"
     # tokens 如实记录（已收到的用量仍要计费）
     assert event["input_tokens"] == 11 and event["output_tokens"] == 22
     # 凭证健康不受影响：不计错、不冷却
-    candidate = next(c for c in credentials.candidates()
-                     if c.credential_id == credential_id)
+    candidate = next(
+        c for c in credentials.candidates() if c.credential_id == credential_id
+    )
     assert candidate.err_count == 0 and candidate.cooling_until is None
     # 客户端仍收到 [DONE] 收尾帧
     assert b"[DONE]" in b"".join(frames)
+
 
 async def test_stream_without_usage_frame_records_null_tokens(repo):
     """上游没给 usage 时统计字段为 None，不能崩也不能写 0。"""
@@ -184,28 +235,51 @@ async def test_stream_without_usage_frame_records_null_tokens(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     collector = RecordingCollector()
     executor = _exec_with_stats(
-        repo, [[Event(kind=EventKind.CONTENT, content="hi"),
-                Event(kind=EventKind.FINISH, finish_reason="stop")]], collector)
+        repo,
+        [
+            [
+                Event(kind=EventKind.CONTENT, content="hi"),
+                Event(kind=EventKind.FINISH, finish_reason="stop"),
+            ]
+        ],
+        collector,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True})):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+    ):
         pass
     assert collector.events[-1]["input_tokens"] is None
+
 
 async def test_stream_prefers_credential_expiring_soon(repo):
     """到期积分指标贯通到真实选号：低健康度但快过期积分多的号先被选中。"""
     credentials, _db = repo
-    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
-    burn_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "b"})
+    steady_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "s"}
+    )
+    burn_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "b"}
+    )
     now = int(time.time())
-    credentials.save_quota(steady_id, Quota(remaining=95, total=100,
-                                            cycle_end=now + 48 * 3600, probed_at=now))
-    credentials.save_quota(burn_id, Quota(remaining=10, total=100, cycle_end=now + 600,
-                                           expiry_ladder=[(now + 600, 100.0),
-                                                          (now + 700, 50.0)],
-                                           probed_at=now))
+    credentials.save_quota(
+        steady_id,
+        Quota(remaining=95, total=100, cycle_end=now + 48 * 3600, probed_at=now),
+    )
+    credentials.save_quota(
+        burn_id,
+        Quota(
+            remaining=10,
+            total=100,
+            cycle_end=now + 600,
+            expiry_ladder=[(now + 600, 100.0), (now + 700, 50.0)],
+            probed_at=now,
+        ),
+    )
     cands = {c.credential_id: c for c in credentials.candidates()}
     assert cands[burn_id].expiry_ladder == [(now + 600, 100.0), (now + 700, 50.0)]
     assert cands[steady_id].expiry_ladder is None
@@ -214,56 +288,85 @@ async def test_stream_prefers_credential_expiring_soon(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="alice"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    ):
         pass
 
     assert collector.events[-1]["credential_id"] == burn_id
 
+
 async def test_stream_expiry_window_zero_keeps_health_order(repo):
     """窗口关闭后退回健康度排序（到期指标全员 0 分）。"""
     credentials, _db = repo
-    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
-    burn_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "b"})
+    steady_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "s"}
+    )
+    burn_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "b"}
+    )
     now = int(time.time())
     credentials.save_quota(steady_id, Quota(remaining=95, total=100, probed_at=now))
-    credentials.save_quota(burn_id, Quota(remaining=10, total=100,
-                                           expiry_ladder=[(now + 600, 100.0)],
-                                           probed_at=now))
+    credentials.save_quota(
+        burn_id,
+        Quota(
+            remaining=10, total=100, expiry_ladder=[(now + 600, 100.0)], probed_at=now
+        ),
+    )
     collector = RecordingCollector()
     executor = _exec_with_stats(repo, [GOOD_EVENTS], collector, expiry_window=0)
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="alice"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    ):
         pass
 
     assert collector.events[-1]["credential_id"] == steady_id
 
+
 async def test_stream_secondary_expiry_breaks_tie(repo):
     """两级窗口贯通到真实选号：36h 内都没到期积分时，7 天内会过期者优先。"""
     credentials, _db = repo
-    steady_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "s"})
-    week_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "w"})
+    steady_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "s"}
+    )
+    week_id = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "w"}
+    )
     now = int(time.time())
     credentials.save_quota(steady_id, Quota(remaining=95, total=100, probed_at=now))
-    credentials.save_quota(week_id, Quota(remaining=50, total=100,
-                                          expiry_ladder=[(now + 3 * 86400, 140.0)],
-                                          probed_at=now))
+    credentials.save_quota(
+        week_id,
+        Quota(
+            remaining=50,
+            total=100,
+            expiry_ladder=[(now + 3 * 86400, 140.0)],
+            probed_at=now,
+        ),
+    )
     collector = RecordingCollector()
     executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="alice"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="alice",
+    ):
         pass
 
     assert collector.events[-1]["credential_id"] == week_id
+
 
 async def test_stream_records_failure_when_credentials_exhausted(repo):
     credentials, _db = repo
@@ -272,13 +375,17 @@ async def test_stream_records_failure_when_credentials_exhausted(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="bob"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="bob",
+    ):
         pass
     event = collector.events[-1]
     assert event["ok"] is False and event["error_type"] == "no_healthy_credential"
     assert event["username"] == "bob"
+
 
 async def test_stream_skips_undecryptable_credential_and_uses_another(repo):
     """一条凭证解不开 → 跳过它换下一个号，**不让整个请求 500**。
@@ -291,13 +398,17 @@ async def test_stream_skips_undecryptable_credential_and_uses_another(repo):
     from src.db.crypto import CredentialCipher
 
     credentials, db = repo
-    broken = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    broken = credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "t"}
+    )
     good = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t2"})
     # 换密钥加密 → 当前 APP_SECRET 解不开
     other = CredentialCipher("a-completely-different-secret")
     with db.transaction() as conn:
-        conn.execute("UPDATE credentials SET data_enc = ? WHERE id = ?",
-                     (other.encrypt(b'{"bearer_token": "t"}'), broken))
+        conn.execute(
+            "UPDATE credentials SET data_enc = ? WHERE id = ?",
+            (other.encrypt(b'{"bearer_token": "t"}'), broken),
+        )
     # **pin 住坏的那条**：选号必须先试它，否则「跳过解不开的凭证」这条分支
     # 根本不会执行——而选号顺序取决于健康度 / 在途数 / 到期额度等一堆
     # 动态因素，测试不能靠它们碰巧（CI 上曾因此漏测）。
@@ -305,22 +416,37 @@ async def test_stream_skips_undecryptable_credential_and_uses_another(repo):
 
     collector = RecordingCollector()
     executor = _exec_with_stats(repo, [GOOD_EVENTS], collector)
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
     assert chunks
     event = collector.events[-1]
     assert event["ok"] is True
     # 实际用的是那个好凭证（解不开的被跳过）
     assert event["credential_id"] == good
 
+
 def _model_cool_one(credentials, model):
     """给唯一凭证写一条未过期的模型级冷却（耗尽轮换的前置条件）。"""
     from src.engine.scheduler import ErrorOutcome, ModelCooldown
 
     credential_id = credentials.candidates()[0].credential_id
-    credentials.save_error(credential_id, ErrorOutcome(model_cooldowns={
-        model: ModelCooldown(cooling_until=int(time.time()) + 600,
-                             hits=1, reason="model")}))
+    credentials.save_error(
+        credential_id,
+        ErrorOutcome(
+            model_cooldowns={
+                model: ModelCooldown(
+                    cooling_until=int(time.time()) + 600, hits=1, reason="model"
+                )
+            }
+        ),
+    )
+
 
 async def test_stream_all_model_cooled_records_model_unavailable(repo):
     """候选全部只因该模型的模型级冷却不可用 → 统计记 model_unavailable。
@@ -337,14 +463,18 @@ async def test_stream_all_model_cooled_records_model_unavailable(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="bob"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="bob",
+    ):
         pass
     event = collector.events[-1]
     assert event["ok"] is False and event["error_type"] == "model_unavailable"
     # 对外错误码不变：兼容层（Anthropic/Responses）按 no_healthy_credential 映射
     # （本用例不直接断言错误码，见 test_coverage_edge_executor 的终帧断言）
+
 
 async def test_complete_all_model_cooled_records_model_unavailable(repo):
     """非流式路径同口径：模型级冷却耗尽记 model_unavailable。"""
@@ -357,9 +487,11 @@ async def test_complete_all_model_cooled_records_model_unavailable(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "model_unavailable"
+
 
 async def test_stream_exhaustion_without_any_pick_records_candidate_provider(repo):
     """一次都没选中凭证（候选全在冷却 / 池子为空）时，明细要落**候选渠道**。
@@ -374,12 +506,16 @@ async def test_stream_exhaustion_without_any_pick_records_candidate_provider(rep
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True})):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+    ):
         pass
     event = collector.events[-1]
     assert event["ok"] is False and event["provider"] == "codebuddy"
     assert event["credential_id"] is None
+
 
 async def test_complete_exhaustion_without_any_pick_records_candidate_provider(repo):
     """非流式同口径：没有选中凭证时明细仍能指出是哪个渠道。"""
@@ -390,9 +526,11 @@ async def test_complete_exhaustion_without_any_pick_records_candidate_provider(r
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["provider"] == "codebuddy"
+
 
 async def test_exhaustion_after_a_tried_credential_keeps_actual_provider(repo):
     """真打过上游时明细记**实际**渠道，不被候选渠道顶掉。"""
@@ -408,10 +546,12 @@ async def test_exhaustion_after_a_tried_credential_keeps_actual_provider(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["provider"] == "codebuddy"
     assert collector.events[-1]["credential_id"] is not None
+
 
 async def test_complete_records_success_and_failure(repo):
     credentials, _db = repo
@@ -421,18 +561,24 @@ async def test_complete_records_success_and_failure(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    await executor.complete(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}]}), username="alice")
+    await executor.complete(
+        parse_chat_request({"messages": [{"role": "user", "content": "hi"}]}),
+        username="alice",
+    )
     assert collector.events[-1]["ok"] is True
     assert collector.events[-1]["input_tokens"] == 11
     # 非流式也记首字延迟（上游首个事件时刻）
     assert collector.events[-1]["ttfb_ms"] is not None
 
-    credentials.save_error(credentials.candidates()[0].credential_id, _disabled_outcome())
+    credentials.save_error(
+        credentials.candidates()[0].credential_id, _disabled_outcome()
+    )
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "no_healthy_credential"
+
 
 async def test_stats_failure_never_breaks_chat(repo):
     """统计后端不可用时聊天必须照常返回。"""
@@ -444,15 +590,18 @@ async def test_stats_failure_never_breaks_chat(repo):
 
     from src.compat.openai.request import parse_chat_request
 
-    result = await executor.complete(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}]}))
+    result = await executor.complete(
+        parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+    )
     assert result["choices"][0]["message"]["content"] == "hi"
+
 
 def test_executor_without_stats_collector_is_noop(repo):
     credentials, _db = repo
     executor = _exec_with_stats(repo, [GOOD_EVENTS], None)
     assert executor._deps.stats is None
     executor._deps.record(username="x", provider="y", model="z", ok=True)  # 不崩
+
 
 async def test_upstream_http_failure_records_error_type(repo):
     credentials, _db = repo
@@ -470,12 +619,14 @@ async def test_upstream_http_failure_records_error_type(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     # 会话失效 → 硬禁用；尝试行已给出真实归因（凭证失效），轮换耗尽的收尾行
     # 不再重复落（否则一次请求两行，requests 与 Key 日额度双计）
     assert collector.events[-1]["error_type"] == "credential_unavailable"
     assert credentials.candidates()[0].disabled is True
+
 
 def test_error_type_mapping_covers_all_kinds():
     from src.engine.executor import _error_type_for
@@ -549,8 +700,9 @@ async def test_dead_credential_also_records_attribution_row(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
     kinds = [event["error_type"] for event in collector.events]
     # 只落尝试级（DEAD 归因）：轮换耗尽的收尾行不再重复落，否则同一请求
@@ -575,11 +727,18 @@ async def test_stream_dead_error_does_not_duplicate_terminal_row(repo):
     executor = _exec_with_stats(repo, [[Dead()]], collector)
     from src.compat.openai.request import parse_chat_request
 
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
-    assert chunks                       # 以错误帧收尾，不是静默断开
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
+    assert chunks  # 以错误帧收尾，不是静默断开
     assert [event["error_type"] for event in collector.events] == [
-        "credential_unavailable"]
+        "credential_unavailable"
+    ]
 
 
 def test_dead_as_credit_switches_only_when_quota_proven_exhausted():
@@ -593,8 +752,7 @@ def test_dead_as_credit_switches_only_when_quota_proven_exhausted():
 def test_quota_exhausted_is_three_state_and_tolerates_deleted_credential(repo):
     """`_quota_exhausted` 三态：未探测 ≠ 耗尽；探到 0 / health=-1 才算。"""
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     executor = _exec_with_stats(repo, [], None)
 
     # 没探测过：未知，不能当「用完了」的证据（否则真坏的 AppKey 会被静默成等签到）
@@ -609,6 +767,11 @@ def test_quota_exhausted_is_three_state_and_tolerates_deleted_credential(repo):
     # 断言是 `is True`，此行是 fork 有意偏离的标记点。
     credentials.save_quota(cid, Quota(remaining=None, total=None, probed_at=3))
     assert executor._quota_exhausted(cid, "codebuddy") is False
+    # fork 语义下 health == -1（EXHAUSTED）仍直接判耗尽：探测成功但 total ≤ 0
+    # （分母异常）→ health_score 给 -1。上面的 UNKNOWN 豁免只针对「两个字段
+    # 都缺失」的形态，不豁免显式 0。
+    credentials.save_quota(cid, Quota(remaining=0, total=0, probed_at=4))
+    assert executor._quota_exhausted(cid, "codebuddy") is True
     # 凭证被并发删除（请求途中）：占位候选额度未知 → 不降级
     assert executor._quota_exhausted("cred_gone", "codebuddy") is False
 
@@ -626,10 +789,10 @@ async def test_dead_with_exhausted_quota_cools_instead_of_hard_disabling(repo):
     from src.engine.scheduler import next_credit_reset
 
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
-    credentials.save_quota(cid, Quota(remaining=0, total=4100,
-                                      probed_at=int(time.time())))
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_quota(
+        cid, Quota(remaining=0, total=4100, probed_at=int(time.time()))
+    )
     collector = RecordingCollector()
 
     class Dead(Exception):
@@ -640,11 +803,12 @@ async def test_dead_with_exhausted_quota_cools_instead_of_hard_disabling(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
     row = credentials.candidates()[0]
-    assert row.disabled is False                      # 没被硬禁用
+    assert row.disabled is False  # 没被硬禁用
     assert row.cooling_until == next_credit_reset(int(time.time()))
     # 收尾行按**最后一次错误的真实归因**落：改判 CREDIT（额度耗尽）→ rate_limit，
     # 不再笼统 `no_healthy_credential`（见 `_exhaust_error_type`）。
@@ -656,10 +820,10 @@ async def test_dead_with_exhausted_quota_cools_instead_of_hard_disabling(repo):
 async def test_stream_dead_with_exhausted_quota_records_rate_limit(repo):
     """流式同样不因「额度耗尽的 401」硬禁用凭证（与尝试行同一判据）。"""
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
-    credentials.save_quota(cid, Quota(remaining=0, total=4100,
-                                      probed_at=int(time.time())))
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    credentials.save_quota(
+        cid, Quota(remaining=0, total=4100, probed_at=int(time.time()))
+    )
     collector = RecordingCollector()
 
     class Dead(Exception):
@@ -669,8 +833,14 @@ async def test_stream_dead_with_exhausted_quota_records_rate_limit(repo):
     executor = _exec_with_stats(repo, [[Dead()]], collector)
     from src.compat.openai.request import parse_chat_request
 
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
     assert chunks
     kinds = [event["error_type"] for event in collector.events]
     assert kinds == ["rate_limit"]
@@ -690,8 +860,7 @@ async def test_dead_probes_quota_now_when_local_evidence_is_stale(repo):
     from src.request_context import get_credential_id
 
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=56.66, total=4100, probed_at=1))
     seen: list[str | None] = []
 
@@ -710,23 +879,24 @@ async def test_dead_probes_quota_now_when_local_evidence_is_stale(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
-    assert seen == [cid]                       # 复探在凭证作用域内执行
+    assert seen == [cid]  # 复探在凭证作用域内执行
     row = credentials.candidates()[0]
     assert row.disabled is False
     assert row.cooling_until == next_credit_reset(int(time.time()))
-    assert row.quota_remaining == 0            # 新鲜证据已写回
+    assert row.quota_remaining == 0  # 新鲜证据已写回
     assert "credential_unavailable" not in [
-        event["error_type"] for event in collector.events]
+        event["error_type"] for event in collector.events
+    ]
 
 
 async def test_dead_probe_keeps_dead_when_quota_still_positive(repo):
     """复探仍是正数 → AppKey 真坏了，保持 DEAD（不静默成「等签到」）。"""
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=100, total=4100, probed_at=1))
 
     async def probe(_data):
@@ -741,12 +911,19 @@ async def test_dead_probe_keeps_dead_when_quota_still_positive(repo):
     executor = _exec_with_stats(repo, [[Dead()]], collector, probe=probe)
     from src.compat.openai.request import parse_chat_request
 
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
     assert chunks
     assert credentials.candidates()[0].disabled is True
     assert "credential_unavailable" in [
-        event["error_type"] for event in collector.events]
+        event["error_type"] for event in collector.events
+    ]
 
 
 async def test_dead_probe_failure_keeps_dead_and_keeps_known_quota(repo):
@@ -756,8 +933,7 @@ async def test_dead_probe_failure_keeps_dead_and_keeps_known_quota(repo):
     静默成「等签到」。探测失败也不写库——一次网络抖动不该把已探明的正数抹成未知。
     """
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=100, total=4100, probed_at=1))
 
     async def boom(_data):
@@ -767,21 +943,29 @@ async def test_dead_probe_failure_keeps_dead_and_keeps_known_quota(repo):
         return Quota(probe_failed=True, probed_at=int(time.time()))
 
     executor = _exec_with_stats(repo, [], None, probe=boom)
-    assert await executor._credit_if_exhausted(ErrKind.DEAD, cid,
-                                               "codebuddy") is ErrKind.DEAD
+    assert (
+        await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
+        is ErrKind.DEAD
+    )
     # 探测失败：额度保持上次已知值（不被抹成未知）
     executor = _exec_with_stats(repo, [], None, probe=failed)
-    assert await executor._credit_if_exhausted(ErrKind.DEAD, cid,
-                                               "codebuddy") is ErrKind.DEAD
+    assert (
+        await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
+        is ErrKind.DEAD
+    )
     assert credentials.candidates()[0].quota_remaining == 100
     # provider 没有 probe_quota（zen / kilo 之外的自定义装配）
     executor = _exec_with_stats(repo, [], None)
-    assert await executor._credit_if_exhausted(ErrKind.DEAD, cid,
-                                               "codebuddy") is ErrKind.DEAD
+    assert (
+        await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
+        is ErrKind.DEAD
+    )
     # 凭证在请求途中被并发删除：取不到明文，不能凭空探一个不存在的号
     executor = _exec_with_stats(repo, [], None, probe=failed)
-    assert await executor._credit_if_exhausted(
-        ErrKind.DEAD, "cred_gone", "codebuddy") is ErrKind.DEAD
+    assert (
+        await executor._credit_if_exhausted(ErrKind.DEAD, "cred_gone", "codebuddy")
+        is ErrKind.DEAD
+    )
 
 
 async def test_dead_probe_is_deduplicated_per_credential(repo):
@@ -791,8 +975,7 @@ async def test_dead_probe_is_deduplicated_per_credential(repo):
     复探结论为 DEAD 时也必须去重（结论相同，重复探测毫无收益）。
     """
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=100, total=4100, probed_at=1))
     calls: list[dict] = []
 
@@ -802,9 +985,11 @@ async def test_dead_probe_is_deduplicated_per_credential(repo):
 
     executor = _exec_with_stats(repo, [], None, probe=probe)
     for _ in range(3):
-        assert await executor._credit_if_exhausted(
-            ErrKind.DEAD, cid, "codebuddy") is ErrKind.DEAD
-    assert len(calls) == 1                   # 三次 401 只探一次
+        assert (
+            await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
+            is ErrKind.DEAD
+        )
+    assert len(calls) == 1  # 三次 401 只探一次
 
 
 async def test_dead_probe_cache_expires(repo):
@@ -812,8 +997,7 @@ async def test_dead_probe_cache_expires(repo):
     from src.engine import executor as executor_module
 
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=100, total=4100, probed_at=1))
     calls: list[dict] = []
 
@@ -825,7 +1009,9 @@ async def test_dead_probe_cache_expires(repo):
     await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
     # 把缓存时刻拨到窗口之外（等价于「上一次复探已过 TTL」）
     executor._dead_quota_probes[cid] = (
-        time.monotonic() - executor_module.DEAD_QUOTA_PROBE_TTL_SECONDS - 1, False)
+        time.monotonic() - executor_module.DEAD_QUOTA_PROBE_TTL_SECONDS - 1,
+        False,
+    )
     await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
     assert len(calls) == 2
 
@@ -833,8 +1019,7 @@ async def test_dead_probe_cache_expires(repo):
 async def test_credit_if_exhausted_short_circuits_non_dead_and_known_exhaustion(repo):
     """非 DEAD 与「本地已探明耗尽」都不出网：复探只为补陈旧的额度证据。"""
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     calls: list[dict] = []
 
     async def probe(_data):
@@ -843,22 +1028,25 @@ async def test_credit_if_exhausted_short_circuits_non_dead_and_known_exhaustion(
 
     executor = _exec_with_stats(repo, [], None, probe=probe)
     # 非 DEAD：原样返回，连候选都不查（其它分类的冷却口径不受影响）
-    assert await executor._credit_if_exhausted(ErrKind.SOFT, cid,
-                                               "codebuddy") is ErrKind.SOFT
+    assert (
+        await executor._credit_if_exhausted(ErrKind.SOFT, cid, "codebuddy")
+        is ErrKind.SOFT
+    )
     assert await executor._credit_if_exhausted(None, cid, "codebuddy") is None
     assert calls == []
     # 本地已探明耗尽：直接降级，不再出网
     credentials.save_quota(cid, Quota(remaining=0, total=4100, probed_at=1))
-    assert await executor._credit_if_exhausted(ErrKind.DEAD, cid,
-                                               "codebuddy") is ErrKind.CREDIT
+    assert (
+        await executor._credit_if_exhausted(ErrKind.DEAD, cid, "codebuddy")
+        is ErrKind.CREDIT
+    )
     assert calls == []
 
 
 async def test_stream_dead_with_stale_quota_probes_and_records_rate_limit(repo):
     """流式同判据：证据陈旧时先复探，收尾行按复探结果记 rate_limit。"""
     credentials, _db = repo
-    cid = credentials.add(provider="codebuddy",
-                          credential_data={"bearer_token": "t"})
+    cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.save_quota(cid, Quota(remaining=51.37, total=4100, probed_at=1))
 
     async def probe(_data):
@@ -873,8 +1061,14 @@ async def test_stream_dead_with_stale_quota_probes_and_records_rate_limit(repo):
     executor = _exec_with_stats(repo, [[Dead()]], collector, probe=probe)
     from src.compat.openai.request import parse_chat_request
 
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
     assert chunks
     kinds = [event["error_type"] for event in collector.events]
     assert kinds == ["rate_limit"]
@@ -914,11 +1108,12 @@ async def test_soft_error_does_not_record_attribution_row(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
     kinds = [event["error_type"] for event in collector.events]
-    assert "upstream_error" not in kinds       # 尝试级不落行
+    assert "upstream_error" not in kinds  # 尝试级不落行
     # 收尾行按最后一次错误类型落：SOFT（限流）→ rate_limit
     assert kinds[-1] == "rate_limit"
 
@@ -934,7 +1129,7 @@ def test_error_detail_includes_exception_class_for_empty_message():
     class Blank(Exception):
         pass
 
-    assert _error_detail(Blank()) == "Blank"          # 空消息只给类名
+    assert _error_detail(Blank()) == "Blank"  # 空消息只给类名
     assert _error_detail(ValueError("boom")) == "ValueError: boom"
     assert _error_detail(None) == "-"
 
@@ -945,6 +1140,7 @@ def test_usage_field_tolerates_missing_usage():
     assert _usage_field(None, "input_tokens") is None
     assert _usage_field(Usage(5, 6, 7), "output_tokens") == 6
     assert _usage_field(Usage(), "credit") is None
+
 
 async def test_plan_error_records_rate_limit_error_type(repo):
     """权益耗尽 → 统计记为 rate_limit（受控错误类型白名单内）。"""
@@ -963,8 +1159,9 @@ async def test_plan_error_records_rate_limit_error_type(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "rate_limit"
     assert credentials.candidates()[0].cooling_until is not None
 
@@ -993,15 +1190,22 @@ async def test_blocked_error_records_model_not_found(repo):
     executor = _exec_with_stats(repo, [[Blocked()]], collector, max_rotate=1)
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True})):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+    ):
         pass
     kinds = [event["error_type"] for event in collector.events]
     assert "model_not_found" in kinds
     assert "invalid_request" not in kinds
     # 模型级负缓存照写（只锁这一个模型，不牵连整条凭证）
-    assert _db.connect().execute(
-        "SELECT COUNT(*) FROM credential_model_cooldowns").fetchone()[0] == 1
+    assert (
+        _db.connect()
+        .execute("SELECT COUNT(*) FROM credential_model_cooldowns")
+        .fetchone()[0]
+        == 1
+    )
 
 
 async def test_blocked_exhaustion_still_records_model_unavailable(repo):
@@ -1022,9 +1226,11 @@ async def test_blocked_exhaustion_still_records_model_unavailable(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "model_unavailable"
+
 
 async def test_context_overflow_exhaustion_records_context_overflow(repo):
     """上下文超限（11115 / ErrKind.CONTEXT）轮换耗尽 → 归因记 context_overflow。
@@ -1045,8 +1251,9 @@ async def test_context_overflow_exhaustion_records_context_overflow(repo):
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "context_overflow"
     # 零动作：不冷却凭证
     assert credentials.candidates()[0].cooling_until is None
@@ -1071,8 +1278,9 @@ async def test_capability_rejection_skips_provider_and_records_model_capability(
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(OpenAIInvalidRequest):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert [event["error_type"] for event in collector.events] == ["model_capability"]
     assert credentials.candidates()[0].cooling_until is None
 
@@ -1089,13 +1297,15 @@ async def test_transport_timeout_exhaustion_records_upstream_timeout(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     collector = RecordingCollector()
 
-    executor = _exec_with_stats(repo, [[httpx.ConnectTimeout("boom")]], collector,
-                                max_rotate=1)
+    executor = _exec_with_stats(
+        repo, [[httpx.ConnectTimeout("boom")]], collector, max_rotate=1
+    )
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "upstream_timeout"
 
 
@@ -1112,13 +1322,17 @@ async def test_dns_connect_error_records_network_error_and_does_not_cool(repo):
     collector = RecordingCollector()
 
     executor = _exec_with_stats(
-        repo, [[httpx.ConnectError("[Errno 8] nodename nor servname provided")]],
-        collector, max_rotate=1)
+        repo,
+        [[httpx.ConnectError("[Errno 8] nodename nor servname provided")]],
+        collector,
+        max_rotate=1,
+    )
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
     assert collector.events[-1]["error_type"] == "network_error"
     assert credentials.candidates()[0].cooling_until is None
 
@@ -1139,12 +1353,16 @@ async def test_stream_plan_error_records_failure(repo):
     executor = _exec_with_stats(repo, [[Plan()]], collector, max_rotate=1)
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="carol"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="carol",
+    ):
         pass
     assert collector.events[-1]["ok"] is False
     assert collector.events[-1]["username"] == "carol"
+
 
 async def test_stream_inline_request_error_records_real_type(repo):
     """流内业务错误（HTTP 200 内嵌 error 帧）要落**真实**类型而非 upstream_protocol。
@@ -1156,39 +1374,68 @@ async def test_stream_inline_request_error_records_real_type(repo):
     credentials, _db = repo
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     collector = RecordingCollector()
-    executor = _exec_with_stats(repo, [[
-        Event(kind=EventKind.ERROR, error_code=406,
-              error_message="The request model is not multimodal",
-              error_kind=ErrKind.REQUEST)]], collector, max_rotate=1)
+    executor = _exec_with_stats(
+        repo,
+        [
+            [
+                Event(
+                    kind=EventKind.ERROR,
+                    error_code=406,
+                    error_message="The request model is not multimodal",
+                    error_kind=ErrKind.REQUEST,
+                )
+            ]
+        ],
+        collector,
+        max_rotate=1,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
-    async for _ in executor.stream(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            username="dave"):
+    async for _ in executor.stream(
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ),
+        username="dave",
+    ):
         pass
     assert collector.events[-1]["error_type"] == "invalid_request"
     assert collector.events[-1]["error_type"] != "upstream_protocol"
     # 请求侧错误不是凭证的错：不冷却、不累计
     assert credentials.candidates()[0].cooling_until is None
 
+
 async def test_complete_inline_request_error_records_real_type(repo):
     """非流式路径同口径：`aggregate()` 抛出的流内错误也带真实分类。"""
     credentials, _db = repo
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     collector = RecordingCollector()
-    executor = _exec_with_stats(repo, [[
-        Event(kind=EventKind.ERROR, error_code=406,
-              error_message="The request model is not multimodal",
-              error_kind=ErrKind.REQUEST)]], collector, max_rotate=1)
+    executor = _exec_with_stats(
+        repo,
+        [
+            [
+                Event(
+                    kind=EventKind.ERROR,
+                    error_code=406,
+                    error_message="The request model is not multimodal",
+                    error_kind=ErrKind.REQUEST,
+                )
+            ]
+        ],
+        collector,
+        max_rotate=1,
+    )
 
     from src.compat.openai.request import parse_chat_request
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}), username="erin")
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]}),
+            username="erin",
+        )
     assert collector.events[-1]["error_type"] == "invalid_request"
     assert credentials.candidates()[0].cooling_until is None
+
 
 async def test_restricted_11140_cools_account_and_skips_channel(repo):
     """403/11140（账号被上游限制）：2h 账号级冷却 + 跳过该渠道，不换号去撞。
@@ -1208,8 +1455,10 @@ async def test_restricted_11140_cools_account_and_skips_channel(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "u"})
     collector = RecordingCollector()
-    body = (b'{"code":11140,"msg":"request illegal",'
-            b'"displayMsg":{"en":"Your account has been restricted due to unusual activity"}}')
+    body = (
+        b'{"code":11140,"msg":"request illegal",'
+        b'"displayMsg":{"en":"Your account has been restricted due to unusual activity"}}'
+    )
 
     class Restricted:
         id = "codebuddy"
@@ -1223,25 +1472,38 @@ async def test_restricted_11140_cools_account_and_skips_channel(repo):
         def disabled_reason(self, raw: bytes) -> str:
             return cb_events.disabled_reason(raw)
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": Restricted()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=collector))
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": Restricted()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=collector,
+        )
+    )
 
     started = int(time.time())
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
-    assert Restricted.calls == 1            # 同渠道其余号没有被拿去撞
+    assert Restricted.calls == 1  # 同渠道其余号没有被拿去撞
     assert [event["error_type"] for event in collector.events] == ["account_restricted"]
-    rows = db.connect().execute(
-        "SELECT disabled, cooling_until FROM credentials").fetchall()
-    assert all(row["disabled"] == 0 for row in rows)     # 不禁用，等上游解除
+    rows = (
+        db.connect()
+        .execute("SELECT disabled, cooling_until FROM credentials")
+        .fetchall()
+    )
+    assert all(row["disabled"] == 0 for row in rows)  # 不禁用，等上游解除
     cooled = [row["cooling_until"] for row in rows if row["cooling_until"] is not None]
     # 第一次命中只冷却触发的那个号（渠道级暂停要窗口内第二次命中才升级）
     assert len(cooled) == 1
-    assert started + RESTRICTED_COOLDOWN_SECONDS - 60 <= cooled[0] \
+    assert (
+        started + RESTRICTED_COOLDOWN_SECONDS - 60
+        <= cooled[0]
         <= started + RESTRICTED_COOLDOWN_SECONDS + 60
+    )
 
 
 async def test_restricted_burst_pauses_whole_provider(repo):
@@ -1268,25 +1530,33 @@ async def test_restricted_burst_pauses_whole_provider(repo):
             raise UpstreamHTTPError(403, b'{"code":11140}')
             yield  # pragma: no cover - 抛错后的不可达分支，只为保持异步生成器形态
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": Restricted()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=RecordingCollector()))
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": Restricted()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=RecordingCollector(),
+        )
+    )
     request = {"messages": [{"role": "user", "content": "hi"}]}
 
     started = int(time.time())
     with pytest.raises(NoHealthyCredential):
         await executor.complete(parse_chat_request(request))
-    assert Restricted.calls == 1            # 第一次：只冷却触发的号
+    assert Restricted.calls == 1  # 第一次：只冷却触发的号
     with pytest.raises(NoHealthyCredential):
         await executor.complete(parse_chat_request(request))
-    assert Restricted.calls == 2            # 第二次命中另一个号 → 触发升级
+    assert Restricted.calls == 2  # 第二次命中另一个号 → 触发升级
 
-    rows = db.connect().execute(
-        "SELECT cooling_until FROM credentials").fetchall()
+    rows = db.connect().execute("SELECT cooling_until FROM credentials").fetchall()
     assert all(row["cooling_until"] is not None for row in rows)
     for row in rows:
-        assert started + RESTRICTED_PROVIDER_PAUSE_SECONDS - 60 \
-            <= row["cooling_until"] <= started + RESTRICTED_PROVIDER_PAUSE_SECONDS + 60
+        assert (
+            started + RESTRICTED_PROVIDER_PAUSE_SECONDS - 60
+            <= row["cooling_until"]
+            <= started + RESTRICTED_PROVIDER_PAUSE_SECONDS + 60
+        )
 
 
 async def test_dead_unrecognised_403_keeps_session_dead(repo):
@@ -1310,17 +1580,28 @@ async def test_dead_unrecognised_403_keeps_session_dead(repo):
         def disabled_reason(self, raw: bytes) -> str:
             return cb_events.disabled_reason(raw)
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": PlainDenied()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=RecordingCollector()))
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": PlainDenied()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=RecordingCollector(),
+        )
+    )
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
-    row = db.connect().execute(
-        "SELECT disabled_reason FROM credentials WHERE id = ?", (cid,)).fetchone()
+    row = (
+        db.connect()
+        .execute("SELECT disabled_reason FROM credentials WHERE id = ?", (cid,))
+        .fetchone()
+    )
     assert row["disabled_reason"] == "session dead"
+
 
 async def test_dead_http_error_without_provider_hint_keeps_session_dead(repo):
     """provider 没实现 disabled_reason 时：即使 HTTP 有 body 也回落默认文案。"""
@@ -1330,16 +1611,23 @@ async def test_dead_http_error_without_provider_hint_keeps_session_dead(repo):
     credentials, db = repo
     cid = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     executor = _exec_with_stats(
-        repo, [[UpstreamHTTPError(403, b'{"code":403,"msg":"forbidden"}')]],
-        RecordingCollector())
+        repo,
+        [[UpstreamHTTPError(403, b'{"code":403,"msg":"forbidden"}')]],
+        RecordingCollector(),
+    )
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
-    row = db.connect().execute(
-        "SELECT disabled_reason FROM credentials WHERE id = ?", (cid,)).fetchone()
+    row = (
+        db.connect()
+        .execute("SELECT disabled_reason FROM credentials WHERE id = ?", (cid,))
+        .fetchone()
+    )
     assert row["disabled_reason"] == "session dead"
+
 
 async def test_stream_inband_restricted_skips_channel(repo):
     """流内 error 事件标了 RESTRICTED：同样跳过该渠道，不逐个号撞。"""
@@ -1351,8 +1639,12 @@ async def test_stream_inband_restricted_skips_channel(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "u"})
     collector = RecordingCollector()
-    restricted = Event(kind=EventKind.ERROR, error_kind=ErrKind.RESTRICTED,
-                       error_code=11140, error_message="request illegal")
+    restricted = Event(
+        kind=EventKind.ERROR,
+        error_kind=ErrKind.RESTRICTED,
+        error_code=11140,
+        error_message="request illegal",
+    )
 
     class Inband:
         id = "codebuddy"
@@ -1362,14 +1654,26 @@ async def test_stream_inband_restricted_skips_channel(repo):
             Inband.calls += 1
             yield restricted
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": Inband()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=collector))
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": Inband()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=collector,
+        )
+    )
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
 
-    assert chunks                     # 以错误帧收尾，不是静默断开
-    assert Inband.calls == 1          # 同渠道第二个号没有被拿去撞
+    assert chunks  # 以错误帧收尾，不是静默断开
+    assert Inband.calls == 1  # 同渠道第二个号没有被拿去撞
     assert [event["error_type"] for event in collector.events] == ["account_restricted"]
 
 
@@ -1394,11 +1698,23 @@ async def test_stream_http_restricted_skips_channel(repo):
             raise UpstreamHTTPError(403, b'{"code":11140}')
             yield  # pragma: no cover - 抛错后的不可达分支，只为保持异步生成器形态
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": HttpRestricted()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=collector))
-    chunks = [chunk async for chunk in executor.stream(parse_chat_request(
-        {"messages": [{"role": "user", "content": "hi"}], "stream": True}))]
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": HttpRestricted()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=collector,
+        )
+    )
+    chunks = [
+        chunk
+        async for chunk in executor.stream(
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+            )
+        )
+    ]
 
     assert chunks
     assert HttpRestricted.calls == 1
@@ -1415,8 +1731,12 @@ async def test_complete_inband_restricted_skips_channel(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "u"})
     collector = RecordingCollector()
-    restricted = Event(kind=EventKind.ERROR, error_kind=ErrKind.RESTRICTED,
-                       error_code=11140, error_message="request illegal")
+    restricted = Event(
+        kind=EventKind.ERROR,
+        error_kind=ErrKind.RESTRICTED,
+        error_code=11140,
+        error_message="request illegal",
+    )
 
     class Inband:
         id = "codebuddy"
@@ -1426,13 +1746,20 @@ async def test_complete_inband_restricted_skips_channel(repo):
             Inband.calls += 1
             yield restricted
 
-    executor = Executor(ExecutorDeps(
-        providers={"codebuddy": Inband()}, credentials=credentials,
-        scheduler=Scheduler(), default_model="glm-5.2", stats=collector))
+    executor = Executor(
+        ExecutorDeps(
+            providers={"codebuddy": Inband()},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=collector,
+        )
+    )
 
     with pytest.raises(NoHealthyCredential):
-        await executor.complete(parse_chat_request(
-            {"messages": [{"role": "user", "content": "hi"}]}))
+        await executor.complete(
+            parse_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+        )
 
     assert Inband.calls == 1
     # 尝试行已归因，收尾行不再重复落（否则 requests 与 Key 日额度双计）
@@ -1451,14 +1778,24 @@ def test_restricted_summary_never_echoes_upstream_body():
     class NoCode(Exception):
         pass
 
-    assert _restricted_summary(Event(kind=EventKind.ERROR, error_code=11140,
-                                      error_message="secret user text")) == "code=11140"
-    assert _restricted_summary(UpstreamHTTPError(403, b'{"code":11140}')) == "status=403"
+    assert (
+        _restricted_summary(
+            Event(
+                kind=EventKind.ERROR, error_code=11140, error_message="secret user text"
+            )
+        )
+        == "code=11140"
+    )
+    assert (
+        _restricted_summary(UpstreamHTTPError(403, b'{"code":11140}')) == "status=403"
+    )
     assert _restricted_summary(NoCode("secret")) == "kind=NoCode"
     # UpstreamStreamError 经 `.event` 取码（不是把异常描述打进日志）
     from src.compat.openai.errors import UpstreamStreamError
-    wrapped = UpstreamStreamError(Event(kind=EventKind.ERROR, error_code=11140,
-                                        error_message="secret user text"))
+
+    wrapped = UpstreamStreamError(
+        Event(kind=EventKind.ERROR, error_code=11140, error_message="secret user text")
+    )
     assert _restricted_summary(wrapped) == "code=11140"
 
 
@@ -1479,30 +1816,41 @@ def test_restricted_burst_needs_two_distinct_credentials(repo):
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
     credentials.add(provider="codebuddy", credential_data={"bearer_token": "u"})
 
-    executor = Executor(ExecutorDeps(
-        providers={}, credentials=credentials, scheduler=Scheduler(),
-        default_model="glm-5.2", stats=RecordingCollector()))
+    executor = Executor(
+        ExecutorDeps(
+            providers={},
+            credentials=credentials,
+            scheduler=Scheduler(),
+            default_model="glm-5.2",
+            stats=RecordingCollector(),
+        )
+    )
 
     def cooled():
-        rows = db.connect().execute(
-            "SELECT cooling_until FROM credentials").fetchall()
+        rows = db.connect().execute("SELECT cooling_until FROM credentials").fetchall()
         return any(row["cooling_until"] is not None for row in rows)
 
     now = int(time.time())
-    executor._pause_provider_on_burst("codebuddy", "c1")   # noqa: SLF001
-    executor._pause_provider_on_burst("codebuddy", "c1")   # noqa: SLF001
-    assert not cooled()                                    # 同号两次不升级
+    executor._pause_provider_on_burst("codebuddy", "c1")  # noqa: SLF001
+    executor._pause_provider_on_burst("codebuddy", "c1")  # noqa: SLF001
+    assert not cooled()  # 同号两次不升级
 
     # 窗口过期：上一轮的凭证集合清零，同号再来一次也不升级
-    executor._restricted_hits["codebuddy"] = (            # noqa: SLF001
-        now - RESTRICTED_BURST_WINDOW_SECONDS - 1, {"c1"})
-    executor._pause_provider_on_burst("codebuddy", "c1")   # noqa: SLF001
+    executor._restricted_hits["codebuddy"] = (  # noqa: SLF001
+        now - RESTRICTED_BURST_WINDOW_SECONDS - 1,
+        {"c1"},
+    )
+    executor._pause_provider_on_burst("codebuddy", "c1")  # noqa: SLF001
     assert not cooled()
 
     # 第二个**不同**凭证在窗口内中招 → 整渠道暂停，但不禁用
-    executor._pause_provider_on_burst("codebuddy", "c2")   # noqa: SLF001
-    rows = db.connect().execute(
-        "SELECT disabled, cooling_until FROM credentials").fetchall()
-    assert all(row["disabled"] == 0 for row in rows)       # 只冷却，不禁用
-    assert all(now + 3600 <= row["cooling_until"] <= now + 24 * 3600 + 60
-               for row in rows)
+    executor._pause_provider_on_burst("codebuddy", "c2")  # noqa: SLF001
+    rows = (
+        db.connect()
+        .execute("SELECT disabled, cooling_until FROM credentials")
+        .fetchall()
+    )
+    assert all(row["disabled"] == 0 for row in rows)  # 只冷却，不禁用
+    assert all(
+        now + 3600 <= row["cooling_until"] <= now + 24 * 3600 + 60 for row in rows
+    )

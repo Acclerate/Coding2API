@@ -34,11 +34,11 @@ def keys(tmp_path):
     db.close()
 
 
-
 def _create_key(client, **payload) -> dict:
     response = client.post("/api/api-keys", json={"name": "t", **payload})
     assert response.status_code == 200, response.text
     return response.json()
+
 
 class _Provider:
     def __init__(self, provider_id: str) -> None:
@@ -50,6 +50,7 @@ class _Provider:
         for event in GOOD:
             yield event
 
+
 @pytest.fixture()
 def dual(tmp_path):
     db = Database(tmp_path / "dual.sqlite3")
@@ -60,25 +61,41 @@ def dual(tmp_path):
     yield repo
     db.close()
 
+
 def _executor(repo, aliases):
     assert repo is not None
     cb, trae = _Provider("codebuddy"), _Provider("trae")
-    return (Executor(ExecutorDeps(providers={"codebuddy": cb, "trae": trae},
-                                  credentials=repo, scheduler=Scheduler(),
-                                  default_model="glm-5.2", model_aliases=aliases)),
-            cb, trae)
+    return (
+        Executor(
+            ExecutorDeps(
+                providers={"codebuddy": cb, "trae": trae},
+                credentials=repo,
+                scheduler=Scheduler(),
+                default_model="glm-5.2",
+                model_aliases=aliases,
+            )
+        ),
+        cb,
+        trae,
+    )
+
 
 def _chat(model="glm-5.2"):
     from src.compat.openai.request import parse_chat_request
 
-    return parse_chat_request({"model": model,
-                               "messages": [{"role": "user", "content": "hi"}]})
+    return parse_chat_request(
+        {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+    )
+
 
 def test_split_entries_trims_and_drops_blanks():
     assert split_entries(None) == []
     assert split_entries("") == []
     assert split_entries(" 10.0.0.1 , , 192.168.1.0/24 ") == [
-        "10.0.0.1", "192.168.1.0/24"]
+        "10.0.0.1",
+        "192.168.1.0/24",
+    ]
+
 
 def test_normalize_allowed_ips_canonicalizes_and_dedupes():
     assert normalize_allowed_ips("10.0.0.1") == "10.0.0.1/32"
@@ -86,27 +103,34 @@ def test_normalize_allowed_ips_canonicalizes_and_dedupes():
     assert normalize_allowed_ips(" 192.168.1.5/24 ") == "192.168.1.0/24"
     assert normalize_allowed_ips("") == ""
 
+
 def test_normalize_allowed_ips_rejects_garbage():
     with pytest.raises(ValueError, match="非法 IP/CIDR"):
         normalize_allowed_ips("not-an-ip")
+
 
 def test_normalize_allowed_ips_enforces_entry_cap():
     many = ",".join(f"10.0.{i}.0/24" for i in range(MAX_IP_ENTRIES + 1))
     with pytest.raises(ValueError, match="最多"):
         normalize_allowed_ips(many)
     # 恰好在上限内可以通过
-    assert normalize_allowed_ips(
-        ",".join(f"10.0.{i}.0/24" for i in range(MAX_IP_ENTRIES))) != ""
+    assert (
+        normalize_allowed_ips(",".join(f"10.0.{i}.0/24" for i in range(MAX_IP_ENTRIES)))
+        != ""
+    )
+
 
 def test_ip_allowed_empty_means_unrestricted():
     assert ip_allowed("1.2.3.4", "") is True
     assert ip_allowed("1.2.3.4", None) is True
+
 
 def test_ip_allowed_matches_single_and_network():
     assert ip_allowed("10.0.0.1", "10.0.0.1/32") is True
     assert ip_allowed("10.0.0.2", "10.0.0.1/32") is False
     assert ip_allowed("10.1.2.3", "10.0.0.0/8") is True
     assert ip_allowed("2001:db8::1", "2001:db8::/32") is True
+
 
 def test_ip_allowed_rejects_when_ip_or_entry_unusable():
     # 拿不到对端地址 → 拒绝（不能默认放行）
@@ -117,8 +141,10 @@ def test_ip_allowed_rejects_when_ip_or_entry_unusable():
     # 整份白名单不可解析 → 拒绝（fail closed，不因脏数据敞开）
     assert ip_allowed("10.0.0.1", "garbage") is False
 
+
 def test_ip_allowed_never_crosses_address_families():
     assert ip_allowed("::1", "10.0.0.0/8") is False
+
 
 def test_client_ip_ignores_xff_unless_trusted():
     assert client_ip("10.0.0.9", "1.2.3.4", trust_proxy=False) == "10.0.0.9"
@@ -128,10 +154,12 @@ def test_client_ip_ignores_xff_unless_trusted():
     # 开了但头是空的 → 回落对端
     assert client_ip("127.0.0.1", " , ", trust_proxy=True) == "127.0.0.1"
 
+
 def test_normalize_allowed_models_trims_and_dedupes():
     assert normalize_allowed_models(None) == ""
     assert normalize_allowed_models("") == ""
     assert normalize_allowed_models(" glm-* , kimi-k3 , GLM-* ") == "glm-*,kimi-k3"
+
 
 def test_normalize_allowed_models_rejects_overlong_and_too_many():
     with pytest.raises(ValueError, match="过长"):
@@ -141,9 +169,11 @@ def test_normalize_allowed_models_rejects_overlong_and_too_many():
         normalize_allowed_models(many)
     assert normalize_allowed_models(",".join(f"m{i}" for i in range(128))) != ""
 
+
 def test_model_allowed_empty_means_unrestricted():
     assert model_allowed("glm-5.2", "") is True
     assert model_allowed("glm-5.2", None) is True
+
 
 def test_model_allowed_matches_glob_case_insensitively():
     assert model_allowed("glm-5.2", "glm-*") is True
@@ -151,10 +181,25 @@ def test_model_allowed_matches_glob_case_insensitively():
     assert model_allowed("kimi-k3", "glm-*") is False
     assert model_allowed("kimi-k3", "glm-*,kimi-k3") is True
 
+
 def test_model_allowed_handles_provider_suffix_and_default_model():
     # @provider 后缀不参与匹配，但整体写法也允许被 glob 命中
     assert model_allowed("glm-5.2@trae", "glm-5.2") is True
     assert model_allowed("glm-5.2@trae", "glm-*") is True
+
+
+def test_model_allowed_matches_channel_suffixed_id_by_bare_pattern():
+    """fork：对外 id 的 `-{渠道}` 后缀剥离后可被裸名模式命中。
+
+    `kimi-k3-qoder` 该被模式 `kimi-k3` 命中（与 /v1/models 过滤展示、请求侧
+    放行三处同口径）；无渠道后缀的名字不受剥取影响，不误放行。
+    """
+    assert model_allowed("kimi-k3-qoder", "kimi-k3") is True
+    assert model_allowed("kimi-k3-qoder", "kimi-k3-*") is True
+    # 整体写法（不剥后缀）也保留为候选
+    assert model_allowed("kimi-k3-qoder", "kimi-k3-qoder") is True
+    # 剥出的主体与模式都对不上 → 拒绝
+    assert model_allowed("qwen4-max", "kimi-k3") is False
     # 省略模型名（空 / auto）时用默认模型判定，不能借空名绕过
     assert model_allowed("", "glm-*", default_model="glm-5.2") is True
     assert model_allowed("auto", "glm-*", default_model="kimi-k3") is False
@@ -162,25 +207,37 @@ def test_model_allowed_handles_provider_suffix_and_default_model():
     assert model_allowed("", "glm-*", default_model="") is False
     assert model_allowed("auto", "glm-*") is False
 
+
 def test_repository_round_trips_policy_columns(keys):
-    created = keys.create("alice", "laptop", provider_binding="trae",
-                          allowed_ips="10.0.0.0/8",
-                          allowed_models="glm-*", expires_at=4_100_000_000)
+    created = keys.create(
+        "alice",
+        "laptop",
+        provider_binding="trae",
+        allowed_ips="10.0.0.0/8",
+        allowed_models="glm-*",
+        expires_at=4_100_000_000,
+    )
     assert created["provider_binding"] == "trae"
     assert created["allowed_ips"] == "10.0.0.0/8"
     assert created["allowed_models"] == "glm-*"
     assert created["expires_at"] == 4_100_000_000
 
     row = keys.authenticate(created["api_key"])
-    assert row == {"id": created["id"], "username": "alice",
-                   "provider_binding": "trae", "allowed_ips": "10.0.0.0/8",
-                   "allowed_models": "glm-*", "expires_at": 4_100_000_000,
-                   "quota": ""}
+    assert row == {
+        "id": created["id"],
+        "username": "alice",
+        "provider_binding": "trae",
+        "allowed_ips": "10.0.0.0/8",
+        "allowed_models": "glm-*",
+        "expires_at": 4_100_000_000,
+        "quota": "",
+    }
     listed = keys.list_for("alice")[0]
     assert listed["provider_binding"] == "trae"
     assert listed["allowed_ips"] == "10.0.0.0/8"
     assert listed["allowed_models"] == "glm-*"
     assert listed["expires_at"] == 4_100_000_000
+
 
 def test_repository_defaults_to_unrestricted(keys):
     created = keys.create("alice")
@@ -192,18 +249,24 @@ def test_repository_defaults_to_unrestricted(keys):
     assert keys.authenticate("sk-nope") is None
     assert keys.verify("sk-nope") is None
 
+
 def test_authenticate_throttles_last_used_writes(keys):
     """last_used_at 写库节流到分钟级：热路径不每请求写一次（LOW）。"""
     created = keys.create("alice", now=1_000_000)
     db = keys._db  # noqa: SLF001
-    assert db.connect().execute(
-        "SELECT last_used_at FROM api_keys WHERE id = ?",
-        (created["id"],)).fetchone()["last_used_at"] is None
+    assert (
+        db.connect()
+        .execute("SELECT last_used_at FROM api_keys WHERE id = ?", (created["id"],))
+        .fetchone()["last_used_at"]
+        is None
+    )
 
     def last_used() -> int | None:
-        return db.connect().execute(
-            "SELECT last_used_at FROM api_keys WHERE id = ?",
-            (created["id"],)).fetchone()["last_used_at"]
+        return (
+            db.connect()
+            .execute("SELECT last_used_at FROM api_keys WHERE id = ?", (created["id"],))
+            .fetchone()["last_used_at"]
+        )
 
     # 首次鉴权写入（旧值为 NULL）
     keys.authenticate(created["api_key"])
@@ -213,25 +276,36 @@ def test_authenticate_throttles_last_used_writes(keys):
     assert keys.authenticate(created["api_key"]) is not None
     assert last_used() == first
     # 超过窗口（把旧值改成很早）→ 重新写入
-    db.connect().execute("UPDATE api_keys SET last_used_at = 0 WHERE id = ?",
-                         (created["id"],))
+    db.connect().execute(
+        "UPDATE api_keys SET last_used_at = 0 WHERE id = ?", (created["id"],)
+    )
     db.connect().commit()
     keys.authenticate(created["api_key"])
     assert last_used() not in (0, None)
 
+
 def test_create_key_rejects_unknown_binding(client):
-    response = client.post("/api/api-keys", json={"name": "t", "provider_binding": "ghost"})
+    response = client.post(
+        "/api/api-keys", json={"name": "t", "provider_binding": "ghost"}
+    )
     assert response.status_code == 400
     assert "provider_binding" in response.json()["error"]["message"]
+
 
 def test_create_key_rejects_bad_allowed_ips(client):
     response = client.post("/api/api-keys", json={"name": "t", "allowed_ips": "nope"})
     assert response.status_code == 400
     assert "非法 IP/CIDR" in response.json()["error"]["message"]
 
+
 def test_create_key_normalizes_and_lists_policy(client):
-    created = _create_key(client, provider_binding=" TRAE ", allowed_ips="10.0.0.1",
-                          allowed_models=" glm-* , kimi-k3 ", expires_at=4102444800)
+    created = _create_key(
+        client,
+        provider_binding=" TRAE ",
+        allowed_ips="10.0.0.1",
+        allowed_models=" glm-* , kimi-k3 ",
+        expires_at=4102444800,
+    )
     assert created["provider_binding"] == "trae"
     assert created["allowed_ips"] == "10.0.0.1/32"
     assert created["allowed_models"] == "glm-*,kimi-k3"
@@ -242,11 +316,14 @@ def test_create_key_normalizes_and_lists_policy(client):
     assert listed["allowed_models"] == "glm-*,kimi-k3"
     assert listed["expires_at"] == 4102444800
 
+
 def test_create_key_rejects_bad_allowed_models(client):
-    response = client.post("/api/api-keys", json={"name": "t",
-                                                  "allowed_models": "x" * 200})
+    response = client.post(
+        "/api/api-keys", json={"name": "t", "allowed_models": "x" * 200}
+    )
     assert response.status_code == 400
     assert "过长" in response.json()["error"]["message"]
+
 
 def test_create_key_rejects_bad_expires_at(client):
     for bad in ("soon", 0, -5, True):
@@ -254,23 +331,29 @@ def test_create_key_rejects_bad_expires_at(client):
         assert response.status_code == 400, bad
         assert "expires_at" in response.json()["error"]["message"]
 
+
 def test_create_key_accepts_float_and_empty_expiry(client):
     created = _create_key(client, expires_at=4102444800.9)
     assert created["expires_at"] == 4102444800
     assert _create_key(client, name="forever", expires_at="")["expires_at"] is None
 
+
 def test_model_allowlist_blocks_chat_and_responses(client):
     key = _create_key(client, allowed_models="glm-*")["api_key"]
     headers = {"Authorization": f"Bearer {key}"}
-    chat = client.post("/v1/chat/completions", headers=headers,
-                       json={"model": "kimi-k3", "messages": [{"role": "user",
-                                                               "content": "hi"}]})
+    chat = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={"model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert chat.status_code == 400
     assert "not allowed" in chat.json()["error"]["message"]
-    responses = client.post("/v1/responses", headers=headers,
-                            json={"model": "kimi-k3", "input": "hi"})
+    responses = client.post(
+        "/v1/responses", headers=headers, json={"model": "kimi-k3", "input": "hi"}
+    )
     assert responses.status_code == 400
     assert "not allowed" in responses.json()["error"]["message"]
+
 
 def test_user_model_policy_bounds_chat_and_model_list(client):
     """管理员按人设的白名单在 /v1 也生效：自签空白名单的 Key 不能越权。
@@ -280,12 +363,14 @@ def test_user_model_policy_bounds_chat_and_model_list(client):
     """
     services = client.app.state.services
     services.user_repo.set_policy("root", allowed_models="glm-*", quota="")
-    key = _create_key(client)["api_key"]            # Key 自己不设白名单
+    key = _create_key(client)["api_key"]  # Key 自己不设白名单
     headers = {"Authorization": f"Bearer {key}"}
 
-    chat = client.post("/v1/chat/completions", headers=headers,
-                       json={"model": "kimi-k3", "messages": [{"role": "user",
-                                                               "content": "hi"}]})
+    chat = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={"model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert chat.status_code == 400
     assert chat.json()["error"]["message"].endswith("not allowed for this user")
 
@@ -308,22 +393,27 @@ def test_expired_key_is_rejected(client):
     # 统一鉴权失败文案（不泄露「Key 存在但已过期」这类可枚举信息）
     assert response.json()["error"]["code"] == "invalid_api_key"
 
+
 def test_key_expired_helper_boundaries():
     from src.auth.api_key import key_expired
 
     assert key_expired(None) is False
     assert key_expired(0) is False
     assert key_expired(100, now=99) is False
-    assert key_expired(100, now=100) is True      # 到期时刻本身算过期
+    assert key_expired(100, now=100) is True  # 到期时刻本身算过期
     assert key_expired(100, now=101) is True
     # 不传 now 时用当前时间（取一个远过去的到期点必然过期）
     assert key_expired(1) is True
+
 
 def test_allowed_ips_blocks_foreign_source(client):
     key = _create_key(client, allowed_ips="10.0.0.1/32")["api_key"]
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert response.status_code == 403
-    assert response.json()["error"]["message"] == "source ip not allowed for this api key"
+    assert (
+        response.json()["error"]["message"] == "source ip not allowed for this api key"
+    )
+
 
 def test_allowed_ips_allows_matching_source(client):
     # TestClient 的对端是 "testclient"（非 IP）→ 用不加限制的 Key 才通得过；
@@ -332,30 +422,42 @@ def test_allowed_ips_allows_matching_source(client):
     response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert response.status_code == 200
 
+
 def test_trust_proxy_honors_forwarded_for(tmp_path):
     """TRUST_PROXY 开启时按 XFF 末条判定；关闭时忽略该头。"""
     settings = _settings(tmp_path, TRUST_PROXY=True)
     app = build_app(settings)
     key = app.state.api_keys.create("root", allowed_ips="203.0.113.0/24")["api_key"]
     with TestClient(app) as http:
-        ok = http.get("/v1/models", headers={
-            "Authorization": f"Bearer {key}",
-            "X-Forwarded-For": "1.2.3.4, 203.0.113.9"})
+        ok = http.get(
+            "/v1/models",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "X-Forwarded-For": "1.2.3.4, 203.0.113.9",
+            },
+        )
         assert ok.status_code == 200
-        blocked = http.get("/v1/models", headers={
-            "Authorization": f"Bearer {key}",
-            "X-Forwarded-For": "1.2.3.4"})
+        blocked = http.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {key}", "X-Forwarded-For": "1.2.3.4"},
+        )
         assert blocked.status_code == 403
+
 
 def test_forwarded_for_ignored_without_trust_proxy(tmp_path):
     app = build_app(_settings(tmp_path, TRUST_PROXY=False))
     key = app.state.api_keys.create("root", allowed_ips="203.0.113.0/24")["api_key"]
     with TestClient(app) as http:
         # XFF 说自己在白名单内，但默认不采信 → 403
-        response = http.get("/v1/models", headers={
-            "Authorization": f"Bearer {key}",
-            "X-Forwarded-For": "203.0.113.9"})
+        response = http.get(
+            "/v1/models",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "X-Forwarded-For": "203.0.113.9",
+            },
+        )
     assert response.status_code == 403
+
 
 def test_build_app_rejects_enforced_empty_trusted_proxies(tmp_path):
     """REQUIRE_TRUSTED_PROXIES=true + TRUST_PROXY=true + 空名单 → 启动期硬拒。
@@ -368,18 +470,22 @@ def test_build_app_rejects_enforced_empty_trusted_proxies(tmp_path):
     assert "修正 .env 后重启" in str(caught.value)
     assert not (tmp_path / "coding2api.sqlite3").exists()
 
+
 def test_build_app_tolerates_empty_trusted_proxies_by_default(tmp_path):
     """默认未强制：同样「可疑」的配置照常构建——升级不打断存量部署是硬要求。"""
     app = build_app(_settings(tmp_path, TRUST_PROXY=True))
     assert app.state.settings.require_trusted_proxies is False
 
+
 async def test_binding_narrows_to_bound_provider(dual):
     """绑定 TRAE：只打 TRAE，即使 CB 排序更优。"""
-    executor, cb, trae = _executor(dual, {"codebuddy": {"glm-5.2": "glm-5.2"},
-                                          "trae": {"glm-5.2": "glm-5.2"}})
+    executor, cb, trae = _executor(
+        dual, {"codebuddy": {"glm-5.2": "glm-5.2"}, "trae": {"glm-5.2": "glm-5.2"}}
+    )
     result = await executor.complete(_chat(), username="u", provider_binding="trae")
     assert result["choices"][0]["message"]["content"] == "ok"
     assert (trae.calls, cb.calls) == (1, 0)
+
 
 async def test_binding_rejects_model_owned_by_other_provider(dual):
     """模型目录证明该模型只属于 CB，但 Key 绑定 TRAE → 400，零上游调用。"""
@@ -390,6 +496,7 @@ async def test_binding_rejects_model_owned_by_other_provider(dual):
         await executor.complete(_chat("cb-only"), username="u", provider_binding="trae")
     assert "not available on provider 'trae'" in str(exc_info.value)
     assert (cb.calls, trae.calls) == (0, 0)
+
 
 async def test_binding_conflicts_with_forced_provider(dual):
     """@codebuddy 与绑定 trae 冲突 → 400（明确意图冲突，不静默改道）。
@@ -405,19 +512,25 @@ async def test_binding_conflicts_with_forced_provider(dual):
     assert "restricted to 'trae'" in str(exc_info.value)
     assert (cb.calls, trae.calls) == (0, 0)
 
+
 async def test_binding_defers_when_catalog_not_ready(dual):
     """目录未就绪（空映射）→ 不做归属判断，按绑定渠道直接放行。"""
     executor, cb, trae = _executor(dual, {})
-    result = await executor.complete(_chat("whatever"), username="u",
-                                     provider_binding="codebuddy")
+    result = await executor.complete(
+        _chat("whatever"), username="u", provider_binding="codebuddy"
+    )
     assert result["choices"][0]["message"]["content"] == "ok"
     assert (cb.calls, trae.calls) == (1, 0)
+
 
 async def test_binding_keeps_forced_target_when_consistent(dual):
     """@trae 与绑定 trae 一致 → 正常执行（forced 分支的放行支）。"""
     executor, cb, trae = _executor(dual, {})
-    await executor.complete(_chat("glm-5.2@trae"), username="u", provider_binding="trae")
+    await executor.complete(
+        _chat("glm-5.2@trae"), username="u", provider_binding="trae"
+    )
     assert (trae.calls, cb.calls) == (1, 0)
+
 
 async def test_preflight_applies_binding(dual):
     """流式前置校验同样生效：不能等 200 响应头发出后才报 400。"""
@@ -427,21 +540,27 @@ async def test_preflight_applies_binding(dual):
     with pytest.raises(InvalidRequest):
         executor.preflight(_chat("cb-only"), provider_binding="trae")
 
+
 def test_http_binding_end_to_end(tmp_path):
     """走完整 HTTP：绑定 Key 请求属别家渠道的模型 → 400 且提示绑定渠道。"""
     app = build_app(_settings(tmp_path), providers={"trae": _Provider("trae")})
     key = app.state.api_keys.create("root", provider_binding="trae")["api_key"]
     # `@codebuddy` 与绑定 trae 冲突：不经模型目录即可判定
     with TestClient(app) as http:
-        response = http.post("/v1/chat/completions",
-                             headers={"Authorization": f"Bearer {key}"},
-                             json={"model": "glm-5.2@codebuddy",
-                                   "messages": [{"role": "user", "content": "hi"}]})
+        response = http.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "glm-5.2@codebuddy",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
     assert response.status_code == 400
     assert "restricted to 'trae'" in response.json()["error"]["message"]
     # 展示面：列表把策略一并下发
     listed = app.state.api_keys.list_for("root")[0]
     assert listed["provider_binding"] == "trae"
+
 
 def test_http_binding_rejects_foreign_model_via_catalog(tmp_path):
     """目录证明模型归属别家渠道时 400，文案给出实际归属。
@@ -458,15 +577,21 @@ def test_http_binding_rejects_foreign_model_via_catalog(tmp_path):
         ex.preflight(_chat("cb-only"), "trae")
     assert "not available on provider 'trae'" in str(exc_info.value)
 
+
 def test_http_binding_stream_preflight(tmp_path):
     """流式：绑定冲突必须在 200 SSE 头之前以 400 拒绝。"""
     app = build_app(_settings(tmp_path), providers={"trae": _Provider("trae")})
     key = app.state.api_keys.create("root", provider_binding="trae")["api_key"]
     with TestClient(app) as http:
-        response = http.post("/v1/chat/completions",
-                             headers={"Authorization": f"Bearer {key}"},
-                             json={"model": "glm-5.2@codebuddy", "stream": True,
-                                   "messages": [{"role": "user", "content": "hi"}]})
+        response = http.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "glm-5.2@codebuddy",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
     assert response.status_code == 400
     assert "restricted to 'trae'" in response.json()["error"]["message"]
 
@@ -479,24 +604,37 @@ def test_client_ip_only_trusts_xff_from_trusted_proxy_peers():
     """
     packet = "1.2.3.4, 10.0.0.9"
     # 对端命中名单 → 采信 XFF
-    assert client_ip("127.0.0.1", packet, trust_proxy=True,
-                     trusted_proxies="127.0.0.1/32") == "10.0.0.9"
+    assert (
+        client_ip("127.0.0.1", packet, trust_proxy=True, trusted_proxies="127.0.0.1/32")
+        == "10.0.0.9"
+    )
     # 对端不在名单（直连攻击者）→ 忽略 XFF，用真实对端
-    assert client_ip("203.0.113.7", packet, trust_proxy=True,
-                     trusted_proxies="127.0.0.1/32") == "203.0.113.7"
+    assert (
+        client_ip(
+            "203.0.113.7", packet, trust_proxy=True, trusted_proxies="127.0.0.1/32"
+        )
+        == "203.0.113.7"
+    )
     # 名单为空 = 旧行为（不限制）
     assert client_ip("203.0.113.7", packet, trust_proxy=True) == "10.0.0.9"
     # trust_proxy 关闭时名单无用武之地
-    assert client_ip("127.0.0.1", packet, trust_proxy=False,
-                     trusted_proxies="127.0.0.1/32") == "127.0.0.1"
+    assert (
+        client_ip(
+            "127.0.0.1", packet, trust_proxy=False, trusted_proxies="127.0.0.1/32"
+        )
+        == "127.0.0.1"
+    )
 
 
 def test_client_ip_trusted_proxies_fails_closed_on_bad_input():
     """名单写坏 / 对端为空 / 对端不是 IP → 一律不采信 XFF。"""
     packet = "1.2.3.4"
-    assert client_ip("127.0.0.1", packet, trust_proxy=True,
-                     trusted_proxies="garbage") == "127.0.0.1"
-    assert client_ip("", packet, trust_proxy=True,
-                     trusted_proxies="127.0.0.1/32") == ""
-    assert client_ip("not-an-ip", packet, trust_proxy=True,
-                     trusted_proxies="127.0.0.1/32") == "not-an-ip"
+    assert (
+        client_ip("127.0.0.1", packet, trust_proxy=True, trusted_proxies="garbage")
+        == "127.0.0.1"
+    )
+    assert client_ip("", packet, trust_proxy=True, trusted_proxies="127.0.0.1/32") == ""
+    assert (
+        client_ip("not-an-ip", packet, trust_proxy=True, trusted_proxies="127.0.0.1/32")
+        == "not-an-ip"
+    )
