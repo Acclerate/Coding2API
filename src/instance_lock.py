@@ -75,7 +75,8 @@ class AlreadyRunning(RuntimeError):
             f"另一个实例已在使用 {lock_path.parent}（PID {holder}）。"
             f"同一数据目录只能起一个进程：两个实例会各自跑后台任务、"
             f"重复探测凭证并互相覆盖统计。若确认没有实例在跑，删掉 "
-            f"{lock_path} 后重试。")
+            f"{lock_path} 后重试。"
+        )
 
 
 class LockUnsupported(RuntimeError):
@@ -92,7 +93,8 @@ class LockUnsupported(RuntimeError):
         super().__init__(
             f"当前平台不支持文件锁（需要 fcntl / POSIX 或 msvcrt / Windows）："
             f"{lock_path.parent}。不能在没有单实例保护的情况下启动服务；"
-            f"请改用受支持的平台，或经 WSL2 / Docker 部署（见 README「部署注意」）。")
+            f"请改用受支持的平台，或经 WSL2 / Docker 部署（见 README「部署注意」）。"
+        )
 
 
 class InstanceLock:
@@ -145,12 +147,17 @@ class InstanceLock:
 
     def _acquire_windows(self) -> None:
         assert msvcrt is not None  # acquire() 按 LOCK_SUPPORTED 分派后的不变式
-        # O_NOINHERIT：对应 POSIX 的 O_CLOEXEC——不把句柄漏给子进程。
-        # O_BINARY：msvcrt 区域锁按字节计，别让 \n 翻译搅局。
+        # O_BINARY：msvcrt 区域锁按字节计，别让 \n 翻译搅局。用 getattr 兜
+        # 底：Linux 上跑 Windows 分支的 monkeypatch 测试（注入 FakeMsvcrt）
+        # 时 os.O_BINARY 不存在——0 恰是 POSIX 上 O_BINARY 的语义（无翻译）。
         fd = os.open(
             self.path,
-            os.O_RDWR | os.O_CREAT | os.O_BINARY | getattr(os, "O_NOINHERIT", 0),
-            0o600)
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0),
+            0o600,
+        )
         try:
             os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
             # 锁 LOCK_OFFSET 起 1 字节、不等待：第二实例在此立刻拿到 OSError
