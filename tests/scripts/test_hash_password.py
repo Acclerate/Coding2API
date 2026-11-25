@@ -20,10 +20,14 @@ SCRIPT_MODULE = _load()
 
 
 def test_main_creates_user_file_with_restrictive_mode(tmp_path):
+    """生成逻辑双平台都验证；0600 断言仅 POSIX（Windows chmod 只翻只读位）。"""
+    import os
+
     path = tmp_path / "nested" / "users.txt"
     assert SCRIPT_MODULE.main(["alice", "--output", str(path), "--password", "pw"]) == 0
     assert verify_password("pw", path.read_text(encoding="utf-8").split(":", 1)[1].strip())
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_main_replaces_existing_username(tmp_path):

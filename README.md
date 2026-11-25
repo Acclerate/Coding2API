@@ -541,6 +541,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `GROWTH_IRREVERSIBLE_ACTIONS` | `true` | 允许抽奖 / 连登兑换 / 开盲盒 / 消耗补登卡 |
 | `ACTIVITY_REPORT_ENABLED` | `false` | 活跃上报，默认关闭 |
 | `ACTIVITY_REPORT_HOUR` | `10` | 活跃上报本地整点窗口 |
+| `CHECKIN_ENABLED` | `true` | 每日签到总开关：关掉后整类签到 no-op（含任务页手动轮次，单凭证手动签到按钮不受影响）。与渠道级跳过（`CHECKIN_SKIP_PROVIDERS`）正交。可热更 |
 | `CHECKIN_TIMES` | `""` | 签到时点 `HH:MM` 逗号分隔；留空 = 全天每 10 分钟查。可热更 |
 | `CHECKIN_JITTER_MINUTES` | `0` | 签到抖动（分钟）；可热更 |
 | `CHECKIN_SKIP_PROVIDERS` | `""` | 跳过签到的渠道（如 `raccoon`）：只停签到，聊天不受影响。可热更 |
@@ -904,4 +905,5 @@ MIT，见 [LICENSE](LICENSE)。上游署名见 [NOTICE](NOTICE)。
 
 - **全部渠道一键签到**：凭证管理页标题栏的「全部签到」按钮——对池内全部可签到凭证批量执行每日签到（`data-testid="checkin-all"`）。
 - **Windows 一键脚本**：仓库根目录 `start_coding2api.bat` / `stop_coding2api.bat`，免 Docker 的本机启停。
+- **Windows 裸机部署受支持**：上游把平台范围收窄到 Linux / macOS（单实例锁依赖 flock），本 fork 给 `src/instance_lock.py` 补了 `msvcrt.locking` 强制区域锁、`src/security/private_files.py` 的 ACL 校验放行 `OWNER RIGHTS`，`sys.platform=win32` 重新进入支持范围（见 `src/platform_support.py`）。
 - **Qoder 双区域限制**：`QODER_API_ENDPOINT` 是进程级单值——默认国内版（`openapi.qoder.com.cn`），改国际版需 `QODER_API_ENDPOINT=https://openapi.qoder.sh`；国内/国际账号无法同时完整使用，临时同池法与改造方案见 `PROPOSAL.md` §8。

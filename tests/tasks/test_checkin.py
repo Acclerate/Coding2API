@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -349,6 +350,9 @@ async def test_runner_sync_checkin_skips_when_disabled(repo):
     assert await runner._sync_checkin() is not None
     assert provider.checkin_calls == 1
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="TZ 环境变量 + time.tzset() 是 POSIX 语义，Windows 本地跳过，CI(ubuntu) 执行")
 async def test_checkin_day_boundary_is_beijing_regardless_of_local_tz(repo, monkeypatch):
     """日界固定北京时间：进程 TZ 改成 UTC 也不得偏移。
 

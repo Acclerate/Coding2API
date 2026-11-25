@@ -687,10 +687,11 @@ def test_run_releases_lock_when_build_app_raises(monkeypatch, tmp_path):
 
 
 def test_run_refuses_to_start_on_unsupported_platform(monkeypatch, tmp_path, capsys):
-    """非 POSIX 平台（#46）：入口给可读中文后退出，绝不靠静默 no-op 起服务。
+    """未收录平台（#46）：入口给可读中文后退出，绝不靠静默 no-op 起服务。
 
     这里走真实的 `require_supported_platform()`（只 patch `sys.platform`），
     确保「platform_support → run」这条链路是通的，而不是各自单测通过、串起来错。
+    fork 收录了 win32（msvcrt 锁），所以替身用真正未收录的 freebsd13。
     """
     import sys
     import types
@@ -703,12 +704,15 @@ def test_run_refuses_to_start_on_unsupported_platform(monkeypatch, tmp_path, cap
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setenv("APP_SECRET", SECRET)
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "freebsd13")
 
     with pytest.raises(SystemExit) as excinfo:
         main.run()
 
-    assert "仅 Linux / macOS" in str(excinfo.value.code)
+    text = str(excinfo.value.code)
+    assert "本平台暂不支持" in text
+    assert "WSL2" in text or "Docker" in text
+    assert "README" in text
     assert started == [], "不支持的平台上不得启动 uvicorn"
     assert not (tmp_path / ".instance.lock").exists()
 

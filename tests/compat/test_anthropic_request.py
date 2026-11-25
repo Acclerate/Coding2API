@@ -79,104 +79,6 @@ def test_parse_string_content_by_role():
     assert [m["role"] for m in parsed.messages] == ["user", "assistant"]
 
 
-def test_parse_system_role_messages_merge_into_system():
-    # 字符串 content
-    parsed = parse_messages_request(
-        _body(
-            messages=[
-                {"role": "user", "content": "u"},
-                {"role": "system", "content": "hook-output"},
-            ]
-        )
-    )
-    assert parsed.messages[0] == {"role": "system", "content": "hook-output"}
-    assert [m["role"] for m in parsed.messages[1:]] == ["user"]
-    # 数组 content 与顶层 system 合并，按出现顺序拼接
-    parsed = parse_messages_request(
-        _body(
-            system="top",
-            messages=[
-                {
-                    "role": "system",
-                    "content": [
-                        {"type": "text", "text": "a"},
-                        {"type": "text", "text": "b"},
-                    ],
-                },
-                {"role": "user", "content": "u"},
-                {"role": "system", "content": "c"},
-            ],
-        )
-    )
-    assert parsed.messages[0] == {"role": "system", "content": "topabc"}
-    assert [m["role"] for m in parsed.messages[1:]] == ["user"]
-    # 仅 system 角色消息时也构成合法请求
-    parsed = parse_messages_request(
-        _body(messages=[{"role": "system", "content": "only"}])
-    )
-    assert parsed.messages == [{"role": "system", "content": "only"}]
-
-
-def test_parse_system_role_message_rejects_bad_blocks():
-    with pytest.raises(InvalidRequest, match="not supported"):
-        parse_messages_request(
-            _body(messages=[{"role": "system", "content": [{"type": "image"}]}])
-        )
-    with pytest.raises(InvalidRequest, match=r"content\[0\] must be an object"):
-        parse_messages_request(_body(messages=[{"role": "system", "content": ["x"]}]))
-    with pytest.raises(InvalidRequest, match="unknown content block type"):
-        parse_messages_request(
-            _body(messages=[{"role": "system", "content": [{"type": "weird"}]}])
-        )
-    with pytest.raises(InvalidRequest, match="string or an array"):
-        parse_messages_request(_body(messages=[{"role": "system", "content": 5}]))
-
-
-def test_parse_system_role_message_empty_text_is_dropped():
-    """空文本的 system 角色消息（空数组 / 全空 text 块）不产出 system 消息。"""
-    parsed = parse_messages_request(
-        _body(
-            messages=[
-                {"role": "system", "content": []},
-                {"role": "user", "content": "u"},
-            ]
-        )
-    )
-    assert [m["role"] for m in parsed.messages] == ["user"]
-    parsed = parse_messages_request(
-        _body(
-            messages=[
-                {"role": "system", "content": [{"type": "text", "text": ""}]},
-                {"role": "user", "content": "u"},
-            ]
-        )
-    )
-    assert [m["role"] for m in parsed.messages] == ["user"]
-
-
-def test_parse_system_role_message_appends_to_marked_system_blocks():
-    """顶层 system 带缓存标记（内容块数组）时，role:"system" 文本追加为普通
-    text 块——不打标记、不折字符串（折了会丢缓存断点）。"""
-    parsed = parse_messages_request(
-        _body(
-            system=[
-                {"type": "text", "text": "top", "cache_control": {"type": "ephemeral"}}
-            ],
-            messages=[
-                {"role": "system", "content": "hook"},
-                {"role": "user", "content": "u"},
-            ],
-        )
-    )
-    assert parsed.messages[0] == {
-        "role": "system",
-        "content": [
-            {"type": "text", "text": "top", "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": "hook"},
-        ],
-    }
-
-
 def test_parse_rejects_unknown_role_and_bad_message():
     with pytest.raises(InvalidRequest, match="role 'tool' is not supported"):
         parse_messages_request(_body(messages=[{"role": "tool", "content": "x"}]))
@@ -235,6 +137,7 @@ def test_parse_mid_conversation_system_rejects_bad_shapes():
     with pytest.raises(InvalidRequest, match="text must be a string"):
         parse_messages_request(_body(messages=[{"role": "system", "content": [
             {"type": "text", "text": 1}]}]))
+
 
 def test_parse_user_blocks_split_text_and_tool_results():
     parsed = parse_messages_request(

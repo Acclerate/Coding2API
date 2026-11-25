@@ -44,6 +44,18 @@ class UpstreamStreamError(Exception):
     def kind(self) -> ErrKind:
         return event_error_kind(self.event)
 
+    @property
+    def summary(self) -> str:
+        """503 文案用的受控标识（`executor._error_summary` 优先取它）。
+
+        只暴露错误码、不带 `error_message`——上游 message 可能回显请求参数
+        （token 端点实测回显过 secret/code），不能进对外响应。无码（CodeArts
+        的字符串码在 message 里、error_code 槽位为 None）返回空串，由调用方
+        按原路径回落异常类名。
+        """
+        code = self.event.error_code
+        return f"upstream code {code}" if code else ""
+
 
 def error_payload(message: str, code: str, status: int) -> dict[str, Any]:
     return {"error": {"message": message, "type": "api_error", "code": code,

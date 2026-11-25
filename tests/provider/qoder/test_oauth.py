@@ -182,8 +182,15 @@ def test_pkce_pair_shape_and_auth_url_realm_difference():
     assert "redirect_uri" not in intl
     assert "client_id=e883ade2" in intl
 
-def test_machine_id_prefers_official_file(tmp_path, monkeypatch):
+def _isolate_home(monkeypatch, tmp_path):
+    """把 expanduser('~') 指到 tmp_path：HOME 只对 POSIX 生效，Windows 的
+    ntpath 先看 USERPROFILE——只 patch HOME 时本机会读到真实安装的 Qoder
+    的 machine_id（平台差异，见 AGENTS.md），两个都设才真正隔离。"""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+def test_machine_id_prefers_official_file(tmp_path, monkeypatch):
+    _isolate_home(monkeypatch, tmp_path)
     realm = "cn"
     path = tmp_path / qoder_events.get_realm_config(realm).domain / ".auth"
     path.mkdir(parents=True)
@@ -191,15 +198,15 @@ def test_machine_id_prefers_official_file(tmp_path, monkeypatch):
     assert machine_id_for(realm) == "official-id"
 
 def test_machine_id_falls_back_to_stable_value(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     first = machine_id_for("cn")
     assert first and first == machine_id_for("cn")
     # 无 HOME 可读时也不抛
-    monkeypatch.setenv("HOME", str(tmp_path / "missing"))
+    _isolate_home(monkeypatch, tmp_path / "missing")
     assert machine_id_for("intl")
 
 def test_machine_id_skips_empty_and_reads_second_candidate(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     config = qoder_events.get_realm_config("cn")
     # 第一候选存在但为空 → 继续看第二候选
     first = tmp_path / config.domain / ".auth"

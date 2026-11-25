@@ -281,7 +281,13 @@ curl -X POST http://127.0.0.1:8321/api/api-keys \
 
 `start_coding2api.bat`（已复制到 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`）。
 日志写入 `D:\privategit\github\Coding2API\logs\coding2api_startup.log`（UTF-8、无 BOM），
-同时逐行输出到控制台（PowerShell tee；禁止把日志放到 C 盘）：
+同时逐行输出到控制台（PowerShell tee；禁止把日志放到 C 盘）。
+日志只保留近 7 天：每次会话启动时，脚本解析
+`=== uvicorn session start at ... ===` 标记里的日期（`YYYY/M/D`），
+删掉 7 天前那次会话标记之前的全部内容；若所有会话都超过 7 天则清空
+（新会话马上重新写入）。应用自身只写 stderr、不做文件轮转（见
+`src/webapp/logging.py` 的设计说明），Windows 部署的日志轮转就由这一步承担
+（对应 macOS 的 newsyslog、Docker 的 json-file 限制）：
 
 ```batch
 @echo off
@@ -291,6 +297,7 @@ set LOG_DIR=D:\privategit\github\Coding2API\logs
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 set LOG_FILE=%LOG_DIR%\coding2api_startup.log
 set PYTHONIOENCODING=utf-8
+powershell -NoProfile -Command "<7 天剪裁：保留最近 7 天内最早一次会话标记及其之后的内容>"
 echo === uvicorn session start at %date% %time% === >> "%LOG_FILE%"
 powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & 'C:\Users\Administrator\.local\bin\uv.exe' run -- uvicorn src.main:build_app --factory --host 127.0.0.1 --port 8321 2>&1 | ForEach-Object { $line = [string]$_; [IO.File]::AppendAllText('%LOG_FILE%', $line + [char]13 + [char]10, [Text.UTF8Encoding]::new($false)); $line }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }"
 echo [%date% %time%] 服务已退出，退出码: %errorlevel%
@@ -408,7 +415,7 @@ Claude Code v2.1.296
 
 ### 10.5 开机自启状态
 
-使用 §7.1 的 `start_coding2api.bat` + Startup 目录方式（非 schtasks）。开机后 Coding2API 自动启动，日志写入 `D:\privategit\github\Coding2API\logs\coding2api_startup.log`（同时输出到控制台）。
+使用 §7.1 的 `start_coding2api.bat` + Startup 目录方式（非 schtasks）。开机后 Coding2API 自动启动，日志写入 `D:\privategit\github\Coding2API\logs\coding2api_startup.log`（同时输出到控制台；每次会话启动时自动剪裁，只保留近 7 天）。
 
 ### 10.6 待跟进项
 

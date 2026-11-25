@@ -46,6 +46,7 @@ from .admin_model_availability import (
     suspected_index,
 )
 from .deps import Services, principal_from_request
+from .model_merge import _finalize
 from .models import credential_providers, merged_entries
 
 # 模型目录排序白名单：API 键 → 取值函数（缺失值排最后）。
@@ -85,14 +86,14 @@ def _available_keys(services: Services) -> set[str]:
     """当前渠道真能提供的模型 → 候选键集合（与 `/v1/models` 同口径）。
 
     只算「有可用凭证」的渠道（`credential_providers`），并过当前黑名单
-    （`merged_entries` 内部已滤）。按条目的**归一键主体**（`entry["base"]`）
-    与展示名展开候选键：对外 id 只是主体拼 `-渠道`（`kimi-k3-qoder`），外部
-    目录按裸名登记，带后缀的 id 既匹配不上也不该去匹配。
+    （`merged_entries` 内部已滤）。`merged_entries` 返回的是**未定稿**的分组
+    （还没有对外 id），故先 `_finalize` 补出 id / 展示名，再展开成候选键。
     """
     entries = merged_entries(services, credential_providers(services))
     keys: set[str] = set()
     for entry in entries:
-        keys |= match_keys(entry["base"], entry["meta"].get("name"))
+        _finalize(entry)
+        keys |= match_keys(entry["id"], entry["meta"].get("name"))
     return keys
 
 

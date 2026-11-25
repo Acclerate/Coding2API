@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,14 @@ ROOT = Path(__file__).resolve().parents[2]  # noqa: PTH123 — 部署测试须�
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "docker-compose.yml"
 DOCKERIGNORE = ROOT / ".dockerignore"
+
+# macOS（launchd / newsyslog / Homebrew 前缀）部署资产检查：断言执行位与
+# `grp`/`pwd` 属主解析都是 POSIX 语义——Windows 上 git 不保留执行位、也没有
+# 这两个模块。本仓库的 Windows 部署形态走 start_coding2api.bat，不涉及这套
+# 资产，本地跳过；CI（ubuntu）上照常执行。
+MACOS_ASSET_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="macOS/POSIX 部署资产检查（执行位 / grp / pwd），Windows 本地跳过")
 
 
 def _copy_sources(stage: str) -> list[str]:
@@ -303,6 +312,7 @@ def test_deploy_templates_contain_no_personal_absolute_paths():
     assert not offenders, f"仓库混入开发机绝对路径: {offenders}"
 
 
+@MACOS_ASSET_ONLY
 def test_launchd_install_script_renders_placeholder():
     """安装脚本必须渲染占位符并写到 LaunchAgents。"""
     script = ROOT / "scripts" / "install-launchd.sh"
@@ -387,6 +397,7 @@ def test_build_web_resolves_pnpm_outside_login_shell():
     assert "--frozen-lockfile" in text, "依赖安装必须按 lockfile，与 CI 一致"
 
 
+@MACOS_ASSET_ONLY
 def test_build_web_is_executable():
     """两个脚本都必须有执行位，否则 plist 启动会 permission denied。"""
     for script in (BUILD_WEB, LAUNCHD_SERVER):
@@ -582,6 +593,7 @@ def test_rotate_plist_schedules_without_keepalive():
     assert data["ProgramArguments"][-1].endswith("scripts/rotate-logs.sh")
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_install_script_renders_placeholder():
     """安装脚本必须渲染 __PROJECT_ROOT__ 并写进 LaunchAgents。"""
     assert INSTALL_ROTATE.is_file()
@@ -614,6 +626,7 @@ def test_launchd_wrapper_warns_about_installed_newsyslog_copy():
     assert "sudo rm" in code
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_script_actually_rotates_in_isolation(tmp_path):
     """真跑一次：内容归档、当前文件被截断、超额归档被清理。
 
@@ -645,6 +658,7 @@ def test_rotate_script_actually_rotates_in_isolation(tmp_path):
     assert bz2.decompress(archives[0].read_bytes()).decode() == payload
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_script_dry_run_leaves_files_untouched(tmp_path):
     """--dry-run 只报告，不归档也不截断。"""
     import subprocess
@@ -664,6 +678,7 @@ def test_rotate_script_dry_run_leaves_files_untouched(tmp_path):
     assert not list(logs.glob("*.bz2"))
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_script_skips_empty_and_small_files(tmp_path):
     """空文件与未超阈值的文件都不轮转（notifempty / size 语义）。"""
     import subprocess
@@ -682,6 +697,7 @@ def test_rotate_script_skips_empty_and_small_files(tmp_path):
     assert not list(logs.glob("*.bz2"))
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_script_prunes_old_archives(tmp_path):
     """超过 KEEP 的归档按 mtime 倒序清理，只留最近 KEEP 份。"""
     import subprocess
@@ -706,6 +722,7 @@ def test_rotate_script_prunes_old_archives(tmp_path):
     assert len(list(logs.glob("launchd.err.log.*.bz2"))) == 2
 
 
+@MACOS_ASSET_ONLY
 def test_rotate_script_rejects_unknown_flag():
     """未知参数直接退 2，避免拼错的 --dryrun 被当成真跑。"""
     import subprocess
@@ -1008,6 +1025,7 @@ def test_frps_unit_runs_unprivileged_and_hardened():
     assert not re.search(r"^Environment", text, re.M), "unit 里不得内联环境变量/密钥"
 
 
+@MACOS_ASSET_ONLY
 def test_frpc_plist_template_is_valid_and_renders():
     """plist 模板必须合法，且占位符渲染后路径落到项目根内。"""
     import plistlib
@@ -1030,6 +1048,7 @@ def test_frpc_plist_template_is_valid_and_renders():
         "plist 只应注入 token 文件路径，不得注入 token 值"
 
 
+@MACOS_ASSET_ONLY
 def test_frpc_plist_writes_logs_covered_by_rotate_script():
     """launchd 写的 frpc 日志必须被轮转脚本覆盖，否则日志无限增长。"""
     plist_text = _render_template(FRPC_PLIST_TEMPLATE.read_text(encoding="utf-8"))
@@ -1039,6 +1058,7 @@ def test_frpc_plist_writes_logs_covered_by_rotate_script():
         assert suffix in rotate, f"rotate-logs.sh 缺少 logs/{suffix} 的轮转"
 
 
+@MACOS_ASSET_ONLY
 def test_frpc_run_resolves_binary_and_execs():
     """wrapper 解析 frpc 位置后 exec（PID 即 frpc），并指向仓库内配置。"""
     text = FRPC_RUN.read_text(encoding="utf-8")
@@ -1049,6 +1069,7 @@ def test_frpc_run_resolves_binary_and_execs():
     assert FRPC_RUN.stat().st_mode & 0o111, "wrapper 必须可执行"
 
 
+@MACOS_ASSET_ONLY
 def test_install_frpc_renders_placeholders_and_installs_agent():
     """安装脚本：渲染两个占位符 → 写 LaunchAgents → 加载；token 落在 secrets/。"""
     text = INSTALL_FRPC.read_text(encoding="utf-8")

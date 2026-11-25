@@ -222,6 +222,9 @@ def classify_error_code(code: int | None) -> ErrKind:
     6004  = 模型不可用（MODEL）
     4001  = 参数/模型不可用（实测原文 "the param is invalid"）：换凭证没用，
             跳过该上游 —— 与 classify_status 的 400 分支同一结论。
+    3004  = 请求频率超限（实测原文 "your requests have exceeded the rate
+            limit"）：滚动窗口滑过即恢复，短冷却挡住连续打即可——不走 OTHER
+            三振（限流是上游节奏问题，累计会把健康凭证中冷却 10m）。
     """
     if code == 1005:
         return ErrKind.PLAN
@@ -231,6 +234,8 @@ def classify_error_code(code: int | None) -> ErrKind:
         return ErrKind.MODEL
     if code == 4001:
         return ErrKind.INVALID
+    if code == 3004:
+        return ErrKind.SOFT
     return ErrKind.OTHER
 
 

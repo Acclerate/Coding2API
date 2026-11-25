@@ -30,5 +30,7 @@ def test_allowed_endpoints_whitelist():
     assert not validate_endpoint_allowed("https://evil.example", s)
 
 def test_db_path_joins_data_dir():
+    # 期望值同用 os.path.join：Windows 上连接符是反斜杠（平台差异，见 AGENTS.md）
+    import os
     s = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR="/tmp/cbd")
-    assert s.db_path == "/tmp/cbd/coding2api.sqlite3"
+    assert s.db_path == os.path.join("/tmp/cbd", "coding2api.sqlite3")

@@ -21,6 +21,15 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 set LOG_FILE=%LOG_DIR%\coding2api_startup.log
 if not exist "%LOG_FILE%" type nul > "%LOG_FILE%"
 
+:: 7-day retention: the tee below appends forever, so trim at session
+:: start. Session markers ("=== uvicorn session start at ... ===" with
+:: a YYYY/M/D date) are parsed; everything before the oldest marker
+:: dated within 7 days is dropped. If every session is older than that
+:: the file is truncated -- a fresh session starts right below. UTF-8
+:: no-BOM rewrite matches the tee's encoding. Safe only here, before
+:: the tee starts appending (it reopens the file per line).
+powershell -NoProfile -Command "$f='%LOG_FILE%'; if (Test-Path $f) { $cut=(Get-Date).Date.AddDays(-7); $L=[IO.File]::ReadAllLines($f); $keep=-1; $found=$false; for ($i=$L.Count-1; $i -ge 0; $i--) { if ($L[$i] -match '=== uvicorn session start at .*(\d{4})/(\d{1,2})/(\d{1,2})') { $found=$true; $d=Get-Date -Year $Matches[1] -Month $Matches[2] -Day $Matches[3]; if ($d -ge $cut) { $keep=$i } else { break } } }; if ($found) { if ($keep -lt 0) { [IO.File]::WriteAllText($f, '', [Text.UTF8Encoding]::new($false)) } elseif ($keep -gt 0) { [IO.File]::WriteAllLines($f, $L[$keep..($L.Count-1)], [Text.UTF8Encoding]::new($false)) } } }"
+
 set TIMESTAMP=[%date% %time%]
 echo %TIMESTAMP% Starting Coding2API... (log: %LOG_FILE%)
 echo === uvicorn session start at %date% %time% === >> "%LOG_FILE%"

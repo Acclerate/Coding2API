@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -613,6 +614,9 @@ def test_next_credit_reset_boundaries(hour, expected_offset_days):
     assert next_credit_reset(now_at_hour) == expected
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="time.tzset() 是 POSIX 语义，Windows 本地跳过，CI(ubuntu) 执行")
 def test_next_credit_reset_ignores_process_timezone(monkeypatch):
     """进程 TZ 改成 UTC 也不偏移：上游按北京时间重置。"""
     monkeypatch.setenv("TZ", "UTC")

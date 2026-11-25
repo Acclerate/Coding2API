@@ -14,11 +14,12 @@ Claude Code / Anthropic SDK 会用的子集，其余显式 400（`InvalidRequest
     `tool_calls`（`input` 对象序列化成 `arguments` JSON 串）；`thinking`
     块 → assistant 的 `reasoning_content`
   - `system` 的消息（Claude Code 在 SDK/`-p` 模式下会把 SessionStart hook
-    输出以 `role:"system"` 消息携带）→ 文本按出现顺序并入开头的 system
-    消息，而不是 400——官方 API 接受该形状，拒绝会导致 Claude Code 静默
-    丢弃整次回复
+    输出以 `role:"system"` 消息携带，2.1.318 起新会话首轮还有
+    mid-conversation system）→ 就地转成 system 消息按原位置保留，而不是
+    400——官方 API 接受该形状，拒绝会导致 Claude Code 静默丢弃整次回复
   - `image` 块 → chat 的 `image_url` 内容块（`source.type=base64` 拼成
-    data URL，`source.type=url` 直传）；`document` 块仍不支持 → 400
+    data URL，`source.type=url` 直传）；`document` 块 → 占位文本（chat 没有
+    文档形态，丢弃正文但保留块位序，见 `_placeholder_text`）
   - 纯文本内容折成字符串（与旧行为逐字节一致），含图片时保留内容块数组
 - `tools` 的 `{name, description, input_schema}` → chat
   `{type:"function", function:{name, description, parameters}}`
@@ -101,29 +102,6 @@ def _system_content(system: Any) -> str | list[dict[str, Any]]:
     if system is None:
         return ""
     raise InvalidRequest("system must be a string or an array")
-
-
-def _text_from_system_message(content: list[Any], where: str) -> str:
-    """`role:"system"` 消息的 content（text 块数组）→ 纯文本。
-
-    调用方（`_map_messages`）已把字符串 content 直接收集、非 list 的报过 400，
-    进到这里的 content 必为 list；与顶层 `system` 同构校验，图片等不支持的
-    块依旧 400。
-    """
-    parts: list[str] = []
-    for index, block in enumerate(content):
-        if not isinstance(block, dict):
-            raise InvalidRequest(f"{where}.content[{index}] must be an object")
-        kind = block.get("type")
-        if kind == "text":
-            parts.append(_block_text(block, f"{where}.content[{index}]"))
-        elif kind in ("image", "document"):
-            raise InvalidRequest(
-                f"content block type {kind!r} is not supported by this gateway"
-            )
-        else:
-            raise InvalidRequest(f"unknown content block type {kind!r}")
-    return "".join(parts)
 
 
 def _block_text(block: dict[str, Any], where: str) -> str:
@@ -382,14 +360,15 @@ def _assistant_message(blocks: list[Any]) -> dict[str, Any] | None:
     return message
 
 
-def _map_messages(raw_messages: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    """→ (chat 消息序列, `role:"system"` 消息按出现顺序收集的文本)。
+def _map_messages(raw_messages: list[Any]) -> list[dict[str, Any]]:
+    """→ chat 消息序列。
 
-    system 角色的文本不保留原位（chat 上游没有 mid-conversation system），
-    由调用方并入开头 system 消息。
+    `role:"system"` 的消息就地转成 system 消息按原位置保留（见分支内注释），
+    不并入开头——fork 曾把文本上收进开头 system（旧「扁平化」设计），上游
+    改为就地保留后本实现与其对齐：chat 上游对中途 system 宽容，且developer
+    归一（`normalize_developer_role`）也是同样的原地语义。
     """
     messages: list[dict[str, Any]] = []
-    system_texts: list[str] = []
     for index, item in enumerate(raw_messages):
         if not isinstance(item, dict):
             raise InvalidRequest(f"messages[{index}] must be an object")
@@ -405,12 +384,9 @@ def _map_messages(raw_messages: list[Any]) -> tuple[list[dict[str, Any]], list[s
                              "content": _system_block_content(content, index)})
             continue
         if isinstance(content, str):
-            if role == "system":
-                system_texts.append(content)
-            elif role in ("user", "assistant"):
-                messages.append({"role": role, "content": content})
-            else:
+            if role not in ("user", "assistant"):
                 raise InvalidRequest(f"message role {role!r} is not supported")
+            messages.append({"role": role, "content": content})
             continue
         if not isinstance(content, list):
             raise InvalidRequest(
@@ -422,13 +398,9 @@ def _map_messages(raw_messages: list[Any]) -> tuple[list[dict[str, Any]], list[s
             mapped = _assistant_message(content)
             if mapped is not None:
                 messages.append(mapped)
-        elif role == "system":
-            text = _text_from_system_message(content, f"messages[{index}]")
-            if text:
-                system_texts.append(text)
         else:
             raise InvalidRequest(f"message role {role!r} is not supported")
-    return messages, system_texts
+    return messages
 
 
 def _system_block_content(content: Any, index: int) -> str:
@@ -525,20 +497,10 @@ def parse_messages_request(body: Any, *, thinking_efforts: str = "") -> ChatRequ
         raise InvalidRequest("messages must be a non-empty array")
 
     messages: list[dict[str, Any]] = []
-    mapped_messages, system_texts = _map_messages(raw_messages)
     system = _system_content(body.get("system"))
-    if system_texts:
-        if isinstance(system, list):
-            # system 带缓存标记（内容块数组）：role:"system" 文本追加为
-            # 普通 text 块（不带标记，不影响既有缓存断点）
-            system = system + [{"type": "text", "text": text} for text in system_texts]
-        else:
-            system = (
-                "".join([system, *system_texts]) if system else "".join(system_texts)
-            )
     if system:
         messages.append({"role": "system", "content": system})
-    messages.extend(mapped_messages)
+    messages.extend(_map_messages(raw_messages))
     if not messages:
         raise InvalidRequest("messages must contain at least one message")
 

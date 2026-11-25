@@ -1,17 +1,28 @@
 """`src.security.private_files`：POSIX chmod 与 Windows ACL 两种收口路径。
 
-Windows 分支在本机（macOS）与 CI（Linux）上都跑不到，因此一律 monkeypatch
-`_is_windows` / `subprocess.run` 把两条路径测全——不用 pragma 掩盖未测分支。
+Windows 分支在 CI（Linux）上跑不到，因此 monkeypatch `_is_windows` /
+`subprocess.run` 测全逻辑分支；fork 的 Windows 部署机则**原生**跑到真 icacls
+路径（上方不带替身的用例在 win32 上自动落到真实现）。POSIX 文件系统语义的
+用例（0600/0644 mode 位、属主 uid）在 Windows 上物理不可能成立——`os.chmod`
+只翻只读位、`S_IMODE` 恒 0o666 形态（平台差异，见 AGENTS.md；test_assets.py
+的 `MACOS_ASSET_ONLY` 是同一模式先例）——统一 `POSIX_FS_ONLY` 跳过，CI
+（ubuntu）原生执行。
 """
 
 from __future__ import annotations
 
 import stat
 import subprocess
+import sys
 
 import pytest
 
 from src.security import private_files as pf
+
+#: 依赖 POSIX 文件系统真实 mode 位/属主语义的用例（见模块 docstring）。
+POSIX_FS_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX 文件系统语义（mode 位/属主 uid），Windows 本地跳过，CI(ubuntu) 执行")
 
 
 def _write(tmp_path, name: str = "secret.txt"):
@@ -23,6 +34,7 @@ def _write(tmp_path, name: str = "secret.txt"):
 # --------------------------------------------------------------- POSIX 路径
 
 
+@POSIX_FS_ONLY
 def test_secure_file_tightens_posix_mode(tmp_path):
     """POSIX 收紧后读回校验通过，返回 True。"""
     path = _write(tmp_path)
@@ -31,6 +43,7 @@ def test_secure_file_tightens_posix_mode(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@POSIX_FS_ONLY
 def test_secure_dir_tightens_posix_mode(tmp_path):
     target = tmp_path / "data"
     target.mkdir()
@@ -46,6 +59,7 @@ def test_secure_warns_when_chmod_denied(tmp_path, monkeypatch, caplog):
     def boom(_path, _mode):
         raise PermissionError("operation not permitted")
 
+    monkeypatch.setattr(pf, "_is_windows", lambda: False)  # 强制 POSIX 分派
     monkeypatch.setattr(pf.os, "chmod", boom)
     with caplog.at_level("WARNING"):
         assert pf.secure_file(path) is False
@@ -60,6 +74,7 @@ def test_secure_strict_raises_when_not_private(tmp_path, monkeypatch):
     def boom(_path, _mode):
         raise PermissionError("operation not permitted")
 
+    monkeypatch.setattr(pf, "_is_windows", lambda: False)  # 强制 POSIX 分派
     monkeypatch.setattr(pf.os, "chmod", boom)
     with pytest.raises(pf.PrivateAccessError) as excinfo:
         pf.secure_file(path, strict=True)
@@ -82,15 +97,20 @@ def test_secure_reports_unreadable_after_tightening(tmp_path, monkeypatch, caplo
     """收紧后 stat 也失败（路径刚被删/权限不足）时给描述而不是崩。"""
     path = _write(tmp_path)
 
-    def boom(_self):
+    # `pf.Path` 就是 `pathlib.Path` 本体，monkeypatch 会波及 pytest 自己的
+    # 内部调用（失败格式化时按 3.13+ 的签名传 `follow_symlinks`），
+    # 所以替身必须吞掉额外关键字参数。
+    def boom(_self, **_kwargs):
         raise OSError("stat failed")
 
+    monkeypatch.setattr(pf, "_is_windows", lambda: False)  # 强制 POSIX 分派
     monkeypatch.setattr(pf.Path, "stat", boom)
     with caplog.at_level("WARNING"):
         assert pf.secure_file(path) is False
     assert "stat failed" in caplog.text
 
 
+@POSIX_FS_ONLY
 def test_check_private_reports_world_readable(tmp_path):
     path = _write(tmp_path)
     path.chmod(0o644)
@@ -99,6 +119,7 @@ def test_check_private_reports_world_readable(tmp_path):
     assert "0644" in problem
 
 
+@POSIX_FS_ONLY
 def test_check_private_accepts_owner_only(tmp_path):
     path = _write(tmp_path)
     path.chmod(0o600)
@@ -115,9 +136,11 @@ def test_check_private_wraps_oserror(tmp_path, monkeypatch):
     """stat 失败（权限不足）折算成描述，不让 doctor 崩。"""
     path = _write(tmp_path)
 
-    def boom(_self):
+    def boom(_self, **_kwargs):
         raise OSError("stat failed")
 
+    # Windows 分支走 ACL 不 stat，这个替身只对 POSIX 分派有意义：强制 POSIX
+    monkeypatch.setattr(pf, "_is_windows", lambda: False)
     monkeypatch.setattr(pf.Path, "exists", lambda _self: True)
     monkeypatch.setattr(pf.Path, "stat", boom)
     problem = pf.check_private(path, directory=True)
@@ -127,6 +150,7 @@ def test_check_private_wraps_oserror(tmp_path, monkeypatch):
 # -------------------------------------------------------- POSIX 属主校验
 
 
+@POSIX_FS_ONLY
 def test_verify_posix_accepts_matching_owner(tmp_path, monkeypatch):
     """属主 = 当前有效用户时通过（正常部署形态）。"""
     path = _write(tmp_path)
@@ -135,6 +159,7 @@ def test_verify_posix_accepts_matching_owner(tmp_path, monkeypatch):
     assert pf._verify_posix(path, 0o600) is None
 
 
+@POSIX_FS_ONLY
 def test_verify_posix_reports_foreign_owner(tmp_path, monkeypatch):
     """mode 已是 0600 但属主是别人 → 必须报问题（对方可随时换掉文件内容）。
 
@@ -149,6 +174,7 @@ def test_verify_posix_reports_foreign_owner(tmp_path, monkeypatch):
     assert str(foreign_uid) in problem
 
 
+@POSIX_FS_ONLY
 def test_check_private_flags_foreign_owner(tmp_path, monkeypatch):
     """doctor 只读校验同样查属主（走既有 problem 文案路径）。"""
     path = _write(tmp_path)
@@ -157,6 +183,7 @@ def test_check_private_flags_foreign_owner(tmp_path, monkeypatch):
     assert "属主" in (pf.check_private(path, directory=False) or "")
 
 
+@POSIX_FS_ONLY
 def test_secure_dir_rejects_foreign_owner(tmp_path, monkeypatch, caplog):
     """属主不符时 `_secure` 返回 False 并告警（chmod 成功也不能放行）。"""
     target = tmp_path / "data"
@@ -167,6 +194,7 @@ def test_secure_dir_rejects_foreign_owner(tmp_path, monkeypatch, caplog):
     assert "属主" in caplog.text
 
 
+@POSIX_FS_ONLY
 def test_secure_strict_raises_on_foreign_owner(tmp_path, monkeypatch):
     """`strict=True`（data/ 的启动前信任边界）属主不符就阻断启动。"""
     target = tmp_path / "data"
@@ -177,6 +205,7 @@ def test_secure_strict_raises_on_foreign_owner(tmp_path, monkeypatch):
     assert "属主" in str(excinfo.value)
 
 
+@POSIX_FS_ONLY
 def test_posix_path_without_geteuid_fails_closed(tmp_path, monkeypatch, caplog):
     """属主校验依赖 POSIX 的 `os.geteuid`：符号缺失即视为平台不支持。
 
@@ -191,6 +220,7 @@ def test_posix_path_without_geteuid_fails_closed(tmp_path, monkeypatch, caplog):
     assert "无法校验属主" in caplog.text
 
 
+@POSIX_FS_ONLY
 def test_check_private_without_geteuid_reports_problem(tmp_path, monkeypatch):
     """只读校验同样 fail closed：确认不了属主就返回问题描述。"""
     path = _write(tmp_path)
@@ -273,10 +303,35 @@ def test_acl_violations_handles_principal_less_residue():
     assert pf.acl_violations(":(F)\n", "robbs") == []
 
 
+def test_acl_violations_accepts_owner_rights():
+    """`OWNER RIGHTS`（S-1-3-4）语义就是「当前属主」，不算多余主体。
+
+    mkdtemp 的 0700 收紧 / 提升进程会把这一点物化成显式 ACE，而
+    `icacls /grant:r` 只替换同主体 ACE、动不了它——不认账会误判合规 ACL。
+    """
+    text = (
+        "C:\\data JT-XXB-SHY\\Administrator:(OI)(CI)(F)\r\n"
+        "        NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\r\n"
+        "        BUILTIN\\Administrators:(OI)(CI)(F)\r\n"
+        "        OWNER RIGHTS:(OI)(CI)(F)\r\n"
+    )
+    assert pf.acl_violations(text, "Administrator", "C:\\data") == []
+
+
+def test_secure_windows_accepts_owner_rights_leftover(windows):
+    """收紧后残留的 OWNER RIGHTS ACE 不再触发「多余主体」告警。"""
+    windows.stdout = (
+        "C:\\data ROBBS-PC\\robbs:(OI)(CI)(F)\r\n"
+        "        NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\r\n"
+        "        OWNER RIGHTS:(OI)(CI)(F)\r\n"
+    )
+    assert pf.secure_dir("C:/data") is True
+
+
 def test_secure_dir_windows_grants_only_self_and_system(windows):
     assert pf.secure_dir("C:/data") is True
     args = windows.calls[0]
-    assert args[0] == "C:/data"
+    assert args[0].replace("\\", "/") == "C:/data"
     assert "/inheritance:r" in args
     assert "robbs:(OI)(CI)F" in args
     assert "SYSTEM:(OI)(CI)F" in args

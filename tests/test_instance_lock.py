@@ -139,25 +139,33 @@ def test_already_running_message_is_actionable(tmp_path):
 # ------------------------------------------------------- 平台分支（issue #46）
 
 
-def test_module_is_importable_without_fcntl(monkeypatch, tmp_path):
-    """`fcntl` 缺失时模块仍可导入，但 `LOCK_SUPPORTED` 为假。
+def test_module_is_importable_without_fcntl(monkeypatch):
+    """`fcntl` 与 `msvcrt` 都缺失时模块仍可导入，但 `LOCK_SUPPORTED` 为假。
 
-    模块级 import 失败会让 `build_app --factory` 与所有 `scripts/*` 在 Windows
-    上直接炸掉（连一句自己的错误都打不出来），所以导入必须宽容。
+    模块级 import 失败会让 `build_app --factory` 与所有 `scripts/*` 直接炸掉
+    （连一句自己的错误都打不出来），所以导入必须宽容。fork 给 Windows 补了
+    msvcrt 锁，所以这里把 `sys.platform` 一并改成非 win32，模拟「两个原语
+    都不存在」的第三方平台。
+
+    用 `module_from_spec` 在**独立命名空间**执行模块代码，而不是 reload 真
+    模块：reload 会把模块里的类对象整体换成新类，而其他模块（含本测试文件）
+    早已 `from ... import` 了旧类——此后所有 isinstance / pytest.raises 都
+    会静默失配（真实踩坑：reload 后追加的用例接不住 AlreadyRunning）。
     """
-    import importlib
+    import importlib.util
     import sys
 
-    from src import instance_lock
+    import src.instance_lock as real_module
 
-    monkeypatch.delitem(sys.modules, "instance_lock", raising=False)
     monkeypatch.setitem(sys.modules, "fcntl", None)  # import fcntl 抛 ImportError
-    reloaded = importlib.reload(instance_lock)
-    try:
-        assert reloaded.LOCK_SUPPORTED is False
-    finally:
-        monkeypatch.undo()
-        importlib.reload(instance_lock)
+    monkeypatch.setattr(sys, "platform", "cygwin")  # 走「无 msvcrt」分支
+    spec = importlib.util.find_spec("src.instance_lock")
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+    # 真模块必须原封不动：其他地方的旧引用继续有效
+    assert real_module.LOCK_SUPPORTED is True
+    assert isolated.LOCK_SUPPORTED is False
+    assert isolated.fcntl is None and isolated.msvcrt is None
 
 
 def test_acquire_refuses_to_silently_noop_without_fcntl(monkeypatch, tmp_path):
@@ -181,3 +189,82 @@ def test_hold_instance_lock_propagates_unsupported(monkeypatch, tmp_path):
     monkeypatch.setattr(instance_lock, "LOCK_SUPPORTED", False)
     with pytest.raises(instance_lock.LockUnsupported):
         instance_lock.hold_instance_lock(tmp_path)
+
+
+# ------------------------------------------------- Windows 分支（fork 补齐）
+
+
+class FakeMsvcrt:
+    """`msvcrt.locking` 的替身：按文件（st_dev, st_ino）记录锁状态。
+
+    真模块的区域锁落在**文件**上——同一文件的两个句柄必然冲突，与 fd 无关；
+    按 fd 记键会漏掉这个冲突。真 `msvcrt` 只在 Windows 存在；CI（Linux）靠
+    这个替身覆盖 Windows 分支，fork 的 Windows 部署机另有原生用例（上面
+    不走替身的用例在 win32 上自动落到真 `msvcrt` 路径）。
+    """
+
+    LK_UNLCK = 0
+    LK_NBLCK = 2
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []
+        self.locked: set[tuple[int, int]] = set()
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        self.calls.append((fd, mode, nbytes))
+        stat_result = os.fstat(fd)
+        key = (stat_result.st_dev, stat_result.st_ino)
+        if mode == self.LK_UNLCK:
+            self.locked.discard(key)
+            return
+        if key in self.locked:  # LK_NBLCK：区域已被锁，立即失败（真模块抛 OSError）
+            raise OSError(36, "Resource deadlock avoided")
+        self.locked.add(key)
+
+
+@pytest.fixture()
+def fake_msvcrt(monkeypatch):
+    from src import instance_lock
+
+    fake = FakeMsvcrt()
+    monkeypatch.setattr(instance_lock, "msvcrt", fake)
+    return fake
+
+
+def test_windows_branch_acquires_region_lock(fake_msvcrt, tmp_path):
+    """Windows 路径：锁第 0 字节 1 字节长、锁文件写 PID、解锁在 release。"""
+    lock = InstanceLock(tmp_path)
+    lock.acquire()
+    try:
+        assert fake_msvcrt.calls[0][1] == FakeMsvcrt.LK_NBLCK
+        assert fake_msvcrt.calls[0][2] == 1
+        assert (tmp_path / LOCK_NAME).read_text(encoding="utf-8").strip() == str(
+            os.getpid())
+    finally:
+        lock.release()
+    assert fake_msvcrt.calls[-1][1] == FakeMsvcrt.LK_UNLCK
+
+
+def test_windows_branch_second_lock_is_already_running(fake_msvcrt, tmp_path):
+    """区域锁已被占用 → OSError 归一成 AlreadyRunning（与 flock 同语义）。"""
+    first = InstanceLock(tmp_path)
+    first.acquire()
+    try:
+        with pytest.raises(AlreadyRunning) as excinfo:
+            InstanceLock(tmp_path).acquire()
+        assert "另一个实例" in str(excinfo.value)
+    finally:
+        first.release()
+
+
+def test_windows_branch_release_allows_reacquire(fake_msvcrt, tmp_path):
+    """解锁后能再取：重启场景下锁不残留。"""
+    lock = InstanceLock(tmp_path)
+    lock.acquire()
+    lock.release()
+    again = InstanceLock(tmp_path)
+    again.acquire()
+    again.release()
+    # 锁过两次、解锁两次
+    assert sum(mode == FakeMsvcrt.LK_NBLCK for _, mode, _ in fake_msvcrt.calls) == 2
+    assert sum(mode == FakeMsvcrt.LK_UNLCK for _, mode, _ in fake_msvcrt.calls) == 2

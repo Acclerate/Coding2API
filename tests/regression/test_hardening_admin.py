@@ -310,7 +310,7 @@ def test_models_endpoint_falls_back_to_cache(settings):
         provider.fail = True
         second = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert second.status_code == 200
-    assert [m["id"] for m in second.json()["data"]] == ["glm-5.3-trae"]
+    assert [m["id"] for m in second.json()["data"]] == ["glm-5.3"]
     assert services.model_list_cache["trae"]      # 缓存保留
 
 def test_models_endpoint_logs_when_no_cache(settings):
@@ -355,7 +355,7 @@ def test_models_cache_fallback_when_ttl_expired(settings):
         provider.fail = True
         app.state.services.model_list_fetched_at.clear()      # 模拟 TTL 过期
         response = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
-    assert [m["id"] for m in response.json()["data"]] == ["glm-5.3-trae"]
+    assert [m["id"] for m in response.json()["data"]] == ["glm-5.3"]
 
 def test_models_failure_is_negatively_cached(settings):
     """拉取失败也刷 TTL 时间戳：TTL 内不再重试（有缓存用缓存，无缓存跳过）。"""
@@ -415,18 +415,18 @@ def test_models_failure_keeps_cache_for_ttl(settings):
     auth = {"Authorization": f"Bearer {key}"}
     with TestClient(app) as c:
         first = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in first.json()["data"]] == ["glm-5.3-trae"]
+        assert [m["id"] for m in first.json()["data"]] == ["glm-5.3"]
         assert Flaky.attempts == 1
 
         provider.fail = True
         services.model_list_fetched_at.clear()       # 模拟 TTL 过期 → 触发重试并失败
         second = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in second.json()["data"]] == ["glm-5.3-trae"]
+        assert [m["id"] for m in second.json()["data"]] == ["glm-5.3"]
         _drain_model_refresh(c, services)            # SWR：重试在后台，等它跑完
         assert Flaky.attempts == 2
 
         third = c.get("/v1/models", headers=auth)    # 失败后的 TTL 内：不再重试
-        assert [m["id"] for m in third.json()["data"]] == ["glm-5.3-trae"]
+        assert [m["id"] for m in third.json()["data"]] == ["glm-5.3"]
         assert Flaky.attempts == 2
 
 # --------------------------------------------------- #25 dump 有界保留
@@ -465,13 +465,17 @@ def test_dump_files_are_owner_only_and_expire_after_a_day(tmp_path):
     dump_dir = tmp_path / "dumps"
     written = list(dump_dir.glob("*.json"))
     assert len(written) == 1
-    assert dump_dir.stat().st_mode & 0o777 == 0o700
-    assert written[0].stat().st_mode & 0o777 == 0o600
+    # 权限位断言只在 POSIX 成立：Windows 的 os.chmod 只翻只读位（平台差异，
+    # 见 AGENTS.md）；落盘与过期清理本身两平台都执行，保住覆盖率。
+    if os.name == "posix":
+        assert dump_dir.stat().st_mode & 0o777 == 0o700
+        assert written[0].stat().st_mode & 0o777 == 0o600
 
     # 老版本建过 0755 的目录：下一次落盘必须把它收紧（mkdir 的 mode 只影响新建）
     dump_dir.chmod(0o755)
     chat.dump_request_body(tmp_path, {"a": 1})
-    assert dump_dir.stat().st_mode & 0o777 == 0o700
+    if os.name == "posix":
+        assert dump_dir.stat().st_mode & 0o777 == 0o700
 
     # 条数没超，但超过 24h 的文件也要被清掉（按 mtime 判）
     fresh = sorted(dump_dir.glob("*.json"))[-1]

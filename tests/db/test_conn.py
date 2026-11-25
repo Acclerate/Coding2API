@@ -7,13 +7,22 @@
 from __future__ import annotations
 
 import stat
+import sys
 
 import pytest
 
 from src.db.conn import Database
 from src.security.private_files import PrivateAccessError
 
+#: 依赖 POSIX 文件系统真实 mode 位（0700/0600）的用例：Windows 的 os.chmod 只翻
+#: 只读位，断言物理不可能成立（平台差异，见 AGENTS.md 与 test_private_files.py
+#: 的同名先例）；CI（ubuntu）原生执行。
+POSIX_FS_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX 文件系统语义（mode 位），Windows 本地跳过，CI(ubuntu) 执行")
 
+
+@POSIX_FS_ONLY
 def test_database_tightens_parent_dir(tmp_path):
     target = tmp_path / "data"
     target.mkdir()
@@ -31,6 +40,10 @@ def test_database_refuses_startup_when_not_private(tmp_path, monkeypatch):
     target.mkdir()
     target.chmod(0o755)
 
+    # Windows 上收紧走 icacls（真 ACL，不经过 os.chmod）：本用例测的是
+    # 「收紧失败 → strict 阻断」的逻辑，故强制 POSIX 分派让替身生效。
+    monkeypatch.setattr("src.security.private_files._is_windows", lambda: False)
+
     def boom(_path, _mode):
         raise PermissionError("operation not permitted")
 
@@ -45,6 +58,9 @@ def test_database_can_opt_out_of_strict_permissions(tmp_path, monkeypatch, caplo
     target = tmp_path / "shared"
     target.mkdir()
     target.chmod(0o755)
+
+    # 同上：强制 POSIX 分派，让 os.chmod 替身生效（Windows 分派走 icacls）
+    monkeypatch.setattr("src.security.private_files._is_windows", lambda: False)
 
     def boom(_path, _mode):
         raise PermissionError("operation not permitted")
@@ -65,6 +81,7 @@ def test_database_skips_relative_path(tmp_path, monkeypatch):
     db.close()
     assert called == []
 
+@POSIX_FS_ONLY
 def test_database_tightens_db_file_and_sidecars(tmp_path):
     """库文件本身也要 0600：父目录 0700 只挡遍历，不挡直接读文件。
 

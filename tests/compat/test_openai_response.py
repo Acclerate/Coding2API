@@ -153,6 +153,31 @@ def test_upstream_stream_error_kind_defaults_to_other():
     error = UpstreamStreamError(Event(kind=EventKind.ERROR, error_message="boom"))
     assert error.kind() is ErrKind.OTHER
 
+def test_upstream_stream_error_summary_exposes_code_only():
+    """`.summary` 只带错误码，供 503 文案作受控标识。
+
+    上游 message 可能回显请求参数，绝不能进对外响应；无码返回空串回落类名。
+    """
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=3004,
+        error_message="your requests have exceeded the rate limit"))
+    assert error.summary == "upstream code 3004"
+    assert "rate limit" not in error.summary
+
+def test_upstream_stream_error_summary_empty_without_code():
+    """error_code 槽位为 None（CodeArts 的字符串码在 message 里）→ 空串。"""
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_message="ChatAgent.00001001 排队"))
+    assert error.summary == ""
+
+def test_unavailable_message_uses_stream_error_summary():
+    """轮换耗尽的 503 文案带上流内错误码，而不是干巴巴的异常类名。"""
+    from src.engine.executor import _unavailable_message
+
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=3004, error_message="rate limit"))
+    assert _unavailable_message(error) == "all credentials unavailable: upstream code 3004"
+
 def test_error_payload_shape():
     payload = error_payload("msg", "code", 400)
     assert payload["error"]["message"] == "msg" and payload["error"]["status"] == 400

@@ -10,9 +10,11 @@ import errno
 import socket
 import sqlite3
 import ssl
+import sys
 from pathlib import Path
 
 import httpx
+import pytest
 
 from src import doctor
 from src.config import Settings
@@ -110,6 +112,10 @@ def test_check_data_permissions_missing_dir_is_warn(tmp_path):
     assert check.status == doctor.WARN
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="构造「mode 过宽」依赖 POSIX chmod 语义（Windows 只翻只读位、doctor 走 "
+           "ACL 判定），Windows 本地跳过，CI(ubuntu) 执行")
 def test_check_data_permissions_wide_mode_is_fail(tmp_path):
     """权限过宽 = 服务会拒绝启动，doctor 必须 FAIL 而不是 WARN（口径一致）。"""
     tmp_path.chmod(0o755)

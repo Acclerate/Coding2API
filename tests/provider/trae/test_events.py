@@ -106,10 +106,27 @@ def test_classify_status_business_codes(status, body, expected):
 @pytest.mark.parametrize(("code", "expected"), [
     (1005, ErrKind.PLAN), (14018, ErrKind.CREDIT), (4008, ErrKind.CREDIT),
     (6004, ErrKind.MODEL), (4001, ErrKind.INVALID),
+    (3004, ErrKind.SOFT),   # 限流：短冷却恢复，不累计三振
     (None, ErrKind.OTHER), (9999, ErrKind.OTHER),      # 未知码仍走 OTHER 兜底
 ])
 def test_classify_error_code_mapping(code, expected):
     assert trae_events.classify_error_code(code) is expected
+
+def test_classify_error_code_3004_does_not_strike():
+    """限流（3004）绝不累计 err_count：SOFT 与 OTHER 的差别就在这里。
+
+    单凭证渠道上一次 3004 后，凭证只短冷却 60s；若误判 OTHER，3 次限流会把
+    唯一凭证中冷却 10m，期间所有模型都报 no_healthy_credential。
+    """
+    import time
+
+    from src.engine.scheduler import Candidate, Scheduler
+
+    outcome = Scheduler().note_error(
+        Candidate(credential_id="c1", provider="trae", err_count=2),
+        trae_events.classify_error_code(3004), int(time.time()))
+    assert outcome.cooling_until is not None
+    assert outcome.err_count == 2          # 未累计、未清零，保持原值
 
 def test_parse_all_events_non_dict_tool_call_entry_skipped():
     """非对象 tool_call 条目（88）与全空结果（158-160）覆盖。"""

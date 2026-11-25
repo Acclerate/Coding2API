@@ -538,9 +538,12 @@ def test_quota_exhausted_is_three_state_and_tolerates_deleted_credential(repo):
     assert executor._quota_exhausted(cid, "codebuddy") is False
     credentials.save_quota(cid, Quota(remaining=0, total=4100, probed_at=2))
     assert executor._quota_exhausted(cid, "codebuddy") is True
-    # 总量缺失（上游没给分母）＝ `health == -1` 已耗尽
+    # fork 分歧（勿随上游合并回「总量缺失 = 已耗尽」）：探测成功但额度字段
+    # 全空（lingma 无 openapi 额度端点，`health_score` 返回 UNKNOWN）不算
+    # 耗尽——否则 lingma 凭证会被「探明耗尽」误降级成等签到。上游同位置的
+    # 断言是 `is True`，此行是 fork 有意偏离的标记点。
     credentials.save_quota(cid, Quota(remaining=None, total=None, probed_at=3))
-    assert executor._quota_exhausted(cid, "codebuddy") is True
+    assert executor._quota_exhausted(cid, "codebuddy") is False
     # 凭证被并发删除（请求途中）：占位候选额度未知 → 不降级
     assert executor._quota_exhausted("cred_gone", "codebuddy") is False
 

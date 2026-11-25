@@ -8,14 +8,19 @@ ubuntu-latest，也没有任何文档声明平台范围。
 
 这里把「支持哪些平台」变成一处显式常量与一条可读的退出信息，入口在 import
 `instance_lock` **之前**调用 `require_supported_platform()`。
+
+**fork 差异**：上游只收录 Linux / macOS。本 fork 维持 Windows 裸机部署，并把
+`src/instance_lock.py` 的锁原语补齐到 Windows（`msvcrt.locking` 强制区域锁），
+所以这里同时收录 `win32`——拒绝依据不再是「没有锁原语」，而是「没有实现」。
 """
 
 from __future__ import annotations
 
 import sys
 
-#: 支持的系统（`sys.platform` 前缀）。Linux 与 macOS 均提供 `flock`。
-SUPPORTED_PLATFORMS = ("linux", "darwin")
+#: 支持的系统（`sys.platform` 前缀）。Linux 与 macOS 提供 `flock`；Windows 由
+#: fork 的 `msvcrt` 区域锁覆盖（见 `src/instance_lock.py`）。
+SUPPORTED_PLATFORMS = ("linux", "darwin", "win32")
 
 
 def is_supported_platform(platform: str | None = None) -> bool:
@@ -28,9 +33,9 @@ def unsupported_platform_message(platform: str | None = None) -> str:
     """非支持平台的退出文案：说清原因、替代路径与文档位置。"""
     name = sys.platform if platform is None else platform
     return (
-        f"本平台暂不支持：{name}。单实例锁依赖 flock（仅 Linux / macOS），"
-        f"缺失时会让同一 DATA_DIR 的双写保护静默失效。"
-        f"Windows 请用 WSL2 或 Docker 部署（见 README「部署注意」）。"
+        f"本平台暂不支持：{name}。单实例锁依赖 flock / msvcrt（Linux / macOS / "
+        f"Windows），缺失时会让同一 DATA_DIR 的双写保护静默失效。"
+        f"其他平台请用 WSL2 或 Docker 部署（见 README「部署注意」）。"
     )
 
 

@@ -29,13 +29,19 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 #: Windows ACL 里允许出现的主体（小写比较）。除当前用户外只放行：
-#: SYSTEM（S-1-5-18）与 Administrators（S-1-5-32-544）——与 `private-files.mjs`
-#: 的 `privateAcl` 同口径：出现其他身份即判权限过宽。
+#: SYSTEM（S-1-5-18）、Administrators（S-1-5-32-544）与 Owner Rights
+#: （S-1-3-4， fork 补充）。「收紧」语义是「仅属主 + SYSTEM(+ 管理员)」，而
+#: `OWNER RIGHTS:(F)` 正是「当前属主可完全控制」的表达——部分创建路径
+#: （`tempfile.mkdtemp` 的 0700 收紧、提升进程/受限令牌）会把这一点物化成
+#: 显式 ACE，`icacls /grant:r` 只替换同主体的 ACE、动不了它；不认账就会把
+#: 本来合规的 ACL 误判成过宽（实测 mkdtemp 目录全数命中）。它不会把访问权
+#: 交给属主之外的任何主体，收进白名单不是放松口径。
 WINDOWS_ALLOWED_PRINCIPALS = frozenset({
     "system",
     "nt authority\\system",
     "administrators",
     "builtin\\administrators",
+    "owner rights",
 })
 
 

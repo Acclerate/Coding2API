@@ -448,6 +448,40 @@ async def test_wait_after_soft_error_reuses_cooled_credential(repo, clock):
     db.close()
 
 
+async def test_stream_error_cooldown_is_waited_on_rotation(repo, clock):
+    """端到端回归（实测 3004 场景）：本请求触发的软冷却，轮换路径等待后续上。
+
+    时序：第一次尝试在流内收到 SOFT 错误（上游限流）→ 凭证进短冷却 →
+    轮换重选时唯一凭证已在 `tried` 且正在冷却 → 旧行为立即 503（本次
+    修复的盲点）；新行为等冷却到期、放回可选池、第二次尝试成功。
+    """
+    from src.provider.base import ErrKind
+
+    credentials, db = repo
+    credentials.add(provider="trae", credential_data={"accessToken": "a"})
+
+    class FailThenServe(_Provider):
+        async def stream_chat(self, _credential_data, _payload, _model):
+            self.calls += 1
+            if self.calls == 1:
+                yield Event(kind=EventKind.ERROR, error_code=3004,
+                            error_message="rate limit",
+                            error_kind=ErrKind.SOFT)
+                return
+            for event in GOOD:
+                yield event
+
+    provider = FailThenServe()
+    executor = _executor(credentials, provider,
+                         scheduler=Scheduler(soft_cooldown=3),
+                         short_cooldown_wait_seconds=10)
+    result = await executor.complete(_request())
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert provider.calls == 2
+    assert clock.sleeps == [3]                  # 冷却由第一次尝试的真实错误写入
+    db.close()
+
+
 async def test_usage_recorded_after_wait(repo, clock):
     """等待续上后按成功记账（等待本身不产生任何统计行）。"""
     from src.stats.collector import StatsCollector

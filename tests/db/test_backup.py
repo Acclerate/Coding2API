@@ -60,12 +60,18 @@ def test_backup_creates_verifiable_snapshot(tmp_path):
 
 
 def test_backup_file_is_owner_only(tmp_path):
-    """库内是密文凭证 + 明文用量：备份文件 0600、目录 0700。"""
+    """库内是密文凭证 + 明文用量：备份文件 0600、目录 0700。
+
+    权限位断言只在 POSIX 上生效：Windows 的 os.chmod 只翻只读位，
+    S_IMODE 恒为 0o666/0o777 形态（平台差异，见 AGENTS.md）；备份逻辑
+    本身两个平台都执行，保住 src 覆盖率。
+    """
     db_path = tmp_path / "coding2api.sqlite3"
     _seed(db_path)
     target = backup_database(db_path)
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    if os.name == "posix":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
 
 
 def test_backup_includes_uncheckpointed_wal(tmp_path):
@@ -216,7 +222,9 @@ def test_restore_replaces_db_and_keeps_safety_copy(tmp_path):
     assert _read(db_path) == ["current"]
     assert not Path(f"{db_path}-wal").exists()
     assert not Path(f"{db_path}-shm").exists()
-    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+    # 权限位仅 POSIX 可断言（Windows chmod 只翻只读位，见上条测试注释）
+    if os.name == "posix":
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
 
 
 def test_restore_without_existing_db_returns_none(tmp_path):
@@ -309,7 +317,10 @@ def test_stage_restore_validates_and_writes_pending(tmp_path):
                     "uploaded_at": 1234}
     pending = pending_restore_path(db_path)
     assert pending.is_file()
-    assert pending.stat().st_mode & stat.S_IRWXO == 0
+    # 权限位仅 POSIX 可断言（Windows chmod 只翻只读位，见上条测试注释）；
+    # Windows 上收紧走 icacls（_chmod 内部），落盘行为本身两平台都执行。
+    if os.name == "posix":
+        assert pending.stat().st_mode & stat.S_IRWXO == 0
     assert pending_restore_info(db_path)["filename"] == "evil.sqlite3"
 
 

@@ -346,7 +346,12 @@ class TaskRunner:
 
         成功凭证当日封账（run_once 内跳过），失败凭证继续重试。
         `manual=True`（管理台「立即运行」）绕过时点窗口：手动就是立刻跑。
+        开关关闭时整类 no-op（含手动轮次——不需要签到活动的部署连后台轮次
+        带手动触发一起关；单凭证的手动签到按钮走 provider.checkin，不经这里，
+        不受影响）。
         """
+        if not self._checkin_enabled():
+            return None
         if not manual and not self._checkin.due():
             return None
         return await self._checkin.run_once(trigger="manual" if manual else "auto")
@@ -524,9 +529,9 @@ class TaskRunner:
         """key → 周期 property 的派发表。
 
         与 `_task_enabled` 分开维护：周期是每个任务必有的一项，开关只有
-        activity / alert / upstream_status 三个可关。用字典而非 if-chain，
-        新增任务时漏接线会直接落进 `_interval_seconds` 的兜底分支（保留期），
-        而不是静默返回别的任务的周期。
+        activity / alert / checkin / upstream_status 四个可关。用字典而非
+        if-chain，新增任务时漏接线会直接落进 `_interval_seconds` 的兜底分支
+        （保留期），而不是静默返回别的任务的周期。
         """
         return {
             "quota_probe": lambda: self._quota_interval,
@@ -544,10 +549,11 @@ class TaskRunner:
         }
 
     def _task_enabled(self, key: str) -> bool:
-        """任务是否启用；只有三个可关的任务需要现读开关，其余恒 True。"""
+        """任务是否启用；只有四个可关的任务需要现读开关，其余恒 True。"""
         getter = {
             "activity": self._activity_enabled,
             "alert": self._alert_enabled,
+            "checkin": self._checkin_enabled,
             "upstream_status": self._upstream_status_enabled,
         }.get(key)
         return True if getter is None else bool(getter())

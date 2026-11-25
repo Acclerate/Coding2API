@@ -617,6 +617,7 @@ export function CredentialsPage() {
       return true;
     } catch (caught) {
       showError(errorText(caught, "批量操作失败"));
+      return false;
     } finally {
       setBusy(false);
     }
