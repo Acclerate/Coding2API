@@ -33,7 +33,9 @@ from ..audit.actions import (
     ACTION_CREDENTIAL_WEB_COOKIE,
     ACTION_CREDENTIAL_WEIGHT,
 )
+from ..auth.access import normalize_allowed_models
 from ..auth.rbac import require_operator
+from ..compat.openai.errors import error_payload
 from ..compat.openai.request import InvalidRequest
 from ..engine.limits import day_start
 from ..provider.base import CheckinResult, GrowthResult, GrowthStep, StepStatus
@@ -150,6 +152,16 @@ def _limits_detail(limits: dict) -> str:
     return "；".join(parts) or "清除限额"
 
 
+def _expected_version(payload: dict) -> int | None:
+    """读取乐观并发版本号 `expected_updated_at`（不传 = 旧行为，见端点注释）。"""
+    raw = payload.get("expected_updated_at")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise InvalidRequest("expected_updated_at must be a non-negative integer")
+    return raw
+
+
 def describe_probe_failure(error: Exception) -> str:
     """把探测异常翻译成用户能据以行动的原因。
 
@@ -262,6 +274,28 @@ async def checkin_credential_once(credentials, provider, data, credential_id: st
             "status": result.status}
 
 
+def _zen_slot_target(credentials) -> str | None:
+    """挑出 zen 的单槽目标行：**最早创建**的那条（没有则 None）。
+
+    zen 是单槽渠道，正常只有一行；一旦历史遗留/并发导入留下多行，原来的
+    `candidates(["zen"])[0]` 取的是裸 `SELECT` 的第一行——顺序不确定，且
+    多余旧行无人清理。这里按 `created_at`（并列再按 id）确定性取最早一条，
+    与 `find_login_credential` 的「统计归属挂在最早 id」口径一致。
+    """
+    rows = sorted((row for row in credentials.list_all()
+                   if row["provider"] == "zen"),
+                  key=lambda row: (row["created_at"], row["id"]))
+    if not rows:
+        return None
+    if len(rows) > 1:
+        # 多行 zen 是异常状态（单槽渠道本该只有一条）：不擅自删数据，但必须
+        # 留痕，否则「合并到了哪条、剩下几条僵尸行」事后完全无法追溯。
+        logger.warning("检测到 zen 渠道有 %d 条凭证（单槽渠道应为 1 条），"
+                       "合并到最早的一条 %s：%s",
+                       len(rows), rows[0]["id"], [row["id"] for row in rows[1:]])
+    return rows[0]["id"]
+
+
 def create_router(services: Services) -> APIRouter:
     router = APIRouter()
     credentials = services.credentials
@@ -350,8 +384,8 @@ def create_router(services: Services) -> APIRouter:
             raise InvalidRequest(str(error)) from error
         return provider_id, credential_data, tags
 
-    def register_import(provider_id: str, credential_data: dict, tags: list[str],
-                        nickname: str, principal) -> dict:
+    async def register_import(provider_id: str, credential_data: dict, tags: list[str],
+                              nickname: str, principal) -> dict:
         """落库 + 审计 + 探测入队；返回凭证 id、ToS 风险与是否就地合并。
 
         `MANUAL_MERGE_PROVIDERS`（灵犀 / 小浣熊）没有 OAuth 轨道，手工导入就是
@@ -359,6 +393,9 @@ def create_router(services: Services) -> APIRouter:
         一个账号重登一次就多一条重复凭证，旧行的会话已被新登录顶掉、只能等
         下一次 401 才被硬禁用；小浣熊还会把同一账号当两个号并发（额度/积分
         双份统计，且绕过节流器按账号算的并发上限）。
+
+        `async` 是因为 zen 单槽合并要持凭证级 `edit_lock`（与账号登录
+        `credential_login.save_login_credential` 同口径）。
         """
         merged = False
         credential_id = ""
@@ -373,6 +410,23 @@ def create_router(services: Services) -> APIRouter:
                     existing, credential_data, nickname)
                 if merged:
                     credential_id = existing
+        if not merged and provider_id == "zen" and credential_data.get("api_key"):
+            # zen 是单槽渠道（一条虚拟凭证代表整条上游）：带 Key 导入不是
+            # 「再加一条号」，而是把这条虚拟凭证从匿名档换成付费档。否则会
+            # 并存两条，调度先选匿名行 → 撞 429 → 冷却 → 才轮到 Key 行，
+            # 每次换档都白丢一次请求。
+            target_id = _zen_slot_target(credentials)
+            if target_id is not None:
+                # 与账号登录同口径：「读 → 合并 → revive」整段持凭证级编辑锁，
+                # 否则预刷新/账号切换的整份覆写会与本次合互相覆盖。
+                async with credentials.edit_lock(target_id):
+                    merged = credentials.merge_login_credential(
+                        target_id, credential_data, nickname)
+                    if merged:
+                        credential_id = target_id
+                        # 换认证方式后旧的 429/额度判定不再适用（新 Key 是另一份
+                        # 配额）：不清掉会出现「刚导入 Key 却还在冷却」，被当成没生效。
+                        credentials.revive(credential_id, force=True)
         if not merged:
             credential_id = credentials.add(provider=provider_id,
                                             credential_data=credential_data,
@@ -406,8 +460,8 @@ def create_router(services: Services) -> APIRouter:
                                 principal=Depends(principal_from_request)):
         require_operator(principal)
         provider_id, credential_data, tags = prepare_import(payload)
-        return register_import(provider_id, credential_data, tags,
-                               str(payload.get("nickname") or ""), principal)
+        return await register_import(provider_id, credential_data, tags,
+                                     str(payload.get("nickname") or ""), principal)
 
     @router.post("/api/credentials/batch-import")
     async def batch_import_credentials(payload: dict,
@@ -447,8 +501,8 @@ def create_router(services: Services) -> APIRouter:
                 skipped.append({"index": index, "reason": "duplicate"})
                 continue
             seen.add(fingerprint)
-            row = register_import(provider_id, credential_data, tags,
-                                  str(item.get("nickname") or ""), principal)
+            row = await register_import(provider_id, credential_data, tags,
+                                        str(item.get("nickname") or ""), principal)
             created.append({"index": index, **row})
         logger.info("管理员 %s 批量导入：成功 %d，跳过 %d，失败 %d",
                     principal.username, len(created), len(skipped), len(failed))
@@ -497,28 +551,71 @@ def create_router(services: Services) -> APIRouter:
     async def set_credential_limits(credential_id: str, payload: dict,
                                     _csrf: None = Depends(csrf_protected),
                                     principal=Depends(principal_from_request)):
-        """设置/清除一条凭证的限额护栏（整体替换：缺省字段=关闭该护栏）。
+        """设置/清除一条凭证的限额护栏 + 账号级模型白名单（整体替换）。
 
-        四个护栏全关时（提交空配置 / 全 0）删除配置行，凭证回到「不受限」。
+        四个护栏全关时（提交空配置 / 全 0）删除配置行，凭证回到「不受限」；
+        `allowed_models` 同一整表替换语义（与 `api_keys.allowed_models` 同一
+        fnmatch glob 语法，`''` = 不限制）。**该字段缺省时不动它**——只看限额
+        的老调用方不该把别人设的白名单静默清掉；要清必须显式传空串。
+
+        **乐观并发**（P2-19）：请求可带 `expected_updated_at`（列表接口每行的
+        `updated_at`）。与库里不一致 = 别人先保存了，回 409 + 当前快照
+        （`current`），前端提示「已被他人修改」并刷新。不带该字段 = 保持
+        「最后写入者赢」的旧行为——这是给既有脚本/调用方的**兼容口子**，
+        管理台前端必须带，否则冲突检测形同虚设。
+
         写入后 `limit_guard.invalidate()` 让新值立即参与选号，不等快照 TTL。
         """
         require_operator(principal)
         if credentials.provider_of(credential_id) is None:
             raise InvalidRequest("credential not found")
+        expected = _expected_version(payload)
+        # `allowed_models` 缺省 = 不动这一列（只看限额的老调用方不该清掉白名单）；
+        # 显式传（含空串 = 清空）才写。
+        allowed_models: str | None = None
+        if "allowed_models" in payload:
+            try:
+                allowed_models = normalize_allowed_models(payload.get("allowed_models"))
+            except ValueError as error:
+                raise InvalidRequest(str(error)) from error
         limits = {
             "keep_credits": _optional_limit(payload, "keep_credits"),
             "daily_tokens": _optional_limit(payload, "daily_tokens", integer=True),
             "daily_credits": _optional_limit(payload, "daily_credits"),
             "per_model_tokens": _per_model_limits(payload),
         }
+        # 先做版本比对写入（模型白名单与凭证行同一条 UPDATE，天然原子）；
+        # 冲突时一行都不改，直接把当前快照回给客户端。
+        version = credentials.apply_credential_edit(
+            credential_id, allowed_models=allowed_models,
+            expected_updated_at=expected)
+        if version is None:
+            record = services.limits.get(credential_id)
+            current = credentials.edit_snapshot(credential_id)
+            content = error_payload(
+                "凭证已被他人修改，请刷新后重试", "credential_conflict", 409)
+            content["current"] = {
+                "id": credential_id,
+                "updated_at": current.get("updated_at", 0),
+                "allowed_models": current.get("allowed_models", ""),
+                "limits": record.as_dict() if record is not None else None,
+            }
+            return JSONResponse(status_code=409, content=content)
         services.limits.set(credential_id, updated_by=principal.username, **limits)
         services.limit_guard.invalidate()
+        detail = _limits_detail(limits)
+        if allowed_models is not None:
+            detail = (f"{detail}；模型白名单 {allowed_models}" if allowed_models
+                      else f"{detail}；清除模型白名单")
         logger.info("管理员 %s 设置凭证 %s 限额: %s", principal.username, credential_id,
-                    _limits_detail(limits))
+                    detail)
         services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_LIMITS,
-                              target=credential_id, detail=_limits_detail(limits))
+                              target=credential_id, detail=detail)
         record = services.limits.get(credential_id)
-        return {"limits": record.as_dict() if record is not None else None}
+        snapshot = credentials.edit_snapshot(credential_id)
+        return {"limits": record.as_dict() if record is not None else None,
+                "allowed_models": snapshot.get("allowed_models", ""),
+                "updated_at": version}
 
     @router.put("/api/credentials/{credential_id}/weight")
     async def set_credential_weight(credential_id: str, payload: dict,
@@ -828,6 +925,30 @@ def create_router(services: Services) -> APIRouter:
         if services.credentials.provider_of(credential_id) is None:
             raise InvalidRequest("credential not found")
         return {"events": services.checkin_events.recent(credential_id, limit=limit)}
+
+    @router.get("/api/credentials/{credential_id}/timeline")
+    async def credential_timeline(credential_id: str, since: int | None = None,
+                                  until: int | None = None, limit: int = 50,
+                                  offset: int = 0,
+                                  principal=Depends(principal_from_request)):
+        """凭证可用性时间线：冷却开始/结束、硬禁用、人工恢复、启停（倒序）。
+
+        `since` / `until` 是 epoch 秒**闭区间**（None = 不限），用于只看
+        「昨天 14:00 前后」那一段；`limit` 收敛到 [1, 200]、`offset` 供翻页。
+        `has_more` 为真表示还有更早的行（下一屏用 `offset + limit` 取）。
+
+        读的是本地落库的历史，**不触发任何上游请求**：已禁用/失效的凭证也能
+        查到它当初为什么不可用（回复体只有脱敏枚举与可读短句，不含凭证明文）。
+        """
+        require_operator(principal)
+        if services.credentials.provider_of(credential_id) is None:
+            raise InvalidRequest("credential not found")
+        effective = max(1, min(200, limit))
+        events = services.credential_events.recent(
+            credential_id, since=since, until=until, limit=effective,
+            offset=max(0, offset))
+        return {"events": events, "limit": effective,
+                "has_more": len(events) == effective}
 
     @router.get("/api/credentials/{credential_id}/export")
     async def export_credential(credential_id: str,

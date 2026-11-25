@@ -72,7 +72,7 @@ docker compose up -d --build
 docker compose exec coding2api python scripts/create_user.py admin --role admin
 ```
 
-拉镜像：`docker compose pull`（或 `docker pull ghcr.io/robbsluo/coding2api:v0.14.1`）。tag `v*` 推 main → `.github/workflows/publish.yml` → 发 `<tag>` + `:latest`。有公网 IP 的 VPS 要 https → 见「[公网部署](#公网部署docker--caddy-自动-https)」。
+拉镜像：`docker compose pull`（或 `docker pull ghcr.io/robbsluo/coding2api:v0.14.3`）。tag `v*` 推 main → `.github/workflows/publish.yml` → 发 `<tag>` + `:latest`。有公网 IP 的 VPS 要 https → 见「[公网部署](#公网部署docker--caddy-自动-https)」。
 
 ## 用户与角色
 
@@ -98,6 +98,7 @@ python3 scripts/create_user.py alice --role admin   # 交互输入密码
 python3 scripts/create_user.py --list
 python3 scripts/create_user.py alice --delete --force   # 硬删，不可逆
 echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-stdin
+python3 scripts/create_user.py alice --role admin --init   # 库还不存在时先建库（缺 --init 会拒绝，避免误建空库）
 ```
 
 `ADMIN_USERNAMES` 与 `secrets/users.txt` 仅引导期生效（判据：库里还没有活跃 admin）；此后角色只来自 DB。
@@ -119,7 +120,7 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
    - **OfficeAce**：点「登录 OfficeAce」走华为云授权（回调由云端承接）。
    - **小浣熊 / 灵犀**：无登录按钮，只能粘网页会话凭据（小浣熊 `{"access_token":"<xhx_token>"}`，灵犀整段 Cookie 或裸 `wps_sid`）。
    - **通用粘法**：「JSON 导入」接受整段 Cookie，或 DevTools → Network → 右键请求 → **Copy as cURL (bash)**（HttpOnly cookie 也能拿到）；有明确特征（`wps_sid` / `xhx_token` / TRAE 字段 / AK·SK）时自动识别渠道并记住。
-   - **OpenCode Zen / Kilo**：无需添加，启动自动出虚拟凭证（删了可在同面板补回）。
+   - **OpenCode Zen / Kilo**：无需添加，启动自动出虚拟凭证（删了可在同面板补回）；Zen 已充值时可在同面板粘贴 Console API Key 切付费档。
 2. 「API Key」建 `sk-...`（明文仅显示一次）。
 3. 调用：
 
@@ -138,7 +139,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 2. **归一键**：剥免费档标记（`-free` / `free` 路径段）与命名空间前缀（含小浣熊 `sn-`）→ slug 化。列表按它判同模型、合并。
 3. **展示名**：可读文本（`LongCat 2.5 Preview`）；上游给就用，否则从原代号派生，品牌写法从官方。
 
-`GET /v1/models` 的 `id` 全是归一键；转发自动换回原代号，`by_provider.{渠道}.raw_id` 可见。**三种写法都能请求**；同渠道内归一键重复 → 退回原代号。条目可选带 `cost {input, output, cache_read}`（USD / 百万 token）与 `reasoning_efforts`。
+`GET /v1/models` 的 `id` 全是归一键；转发自动换回原代号，`by_provider.{渠道}.raw_id` 可见。**三种写法都能请求**；同渠道内归一键重复 → 退回原代号。条目可选带 `cost {input, output, cache_read}`（USD / 百万 token）与 `reasoning_efforts`。上下文 / 输出上限同值双发：本仓字段 `max_input_tokens` / `max_output_tokens` + OpenRouter 风格别名 `context_length` / `max_completion_tokens`（源字段缺省时不发别名）。
 
 - **自定义别名**（`MODEL_ALIASES`，可热更）：`对外名=模型@渠道;对外名2=模型`，`@渠道` 可省。列表与请求解析共用一份，条目带 `custom_alias: true`；撞名 / 目标不存在 / 渠道不持有 → 该段 ERROR 跳过。无别名链。
 - **单模型查询**（`GET /v1/models/{id}`）：三种写法 + 别名都认，大小写不敏感。找不到 / 不在 Key 白名单 → 404（`model_not_found`），不泄露池内容。两个 models 路由都接受 `x-api-key` 与 `Authorization: Bearer`。
@@ -165,6 +166,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 [opencode.ai/zen](https://opencode.ai) 免费模型，免登录。上游清单混付费、无免费标记 → `-free` 后缀收窄 → 逐个探活 → **只剔除确定不可用**（付费 401 / 下线 400 / 区域 403）；`429` / 5xx / 超时**保留**（判活缓存 30 分钟；免费模型 **x0**）。
 
 **免费层门禁**：上游要伪装官方客户端（UA、会话头、`stream:true`、tools 含门禁工具）→ 自动满足；注入空壳工具，真调用被过滤。门禁是移动靶，全部做成配置（改完重启即换）：`ZEN_USER_AGENT`、`ZEN_API_ROOT`、`ZEN_MODELS_ROOT`、`ZEN_GATE_TOOLS`、`ZEN_CLIENT_PROFILE`（`legacy` 默认 / `v2`）。`v2` 复刻官方 2.x 头集合（4 个 session 副本、`x-opencode-client/project`、`b3`/`traceparent`）并注入 `<env>` 块；2.x 端点拆分时配 `ZEN_API_ROOT=/inference/openai/v1` + `ZEN_MODELS_ROOT=/inference/v1`。付费模型强制 `模型@zen` 也只报不可用。
+
+**付费档（Console 充值 + API Key）**：凭证内容写 `{"api_key": "sk-…"}`（面板「Zen API Key」输入框，或批量导入同名字段）即切付费档——对话走 `/inference/openai/v1`、鉴权 `Bearer <key>`、不再注入门禁工具/`<env>`；模型清单走 `/inference/v1`，**摘掉 `-free` 与零价模型**（这两类带 Key 仍回 429，且那条 429 按账号记，会把付费凭证一起冷却）、不逐个探活。账号没开通任何付费模型时清单为空 → zen 不参与路由（管理台不再显示必撞的免费模型）。zen 是**单槽**渠道：带 Key 导入会更新既有虚拟凭证（不新增第二行），并清掉旧冷却——否则匿名行会先被调度选中、反复撞 429。Key 留空 = 保持匿名免费层。
 
 ### Kilo（`kilo`）
 
@@ -244,7 +247,7 @@ GENERIC_CHAT_MIN_INTERVAL=0               # 可选：压低 RPM
 
 - **留空 = 不启用**：`GENERIC_API_ENDPOINT` 为空的部署里没有这条渠道（`/v1/models`、凭证页、ToS 提示都不出现）。
 - **凭证**：`{"api_key": "sk-…"}`（也接受裸 key / `token` / `accessToken`），进加密池，可多把轮换。
-- **端点校验**：`GENERIC_ALLOWED_ENDPOINTS` 非空只放行名单内；留空放行任意 `http(s)`（接内网自建就是用途），但仍拒 `file://` 等非 HTTP scheme。
+- **端点校验**：`GENERIC_ALLOWED_ENDPOINTS` 非空只放行名单内；留空放行任意 **https** 端点。`http://` 仅允许回环（`localhost` / `127.0.0.1` / `::1`）——凭证是真实 API key，明文 http 打内网等于把 key 交给同网段任何人。内网自建请配 https（自签可走反代）或只监听回环 + 隧道。任何情况下都拒 `file://` 等非 HTTP scheme。
 - **错误分类与 Zen / Kilo 相反**：那两家无凭证，401 只是「要付费 key」→ 跳过渠道；这里 **401/403 = key 废了 → 硬禁用**；402 → 余额不足，429 → 限流，5xx → 其它。
 - **能力**：聊天、模型列表。无签到 / 成长 / 活跃上报 / 刷新 / 额度查询，对应任务自动跳过。
 - **限制**：一个部署只配一条（渠道 id 固定 `generic`）；要多接几家请拆部署。
@@ -351,7 +354,8 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 - `GET /health`：只回 `{"status":"ok"}`，**存活探针用这个**。
 - `GET /healthz`：额外给凭证池计数，`ready == 0` → 503（就绪探针 / 告警）。
 - 两端点不鉴权、接受 `HEAD`；四类计数互斥（`ready` / `cooling` / `paused` / `disabled`），合计 = `total`。**升级注意**：`/healthz` 从「恒 200」改为「ready=0 时 503」。
-- `GET /metrics`（Prometheus）：默认开、默认**不鉴权**；`METRICS_ENABLED=false`（可热更）→ 404；设 `METRICS_TOKEN` 后须带 `Authorization: Bearer <token>`。
+- `GET /metrics`（Prometheus）：默认开；`METRICS_ENABLED=false`（可热更）→ 404。`METRICS_TOKEN` **留空时只放行回环对端**（本机 `127.0.0.1` / `::1` 抓取，公网与内网其它主机一律 401）；设了 token 则要求 `Authorization: Bearer <token>`。公网入口（Caddy / nginx 模板）另已摘掉该路径。
+- **OTLP 导出（可选）**：`OTLP_ENDPOINT` 非空即每 `OTLP_EXPORT_SECONDS` 秒 `POST {endpoint}/v1/metrics`（OTLP/HTTP JSON，**不引入 SDK**）。只导 `gen_ai.*` 指标（供应商 / 模型 / token / 延迟 / TTFT / 错误类型），**绝不导出** `gen_ai.input.messages` / `output.messages` / `system_instructions` 或任何正文；非回环端点强制 https，失败只告警一次、不拖垮服务。
 
 | 指标 | 类型 | 标签 | 数据源 |
 |---|---|---|---|
@@ -371,8 +375,10 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 - **来源 IP 白名单**：逗号分隔 IP / CIDR，写入时规范化（`10.0.0.1` → `10.0.0.1/32`），名单外 → 403。默认不采信 `X-Forwarded-For`；仅 `TRUST_PROXY=true` 按 XFF 取最后一条。
 - **模型白名单**：逗号分隔模型名或 fnmatch glob（`glm-*,kimi-k3`），大小写不敏感，`模型@渠道` 后缀不参与匹配；名单外 400，`/v1/models` 也只列名单内。
 - **到期**：epoch 秒，留空 = 永不过期；到期后 401（与「Key 不存在」同文案）。
-- **配额**：六项独立，`0` / 留空 = 不限——`daily_requests` / `daily_tokens` / `daily_cost_usd` / `rpm` / `tpm`（按预估值）/ `max_concurrency`。当日类按北京时间自然日，速率 / 并发为进程内滑动窗口；超限 429 + `quota_exceeded`，`Retry-After` 指向可重试时刻；异常一律放行 + warning。
+- **配额**：六项独立，`0` / 留空 = 不限——`daily_requests` / `daily_tokens` / `daily_cost_usd` / `rpm` / `tpm`（按预估值）/ `max_concurrency`。当日类按北京时间自然日，速率 / 并发为进程内滑动窗口；超限 429 + `quota_exceeded`，`Retry-After` 指向可重试时刻；异常一律放行 + warning。**`daily_cost_usd` 是 fail closed 口径**：窗口内只要存在「有 token 但价表里查不到价」的请求，就按已达上限阻断（成本量不出来时不能假装有配额）——所以给这个限额前先确认价表覆盖你实际在用的模型。
 - **自助查询**：`GET /v1/usage?days=1|7|30` 返回自己的用量、剩余额度、当前速率占用。
+- **编辑策略**：`PUT /api/api-keys/{id}` 改名称 / 渠道绑定 / 来源 IP 白名单 / 模型白名单 / 到期时间（明文与 id 不可改，换 Key 必须重新签发）。**未提供**的字段保持原值，传空串（`expires_at` 传 `null`）= 清空该项；改的是鉴权每次现读的列，下一个请求即生效，审计 `api_key.update` 带字段 diff（不含明文）。
+- **窗口用量**：列表 `?window=today|7d|30d`（默认 `today`），按含今天在内的最近 N 个自然日聚合每把 Key 的请求数 / token / 成本；无明细返回 0。
 
 ### 凭证暂停与批量运维
 
@@ -386,6 +392,8 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 ### 凭证限额与在途
 
 - **限额护栏**（行内「设置限额」，四项独立，全空 = 不受限，判定在选号前）：保留积分（剩余 ≤ 值 → 整号停用，余额未知不猜）、每日 token 上限、每日积分上限、按模型 token 上限（`{模型: 上限}`，只停该模型）。当日 = 北京时间自然日。写入 `PUT /api/credentials/{id}/limits`（整体替换，即时生效，审计 `credential.limits`）。
+- **凭证级模型白名单**（同一对话框）：`allowed_models` = fnmatch glob、逗号分隔，`''` = 不限制，语法与 API Key 的模型白名单一致。**只作用于对话 / 推理选号**：不在列表里的模型不选这个号，但不硬禁用、不写冷却，换个模型立即可用；签到 / 刷新 / 探活 / 额度探测 / 模型列表等后台路径不受限。模型名无法判定（空 / `auto`）时放行，避免把池子摘空。
+- **并发编辑冲突**：编辑端点带 `expected_updated_at`（列表每行已返回），不匹配回 `409 credential_conflict` 并附当前行快照；管理台提示「已被他人修改，请刷新」。版本号只在**人工编辑**时推进，后台轮询/冷却写入不推进，所以打开着的编辑页不会被自己刷成过期。
 - **在途上限** `MAX_INFLIGHT_PER_CREDENTIAL`（默认 0 = 不限，可热更）：同一凭证并发达到该值后不再参与选号；计数进程内，租约在请求结束时释放，另有 600s TTL 兜底。**兼作负载键**：插在「免费优先」之后、到期额度之前 → 并发自动摊到空闲号。
 - **耗尽语义**：候选全因限额 / 在途跳过 → `no_healthy_credential` 503；模型级冷却 → `model_unavailable`；上游限流 / 额度类冷却统计记 `rate_limit`（对外码仍是 `no_healthy_credential`）。
 
@@ -401,8 +409,9 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 `GET /v1/models` 与 Playground 下拉只合并**当前有可用凭证**的渠道（冷却中仍算）。顺序：CodeBuddy（国内 → 国际）、TRAE、Qoder、CodeArts、OfficeAce、小浣熊、灵犀，Zen / Kilo 垫底；组内按名字典序；多渠道模型归最高优先级渠道（`src/api/model_merge.py` 的 `_PROVIDER_RANK`）。
 
 - **请求路由只认这份缓存**：目录能证明归属 → 候选只有那些渠道，全不可用 → 503；模型完全不在目录 → 仍按全部候选路由；直连指定与 Key 渠道绑定不受影响。
-- **落盘与启动即用**：进程内 TTL 缓存（300s）之外，每次拉取成功写 `DATA_DIR/model_catalog.json`，启动时同步读回；快照损坏或超 7 天只丢缓存。`MODEL_CATALOG_MINUTES` 任务兜底。
+- **落盘与启动即用**：进程内 TTL 缓存（只有服务层一层，TTL 见 `MODEL_LIST_TTL_SECONDS`）之外，每次拉取成功写 `DATA_DIR/model_catalog.json`，启动时同步读回；快照损坏或超 7 天只丢缓存。`MODEL_CATALOG_MINUTES` 任务兜底。
 - **stale-while-revalidate**：有缓存立刻回旧列表，TTL 到期后台刷新；连续失败按 2^(n-1)×TTL 退避（封顶 2 小时），日志只在首次失败打 WARNING。
+- **静态表兜底是可见的降级**：TRAE / CodeBuddy 在动态拉取失败时会回退内置静态表并照常返回。该渠道会被记为失败（带原因），`/metrics` 出 `coding2api_model_list_degraded{provider}`，`GET /api/models/probes` 的 `degraded` 字段列出渠道与原因——否则「这个渠道一直没拿到上游真值」只能靠翻日志发现。
 - **管理台「模型列表」页**（`GET /api/model-catalog`）：只读展示 OpenRouter 公开目录（刊例价、上下文 / 输出上限、模态、能力、知识截止、AA 三项指数，非本服务实测），带 `available` 与「只看当前渠道」开关。浮动别名取同族最新快照的分（按 `canonical_slug` 日期）。
 - **疑似下线视图**（`GET /api/models/availability`，operator）：最近 N 天（默认 7）的 `upstream_blocked` / `model_not_found` / `invalid_request` 按 `(渠道, 模型)` 聚合，行内可「加入黑名单」→ `model_blocklist` + 审计。
 - **主动探活**（`GET /api/models/probes`，operator）：探「仍被 `blocked` 负缓存锁住」与「已判死（`state='failed'`）」两类。**成功** → 清负缓存、回列表（唯一恢复入口）；**`failed`** → 留负缓存 + 累加；**`inconclusive`**（额度 / 限流 / 网络 / 超时 / 空流）→ 绝不禁用，连续失败归零。探活直连 `provider.stream_chat`，不写 `usage_events`、不动冷却表。判死模型只从该 (渠道, 模型) 摘掉，**隐藏没有到期时间**——恢复只靠复探成功（周期 `MODEL_PROBE_MINUTES` 默认 0 = 关）。**人工接管**（`POST /api/models/probes/manual`）让自动探活跳过该行但不改负缓存。
@@ -439,17 +448,21 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 
 - **失败类型**（`CONTROLLED_ERROR_TYPES`）：收尾行取**最后一次错误的真实归因**——`model_unavailable` / `rate_limit` / `upstream_timeout` / `network_error`（本机 DNS / 连接失败，不冷却凭证）/ `context_overflow`（11115）/ `model_capability`（CodeArts 001001020）/ `model_not_found`（模型下线，与「请求无效」分开）。只有**一次都没选中凭证**才回落 `no_healthy_credential`。对外码相同，仅统计口径不同。
 - **请求 ID**：响应带 `X-Request-ID`，入站合法沿用否则自生成（`[A-Za-z0-9._:-]`、1–128 字符）；落 `usage_events.request_id`，**不透传上游**。
+- **尝试链响应头**（`EXPOSE_UPSTREAM_HEADERS=true` 才开，默认关）：`X-Upstream-Attempts` = 本次请求实际用过的凭证数，`X-Upstream-Degraded` = 是否走了 `MODEL_FALLBACK_GROUPS` 回退。关闭时中间件主动剥离同名头（含上游或中间盒回传的伪造值）。默认关的原因：这两个头等于把账号池规模、成本与路由指纹递给调用方。流式场景只反映**发响应头之前**的尝试，首帧之后的轮换无法回改已发出的头。
+- **内容拒绝冻结**：上游内容安全拒绝（当前只识别 CodeBuddy `11128`）不换号、不冷却，按发起者（用户名优先，无用户名用 API Key id）记一次。`ACCESS_FREEZE_THRESHOLD=N`（默认 `0` = 只记录）达到后对该「发起者 × 渠道」在发往上游前回 `403 provider_access_frozen`；`GET /api/access-freezes` 看命中与冻结状态，`POST /api/access-freezes/unfreeze` 解冻（operator+，写审计）。
 - **Credit**：CodeBuddy = 上游真值；TRAE 按官方单价推算并标 `≈`（`src/provider/trae/pricing.py`，未收录不推算）。历史用 `scripts/backfill_trae_credit.py` 补。
 - **成本（估算 ≈）**：token × 公开刊例价，非上游真实扣费。`(输入−命中)×输入价 + 命中×缓存价 + 输出×输出价` 折 USD → 写入时按 `USD_CNY_RATE` 折 CNY，历史不重算。匹配不到就不计（成本是下限），渠道分发代号按显式等价规则归到基础模型。
 - **缓存命中率**：命中 token ÷ 输入 token（1 位小数），未上报或输入 0 → `—`。
 - **输出速度** = `token 总量 ÷ 生成时间总和`（非逐条比值平均）。两口径：**正文速度** `output_tokens - reasoning_tokens`、**总产出速度**含思考。仅算经本服务路由、产出 ≥1 token 的成功请求；生成时间 = `latency_ms - ttfb_ms`，剔除窗口 <200ms 或单条 >1000 tok/s。无样本 → 估算口径（前置 `≈`），两口径皆无 → `—`。
 - **图表**：请求次数 / Token / 成本 / 单请求成本 / 耗时 / 首字延迟 / 成功率 / 缓存命中率。派生指标按 `sum ÷ sum` 算，无样本给 `—`（断线）不画 0；耗时 / 首字另配分位图（P50 + P95，读明细，仅 90 天）。时间轴按小时补齐。`metric` 取值域外显式 400；自定义范围非法时暂停取数。
+- **压缩收益面板**：触发次数（tool 输出 / 上下文体裁剪）、省下的字符与 token（下界估算）、同期前缀缓存命中率、两个压缩开关状态，同屏展示。省 token 必须与缓存代价一起看，否则无法判断「该开还是该关」；`GET /api/stats/compression?since=&until=`（operator+，按小时桶汇总，与总览同时间窗；不传两端为终身累计）。小时桶与终身累计落盘到 `DATA_DIR/compress_buckets.json`（60s 节流、退出补写），重启续接、保留 90 天。
 
 ### 积分与签到记录
 
 - **变动流水**（额度数字后下箭头）= **两次额度探测之间的净变化**，非动作归因（签到、成长、对话都改余额而上游不打日志 → 界面一律写「净变化」）。首次探测只建基线，余额没变不记，变「未知」仍记但不填变化量；留 90 天。
 - **按账本分流**：流水带 `ledger`（`pool` / `credits`）；CodeArts 与小浣熊记 `credits`，其余 `pool`。`GET /api/credentials/{id}/credit-events?ledger=`。
 - **签到记录**（「更多操作 → 签到记录」）= 签到审计日志，每轮一行（时间 / 结果 / 领取积分 / 上游业务码 / 文案 / 触发方式），保留 90 天；`GET /api/credentials/{id}/checkin-events?limit=`。这是**动作的逐次结果**，不依赖余额 diff，故「显示成功却没加积分」可直接对上游答复定位。
+- **可用性时间线**（凭证详情 →「查看时间线」）= 状态迁移历史（冷却开始 / 冷却结束 / 硬失败 / 恢复 / 启停），每行带模型（模型级冷却时）、脱敏原因、可读说明与触发请求 ID；`GET /api/credentials/{id}/timeline?since=&until=&limit=`（operator+），保留 30 天。与 `credential_model_cooldowns` 的**当前态**互补：回答「昨天 14:00 这个号为什么不可用」不必再翻服务端日志。
 - **今日签到汇总**：`GET /api/credentials` 每条附 `checkin_today`（本地审计里今天最近一条，今日无记录 `null`）。`null` = 还没有结论（任务未轮到 / 暂停 / 无签到能力），不是失败。
 
 ### 分组维度
@@ -500,7 +513,7 @@ curl -X POST http://127.0.0.1:8000/v1/fetch \
 
 ### 数据库备份与恢复
 
-**自动备份**（`BACKUP_INTERVAL_MINUTES`，默认每日）写一致性快照到 `DATA_DIR/backups/`，只留最近 `BACKUP_KEEP` 份（默认 7）。用 `VACUUM INTO`（WAL 下直接 `cp` 会丢未 checkpoint 事务），落盘即 `PRAGMA integrity_check`，不过 → 删半成品；产物 `0600`、目录 `0700`；失败只记日志。
+**自动备份**（`BACKUP_INTERVAL_MINUTES`，默认每日）写一致性快照到 `DATA_DIR/backups/`，只留最近 `BACKUP_KEEP` 份（默认 7）。用 `VACUUM INTO`（WAL 下直接 `cp` 会丢未 checkpoint 事务），落盘即 `PRAGMA integrity_check`，不过 → 删半成品；产物 `0600`、目录 `0700`；失败只记日志。**启动时立即跑一轮**（不等第一个周期）：否则每天重启的部署永远轮不到 1440 分钟的第一次执行，等于没有自动备份。
 
 ```bash
 python3 scripts/backup_db.py                 # 备份，保留 7 份
@@ -523,8 +536,8 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `APP_SECRET` | **必填** | 凭证加密密钥，≥16 字符；丢失 = 凭证全废。拒低熵与已知占位值。**换密钥后旧凭证解不开**：先用 `scripts/rotate_app_secret.py` 重加密（停机 + 备份） |
-| `ADMIN_USERNAMES` | 空 | 仅引导期（库里还没有活跃 admin）：首次启动提权 `admin` |
+| `APP_SECRET` | **必填** | 凭证加密密钥，**建议 ≥32 字符随机串**（如 `python -c "import secrets; print(secrets.token_urlsafe(32))"`）；低于 16 字符或低熵/已知占位值拒绝启动。丢失 = 凭证全废。**换密钥后旧凭证解不开**：先用 `scripts/rotate_app_secret.py` 重加密（停机 + 备份） |
+| `ADMIN_USERNAMES` | 空 | 仅引导期（库里还没有活跃 admin）：首次启动提权 `admin`。**代码默认空，但 `.env.example` 与 `docker-compose.yml` 给 `admin`**——bootstrap 要求至少一个活跃 admin，模板留空会让首次启动直接失败 |
 | `USERS_FILE` | `secrets/users.txt` | 仅引导期：老式用户文件，启动导入一次 |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | 浏览器可达地址；TRAE 登录回调用；https 下发 HSTS。不决定会话 Cookie 的 `Secure`。配回环 / `0.0.0.0` → 回调基址取当前请求 origin |
 | `DATA_DIR` | `./data` | SQLite 与运行数据目录 |
@@ -581,11 +594,13 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS` | `604800` | 次到期窗口；`≤0` 关闭 |
 | `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL。优先级：请求体会话标识 > 请求头 > 消息前缀指纹；pin 最高。`≤0` 关 |
 | `MODEL_BLOCKLIST` | 见 `src/config.py` | 列表黑名单（fnmatch，仅影响展示），按归一后写法匹配 |
+| `TRAE_ACCOUNT_IDENTITIES` | `0` | TRAE 本账号拥有的访问身份（`0`=免费档，`1/2/3/5/100`=各档付费/团队/内部）。白名单不含本账号身份的会员模型选中必回 1005，故拉取时过滤；留空 = 不过滤。可热更 |
 | `MODEL_FALLBACK_GROUPS` | `""` | 跨渠道 fallback 组：`组名=成员1,成员2;…`。留空不启用 |
 | `ALLOWED_HOSTS` | 空 | Host 白名单，防 DNS rebinding |
 | `ALLOW_TEST_HOST` | `false` | 放行 `testserver`，仅测试用 |
 | `TRUST_PROXY` | `false` | 是否采信 `X-Forwarded-For`；仅「前恰好一层受信反代」时开 |
 | `TRUSTED_PROXIES` | 空 | `TRUST_PROXY=true` 时只对名单内（IP/CIDR，逗号分隔）的对端解析 XFF；留空 = 任意对端 |
+| `REQUIRE_TRUSTED_PROXIES` | `false` | 置 `true` 后「`TRUST_PROXY=true` 且名单为空/写坏」直接启动失败。默认 `false` 是为了不打断存量「名单留空」的部署，只由 doctor 给 WARN 提示 |
 | `ENABLE_DOCS` | `false` | 暴露 `/docs` 与 `/openapi.json` |
 | `DUMP_REQUEST_BODIES` | `false` | `/v1` 原始请求体落盘（含对话，仅排查）。可热更，目录 0700 / 文件 0600 / ≤200 份且不超 24h；改动进审计 |
 | `GATEWAY_PAUSED` | `false` | 全站暂停（kill switch）：所有 Key 鉴权的 `/v1` 端点返 503（`code=service_paused`），管理台照常。可热更，改动进审计并记 WARNING |
@@ -615,7 +630,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `OFFICEACE_ALLOWED_ENDPOINTS` | `https://agentarts.cn-southwest-2.myhuaweicloud.com` | 只需控制面（模型网关由上游下发） |
 | `OFFICEACE_CHAT_MIN_INTERVAL` | `0` | OfficeAce 聊天最小间隔；可热更 |
 | `GENERIC_API_ENDPOINT` | `""` | 通用 OpenAI 兼容上游；留空 = 不启用该渠道 |
-| `GENERIC_ALLOWED_ENDPOINTS` | `""` | 通用上游白名单；留空 = 放行任意 http(s) |
+| `GENERIC_ALLOWED_ENDPOINTS` | `""` | 通用上游白名单；留空 = 放行任意 **https**（`http://` 仅回环） |
 | `GENERIC_MODELS` | `""` | 上游无 `/models` 时的静态模型表（逗号分隔） |
 | `GENERIC_USER_AGENT` | `""` | 覆盖出站 UA；空 = 不发自定义 UA |
 | `GENERIC_CHAT_MIN_INTERVAL` | `0` | 通用上游聊天最小间隔；可热更 |
@@ -657,7 +672,12 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `MODEL_ALIASES` | `""` | 自定义别名；留空不启用。可热更 |
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | 单账号在途上限；`0` = 不限。600s TTL 兜底 |
 | `METRICS_ENABLED` | `true` | 暴露 `/metrics`。可热更 |
-| `METRICS_TOKEN` | 空 | 设置后 `/metrics` 要求 `Authorization: Bearer <token>`；空 = 公开。启动期项 |
+| `METRICS_TOKEN` | 空 | 设置后 `/metrics` 要求 `Authorization: Bearer <token>`；**空 = 只放行回环对端**（非回环 401）。启动期项 |
+| `EXPOSE_UPSTREAM_HEADERS` | `false` | 响应头 `X-Upstream-Attempts` / `X-Upstream-Degraded`。**默认关**：泄露账号池规模、成本与路由指纹；关闭时主动剥离同名头。可热更 |
+| `ACCESS_FREEZE_THRESHOLD` | `0` | 内容拒绝（CodeBuddy 11128）冻结阈值：同一发起者 × 渠道累计命中多少次后前置 403 `provider_access_frozen`；`0` = 只记录不冻结。可热更 |
+| `OTLP_ENDPOINT` | 空 | OTLP/HTTP JSON 指标出口（`POST {endpoint}/v1/metrics`）；空 = 关闭零出站。只导 `gen_ai.*` 指标，不含提示词/回答。非回环强制 https。启动期项 |
+| `OTLP_EXPORT_SECONDS` | `60` | OTLP 导出周期秒（下限 15） |
+| `OTLP_HEADERS` | 空 | OTLP 自定义头，`k:v;k2:v2` |
 | `REQUEST_LOG_ENABLED` | `true` | 请求级结构化日志（logfmt）；不写 query / 请求体 / 用户名。可热更 |
 | `FORCE_DISABLE_THINKING` | `false` | 出站剥离思考内容；只过滤响应。可热更 |
 | `REASONING_EFFORT_MAP` | `""` | 出站档位映射 `渠道=from:to;*=from:to`（渠道取 `KNOWN_PROVIDERS`）；`none` = 删键。可热更 |
@@ -686,7 +706,7 @@ python3 scripts/doctor.py --skip-upstream # 离线 / 内网：跳过上游连通
 python3 scripts/doctor.py --json          # 机读输出（CI / 部署门禁）
 ```
 
-覆盖：Python 版本与关键依赖、`APP_SECRET` 强度、`DATA_DIR` 可写与权限、`PUBLIC_BASE_URL` 与 `ALLOWED_HOSTS` 一致性、SQLite `integrity_check` + 待执行迁移、端口 `bind`、`web/dist/index.html` 引用的 js/css 是否存在、各渠道端点连通性（不带凭证）。**只读**（不迁移、不写 `runtime_settings`、不落凭证明文）；退出码 `0` = 无 FAIL（WARN 不拦），`1` = 有 FAIL；上游 `401/403` 判为通过（链路通，鉴权由服务承担）。
+覆盖：Python 版本与关键依赖、`APP_SECRET` 强度、`DATA_DIR` 可写与权限、`PUBLIC_BASE_URL` 形态（必须 `http(s)://主机`）与 `ALLOWED_HOSTS` 一致性（`HOST` 绑通配而基址仍是回环 → FAIL）、SQLite `integrity_check` + 待执行迁移、端口 `bind`、`web/dist/index.html` 引用的 js/css 是否存在、各渠道端点连通性（不带凭证）。**只读**（不迁移、不写 `runtime_settings`、不落凭证明文）；退出码 `0` = 无 FAIL（WARN 不拦），`1` = 有 FAIL；上游 `401/403` 判为通过（链路通，鉴权由服务承担）。
 
 ### 文件权限
 
@@ -711,7 +731,7 @@ python3 scripts/rotate_app_secret.py \
 # 4. .env 换新值、chmod 600 .env、重启
 ```
 
-任一条解不开就整体回滚。脚本接受 `.env` 或只含密钥的单行文件；不要把密钥写在命令行（会进 history 与 `ps`）。
+任一条解不开就整体回滚。脚本接受 `.env` 或只含密钥的单行文件；不要把密钥写在命令行（会进 history 与 `ps`）。脚本自己会取 `DATA_DIR` 的**实例锁**——服务仍在运行时直接以退出码 2 拒绝（运行中的 refresh/checkin 会用旧钥回写，导致新旧密文混存），重写完成后对库执行 `VACUUM` 清掉旧密文残留。
 
 ### 升级后必须重启后端
 

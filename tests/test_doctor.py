@@ -28,6 +28,19 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
     return Settings(_env_file=None, **values)
 
 
+def _shape_settings(tmp_path: Path, **overrides) -> Settings:
+    """绕过 field_validator 构造（模拟老 .env / 运行期改写出的非法值）。
+
+    Settings 本身已拒绝非法 PUBLIC_BASE_URL；doctor 仍要对**已存在的坏配置**
+    报 FAIL（升级前写入的 .env、直接构造的对象），所以这里用 model_construct。
+    """
+    values = {"app_secret": SECRET, "data_dir": str(tmp_path),
+              "public_base_url": "http://127.0.0.1:8000", "host": "127.0.0.1",
+              "allowed_hosts": ""}
+    values.update({key.lower(): value for key, value in overrides.items()})
+    return Settings.model_construct(**values)
+
+
 # ------------------------------------------------------------------ Python
 
 
@@ -153,13 +166,148 @@ def test_host_config_strips_path_and_port(tmp_path):
     assert check.status == doctor.PASS
 
 
-def test_host_config_explicit_but_missing_host_is_warn(tmp_path):
-    """最容易踩的一处静默故障：ALLOWED_HOSTS 忘了加自己的域名。"""
+def test_host_config_explicit_but_missing_host_is_fail(tmp_path):
+    """最容易踩的一处静默故障：ALLOWED_HOSTS 忘了加自己的域名。
+
+    此时服务会真的拒掉该 Host（400），不是「能跑但该看一眼」，必须 FAIL。
+    """
     check = doctor.check_host_config(_settings(
         tmp_path, PUBLIC_BASE_URL="https://ai.example.com",
         ALLOWED_HOSTS="other.example.com"))
-    assert check.status == doctor.WARN
+    assert check.status == doctor.FAIL
+    assert "打不开" in check.detail and "ai.example.com" in check.detail
+
+
+def test_host_config_rejects_relative_public_base(tmp_path):
+    """漏写 `://` → 回调变相对路径，登录静默失败，必须 FAIL 并给示例。"""
+    check = doctor.check_host_config(_shape_settings(
+        tmp_path, PUBLIC_BASE_URL="127.0.0.1:8000"))
+    assert check.status == doctor.FAIL
+    assert "https://ai.example.com" in check.detail
+
+
+def test_host_config_rejects_empty_public_base(tmp_path):
+    check = doctor.check_host_config(_shape_settings(tmp_path, PUBLIC_BASE_URL=""))
+    assert check.status == doctor.FAIL
+
+
+def test_host_config_rejects_public_base_without_host(tmp_path):
+    """`http:///path` 有 scheme 但没有主机：同样解析不出可回调的地址。"""
+    check = doctor.check_host_config(_shape_settings(
+        tmp_path, PUBLIC_BASE_URL="https:///oops"))
+    assert check.status == doctor.FAIL
+    assert "缺少主机名" in check.detail
+
+
+def test_host_config_rejects_unparsable_public_base(tmp_path):
+    """`urlsplit` 抛 ValueError（未闭合 IPv6 括号）时不能把 doctor 打挂。"""
+    check = doctor.check_host_config(_shape_settings(
+        tmp_path, PUBLIC_BASE_URL="http://[::1"))
+    assert check.status == doctor.FAIL
+    assert "无法解析" in check.detail
+
+
+def test_host_config_rejects_base_that_parses_to_no_host(tmp_path):
+    """`_host_of` 对无主机地址返回空串（最终兜底分支有单测）。"""
+    assert doctor._host_of("http://") == ""
+    assert doctor._host_of("https://ai.example.com:8443/x") == "ai.example.com"
+    assert doctor._host_of("http://[::1]:8000") == "::1"
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", ""])
+@pytest.mark.parametrize("base", [
+    "http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"])
+def test_host_config_wildcard_bind_with_loopback_base_is_fail(tmp_path, host, base):
+    """绑通配却把基址留在回环：远端管理台与回调都打不开，doctor 不能报 PASS。"""
+    check = doctor.check_host_config(_settings(
+        tmp_path, HOST=host, PUBLIC_BASE_URL=base))
+    assert check.status == doctor.FAIL
     assert "打不开" in check.detail
+
+
+def test_host_config_wildcard_bind_with_public_base_is_pass(tmp_path):
+    """通配监听 + 真实地址是正确部署（远端可达），不应误报。"""
+    check = doctor.check_host_config(_settings(
+        tmp_path, HOST="0.0.0.0", PUBLIC_BASE_URL="https://ai.example.com"))
+    assert check.status == doctor.PASS
+
+
+def test_host_config_loopback_bind_with_loopback_base_is_pass(tmp_path):
+    """只监听回环 + 回环基址是本地开发形态，不应误报。"""
+    check = doctor.check_host_config(_settings(
+        tmp_path, HOST="127.0.0.1", PUBLIC_BASE_URL="http://127.0.0.1:8000"))
+    assert check.status == doctor.PASS
+
+
+@pytest.mark.parametrize("host", ["myhost", "myhost.lan", "192.168.1.10"])
+def test_is_wildcard_host_rejects_non_unspecified(tmp_path, host):
+    """`HOST` 是普通主机名 / 具体网卡地址时都不是通配，不该判成远端打不开。
+
+    覆盖 `ipaddress.ip_address` 抛 `ValueError` 的分支（主机名不是 IP 字面量）。
+    """
+    assert doctor._is_wildcard_host(host) is False
+    check = doctor.check_host_config(_settings(
+        tmp_path, HOST=host, PUBLIC_BASE_URL="http://127.0.0.1:8000"))
+    assert check.status == doctor.PASS
+
+
+def test_host_config_ipv6_base_matches_bracketed_allowlist(tmp_path):
+    """IPv6 基址（`http://[::1]:8000`）与 `ALLOWED_HOSTS=[::1]` 应判一致。"""
+    check = doctor.check_host_config(_settings(
+        tmp_path, PUBLIC_BASE_URL="http://[::1]:8000", ALLOWED_HOSTS="[::1]"))
+    assert check.status == doctor.PASS
+
+
+# ------------------------------------------------ TRUST_PROXY / TRUSTED_PROXIES
+
+
+def test_trusted_proxies_default_is_pass(tmp_path):
+    """默认配置（不信 XFF、名单空、未强制）→ PASS，不该给存量部署亮黄灯。"""
+    check = doctor.check_trusted_proxies(_settings(tmp_path))
+    assert check.status == doctor.PASS
+    assert "TRUST_PROXY=false" in check.detail
+    assert "TRUSTED_PROXIES=空" in check.detail
+
+
+def test_trusted_proxies_empty_but_unenforced_is_warn(tmp_path):
+    """TRUST_PROXY=true 且名单为空、但未强制 → WARN：遗留风险主动提示不拦门禁。"""
+    check = doctor.check_trusted_proxies(_settings(tmp_path, TRUST_PROXY=True))
+    assert check.status == doctor.WARN
+    assert "allowed_ips" in check.detail
+    assert "REQUIRE_TRUSTED_PROXIES=true" in check.detail
+
+
+def test_trusted_proxies_enforced_empty_is_fail(tmp_path):
+    """强制开启且名单为空 → 服务会拒绝启动，doctor 必须 FAIL。"""
+    check = doctor.check_trusted_proxies(_settings(
+        tmp_path, TRUST_PROXY=True, REQUIRE_TRUSTED_PROXIES=True))
+    assert check.status == doctor.FAIL
+    assert "拒绝启动" in check.detail
+
+
+def test_trusted_proxies_enforced_but_trust_proxy_off_is_pass(tmp_path):
+    """强制开启但不采信 XFF：没有风险面，不该拦。"""
+    check = doctor.check_trusted_proxies(_settings(
+        tmp_path, TRUST_PROXY=False, REQUIRE_TRUSTED_PROXIES=True))
+    assert check.status == doctor.PASS
+
+
+def test_trusted_proxies_enforced_unparsable_is_fail(tmp_path):
+    """名单非空但写坏（`not-an-ip`）：运行期 fail closed，配置层却会拦启动。"""
+    check = doctor.check_trusted_proxies(_settings(
+        tmp_path, TRUST_PROXY=True, TRUSTED_PROXIES="not-an-ip",
+        REQUIRE_TRUSTED_PROXIES=True))
+    assert check.status == doctor.FAIL
+    assert "not-an-ip" in check.detail
+
+
+def test_trusted_proxies_enforced_valid_is_pass(tmp_path):
+    check = doctor.check_trusted_proxies(_settings(
+        tmp_path, TRUST_PROXY=True, TRUSTED_PROXIES="172.31.250.0/24",
+        REQUIRE_TRUSTED_PROXIES=True))
+    assert check.status == doctor.PASS
+    assert "172.31.250.0/24" in check.detail
+    assert "REQUIRE_TRUSTED_PROXIES=true" in check.detail
 
 
 # ------------------------------------------------------------- 迁移条目计数

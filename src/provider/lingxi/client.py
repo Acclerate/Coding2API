@@ -37,12 +37,14 @@ import httpx
 from ...provider import base
 from ...provider.base import (
     CheckinResult,
+    ErrKind,
     Event,
     EventKind,
     Model,
     Quota,
     UpstreamProtocolViolation,
 )
+from ..http_json import json_or_raise
 from ..lazy_clients import LazyClients
 from . import events as lingxi_events
 from .credential import APP_NAME, APP_VERSION, DEVICE_ID, LingxiCredential
@@ -71,6 +73,12 @@ CLIENT_TYPE = "lingxi_claw"
 CLIENT_LANG = "zh-CN"
 #: 临时积分窗口（天）：余额里「快到期」的那部分
 TEMP_CREDIT_DAYS = 15
+#: 模型目录端点（`plans`）的响应上限：**独立于错误体的 256KB**。
+#: 它一次返回全部模型目录（含 plans / models 两组，字段远比 TRAE 丰富），
+#: 属于正常业务数据；复用 `BOUNDED_BODY_LIMIT` 会在目录变大后突然整条渠道
+#: 回退快照（issue #56 在 TRAE 上的形态）。当前实测远小于此值，放宽只是
+#: 提前防住同类风险，仍然有界。
+MODELS_BODY_LIMIT = 2 * 1024 * 1024
 
 #: 模型目录不可达时的内置快照（与客户端 1.3.31 的 14 个下拉项一致）
 DEFAULT_MODELS: tuple[dict[str, Any], ...] = (
@@ -118,7 +126,14 @@ class RunExpired(RuntimeError):
     """run / 会话在上游侧失效（`SQLNoRows` /「会话不存在」）：重建一次即可。
 
     只在**首个有效帧之前**抛出：流已经开始就无法回滚已下发的内容。
+
+    分类为 `UPSTREAM_PROTOCOL`（零冷却、不罚号）而不是 SOFT：失效的是
+    一次性的 run（上游协议状态），不是账号额度或状态；惩罚凭证只会把一次
+    上游抖动放大成整池不可用。留痕由 executor 的失败行负责。
     """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.UPSTREAM_PROTOCOL
 
 
 class LingxiClient(LazyClients):
@@ -167,28 +182,32 @@ class LingxiClient(LazyClients):
     async def _json(self, method: str, url: str, *,
                     headers: dict[str, str],
                     body: dict[str, Any] | None = None,
-                    timeout: float = API_TIMEOUT) -> dict[str, Any]:
-        """短请求 → JSON（非 2xx 抛 `UpstreamHTTPError`，传输错误单独归类）。"""
+                    timeout: float = API_TIMEOUT,
+                    limit: int = base.BOUNDED_BODY_LIMIT) -> dict[str, Any]:
+        """短请求 → JSON（非 2xx 抛 `UpstreamHTTPError`，传输错误单独归类）。
+
+        `limit` 默认沿用错误体那档 256KB；模型目录端点由调用点传更大的
+        `MODELS_BODY_LIMIT`（正常业务数据，不该被诊断阈值卡住）。
+        """
         try:
             response = await self._short.request(
                 method, url, headers=headers, json=body, timeout=timeout)
         except httpx.TransportError as error:
             raise base.UpstreamTransportError(str(error)) from error
-        if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code,
-                                    await base.read_body_bounded(response),
-                                    **base.retry_hints(response.headers))
-        try:
-            data = response.json()
-        except ValueError as error:
-            raise UpstreamProtocolViolation("non-JSON response") from error
+        # 成功路径同样有界：被控上游回超大 body 不能把整段读进内存。
+        # `public` 固定为原有文案：异常文本带上游 URL，只进日志，不回显客户端。
+        data = await json_or_raise(
+            response, UpstreamHTTPError, url,
+            message=f"non-JSON response from {url}", public="non-JSON response",
+            with_retry_hints=True, limit=limit)
         if not isinstance(data, dict):
             raise UpstreamProtocolViolation("response is not an object")
         return data
 
     async def _account_json(self, credential: LingxiCredential, path: str,
                             *, body: dict[str, Any] | None = None,
-                            method: str = "GET") -> dict[str, Any]:
+                            method: str = "GET",
+                            limit: int = base.BOUNDED_BODY_LIMIT) -> dict[str, Any]:
         """账号面 GET/POST，主域失败回落一次。
 
         **401 也回落**：kdocs 账号的 cookie 只在 `lingxi.kdocs.cn` 集群有效，
@@ -200,7 +219,7 @@ class LingxiClient(LazyClients):
             try:
                 return await self._json(method, base_host + path,
                                         headers=self.headers(credential),
-                                        body=body)
+                                        body=body, limit=limit)
             except (UpstreamHTTPError, base.UpstreamTransportError,
                     UpstreamProtocolViolation) as error:
                 last = error
@@ -269,7 +288,8 @@ class LingxiClient(LazyClients):
         那是登录态失效，不能拿快照假装还活着。
         """
         try:
-            data = await self._account_json(credential, EP_PLANS)
+            data = await self._account_json(credential, EP_PLANS,
+                                            limit=MODELS_BODY_LIMIT)
         except UpstreamHTTPError as error:
             if error.status in (401, 402):
                 raise

@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import weakref
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -76,9 +77,26 @@ MODEL_LIST_TTL_SECONDS = 300
 # 最多晚 2h 知道上游恢复了（期间一直有缓存兜底）。
 MODEL_LIST_BACKOFF_MAX_SECONDS = 7200
 
-# 拉取串行锁：模块级单锁（一次只有一个进程内的列表刷新在跑）。调用方有 HTTP
-# 出口与后台兜底刷新两处，不串行就会同时打同一条渠道的上游。
-_refresh_lock = asyncio.Lock()
+# 拉取串行锁：**按事件循环**各持一把（一次只有一个进程内的列表刷新在跑）。
+# 调用方有 HTTP 出口与后台兜底刷新两处，不串行就会同时打同一条渠道的上游。
+#
+# 为什么不是模块级单把 `asyncio.Lock()`：锁在**发生竞争**时会绑定到当时的
+# 事件循环，之后再从另一个循环 acquire 就是 `RuntimeError: ... is bound to a
+# different event loop`。同一进程里存在第二个循环是真实场景（测试里每个
+# TestClient 一个；运维脚本里 asyncio.run 各起一次），而落盘改成 `to_thread`
+# 后刷新耗时变长、后台任务更容易跨进下一个循环，这条就从「潜伏」变成必现。
+# 按循环分桶后，同一循环内仍然串行（这正是要保证的），跨循环天然不共享。
+_refresh_locks: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _refresh_lock() -> asyncio.Lock:
+    """当前事件循环对应的刷新锁（懒建；循环回收后自动失效）。"""
+    loop = asyncio.get_running_loop()
+    lock = _refresh_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _refresh_locks[loop] = lock
+    return lock
 
 
 def credential_providers(services: Services) -> set[str]:
@@ -245,11 +263,8 @@ async def _refresh_provider(services: Services, provider_id: str, provider: Any)
         # **不该让整页模型列表 500**（实测 2026-10-26 14:48：一条坏凭证
         # 连累所有渠道）。按「本次拉取失败」处理：保留旧缓存、记负缓存
         # （避免每次请求都重试同一个坏凭证），其余上游照常。
-        logger.error("模型列表获取失败 %s: 凭证解密失败（APP_SECRET 是否被更换过？）",
-                     provider_id)
-        services.model_list_failures[provider_id] = (
-            services.model_list_failures.get(provider_id, 0) + 1)
-        services.model_list_fetched_at[provider_id] = time.monotonic()
+        _note_failure(services, provider_id, "凭证解密失败（APP_SECRET 是否被更换过？）",
+                      has_cache=bool(services.model_list_cache.get(provider_id)))
         return
     try:
         models = await provider.list_models(credential_data)
@@ -258,20 +273,78 @@ async def _refresh_provider(services: Services, provider_id: str, provider: Any)
         # 连续失败按 `_needs_refresh` 的退避拉长下一次尝试；日志只在**首次**
         # 失败打 WARNING，其后降 INFO——长期封禁下同样内容的 WARNING 刷屏
         # 只会淹没真问题，连续次数仍留在消息里供排查。
-        failures = services.model_list_failures.get(provider_id, 0) + 1
-        services.model_list_failures[provider_id] = failures
-        services.model_list_fetched_at[provider_id] = time.monotonic()
-        log = logger.warning if failures == 1 else logger.info
-        if services.model_list_cache.get(provider_id):
-            log("模型列表获取失败 %s（连续 %d 次），使用上次缓存: %s",
-                provider_id, failures, error)
-        else:
-            log("模型列表获取失败 %s（连续 %d 次）: %s", provider_id, failures, error)
+        _note_failure(services, provider_id, str(error),
+                      has_cache=bool(services.model_list_cache.get(provider_id)))
         return
-    services.model_list_failures.pop(provider_id, None)
+    # 渠道自己能拉、但本次回的是**静态兜底表**（TRAE / CodeBuddy 在内部吞异常
+    # 后照常返回）：按失败记账并标记降级，否则管理台与 `/metrics` 看不到
+    # 「这个渠道一直没拿到动态模型」（issue #56 第三条）。
+    degraded, reason = _model_list_source(provider)
+    if degraded:
+        _note_failure(services, provider_id, reason, has_cache=False)
+    else:
+        services.model_list_failures.pop(provider_id, None)
+        services.model_list_failure_reason.pop(provider_id, None)
+    services.model_list_degraded[provider_id] = degraded
     services.model_list_cache[provider_id] = {model.id.lower(): model for model in models}
     services.model_list_fetched_at[provider_id] = time.monotonic()
-    save_catalog(services.settings.data_dir, services.model_list_cache)
+    await _persist_catalog(services)
+
+
+def _model_list_source(provider: Any) -> tuple[bool, str]:
+    """provider 申报的表来源；未实现该方法 = 本次就是上游真值（不降级）。
+
+    可选协议而非必选：只有自带静态兜底表的渠道需要申报，其余渠道的
+    `list_models` 抛错即失败，服务层本来就看得见。
+    """
+    probe = getattr(provider, "model_list_source", None)
+    if probe is None:
+        return False, ""
+    degraded, reason = probe()
+    return bool(degraded), str(reason or "")
+
+
+def _note_failure(services: Services, provider_id: str, reason: str, *,
+                  has_cache: bool) -> None:
+    """记一次模型列表失败：连续次数 + 原因 + 降级标记 + 分级日志。
+
+    降级标记与失败计数分开维护：计数会被退避拉长，标记回答的是「现在对外展示
+    的表是不是上游真值」——provider 回了静态兜底表、或本次抛错后沿用旧缓存，
+    两者都算降级（用户看到的都可能缺少上游新模型）。
+    """
+    failures = services.model_list_failures.get(provider_id, 0) + 1
+    services.model_list_failures[provider_id] = failures
+    services.model_list_failure_reason[provider_id] = reason
+    services.model_list_degraded[provider_id] = True
+    services.model_list_fetched_at[provider_id] = time.monotonic()
+    log = logger.warning if failures == 1 else logger.info
+    if has_cache:
+        log("模型列表获取失败 %s（连续 %d 次），使用上次缓存: %s",
+            provider_id, failures, reason)
+    else:
+        log("模型列表获取失败 %s（连续 %d 次）: %s", provider_id, failures, reason)
+
+
+async def _persist_catalog(services: Services) -> None:
+    """把进程内模型目录落盘；**io 部分在线程池里跑**（P2-23）。
+
+    `save_catalog` 里是 makedirs / open / json.dump / os.replace 四个同步系统
+    调用，模型多时（zen 70+ 条、CodeBuddy 全量）序列化 + 写盘能占住事件循环
+    几毫秒到十几毫秒，正好卡在其它请求的 SSE 出帧上。
+
+    传**副本**而不是活引用：worker 线程序列化期间事件循环还在跑，别的渠道可能
+    正在改同一个 dict（迭代中改大小会抛 RuntimeError，逐条改则写出「一半旧
+    一半新」的表）。`os.replace` 的原子性保证文件不会是半截，副本保证内容也是
+    同一时刻的一致快照；并发刷新最多「后写者赢」。
+
+    任何异常都在这里吞掉：缓存是加速手段，写盘失败不该让一次成功的上游拉取
+    变成「模型列表刷新失败」。
+    """
+    snapshot = {pid: dict(table) for pid, table in services.model_list_cache.items()}
+    try:
+        await asyncio.to_thread(save_catalog, services.settings.data_dir, snapshot)
+    except Exception as error:  # noqa: BLE001 - 落盘失败不影响列表刷新
+        logger.warning("模型目录落盘失败: %s", error_text(error))
 
 
 def _needs_refresh(services: Services, provider_id: str, *, now: float) -> bool:
@@ -339,7 +412,7 @@ async def _refresh_providers(services: Services, connected: set[str]) -> None:
     可能进来，无锁时会同时对同一条渠道打上游（zen 那次是十几秒真推理），后到
     的拿到的还是同一份数据，纯属白打。
     """
-    async with _refresh_lock:
+    async with _refresh_lock():
         now = time.monotonic()
         for provider_id, provider in services.registry.items():
             if provider_id not in connected:

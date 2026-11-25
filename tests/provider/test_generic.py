@@ -53,6 +53,34 @@ def test_classify_401_is_dead_unlike_keyless_channels():
     assert GenericProvider().classify(401, b"") is ErrKind.DEAD
 
 
+@pytest.mark.parametrize(("status", "body", "expected"), [
+    # 免费池（OpenRouter :free / ModelScope）的模型级限额也回 401/402：
+    # 判 DEAD 会一次限额硬禁用整池 key
+    (401, b'{"error":{"code":"model_not_found","message":"No endpoints found"}}',
+     ErrKind.INVALID),
+    (401, b'{"error":{"message":"Rate limit exceeded (free tier)"}}', ErrKind.CREDIT),
+    (401, b'{"error":{"code":"insufficient_quota"}}', ErrKind.CREDIT),
+    # 纯鉴权失败才 DEAD
+    (401, b'{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}',
+     ErrKind.DEAD),
+    (403, b'{"error":{"code":"unauthorized"}}', ErrKind.DEAD),
+    # 证据不足（空 / 非 JSON / 多类命中 / 无关文案）→ 保持现状 DEAD
+    (401, b"", ErrKind.DEAD),
+    (401, b"\xff\xfe not json", ErrKind.DEAD),
+    (401, b'{"error":{"message":"invalid_api_key and quota"}}', ErrKind.DEAD),
+    (401, b'{"error":{"message":"something else"}}', ErrKind.DEAD),
+    # 402 本身已是 CREDIT；只有点名「没有这个模型」才改判 INVALID
+    (402, b"", ErrKind.CREDIT),
+    (402, b'{"error":{"message":"Insufficient credits"}}', ErrKind.CREDIT),
+    (402, b'{"error":{"code":"model_not_found"}}', ErrKind.INVALID),
+])
+def test_classify_splits_model_quota_from_dead_key(status, body, expected):
+    """401/403 按响应体拆分：模型级限额不硬禁用凭证，纯鉴权失败才 DEAD。"""
+    assert classify_status(status, body) is expected
+    # provider 入口必须把 body 透传下去（否则等价于只看状态码）
+    assert GenericProvider().classify(status, body) is expected
+
+
 # ------------------------------------------------------------------ 凭证
 
 @pytest.mark.parametrize(("raw", "expected"), [
@@ -243,13 +271,17 @@ def test_generic_allowed_whitelist_and_validation():
     assert not validate_generic_endpoint_allowed("file:///etc/passwd", settings)
 
 
-def test_generic_empty_whitelist_allows_any_http():
+def test_generic_empty_whitelist_allows_https_and_loopback_http():
+    """白名单为空 = 放行任意 https；明文 http 只限回环（凭证是真 key）。"""
     from src.config import validate_generic_endpoint_allowed
 
     settings = Settings(_env_file=None, APP_SECRET="x" * 32, DATA_DIR="/tmp",
                         GENERIC_API_ENDPOINT="http://127.0.0.1:9000/v1")
     assert settings.generic_allowed == ()
-    assert validate_generic_endpoint_allowed("http://10.0.0.5:8080/v1", settings)
+    assert validate_generic_endpoint_allowed("https://10.0.0.5:8080/v1", settings)
+    assert validate_generic_endpoint_allowed("http://127.0.0.1:9000/v1", settings)
+    # 公网明文 http 拒绝：key 会在链路上裸奔
+    assert not validate_generic_endpoint_allowed("http://10.0.0.5:8080/v1", settings)
 
 
 def test_known_providers_and_tos_include_generic():

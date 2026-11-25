@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from ..auth.access import model_allowed
 from ..auth.api_key import digest_api_key, generate_api_key, preview_api_key
 from ..db.crypto import CredentialCipher, CredentialDecryptError
 from ..engine.scheduler import (
@@ -24,6 +25,7 @@ from ..engine.scheduler import (
 )
 from ..provider.base import ErrKind, Quota, health_score
 from ..provider.token_expiry import credential_token_times
+from ..request_context import get_request_id
 from ..sorting import sort_rows, sql_order
 from ..tags import tags_text, tags_value
 
@@ -48,8 +50,68 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+# 凭证可用性时间线（credential_events）的事件枚举。
+#
+# 只放**代码里真实存在**的状态迁移（写入点见 CredentialRepository 各函数），
+# 不造上游从未告知的归因——和 credit_events 的 source 同一纪律。`revived`
+# 同时覆盖普通/强制人工恢复，force 与否写在 detail 里（不拆成两个语义近似的
+# 枚举值，否则按 event 过滤时要把两段历史拼起来才算「恢复过」）。
+CREDENTIAL_EVENT_KINDS: frozenset[str] = frozenset({
+    "cooldown_start",   # 账号级 / (凭证, 模型) 级冷却开始
+    "cooldown_end",     # 冷却到期回收 / 负缓存被清除
+    "hard_failure",     # 硬禁用（session 死亡 / 上游风控）
+    "revived",          # 人工恢复（force 与否见 detail）
+    "enabled",          # 管理台用户软开关：启用
+    "disabled",         # 管理台用户软开关：停用
+})
+
+# 时间线保留期（天）。刻意**不**接 hot setting：保留期是运维口径的一致性
+# 约定（与请求明细同一量级），改它要连带重算统计口径；走常量避免与
+# runtime_settings 的其它改动面冲突。RetentionTask 每轮按它裁剪。
+CREDENTIAL_EVENT_RETENTION_DAYS = 30
+
+
+def _record_credential_event(
+    conn: Any, credential_id: str, event: str, *, reason: str = "",
+    model: str | None = None, detail: str = "", now: int | None = None,
+) -> None:
+    """在**同一事务**内落一行可用性时间线（调用方持有写连接）。
+
+    为什么不另开事务：时间线必须与它所描述的状态 UPDATE 原子生效——否则
+    出现「冷却写了、时间线没写」（解释不了）或「时间线写了、状态没写」
+    （凭空多一条历史）都会让排障结论跑偏。
+
+    `reason` 只放脱敏枚举（ErrKind / model / blocked / expired），**绝不写
+    上游响应正文**（正文可能回显凭证片段）；`detail` 是可读短句，同样禁止
+    凭证明文。`request_id` 取自请求上下文（后台任务为 None）。
+    """
+    conn.execute(
+        "INSERT INTO credential_events "
+        "(id, credential_id, ts, event, reason, model, detail, request_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (_new_id("cevt"), credential_id, _now(now), event, reason, model, detail,
+         get_request_id()))
+
+
 # API Key `last_used_at` 的写库节流窗口（秒）：见 `ApiKeyRepository.authenticate`。
 _LAST_USED_THROTTLE_SECONDS = 60
+
+
+def _model_glob_ok(allowed_models: str, model: str | None) -> bool:
+    """该凭证的账号级模型白名单是否放行本次请求模型。
+
+    为什么选在**候选生成层**（`candidates()`）而不是调度器：调度器只拿
+    `Candidate` 快照排序，模型名要到 `executor` 才知道；而候选集是「本次请求
+    有哪些号可选」的唯一出口——在这里按模型收窄，调度器/半开探测/限额护栏
+    都自然只看到合规的号，且**不产生任何状态副作用**（不硬禁用、不写冷却），
+    与「模型被封就整号停用」的旧做法正好相反。
+
+    `model` 为空或 `auto`（请求没点名具体模型）：无法归因，放行——模型名由
+    引擎解析后再收窄，不能因为「暂时不知道」就把整个池子摘空。
+    """
+    if not model or model.strip().lower() == "auto":
+        return True
+    return model_allowed(model, allowed_models)
 
 
 def _ladder_text(ladder: list[tuple[int, float]] | None) -> str | None:
@@ -258,22 +320,32 @@ class CredentialRepository:
             )
         return credential_id
 
-    def set_tags(self, credential_id: str, tags: list[str]) -> bool:
-        """整体替换一条凭证的标签（空列表 = 清空）。返回是否命中该凭证。"""
+    def set_tags(self, credential_id: str, tags: list[str],
+                 *, now: int | None = None) -> bool:
+        """整体替换一条凭证的标签（空列表 = 清空）。返回是否命中该凭证。
+
+        人工编辑会推进 `updated_at`（编辑版本号）：正在编辑这条凭证的另一个
+        管理页据此发现「已被他人修改」。
+        """
         with self._db.transaction() as conn:
-            cursor = conn.execute("UPDATE credentials SET tags = ? WHERE id = ?",
-                                  (tags_text(tags), credential_id))
+            cursor = conn.execute(
+                "UPDATE credentials SET tags = ?, "
+                "updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                (tags_text(tags), _now(now), credential_id))
         return cursor.rowcount > 0
 
-    def set_routing_weight(self, credential_id: str, weight: int | None) -> bool:
+    def set_routing_weight(self, credential_id: str, weight: int | None,
+                           *, now: int | None = None) -> bool:
         """设置调度权重（None = 恢复默认）。返回是否命中该凭证。
 
         权重只影响**选号顺序**，不是准入条件：低于任一「可调度」前提（健康、
         冷却、启用）不产生任何效果，也不会把低健康度的号顶上去。
         """
         with self._db.transaction() as conn:
-            cursor = conn.execute("UPDATE credentials SET routing_weight = ? WHERE id = ?",
-                                  (weight, credential_id))
+            cursor = conn.execute(
+                "UPDATE credentials SET routing_weight = ?, "
+                "updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                (weight, _now(now), credential_id))
         return cursor.rowcount > 0
 
     def delete(self, credential_id: str) -> bool:
@@ -284,11 +356,18 @@ class CredentialRepository:
             _clear_model_cooldowns(conn, credential_id)
         return cursor.rowcount > 0
 
-    def set_enabled(self, credential_id: str, enabled: bool) -> bool:
+    def set_enabled(self, credential_id: str, enabled: bool,
+                    *, now: int | None = None) -> bool:
         with self._db.transaction() as conn:
             cursor = conn.execute(
-                "UPDATE credentials SET enabled = ? WHERE id = ?",
-                (1 if enabled else 0, credential_id))
+                "UPDATE credentials SET enabled = ?, "
+                "updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                (1 if enabled else 0, _now(now), credential_id))
+            if cursor.rowcount > 0:
+                # 用户软开关（与 disabled 的硬禁用是两回事）：时间线按 event 分开。
+                _record_credential_event(
+                    conn, credential_id, "enabled" if enabled else "disabled",
+                    detail="管理台启用" if enabled else "管理台停用")
         return cursor.rowcount > 0
 
     def set_pinned(self, credential_id: str | None) -> bool:
@@ -318,7 +397,8 @@ class CredentialRepository:
                     (credential_id,))
             return True
 
-    def revive(self, credential_id: str, *, force: bool = False) -> bool:
+    def revive(self, credential_id: str, *, force: bool = False,
+               now: int | None = None) -> bool:
         """解除硬禁用（session 死亡）；冷却按来源决定是否一并清除。
 
         没有这个入口时，凭证一旦因 session 失效被硬禁用就只能删除重建，
@@ -342,13 +422,23 @@ class CredentialRepository:
             if keep_cooldown:
                 conn.execute(
                     "UPDATE credentials SET disabled = 0, disabled_reason = NULL, "
-                    "err_count = 0 WHERE id = ?", (credential_id,))
+                    "err_count = 0, updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                    (_now(now), credential_id))
             else:
                 conn.execute(
                     "UPDATE credentials SET disabled = 0, disabled_reason = NULL, "
-                    "cooling_until = NULL, cooling_kind = NULL, err_count = 0 "
-                    "WHERE id = ?", (credential_id,))
+                    "cooling_until = NULL, cooling_kind = NULL, err_count = 0, "
+                    "updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                    (_now(now), credential_id))
             _clear_model_cooldowns(conn, credential_id)
+            # 时间线：`revived` 同时覆盖普通/强制恢复，force 与否写在 detail；
+            # reason 记「当时为什么在冷却」（上游点名的 kind 最有解释力）。
+            _record_credential_event(
+                conn, credential_id, "revived",
+                reason="forced" if force else (row["cooling_kind"] or ""),
+                detail=("人工恢复（强制清除上游点名冷却）" if force
+                        else "人工恢复（保留上游点名冷却）" if keep_cooldown
+                        else "人工恢复（清除本地冷却与模型级冷却）"))
         return True
 
     def mark_relogin_required(self, credential_id: str, reason: str) -> None:
@@ -367,6 +457,9 @@ class CredentialRepository:
                 "UPDATE credentials SET disabled = 1, disabled_reason = ?, err_count = 0, "
                 "cooling_until = NULL, cooling_kind = NULL WHERE id = ?", (reason, credential_id))
             _clear_model_cooldowns(conn, credential_id)
+            _record_credential_event(
+                conn, credential_id, "hard_failure", reason="relogin_required",
+                detail=f"硬禁用：{reason}")
 
     def save_error(self, credential_id: str, outcome: ErrorOutcome) -> None:
         """落库一次错误结果。
@@ -394,12 +487,21 @@ class CredentialRepository:
                         "reason = excluded.reason",
                         (credential_id, model, entry.cooling_until, entry.hits,
                          entry.reason))
+                    # 时间线：模型级冷却按模型各落一行（账号级不动）。
+                    _record_credential_event(
+                        conn, credential_id, "cooldown_start", reason=entry.reason,
+                        model=model,
+                        detail=f"模型级冷却至 {entry.cooling_until}（第 {entry.hits} 次）")
                 return
             if outcome.disabled:
+                disabled_reason = outcome.disabled_reason or "session dead"
                 conn.execute(
                     "UPDATE credentials SET disabled = 1, disabled_reason = ?, err_count = 0, "
                     "cooling_until = NULL, cooling_kind = NULL WHERE id = ?",
-                    (outcome.disabled_reason or "session dead", credential_id))
+                    (disabled_reason, credential_id))
+                _record_credential_event(
+                    conn, credential_id, "hard_failure", reason="dead",
+                    detail=f"硬禁用：{disabled_reason}")
             else:
                 # `cooling_until = NULL` 的语义是「本次不动冷却」，不是「清掉冷却」：
                 # 低于阈值的 OTHER 类错误（`note_error` 返回 err_count=count、
@@ -414,7 +516,18 @@ class CredentialRepository:
                     "err_count = ? WHERE id = ?",
                     (outcome.cooling_until, outcome.cooling_kind or None,
                      outcome.err_count, credential_id))
+                # 只有真的**新写/推后**了账号级冷却才落时间线：
+                # `cooling_until=None` 表示本次不动冷却，写一条会被读成
+                # 「此刻刚进冷却」，与库里的旧值自相矛盾。
+                if outcome.cooling_until is not None:
+                    _record_credential_event(
+                        conn, credential_id, "cooldown_start",
+                        reason=outcome.cooling_kind or "",
+                        detail=f"账号级冷却至 {outcome.cooling_until}")
             if outcome.cooling_until is not None:
+                # 账号级冷却会清掉模型级条目（不允许切模型绕过）：那些条目
+                # 的「结束」由上面这条账号级 cooldown_start 一并解释，不另记
+                # 逐模型 cooldown_end（否则一次账号级冷却刷出 N 条噪声）。
                 _clear_model_cooldowns(conn, credential_id)
 
     def cool_provider(self, provider: str, *, until: int) -> int:
@@ -430,6 +543,12 @@ class CredentialRepository:
         豁免会泄漏成「换模型绕过账号级限制」。
         """
         with self._db.transaction() as conn:
+            # 先取受影响的凭证 id 再 UPDATE：UPDATE 之后谓词已不成立
+            # （cooling_until 刚被推后），再查就只剩「未受影响」的行。
+            affected = [row["id"] for row in conn.execute(
+                "SELECT id FROM credentials WHERE provider = ? "
+                "AND (cooling_until IS NULL OR cooling_until < ?)",
+                (provider, until)).fetchall()]
             cursor = conn.execute(
                 "UPDATE credentials SET cooling_until = ?, cooling_kind = ?, err_count = 0 "
                 "WHERE provider = ? AND (cooling_until IS NULL OR cooling_until < ?)",
@@ -437,6 +556,11 @@ class CredentialRepository:
             conn.execute(
                 "DELETE FROM credential_model_cooldowns WHERE credential_id IN "
                 "(SELECT id FROM credentials WHERE provider = ?)", (provider,))
+            for credential_id in affected:
+                _record_credential_event(
+                    conn, credential_id, "cooldown_start",
+                    reason=ErrKind.RESTRICTED.value,
+                    detail=f"渠道级冷却至 {until}（整批同源账号被上游风控限制）")
         return cursor.rowcount
 
     def save_success(self, credential_id: str, *, model: str | None = None) -> None:
@@ -448,17 +572,31 @@ class CredentialRepository:
         with self._db.transaction() as conn:
             conn.execute("UPDATE credentials SET err_count = 0 WHERE id = ?", (credential_id,))
             if model:
-                conn.execute(
+                cursor = conn.execute(
                     "DELETE FROM credential_model_cooldowns "
                     "WHERE credential_id = ? AND model = ? AND reason = ?",
                     (credential_id, model, "blocked"))
+                if cursor.rowcount > 0:
+                    # 只有真的删掉了负缓存才记「冷却结束」：没命中行说明该
+                    # (凭证, 模型) 本来就不在负缓存里，凭空记一条会污染时间线。
+                    _record_credential_event(
+                        conn, credential_id, "cooldown_end", reason="blocked", model=model,
+                        detail="负缓存被清除（该模型在成功响应里出现）")
 
     def purge_expired_model_cooldowns(self, now: int | None = None) -> int:
         """删除已过期的 (凭证, 模型) 冷却行（留存任务每轮调用）。"""
         with self._db.transaction() as conn:
+            # 先取要删的行：DELETE 之后就没法按模型/凭证补时间线了。
+            expired = conn.execute(
+                "SELECT credential_id, model FROM credential_model_cooldowns "
+                "WHERE cooling_until <= ?", (_now(now),)).fetchall()
             cursor = conn.execute(
                 "DELETE FROM credential_model_cooldowns WHERE cooling_until <= ?",
                 (_now(now),))
+            for row in expired:
+                _record_credential_event(
+                    conn, row["credential_id"], "cooldown_end", reason="expired",
+                    model=row["model"], detail="模型级冷却到期")
         return cursor.rowcount
 
     def purge_expired_account_cooldowns(self, now: int | None = None) -> int:
@@ -470,10 +608,17 @@ class CredentialRepository:
         幽灵记录。与模型级条目分开计数，便于区分两类回收。
         """
         with self._db.transaction() as conn:
+            expired = [row["id"] for row in conn.execute(
+                "SELECT id FROM credentials WHERE cooling_until IS NOT NULL "
+                "AND cooling_until <= ?", (_now(now),)).fetchall()]
             cursor = conn.execute(
                 "UPDATE credentials SET cooling_until = NULL, cooling_kind = NULL "
                 "WHERE cooling_until IS NOT NULL AND cooling_until <= ?",
                 (_now(now),))
+            for credential_id in expired:
+                _record_credential_event(
+                    conn, credential_id, "cooldown_end", reason="expired",
+                    detail="账号级冷却到期")
         return cursor.rowcount
 
     def model_cooldowns_for(self, credential_id: str,
@@ -508,10 +653,19 @@ class CredentialRepository:
         只清探活用的那一个号，其余号会各等一个 6h 起步的 TTL 才恢复。
         """
         with self._db.transaction() as conn:
+            affected = [row["credential_id"] for row in conn.execute(
+                "SELECT DISTINCT credential_id FROM credential_model_cooldowns "
+                "WHERE model = ? AND reason = 'blocked' AND credential_id IN "
+                "(SELECT id FROM credentials WHERE provider = ?)",
+                (model, provider)).fetchall()]
             cursor = conn.execute(
                 "DELETE FROM credential_model_cooldowns WHERE model = ? "
                 "AND reason = 'blocked' AND credential_id IN "
                 "(SELECT id FROM credentials WHERE provider = ?)", (model, provider))
+            for credential_id in affected:
+                _record_credential_event(
+                    conn, credential_id, "cooldown_end", reason="blocked", model=model,
+                    detail="负缓存被清除（人工恢复 / 探活成功）")
         return cursor.rowcount
 
     def save_credential_data(self, credential_id: str, credential_data: dict) -> None:
@@ -535,10 +689,69 @@ class CredentialRepository:
                  _login_secret_flag(credential_data), credential_id))
 
     def set_web_cookie_state(self, credential_id: str, state: str | None) -> None:
-        """写入/清除网页 Cookie 状态（管理台提示用，不参与调度）。"""
+        """写入/清除网页 Cookie 状态（管理台提示用，不参与调度）。
+
+        不算人工编辑：状态由探测结果回写（`expired` 是上游会话失效），不推进
+        `updated_at`——否则一次后台探测就会让打开中的编辑页误判「被别人改了」。
+        """
         with self._db.transaction() as conn:
             conn.execute("UPDATE credentials SET web_cookie_state = ? WHERE id = ?",
                          (state, credential_id))
+
+    def apply_credential_edit(self, credential_id: str, *,
+                              allowed_models: str | None = None,
+                              expected_updated_at: int | None = None,
+                              now: int | None = None) -> int | None:
+        """写入账号级模型白名单并推进编辑版本号（乐观并发）。
+
+        返回**新版本号**；`expected_updated_at` 与库里不一致（别人先保存了）时
+        返回 None，一行都不改——调用方据此回 409 + 当前快照。
+
+        `allowed_models=None` = **不动这一列**（只推进版本号）：既有调用方
+        （老版管理台/脚本）只改限额、不带该字段，不能因此把别人设的白名单
+        静默清成「不限制」。清空要显式传 `""`。
+
+        `expected_updated_at=None` 是**兼容口子**：既有脚本/调用方不传版本时
+        保持「最后写入者赢」的旧行为。管理台前端必须传，否则冲突检测形同虚设。
+
+        版本号用 `MAX(now, 旧值+1)`：epoch 秒在同一秒内的两次编辑会取到同一个
+        值，只看时间戳就检测不出并发写；+1 保证严格单调，同时保留「最近一次
+        编辑发生在何时」的可读性。
+
+        为什么放在仓储层而不是端点：比对与写入必须在同一条 UPDATE 里完成
+        （`WHERE updated_at = ?`），拆成「先读再写」会留出竞态窗口——两个并发
+        请求都能读到旧版本、然后都写成功。SQLite 的单条 UPDATE 天然原子。
+        """
+        stamp = _now(now)
+        with self._db.transaction() as conn:
+            if expected_updated_at is None:
+                cursor = conn.execute(
+                    "UPDATE credentials SET allowed_models = COALESCE(?, allowed_models), "
+                    "updated_at = MAX(?, updated_at + 1) WHERE id = ?",
+                    (allowed_models, stamp, credential_id))
+            else:
+                cursor = conn.execute(
+                    "UPDATE credentials SET allowed_models = COALESCE(?, allowed_models), "
+                    "updated_at = MAX(?, updated_at + 1) "
+                    "WHERE id = ? AND updated_at = ?",
+                    (allowed_models, stamp, credential_id, expected_updated_at))
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute("SELECT updated_at FROM credentials WHERE id = ?",
+                               (credential_id,)).fetchone()
+            return int(row["updated_at"])
+
+    def edit_snapshot(self, credential_id: str) -> dict[str, Any]:
+        """编辑版本 + 当前模型白名单快照（409 响应体的 `current` 字段）。
+
+        只读、不含任何凭证明文：客户端拿它就能显示「现在是哪个版本、白名单是
+        什么」，然后让操作员刷新后重试。凭证已被并发删除时返回空 dict——
+        调用方用 `.get(..., 默认值)` 读，不必再判 None。
+        """
+        row = self._db.connect().execute(
+            "SELECT id, updated_at, allowed_models FROM credentials WHERE id = ?",
+            (credential_id,)).fetchone()
+        return dict(row) if row is not None else {}
 
     def find_login_credential(self, provider: str,
                               identity: Callable[[dict[str, Any]], frozenset[str]],
@@ -714,16 +927,23 @@ class CredentialRepository:
     # ------------------------------------------------------------- 读取
 
     def candidates(self, providers: Iterable[str] | None = None,
-                   *, selectable_only: bool = False) -> list[Candidate]:
+                   *, selectable_only: bool = False,
+                   model: str | None = None) -> list[Candidate]:
         """列出候选凭证。
 
         selectable_only=True 时排除硬禁用（session 死亡）与用户软关闭的凭证：
         它们不会被调度器选中，用它们去拉模型列表/探测只会白白失败。
         默认 False：签到、刷新等任务需要看到全部凭证才能正确计数 skipped。
+
+        `model` 非空时再按账号级模型白名单收窄（见 `_model_glob_ok`）：不匹配的
+        凭证**不参与本次选号**，但库里的状态一点不动——不硬禁用、不写冷却，
+        下一个别的模型请求照常能选它。不传 `model` 的调用方（签到/刷新/探活/
+        额度探测等后台任务）看到的是全量候选，行为与补列前一致。
         """
         rows = self._db.connect().execute(
             "SELECT id, provider, health, cooling_until, disabled, enabled, err_count, pinned, "
-            "quota_remaining, quota_cycle_end, quota_expiry_ladder, routing_weight "
+            "quota_remaining, quota_cycle_end, quota_expiry_ladder, routing_weight, "
+            "allowed_models "
             "FROM credentials").fetchall()
         allowed = set(providers) if providers is not None else None
         # 模型级冷却整表读一次（表很小：只在模型限流/负缓存时才有行），
@@ -750,7 +970,9 @@ class CredentialRepository:
                 routing_weight=row["routing_weight"],
                 model_cooldowns=by_credential.get(row["id"]),
             )
-            for row in rows if allowed is None or row["provider"] in allowed
+            for row in rows
+            if (allowed is None or row["provider"] in allowed)
+            and _model_glob_ok(row["allowed_models"], model)
         ]
         if selectable_only:
             result = [c for c in result if c.enabled and not c.disabled]
@@ -909,6 +1131,9 @@ class CredentialRepository:
             "quota_expiry_ladder, quota_packages, data_enc, "
             "web_cookie_state, routing_weight, login_secret, "
             "token_expires_at, token_issued_at, "
+            # 编辑版本号 + 账号级模型白名单：管理台编辑对话框据此带
+            # `expected_updated_at`（冲突检测）并回显 glob 列表。
+            "updated_at, allowed_models, "
             "tags "
             "FROM credentials ORDER BY created_at").fetchall()
         cooling_rows = self._db.connect().execute(
@@ -1257,6 +1482,58 @@ class CheckinEventRepository:
         return sorted(result, key=lambda item: item["streak"], reverse=True)
 
 
+class CredentialEventRepository:
+    """凭证可用性时间线（credential_events）：只读查询 + 保留期裁剪。
+
+    为什么读侧独立成仓储：写入必须在 `CredentialRepository` 的状态迁移函数里
+    与状态 UPDATE 同事务完成（见 `_record_credential_event`），否则会出现
+    「冷却写了、时间线没写」这类解释不了的历史。本类只负责回看与回收。
+
+    与 `credential_model_cooldowns` 的分工：那张表是**当前态**（覆盖写，调度
+    的权威来源），本表是**只增不改的历史**，回答「昨天 14:00 这个号为什么不可用」。
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    def recent(self, credential_id: str, *, since: int | None = None,
+               until: int | None = None, limit: int = 50,
+               offset: int = 0) -> list[dict[str, Any]]:
+        """时间窗内的时间线（新 → 旧），供凭证详情抽屉回看。
+
+        `since` / `until` 是 epoch 秒**闭区间**（None = 不限），用于「只看出问题
+        的那一小时」；`limit` 收敛到 [1, 200]、`offset` 供翻页，防止一次拉爆
+        前端。排序带 `id` 兜底：同一秒内的多条迁移必须给出稳定顺序，否则翻页
+        会重复/漏行。
+        """
+        clauses = ["credential_id = ?"]
+        params: list[Any] = [credential_id]
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("ts <= ?")
+            params.append(int(until))
+        params.extend([max(1, min(200, limit)), max(0, int(offset))])
+        rows = self._db.connect().execute(
+            f"SELECT * FROM credential_events WHERE {' AND '.join(clauses)} "
+            f"ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune(self, *, keep_days: int = CREDENTIAL_EVENT_RETENTION_DAYS,
+              now: int | None = None) -> int:
+        """删除超过保留期的时间线（留存任务每轮调用）。
+
+        每次状态迁移都可能落一行，不回收会无界增长（读侧有 LIMIT，但表本身
+        会一直变大）。保留期默认 30 天：排障看的是「最近几周发生了什么」，
+        比请求明细（90 天）短是刻意的——时间线只解释状态，不承担合规审计。
+        """
+        cutoff = _now(now) - keep_days * 86400
+        with self._db.transaction() as conn:
+            cursor = conn.execute("DELETE FROM credential_events WHERE ts < ?", (cutoff,))
+        return cursor.rowcount
+
+
 class CreditEventRepository:
     """积分变动流水（credit_events）：只读查询，写入在 save_quota 事务内完成。
 
@@ -1582,6 +1859,21 @@ class UserRepository:
             )
         return cursor.rowcount > 0
 
+    def bump_session_epoch(self, username: str, *, now: int | None = None) -> bool:
+        """作废该用户的全部会话（登出用）。
+
+        会话 Cookie 是无状态 HMAC：只删浏览器里的那份，**被复制走的**仍能用到
+        `max_age` 到期。只有 bump epoch 能让所有旧 Cookie 在下次校验时失配。
+        返回 False 表示用户不存在（调用方仍应按登出成功处理）。
+        """
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE users SET session_epoch = session_epoch + 1, updated_at = ? "
+                "WHERE username = ?",
+                (_now(now), username),
+            )
+        return cursor.rowcount > 0
+
     def set_activation_token(self, username: str, digest: str, expires_at: int, *,
                              now: int | None = None) -> bool:
         """挂一次性激活令牌（登录前使用，故**不** bump epoch）。"""
@@ -1626,6 +1918,73 @@ class UserRepository:
             "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND enabled = 1"
         ).fetchone()
         return int(row["n"])
+
+
+class AccessFreezeRepository:
+    """访问冻结（access_freezes）：内容拒绝的发起者归因计数。
+
+    每一行是一次命中（不是「当前冻结态」）：阈值判定按 `(subject, provider)`
+    的累计行数，阈值 0 只记录不拦截。解冻删除这两键下的全部行，删除动作由
+    调用方写 `audit_events`——本仓储只负责计数与清理，不推断操作者意图。
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    def record_hit(self, *, subject: str, provider: str, reason: str,
+                   frozen_by: str = "auto", now: int | None = None) -> None:
+        """记一次内容拒绝命中（`reason` 只放脱敏标识，禁止上游正文）。"""
+        with self._db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO access_freezes (subject, provider, reason, frozen_at, frozen_by) "
+                "VALUES (?,?,?,?,?)",
+                (subject, provider, reason, _now(now), frozen_by),
+            )
+
+    def count(self, *, subject: str, provider: str) -> int:
+        """该 (发起者, 渠道) 的累计命中次数。"""
+        row = self._db.connect().execute(
+            "SELECT COUNT(*) AS n FROM access_freezes WHERE subject = ? AND provider = ?",
+            (subject, provider)).fetchone()
+        return int(row["n"])
+
+    def is_frozen(self, *, subject: str, provider: str, threshold: int) -> bool:
+        """累计命中是否已达冻结阈值；threshold ≤ 0 恒为 False（只记录）。"""
+        return threshold > 0 and self.count(subject=subject, provider=provider) >= threshold
+
+    def recent(self, *, limit: int = 100, offset: int = 0,
+               subject: str | None = None, provider: str | None = None) -> list[dict[str, Any]]:
+        """按时间倒序列出命中记录（管理台列表用）。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subject:
+            clauses.append("subject = ?")
+            params.append(subject)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._db.connect().execute(
+            f"SELECT subject, provider, reason, frozen_at, frozen_by "
+            f"FROM access_freezes {where} ORDER BY frozen_at DESC LIMIT ? OFFSET ?",
+            (*params, max(1, min(500, limit)), max(0, offset))).fetchall()
+        return [dict(row) for row in rows]
+
+    def subjects(self) -> list[dict[str, Any]]:
+        """按 (subject, provider) 聚合：命中次数 + 最近一次命中时刻。"""
+        rows = self._db.connect().execute(
+            "SELECT subject, provider, COUNT(*) AS hits, MAX(frozen_at) AS last_at "
+            "FROM access_freezes GROUP BY subject, provider "
+            "ORDER BY last_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def unfreeze(self, *, subject: str, provider: str) -> int:
+        """解冻：删除该 (发起者, 渠道) 的全部命中行，返回删除行数。"""
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM access_freezes WHERE subject = ? AND provider = ?",
+                (subject, provider))
+        return cursor.rowcount
 
 
 class AuditRepository:

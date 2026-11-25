@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from .api import (
     activate,
+    admin_access_freezes,
     admin_alerts,
     admin_audit,
     admin_auth,
@@ -47,7 +48,11 @@ from .api import (
     tools,
     usage,
 )
-from .api.context import build_context_compressor, build_prefix_observer
+from .api.context import (
+    CompressStats,
+    build_context_compressor,
+    build_prefix_observer,
+)
 from .api.deps import Services
 from .auth.throttle import LoginThrottle
 from .benchmarks import (
@@ -62,6 +67,7 @@ from .benchmarks import (
 from .config import (
     Settings,
     load_settings,
+    trusted_proxies_problem,
     validate_codearts_endpoint_allowed,
     validate_codebuddy_intl_endpoint_allowed,
     validate_endpoint_allowed,
@@ -82,10 +88,12 @@ from .db.log_repo import LogRepository
 from .db.migrate import apply_schema
 from .db.paid_models import PaidModelRepository
 from .db.repo import (
+    AccessFreezeRepository,
     AlertRepository,
     ApiKeyRepository,
     AuditRepository,
     CheckinEventRepository,
+    CredentialEventRepository,
     CredentialRepository,
     CreditEventRepository,
     GrowthRepository,
@@ -102,6 +110,8 @@ from .engine.model_resolver import KNOWN_PROVIDERS, parse_fallback_groups
 from .engine.scheduler import Scheduler
 from .instance_lock import AlreadyRunning, hold_instance_lock
 from .key_quota import KeyQuotaGuard
+from .observability.otlp import OtlpExporter, metrics_snapshot
+from .persistence.compress_buckets import snapshot_path as compress_buckets_path
 from .platform_support import require_supported_platform
 from .provider.codearts import CodeArtsProvider
 from .provider.codearts.client import CodeArtsClient
@@ -139,6 +149,7 @@ from .stats.live import LiveEventHub
 from .stats.query import StatsQuery
 from .tasks.backup import BackupTask
 from .tasks.model_probe import ModelProbeTask
+from .tasks.otlp_export import OtlpExportTask
 from .tasks.pacer import Pacer
 from .tasks.runner import build_runner
 from .tasks.upstream_status import UpstreamStatusTask
@@ -153,6 +164,7 @@ from .webapp.log_buffer import LogBuffer, detach_root_handler, sync_root_handler
 from .webapp.logging import configure_logging
 from .webapp.request_id import RequestIdMiddleware
 from .webapp.security import host_allowed, security_middleware
+from .webapp.upstream_headers import UpstreamHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +434,14 @@ def _restore_model_list(services) -> None:
 def build_app(settings: Settings | None = None, *, providers: dict | None = None,
               users: object | None = None) -> FastAPI:
     config = settings or load_settings()
+    # 受信反代的**可选**硬拒（默认关，见 Settings.require_trusted_proxies）：
+    # 放在建 DB / 起线程之前——配置不合法时不该先写库、再在 lifespan 里半启动。
+    proxy_problem = trusted_proxies_problem(
+        trust_proxy=config.trust_proxy,
+        trusted_proxies=config.trusted_proxies,
+        require_trusted_proxies=config.require_trusted_proxies)
+    if proxy_problem is not None:
+        raise RuntimeError(f"{proxy_problem}；请修正 .env 后重启")
     # 与 `run()` 同一道门禁，覆盖 `uvicorn src.main:build_app --factory` 这条
     # 生产路径：它不经过 run()，若不拦，Windows 上会绕过单实例锁直接起服务
     # ——正是 issue #46 说的「升级到保护静默失效」。
@@ -442,9 +462,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     growth_events = GrowthRepository(db)
     credit_events = CreditEventRepository(db)
     checkin_events = CheckinEventRepository(db)
+    credential_events = CredentialEventRepository(db)
     api_keys = ApiKeyRepository(db)
     user_repo = UserRepository(db)
     audit = AuditRepository(db)
+    access_freezes = AccessFreezeRepository(db)
     alerts = AlertRepository(db)
     # 上游状态页快照：纯内存、不落盘（状态分钟级易变，旧快照比没有更危险）。
     # 装配在这里、路由层每请求现读 app.state，任务就地替换整批。
@@ -514,7 +536,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     set_proxy_pool(CredentialProxyPool(parse_proxy_pool(config.credential_proxy_pool)))
     registry = providers if providers is not None else {
         "trae": TraeProvider(
-            client=TraeClient(proxy=proxies.get("trae")), pacer=chat_pacer),
+            client=TraeClient(proxy=proxies.get("trae")), pacer=chat_pacer,
+            # 身份取热更值：会员开通后改配置即生效，不必重启（issue #56）
+            identities=lambda: runtime.trae_identities),
         "codebuddy": CodeBuddyProvider(
             client=CodeBuddyClient(
                 endpoint=_codebuddy_endpoint(config),
@@ -654,6 +678,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 冷却到期半开探测：到期先放 1 个请求，成功再全量回池（进程内状态，
     # 重启丢失只会让每个号多探一次）。
     half_open_guard = HalfOpenGuard()
+    # 压缩收益计数器：与 `/metrics`、`/api/stats/compression` 共用同一个实例
+    # （统计页要「省下的 token」与「同期命中率」并排读）。启动从
+    # `DATA_DIR/compress_buckets.json` 读回小时桶，重启不再清空窗口差异；
+    # 挂到 app.state 是为了测试可以注入独立实例，不影响进程级单例。
+    compress_stats = CompressStats.load(compress_buckets_path(config.data_dir))
     executor = Executor(ExecutorDeps(providers=registry, credentials=credentials,
                                      scheduler=Scheduler(
                                          expiry_window=lambda: runtime.quota_expiry_window_seconds,
@@ -702,14 +731,20 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                                      # 渠道的窗口裁剪；settings 传运行态覆盖层，
                                      # 开关与四个参数每请求现读（热更）
                                      context_compress=build_context_compressor(
-                                         model_cache, model_aliases, runtime),
+                                         model_cache, model_aliases, runtime,
+                                         stats=compress_stats),
                                      # 前缀缓存诊断（默认关）：命中率异常时
                                      # 在管理台打开，日志里就能看到前缀在哪条
                                      # 消息分叉、压缩是否每轮都在裁
                                      prefix_debug=build_prefix_observer(runtime),
                                      limits=limit_guard,
                                      inflight=inflight_guard,
-                                     half_open=half_open_guard))
+                                     half_open=half_open_guard,
+                                     # 内容拒绝归因：按 (发起者, 渠道) 计数；
+                                     # 阈值 0（默认）只记录不拦截
+                                     access_freezes=access_freezes,
+                                     access_freeze_threshold=lambda: (
+                                         runtime.access_freeze_threshold)))
 
     # 即时额度探测：新增凭证 / OAuth 保存 / 账号切换 / 签到成功后重探测。
     # 定义在 lifespan 之前：签到任务要在装配时拿到它（签到=积分变化的那一刻，
@@ -812,10 +847,21 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             upstream_model=lambda provider_id, name: (
                 model_aliases.get(provider_id, {}).get(name.lower(), name)))
         app_.state.model_probe_task = model_probe_task
+        # OTLP/HTTP JSON 指标出口（默认关）：端点为空时导出器 `enabled=False`，
+        # 循环每轮 no-op、一个连接都不建。数据源与 `/metrics` 完全同源。
+        services_ = app_.state.services
+        otlp_exporter = OtlpExporter(config.otlp_endpoint,
+                                     headers=config.otlp_headers,
+                                     snapshot=lambda: metrics_snapshot(
+                                         services_.stats_query,
+                                         app_.state.stats_collector))
+        app_.state.otlp_exporter = otlp_exporter
+        otlp_task = OtlpExportTask(otlp_exporter)
         runner = build_runner(credentials, registry, app_.state.stats_collector, runtime,
                               growth_events=app_.state.growth_events,
                               credit_events=credit_events,
                               checkin_events=checkin_events,
+                              credential_events=credential_events,
                               audit=audit,
                               alerts=alerts,
                               logs=app_.state.services.log_repo,
@@ -824,6 +870,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               upstream_status=upstream_status_task,
                               model_probe=model_probe_task,
                               model_probe_minutes=lambda: runtime.model_probe_minutes,
+                              otlp_export=otlp_task,
+                              otlp_export_seconds=lambda: config.otlp_export_seconds,
+                              otlp_export_enabled=lambda: otlp_exporter.enabled,
                               model_catalog=_refresh_channel_models,
                               openrouter_catalog=_refresh_model_catalog,
                               on_checkin_success=schedule_probe,
@@ -903,6 +952,17 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
             # 摘掉日志缓冲处理器：否则已关闭的 app 实例仍被 root 引用，
             # 反复建 app 的测试里每条日志会写进多个死实例。
             detach_root_handler(log_buffer)
+            # 日志落库队列排空后再关库：消费者线程持自己的连接，先关库会让
+            # 最后几批日志写不进去（排障最需要的恰恰是崩溃/停机前的几条）。
+            log_repo.close()
+            # 统计批量缓冲也要在关库前排空：`record()` 现在先入队再等本行提交，
+            # 正常稳态队列为空，但停机瞬间仍在途的行必须落库，否则「最后几个
+            # 请求」的用量永久丢失。`atexit` 钩子是兜底（那时库已关，写不进去
+            # 只会计一次 `write_failures`），所以这里先排一次。
+            stats_collector.flush()
+            # 压缩收益的小时桶同理：正常路径有 60s 节流落盘，停机补一次，
+            # 否则最后一次落盘到停机之间的收益会丢。
+            compress_stats.flush()
             db.close()
 
     app = FastAPI(title="Coding2API", version=app_version(), lifespan=lifespan,
@@ -920,12 +980,16 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.state.users = store
     app.state.user_repo = user_repo
     app.state.audit = audit
+    app.state.access_freezes = access_freezes
     app.state.credentials = credentials
     app.state.api_keys = api_keys
     app.state.executor = executor
     app.state.stats_collector = stats_collector
+    # 压缩收益计数器（`/metrics` 与 `/api/stats/compression` 读它）
+    app.state.compress_stats = compress_stats
     app.state.growth_events = growth_events
     app.state.checkin_events = checkin_events
+    app.state.credential_events = credential_events
     app.state.stats_query = StatsQuery(db)
     # SSE 实时流的订阅中心（与 StatsCollector 的 on_record 同源）
     app.state.live_events = live_events
@@ -955,12 +1019,14 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
         growth_events=growth_events,
         credit_events=credit_events,
         checkin_events=checkin_events,
+        credential_events=credential_events,
         api_keys=api_keys,
         executor=executor,
         registry=registry,
         users=store,
         user_repo=user_repo,
         audit=audit,
+        access_freezes=access_freezes,
         alerts=alerts,
         limits=limits_repo,
         model_probes=model_probes,
@@ -1034,6 +1100,7 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     app.include_router(admin_alerts.create_router(services))
     app.include_router(admin_badges.create_router(services))
     app.include_router(admin_upstream.create_router(services))
+    app.include_router(admin_access_freezes.create_router(services))
     app.include_router(admin_stats.create_router(services))
     app.include_router(admin_billing.create_router(services))
     app.include_router(admin_users.create_router(services))
@@ -1063,6 +1130,11 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
     # 外侧（413 也是请求结果，要记下来）。热更开关走取值器，改完下一请求生效。
     app.add_middleware(RequestLogMiddleware,
                        enabled=lambda: bool(runtime.request_log_enabled))
+    # 上游尝试响应头（X-Upstream-Attempts / X-Upstream-Degraded）：在
+    # RequestId 内侧、BodySizeLimit 外侧。热更开关关时不写且主动剥离同名头；
+    # 未处理异常就地回 500 并带上这两个头（ServerErrorMiddleware 在本层之外）。
+    app.add_middleware(UpstreamHeadersMiddleware,
+                       enabled=lambda: bool(runtime.expose_upstream_headers))
     # 请求 ID 必须比 BodySizeLimitMiddleware 更外层：请求体超限时后者自己造
     # 413 响应（不经过更内层的 security），只有最外层才能保证**任何**响应
     # （含 413 / Host 校验 400）都带上 X-Request-ID。

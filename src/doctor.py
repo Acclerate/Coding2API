@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import errno
+import ipaddress
 import os
 import re
 import socket
@@ -30,7 +31,8 @@ from pathlib import Path
 
 import httpx
 
-from .config import Settings
+from .auth.access import split_entries
+from .config import Settings, public_base_url_problem, trusted_proxies_problem
 from .db.crypto import CredentialCipher
 from .db.migrate import (
     _MIGRATION_COLUMN_DROPS,
@@ -151,24 +153,111 @@ def check_data_permissions(settings: Settings) -> Check:
     return Check("DATA_DIR 权限", FAIL, f"{problem}（服务会拒绝启动，先修权限）")
 
 
+def _is_loopback_host(host: str) -> bool:
+    """主机是不是本机回环名（`localhost` / `127.0.0.1` / `::1`）。"""
+    return host.strip().strip("[]").lower() in ("localhost", "127.0.0.1", "::1")
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """监听地址是不是通配（`0.0.0.0` / `::` / 空）——远端一定打不开。
+
+    用 `ipaddress` 的 `is_unspecified` 判定而不是字符串比对：既覆盖 `0.0.0.0`
+    与 `::` 两种写法，也不会让静态扫描把这里的**字面量比较**误判成真的在绑定
+    全网卡（bandit B104）。非 IP 的普通主机名一律不是通配。
+    """
+    text = host.strip().strip("[]")
+    if not text:
+        return True
+    try:
+        return ipaddress.ip_address(text).is_unspecified
+    except ValueError:
+        return False
+
+
+def _host_of(url: str) -> str:
+    """URL 的主机名（剥 scheme / path / 端口），没有主机时返回空串。
+
+    调用前必过 `public_base_url_problem`：能解析的地址这里不会再抛 ValueError，
+    所以不需要 try/except（那会变成不可达的防御分支）。
+    """
+    from urllib.parse import urlsplit
+
+    return urlsplit(url.strip()).hostname or ""
+
+
 def check_host_config(settings: Settings) -> Check:
     """`PUBLIC_BASE_URL` 与 `ALLOWED_HOSTS` 一致（`SECURITY.md` 的部署须知项）。
 
     不一致的后果不是报错而是**静默**：管理台打不开（Host 校验拒掉）、TRAE
     回调地址指向一个不被放行的主机。所以能在启动前报出来就报出来。
+
+    三条判定：
+    - `PUBLIC_BASE_URL` 不是 `http(s)://host` 形态（漏写 `://`、没有主机）→ FAIL：
+      漏写 scheme 会让回调变成相对路径，登录静默失败（config 的校验只是兜底，
+      老 `.env` / 运行期改写仍可能落到这里）。
+    - `HOST` 是通配（`0.0.0.0` / `::` / 空）而 `PUBLIC_BASE_URL` 主机是回环 →
+      FAIL：远端 Host 全被拒、管理台打不开，而 doctor 却说「通过」。
+    - 配了 `ALLOWED_HOSTS` 却不含 `PUBLIC_BASE_URL` 主机 → FAIL：这是最容易踩的
+      静默故障（忘了把自己的域名加进去），服务实际拒绝该 Host，不是「能跑」。
     """
     public_host = settings.public_base_url
+    problem = public_base_url_problem(public_host)
+    if problem is not None:
+        # 配置层已挡（config.Settings 的 field_validator）；这里覆盖「老 .env /
+        # 运行期改写 / 直接构造的对象」这些绕过校验的路径。
+        return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", FAIL, problem)
+    public_host = public_host.strip()
+    host = _host_of(public_host)
+    if _is_wildcard_host(settings.host) and _is_loopback_host(host):
+        return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", FAIL,
+                     f"HOST={settings.host!r} 监听所有网卡，但 "
+                     f"PUBLIC_BASE_URL 仍是回环 {settings.public_base_url}——"
+                     "远端管理台与回调都打不开；请设成浏览器可达的地址"
+                     "（如 https://ai.example.com），或配 ALLOWED_HOSTS 放行远端 Host")
     if not settings.allowed_hosts:
         # 空 = 本地回环 + PUBLIC_BASE_URL 主机，天然一致
         return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", PASS,
                      f"{public_host}（ALLOWED_HOSTS 留空，按默认口径放行）")
     # 只留主机名：`host_allowed` 比的是纯主机（剥 scheme / 端口），
     # 但 PUBLIC_BASE_URL 可能带 path（`https://host/callback`），不剥会误判。
-    host = public_host.split("://", 1)[-1].split("/", 1)[0]
-    if host_allowed(host, settings):
+    plain = public_host.split("://", 1)[-1].split("/", 1)[0]
+    if host_allowed(plain, settings):
         return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", PASS, public_host)
-    return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", WARN,
-                 f"{public_host} 不在 ALLOWED_HOSTS 里，管理台与回调会打不开")
+    return Check("PUBLIC_BASE_URL / ALLOWED_HOSTS", FAIL,
+                 f"{public_host} 不在 ALLOWED_HOSTS 里，管理台与回调会打不开"
+                 f"（在 ALLOWED_HOSTS 加上 {host}）")
+
+
+def check_trusted_proxies(settings: Settings) -> Check:
+    """`TRUST_PROXY` / `TRUSTED_PROXIES` 组合（`SECURITY.md` 的部署须知项）。
+
+    与 `Settings.require_trusted_proxies` 同口径：那条默认 false 的开关决定
+    「不合法组合」是启动失败还是只提示，故这里的严重度跟着它走——
+
+    - 强制开启且组合不合法（空名单 / 名单全写坏）→ FAIL：服务会拒绝启动。
+    - 未强制，但 `TRUST_PROXY=true` 且名单为空 → WARN：这正是遗留风险，
+      运行期采信任意对端的 XFF（`allowed_ips` 与登录限流失效），主动提示
+      但不拦门禁（存量部署的合法形态）。
+    - 其余（未开 TRUST_PROXY，或名单已配好）→ PASS。
+    """
+    trust = "true" if settings.trust_proxy else "false"
+    raw = settings.trusted_proxies.strip()
+    listed = repr(raw) if raw else "空"
+    problem = trusted_proxies_problem(
+        trust_proxy=settings.trust_proxy,
+        trusted_proxies=settings.trusted_proxies,
+        require_trusted_proxies=settings.require_trusted_proxies)
+    if problem is not None:
+        return Check("受信反代", FAIL, f"{problem}（服务会拒绝启动，先修配置）")
+    if settings.trust_proxy and not split_entries(raw):
+        return Check("受信反代", WARN,
+                     "TRUST_PROXY=true 但 TRUSTED_PROXIES 为空：X-Forwarded-For "
+                     "可被任意客户端伪造，allowed_ips 与登录限流失效；"
+                     "配好名单后可按需置 REQUIRE_TRUSTED_PROXIES=true")
+    return Check("受信反代", PASS,
+                 f"TRUST_PROXY={trust} TRUSTED_PROXIES={listed}"
+                 f"（REQUIRE_TRUSTED_PROXIES="
+                 f"{'true' if settings.require_trusted_proxies else 'false'}）")
 
 
 def pending_migration_count(conn: sqlite3.Connection) -> int:

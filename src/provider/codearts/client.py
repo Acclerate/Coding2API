@@ -35,7 +35,14 @@ from urllib.parse import urlsplit
 import httpx
 
 from ...provider import base
-from ...provider.base import Event, Model, Quota, UpstreamReloginRequired
+from ...provider.base import (
+    ErrKind,
+    Event,
+    Model,
+    Quota,
+    UpstreamReloginRequired,
+)
+from ..http_json import json_or_raise
 from ..lazy_clients import LazyClients
 from . import auth as codearts_auth
 from . import events as codearts_events
@@ -258,7 +265,13 @@ class _WebCookieExpired(Exception):
     页面导航请求回 SPA HTML，登录跳转则回 3xx 到 `auth.huaweicloud.com`。
     这些形态都归「需要重贴 Cookie」，与 5xx/网络/形状变化（只是暂时拿不到
     明细）分开，前者才在管理台打「已失效」标记。
+
+    分类为 `UPSTREAM_PROTOCOL`（零冷却、不罚号）：响应形态不符合协议，
+    不是账号额度/状态问题；留痕由 executor 的失败行负责。
     """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.UPSTREAM_PROTOCOL
 
 
 class CodeArtsClient(LazyClients):
@@ -677,15 +690,9 @@ class CodeArtsClient(LazyClients):
             headers=headers, payload=raw, x_sdk_date=sdk_date())
         response = await self._short.request(method, url, content=raw if body is not None
                                                else None, headers=signed)
-        if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code,
-                                    await base.read_body_bounded(response))
-        try:
-            data = response.json()
-        except ValueError as error:
-            raise UpstreamProtocolViolation(
-                f"non-JSON response from {url}",
-                public="upstream returned a non-JSON response") from error
+        data = await json_or_raise(
+            response, UpstreamHTTPError, url,
+            public="upstream returned a non-JSON response")
         if not isinstance(data, dict):
             raise UpstreamProtocolViolation(
                 f"unexpected response shape from {url}",

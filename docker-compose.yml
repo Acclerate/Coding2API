@@ -10,6 +10,34 @@ services:
     # 指向容器自身，代理静默连不上（启动期只校验格式、不校验可达）。
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # ---- 最小权限加固 ----
+    # 应用全程以非 root（uid 1001）运行、只监听一个端口、不起子进程，因此
+    # 不需要任何 Linux capability：
+    #   cap_drop ALL —— 默认 root 才有的 CAP_CHOWN/CAP_SETUID 等一律不留，
+    #     镜像里被塞进来的提权路径（setuid 二进制）也走不通；
+    #   no-new-privileges —— 即使 execve 一个 setuid 程序，权限也不上升。
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # pids_limit：防 fork 炸弹把宿主 PID 打满（应用正常只 ~10 个线程/进程）。
+    pids_limit: 256
+    # 内存上限是**保守默认**：实测正常运行时 RSS 约 150–400MB（取决于模型目录与
+    # 在途长流）。库很大 / 并发很高时按需上调（如 2g），否则 OOM kill 表现为
+    # 容器反复重启、health 永远不通。
+    mem_limit: 1g
+    # read_only：只读根文件系统。可写点已逐一确认（均不是根文件系统）：
+    #   /app/data   —— bind mount，SQLite/WAL、备份、模型快照都写这里；
+    #   /app/secrets—— bind mount，只读挂载，应用只读不写；
+    #   /tmp        —— tmpfs（下方声明），给第三方库的临时文件；
+    #   /dev/shm    —— Docker 默认即为独立 tmpfs，不受 read_only 影响。
+    # Python 不会往根文件系统写字节码（Dockerfile 已设 PYTHONDONTWRITEBYTECODE=1），
+    # uv 只在构建期运行。已用真实镜像验证：read_only + 上述挂载下容器 healthy、
+    # 无任何 EROFS/EACCES。
+    read_only: true
+    tmpfs:
+      # noexec,nosuid：临时目录不需要可执行位，挡住「落一个脚本再执行」的路径。
+      - /tmp:rw,noexec,nosuid,size=64m
     environment:
       # 必填：凭证列加密密钥。丢失后已存凭证全部不可解，只能重录。
       APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env}
@@ -20,7 +48,10 @@ services:
       CODEBUDDY_API_ENDPOINT: ${CODEBUDDY_API_ENDPOINT:-https://copilot.tencent.com}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-deepseek-v4.1-flash}
       # 模型列表黑名单（fnmatch glob，逗号分隔，完全替换语义）
-      MODEL_BLOCKLIST: ${MODEL_BLOCKLIST:-custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,fast,balanced,deep,primary,auto,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,glm-5.0*,glm-5.1,glm-5v-*,glm-5.2*,glm.5.2*,kimi-k2.*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,kimi-k3,minimax-m2.5,minimax-m2.7,minimax-m3,deepseek-v3-*,deepseek-v4-*,qwen3.7-*,qwen3-*,qwen3.6*,qwen3-vl-235b,gpt-5.4,gpt-5.5,gpt-5.6*,hy3*,hy4-preview,hunyuan-*,seed-2.1*,seed-2-1-turbo,doubao-seed-2.1-turbo,seed-code-pro-*,seed-evolving,space-bunny,nemotron-3-*,nemotron-3*,lfm2*,laguna*,north-mini-code,inkling-small,xing4.0-29b-a4,glyph-cluster,openrouter-models-router,deepseek-v4.1-flash-0930,deepseek-v4.1-flash-bnt,glm-5.3-test,glm-5.3-zx,kimi-k3-test-1009,kimi-k3-1019}
+      MODEL_BLOCKLIST: ${MODEL_BLOCKLIST:-custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,fast,balanced,deep,primary,auto,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,glm-5.0*,glm-5.1,glm-5v-*,glm-5.2*,glm.5.2*,kimi-k2.*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,kimi-k3,minimax-m2.5,minimax-m2.7,minimax-m3,deepseek-v3-*,deepseek-v4-*,qwen3.7-*,qwen3-*,qwen3.6*,qwen3-vl-235b,gpt-5.4,gpt-5.5,gpt-5.6*,hy3*,hy4-preview,hunyuan-*,seed-code-pro-*,space-bunny,nemotron-3-*,nemotron-3*,lfm2*,laguna*,north-mini-code,inkling-small,xing4.0-29b-a4,glyph-cluster,openrouter-models-router,deepseek-v4.1-flash-0930,deepseek-v4.1-flash-bnt,glm-5.3-test,glm-5.3-zx,kimi-k3-test-1009,kimi-k3-1019}
+      # TRAE 本账号拥有的访问身份（`0`=免费档）。白名单不含本账号身份的模型
+      # 选中必回 1005，故拉取时按它过滤；留空 = 不过滤。
+      TRAE_ACCOUNT_IDENTITIES: ${TRAE_ACCOUNT_IDENTITIES:-0}
       QUOTA_PROBE_MINUTES: ${QUOTA_PROBE_MINUTES:-60}
       # token 预刷新轮询周期（分钟）：短寿命渠道（CodeArts STS 2h）的预刷新
       # 窗口会被封顶，窗口必须窄于该周期才不会整轮漏过、拖到到期才刷
@@ -115,6 +146,9 @@ services:
       # TRUST_PROXY=true 时只对名单内的对端解析 XFF（逗号分隔 IP/CIDR）。
       # 留空 = 采信任意对端；端口若并非只有反代可达，必须显式配这一项。
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # 置 true 时把「TRUST_PROXY=true 但名单为空/写坏」变成启动失败。
+      # 默认 false 保持旧行为（只由 doctor 给 WARN），升级不打断现有部署。
+      REQUIRE_TRUSTED_PROXIES: ${REQUIRE_TRUSTED_PROXIES:-false}
       # 上游端点白名单（逗号分隔）；改 CODEBUDDY_API_ENDPOINT 时必须同时含它
       CODEBUDDY_ALLOWED_ENDPOINTS: ${CODEBUDDY_ALLOWED_ENDPOINTS:-https://copilot.tencent.com,https://www.codebuddy.ai}
       # CodeBuddy 国际版（独立渠道 codebuddy_intl）的端点与**独立**白名单。
@@ -221,6 +255,18 @@ services:
       METRICS_ENABLED: ${METRICS_ENABLED:-true}
       # 留空 = /metrics 公开；设置后抓取需 Authorization: Bearer <token>
       METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # 上游尝试链响应头（X-Upstream-Attempts / X-Upstream-Degraded）；默认关闭：
+      # 这些头泄露账号池规模、成本与路由指纹。可热更。
+      EXPOSE_UPSTREAM_HEADERS: ${EXPOSE_UPSTREAM_HEADERS:-false}
+      # 内容拒绝冻结阈值：同一发起者对同一渠道累计命中多少次后前置 403；
+      # 0 = 只记录不冻结（默认）。可热更。
+      ACCESS_FREEZE_THRESHOLD: ${ACCESS_FREEZE_THRESHOLD:-0}
+      # OTLP/HTTP JSON 指标出口；留空 = 关闭（零出站）。只导 gen_ai.* 指标，不含提示词/回答。
+      OTLP_ENDPOINT: ${OTLP_ENDPOINT:-}
+      # OTLP 导出周期秒（下限 15）
+      OTLP_EXPORT_SECONDS: ${OTLP_EXPORT_SECONDS:-60}
+      # OTLP 自定义头，格式 `k:v;k2:v2`
+      OTLP_HEADERS: ${OTLP_HEADERS:-}
       # 请求级结构化日志（logfmt，只记 /api、/v1、/authorize；不写 query/正文/用户名）
       REQUEST_LOG_ENABLED: ${REQUEST_LOG_ENABLED:-true}
       # 签到总开关（false = 不需要签到活动的部署整体关掉）；签到定时：本地

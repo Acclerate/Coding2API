@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS credentials (
     growth_last_result TEXT,                       -- 该轮一行中文汇报
     tags             TEXT NOT NULL DEFAULT '',     -- 逗号分隔的运维标签（纯展示筛选，不参与调度）
     created_at       INTEGER NOT NULL,
+    -- 编辑版本号（乐观并发，第 39 版补列）：管理面每次**人工编辑**该行都推进
+    -- （`MAX(now, 旧值+1)`——同一秒里的两次编辑也不会撞成同版本），编辑端点
+    -- 用请求里的 `expected_updated_at` 比对；不一致 = 别人先保存了，回 409 +
+    -- 当前快照。老库补 0 =「从未编辑」，读路径不必判空即可比较。
+    -- 后台自动写（冷却/额度/健康度/刷新续期）**不推进**：否则打开中的编辑页会被
+    -- 30s 一次的轮询写成「过期」，冲突检测退化成永远 409。
+    updated_at       INTEGER NOT NULL DEFAULT 0,
+    -- 账号级模型白名单（fnmatch glob，逗号分隔，''=不限制，与 api_keys 同语法）：
+    -- 请求模型不在列表里时该凭证**不参与本次选号**（不硬禁用、不写冷却）；只影响
+    -- 对话/推理流量的候选集，签到/刷新/探活等后台任务照常看到全部凭证。
+    allowed_models   TEXT NOT NULL DEFAULT '',
     added_by         TEXT                          -- 应用层校验存在于 users 表
 );
 
@@ -348,8 +359,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor, ts);
 
--- 运维告警事件：后台周期评估七类规则（池耗尽 / 任务连续失败 / token
--- 临近到期 / 上游错误率骤升 / 单 Key 用量暴涨 / 非工作时段 / 预算分层），
+-- 运维告警事件：后台周期评估九类规则（池耗尽 / 任务连续失败 / token
+-- 临近到期 / 上游错误率骤升 / 单 Key 用量暴涨 / 非工作时段 / 预算分层 /
+-- 渠道零成功 / 签到连续失败），
 -- 命中即落一行，供管理台「站内告警记录」回看。
 --
 -- 为什么落库而不是像 TaskStatusStore 只留内存：告警的价值恰在「错过的那段
@@ -394,3 +406,66 @@ CREATE TABLE IF NOT EXISTS log_events (
 
 -- 按 request_id 回溯一次请求的全部日志（`GET /api/logs?request_id=…`）
 CREATE INDEX IF NOT EXISTS idx_log_events_request_id ON log_events(request_id);
+
+-- 凭证可用性时间线（credential_events）：每次「可用性状态迁移」落一行。
+--
+-- 为什么单独建表：`credential_model_cooldowns` / `credentials.cooling_until`
+-- 只有**当前态**（覆盖写），回答不了「昨天 14:00 这个号为什么不可用」。
+-- 把历史塞进冷却表会被下一次迁移覆盖掉；写进 `usage_events` 又会污染用量与
+-- 成本统计（那是有请求才有行的口径，冷却到期是后台事件）。故独立成表，只增
+-- 不改，保留期由 RetentionTask（30 天）裁剪。
+--
+-- `event` 取值（写入点全部在 src/db/repo.py 的状态迁移函数内，与状态
+-- UPDATE 同事务；见 `CREDENTIAL_EVENT_KINDS`）：
+--   cooldown_start —— 账号级或 (凭证, 模型) 级冷却开始
+--   cooldown_end   —— 冷却到期回收 / 负缓存被清除
+--   hard_failure   —— 硬禁用（session 死亡 / 上游风控）
+--   revived        —— 人工恢复（force 与否写在 detail）
+--   enabled        —— 管理台用户软开关：启用
+--   disabled       —— 管理台用户软开关：停用
+--
+-- `reason` 只放**脱敏枚举**（ErrKind 值 / 'model' / 'blocked' / 'expired'），
+-- **不得写上游响应正文**：正文可能回显凭证片段。`detail` 是可读短句，同样
+-- 禁止凭证明文。`model` 仅模型级事件非空（账号级为 NULL）；`request_id`
+-- 关联触发这次迁移的请求（后台任务/无请求上下文为 NULL）。
+CREATE TABLE IF NOT EXISTS credential_events (
+    id             TEXT PRIMARY KEY,
+    credential_id  TEXT NOT NULL,
+    ts             INTEGER NOT NULL,             -- 迁移发生时刻（epoch 秒）
+    event          TEXT NOT NULL                -- 见上：六类状态迁移
+                   CHECK (event IN ('cooldown_start', 'cooldown_end', 'hard_failure',
+                                    'revived', 'enabled', 'disabled')),
+    reason         TEXT NOT NULL DEFAULT '',     -- 脱敏枚举（不是上游正文）
+    model          TEXT,                         -- 模型级冷却/负缓存时非空
+    detail         TEXT NOT NULL DEFAULT '',     -- 一行可读短句（无凭证明文）
+    request_id     TEXT                          -- 触发迁移的请求 ID（可空）
+);
+
+-- 时间线按 (凭证, 时间窗) 倒序翻页：没有它会每次全表扫。
+CREATE INDEX IF NOT EXISTS idx_credential_events_cred_ts
+    ON credential_events(credential_id, ts);
+-- 保留期裁剪按 ts 从旧到新删：单列索引让 DELETE 只碰过期段。
+CREATE INDEX IF NOT EXISTS idx_credential_events_ts ON credential_events(ts);
+
+-- 访问冻结（access_freezes）：上游内容拒绝的**发起者**归因计数。
+--
+-- 为什么按发起者而不是凭证：内容安全拒绝（如 CodeBuddy 403 + 11128）是
+-- 请求内容触发的，同池换号只会在更多账号上留下同样的拒绝记录。把发起者
+-- （API Key 所属用户名；无用户名时用 Key id）与渠道组合成冻结键，才能
+-- 「一个人违规只停他自己」，不连累其他租户。
+--
+-- 本表**只增不改**：每一行是一次内容拒绝的命中记录（同一 subject×provider
+-- 可有多行），阈值 `ACCESS_FREEZE_THRESHOLD` 按累计行数判定是否冻结；
+-- 阈值 0 = 只记录不拦截。解冻 = 删除该 (subject, provider) 的全部行并写审计。
+-- `reason` 只入脱敏标识（上游业务码 / HTTP 状态），不得写上游正文。
+CREATE TABLE IF NOT EXISTS access_freezes (
+    subject   TEXT NOT NULL,              -- 发起者：用户名，无则 API Key id
+    provider  TEXT NOT NULL,              -- 渠道 id（与 credentials.provider 同域）
+    reason    TEXT NOT NULL DEFAULT '',   -- 脱敏标识（code=11128 / status=403）
+    frozen_at INTEGER NOT NULL,           -- 命中时刻（epoch 秒）
+    frozen_by TEXT NOT NULL DEFAULT 'auto' -- auto=自动命中；解冻不留行，审计在 audit_events
+);
+
+-- 判定是否冻结按 (subject, provider) 计数；列出/解冻也按这两个键过滤。
+CREATE INDEX IF NOT EXISTS idx_access_freezes_subject_provider
+    ON access_freezes(subject, provider, frozen_at);

@@ -76,8 +76,9 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
               "分数显示 —，不影响模型列表。",
               group="model"),
     TaskSpec("alert", "运维告警",
-             "周期评估七类规则（池耗尽 / 任务连续失败 / token 临近到期 / 上游"
-             "错误率骤升 / 单 Key 用量暴涨 / 非工作时段请求 / 预算分层），"
+             "周期评估九类规则（池耗尽 / 任务连续失败 / token 临近到期 / 上游"
+             "错误率骤升 / 单 Key 用量暴涨 / 非工作时段请求 / 预算分层 / "
+             "渠道零成功 / 签到连续失败），"
              "命中落站内记录并可推送 webhook；周期见「运维告警周期」。",
              group="ops"),
     TaskSpec("backup", "数据库备份",
@@ -89,6 +90,11 @@ TASK_SPECS: tuple[TaskSpec, ...] = (
              "DeepSeek / Together / Moonshot / MiniMax / OpenAI / Anthropic），"
              "归一化后存内存供「上游状态」页展示。只做解释不做决策，不参与选号；"
              "周期见「上游状态页周期」。",
+             group="ops"),
+    TaskSpec("otlp_export", "OTLP 指标导出",
+             "把与 `/metrics` 同源的脱敏指标（延迟 / 首字 / token / 错误计数）"
+             "按 OTLP/HTTP JSON 推给外部采集端；未配置 `OTLP_ENDPOINT` 时每轮"
+             "都是 no-op。永不导出提示词 / 回答 / system 指令。",
              group="ops"),
 )
 

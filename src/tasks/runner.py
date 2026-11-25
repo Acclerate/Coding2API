@@ -22,6 +22,7 @@ from .backup import BackupTask
 from .checkin import CheckinTask
 from .growth import GrowthTask
 from .model_probe import ModelProbeTask
+from .otlp_export import OtlpExportTask
 from .pacer import Pacer
 from .quota_probe import QuotaProbeTask
 from .refresh import RefreshTask
@@ -81,6 +82,9 @@ class TaskRunner:
         # 模型可用性探活：None 表示不装配该循环。即使装配了，周期为 0（默认）
         # 时也由 `_sync_model_probe` 每轮判成 no-op——探活会真发上游请求。
         model_probe: ModelProbeTask | None = None,
+        # OTLP 指标导出：None 表示不装配该循环（老调用方/测试保持原行为）。
+        # 端点未配置时 `run_once` 返回 None，每轮是 no-op。
+        otlp_export: OtlpExportTask | None = None,
         quota_probe_minutes: int | Callable[[], int] = 60,
         growth_interval_minutes: int | Callable[[], int] = 60,
         refresh_interval_minutes: int | Callable[[], int] = 60,
@@ -91,6 +95,8 @@ class TaskRunner:
         alert_interval_minutes: int | Callable[[], int] = 5,
         backup_interval_minutes: int | Callable[[], int] = 1440,
         upstream_status_minutes: int | Callable[[], int] = 5,
+        otlp_export_seconds: int | Callable[[], int] = 60,
+        otlp_export_enabled: Callable[[], bool] | None = None,
         activity_enabled: Callable[[], bool] | None = None,
         alert_enabled: Callable[[], bool] | None = None,
         checkin_enabled: Callable[[], bool] | None = None,
@@ -105,6 +111,7 @@ class TaskRunner:
         self._retention = retention
         self._model_catalog = model_catalog
         self._model_probe = model_probe
+        self._otlp_export = otlp_export
         self._openrouter_catalog = openrouter_catalog
         self._alert = alert
         self._backup = backup
@@ -121,6 +128,9 @@ class TaskRunner:
         self._alert_minutes = live(alert_interval_minutes)
         self._backup_minutes = live(backup_interval_minutes)
         self._upstream_status_minutes = live(upstream_status_minutes)
+        self._otlp_export_seconds = live(otlp_export_seconds)
+        # 端点未配置 = 关闭：任务卡片显示「未启用」，而不是「启用但从不运行」。
+        self._otlp_export_enabled = otlp_export_enabled or (lambda: otlp_export is not None)
         # 活跃上报是否启用也可热更：装配时恒建对象（构造成本为零），
         # 每轮由 _sync_activity 问一次，关着时是 no-op。
         self._activity_enabled = activity_enabled or (lambda: activity is not None)
@@ -201,6 +211,12 @@ class TaskRunner:
         return max(60, int(self._upstream_status_minutes()) * 60)
 
     @property
+    def _otlp_export_interval(self) -> float:
+        # 下限 15 秒与配置项校验对齐：导出的是累计快照，更密不会更准，只会让
+        # 采集端收到重复样本；写错成 0 会让循环变成忙等。
+        return max(15.0, float(self._otlp_export_seconds()))
+
+    @property
     def _checkin_interval(self) -> float:
         """签到循环的醒转周期：留空（旧行为）10 分钟，配了时点则 1 分钟。
 
@@ -218,15 +234,23 @@ class TaskRunner:
         refresh_token 现在只由 RefreshTask 轮转（额度探测不再保活）。服务重启时
         若凭证已落在到期窗口，不抢先刷就会带病服务到下一轮（60 分钟），期间
         聊天 401 会被硬禁用。
+
+        backup / retention 同样**首轮立即跑**，避免短命进程永远错过：
+        `_loop` 是先睡后跑，backup 默认 1440 分钟、retention 首轮也要 5 分钟，
+        每天重启一次的部署会永远等不到备份（README 承诺「每日」），retention
+        也永远清不掉过期明细。各轮互相独立（各自 `_guarded`）：一个失败既不影响
+        另一个，也不影响后面的循环建立。注意**不改变** `_loop_specs` 的接线，
+        手动触发仍走那份清单。
         """
         await self._guarded(
             self._quota_probe.run_once(apply_pacing=False),
             "启动额度探测",
             key="quota_probe",
         )
-        await self._guarded(
-            self._refresh.run_once(), "启动 token 预刷新", key="refresh"
-        )
+        await self._guarded(self._refresh.run_once(), "启动 token 预刷新", key="refresh")
+        if self._backup is not None:
+            await self._guarded(self._sync_backup(), "启动数据库备份", key="backup")
+        await self._guarded(self._sync_retention(), "启动明细清理", key="retention")
         for spec in self._loop_specs():
             self._tasks.append(
                 asyncio.create_task(
@@ -261,15 +285,15 @@ class TaskRunner:
             # 一次，由 `due()` 自己判定是否落在抖动窗口内。**不能**把周期改成
             # 「按最大时点间隔算」——服务恰在两个时点之间重启会直接漏签，而
             # 10 分钟空转的代价只是读一次配置（与 activity 的取舍同理）。
-            self._spec("checkin",
-                       ((lambda: self._sync_checkin(manual=True)) if manual
-                        else self._sync_checkin)),
+            self._spec(
+                "checkin",
+                ((lambda: self._sync_checkin(manual=True)) if manual else self._sync_checkin),
+            ),
         ]
         if self._growth is not None:
             specs.append(self._spec("growth", self._sync_growth))
         if self._activity is not None:
-            activity = ((lambda: self._sync_activity(manual=True)) if manual
-                        else self._sync_activity)
+            activity = (lambda: self._sync_activity(manual=True)) if manual else self._sync_activity
             specs.append(self._spec("activity", activity))
         if self._model_catalog is not None:
             specs.append(self._spec("model_catalog", self._model_catalog))
@@ -283,10 +307,11 @@ class TaskRunner:
             specs.append(self._spec("backup", self._sync_backup))
         if self._upstream_status is not None:
             specs.append(self._spec("upstream_status", self._sync_upstream_status))
+        if self._otlp_export is not None:
+            specs.append(self._spec("otlp_export", self._sync_otlp_export))
         return specs
 
-    def _spec(self, key: str,
-              runner: Callable[[], Awaitable[object]]) -> _LoopSpec:
+    def _spec(self, key: str, runner: Callable[[], Awaitable[object]]) -> _LoopSpec:
         """拼一条循环描述：周期取值器统一走 `_interval_seconds`（热更现读）。"""
         return _LoopSpec(key, runner, lambda: self._interval_seconds(key))
 
@@ -302,9 +327,7 @@ class TaskRunner:
           `ran=False, busy=True`，而不是攒一串重复请求在锁后等。
         - 等结果返回后再回响应：调用方（管理台）要能立刻看到 report / error。
         """
-        spec = next(
-            (item for item in self._loop_specs(manual=True) if item.key == key), None
-        )
+        spec = next((item for item in self._loop_specs(manual=True) if item.key == key), None)
         if spec is None:
             raise UnknownTaskError(key)
         if key in self._running:
@@ -402,6 +425,14 @@ class TaskRunner:
         task = self._require(self._upstream_status, "upstream status")
         return await task.run_once()
 
+    async def _sync_otlp_export(self) -> object:
+        """OTLP 指标导出：端点未配置时 `run_once` 返回 None，本轮记 no-op。
+
+        失败策略在 `OtlpExporter` 内：连续失败只告警一次、永不抛，服务照常跑。
+        """
+        task = self._require(self._otlp_export, "otlp export")
+        return await task.run_once()
+
     async def _loop(
         self,
         name: str,
@@ -422,9 +453,7 @@ class TaskRunner:
             try:
                 seconds = delay()
             except Exception as error:  # noqa: BLE001 - 后台任务不能拖垮服务
-                logger.warning(
-                    "后台任务「%s」读取间隔失败: %s，60 秒后重试", name, error
-                )
+                logger.warning("后台任务「%s」读取间隔失败: %s，60 秒后重试", name, error)
                 seconds = 60.0
             try:
                 await asyncio.sleep(seconds)
@@ -478,9 +507,7 @@ class TaskRunner:
         except Exception as error:  # noqa: BLE001 - 后台任务不能拖垮服务
             logger.warning("后台任务「%s」失败: %s", name, error)
             if key is not None:
-                self.status.record(
-                    key, started_at=started, ok=False, report=None, error=str(error)
-                )
+                self.status.record(key, started_at=started, ok=False, report=None, error=str(error))
             return False
         if key is not None and result is not None:
             self.status.record(
@@ -496,9 +523,7 @@ class TaskRunner:
         顺序仍按 `TASK_SPECS`（前端 tab 顺序稳定）。
         """
         assembled = {spec.key for spec in self._loop_specs()}
-        return [
-            self._task_item(spec.key) for spec in TASK_SPECS if spec.key in assembled
-        ]
+        return [self._task_item(spec.key) for spec in TASK_SPECS if spec.key in assembled]
 
     def _task_item(self, key: str) -> dict[str, Any]:
         """一个任务的最新运行态（`task_status()` 与手动触发响应的共同形状）。"""
@@ -546,6 +571,7 @@ class TaskRunner:
             "alert": lambda: self._alert_interval,
             "backup": lambda: self._backup_interval,
             "upstream_status": lambda: self._upstream_status_interval,
+            "otlp_export": lambda: self._otlp_export_interval,
         }
 
     def _task_enabled(self, key: str) -> bool:
@@ -555,6 +581,7 @@ class TaskRunner:
             "alert": self._alert_enabled,
             "checkin": self._checkin_enabled,
             "upstream_status": self._upstream_status_enabled,
+            "otlp_export": self._otlp_export_enabled,
         }.get(key)
         return True if getter is None else bool(getter())
 
@@ -583,19 +610,31 @@ def _as_report(result: object) -> dict[str, Any]:
     return {"result": repr(result)}
 
 
-def build_runner(credentials, providers: dict, stats_collector, config,
-                 growth_events=None, credit_events=None, checkin_events=None, audit=None,
-                 logs=None,
-                 model_catalog: Callable[[], Awaitable[object]] | None = None,
-                 openrouter_catalog: Callable[[], Awaitable[object]] | None = None,
-                 openrouter_catalog_minutes: int | Callable[[], int] = 1440,
-                 alerts=None,
-                 backup: BackupTask | None = None,
-                 upstream_status: UpstreamStatusTask | None = None,
-                 model_probe: ModelProbeTask | None = None,
-                 model_probe_minutes: int | Callable[[], int] = 0,
-                 status: TaskStatusStore | None = None,
-                 on_checkin_success: Callable[[str], None] | None = None) -> TaskRunner:
+def build_runner(
+    credentials,
+    providers: dict,
+    stats_collector,
+    config,
+    growth_events=None,
+    credit_events=None,
+    checkin_events=None,
+    audit=None,
+    logs=None,
+    credential_events=None,
+    model_catalog: Callable[[], Awaitable[object]] | None = None,
+    openrouter_catalog: Callable[[], Awaitable[object]] | None = None,
+    openrouter_catalog_minutes: int | Callable[[], int] = 1440,
+    alerts=None,
+    backup: BackupTask | None = None,
+    upstream_status: UpstreamStatusTask | None = None,
+    model_probe: ModelProbeTask | None = None,
+    model_probe_minutes: int | Callable[[], int] = 0,
+    otlp_export: OtlpExportTask | None = None,
+    otlp_export_seconds: int | Callable[[], int] = 60,
+    otlp_export_enabled: Callable[[], bool] | None = None,
+    status: TaskStatusStore | None = None,
+    on_checkin_success: Callable[[str], None] | None = None,
+) -> TaskRunner:
     """按配置装配后台任务（Pacer 由两个 provider 共享）。
 
     growth_events 为 None 时（老调用方/测试）不装配成长中心任务：没有落库目标
@@ -659,56 +698,71 @@ def build_runner(credentials, providers: dict, stats_collector, config,
     status_store = status or TaskStatusStore()
     alert = None
     if alerts is not None:
-        alert = AlertTask(credentials, alerts, stats_collector,
-                          task_status=status_store,
-                          enabled=lambda: config.alert_enabled,
-                          webhook_url=lambda: config.alert_webhook_url,
-                          feishu_url=lambda: config.alert_feishu_webhook_url,
-                          slack_url=lambda: config.alert_slack_webhook_url,
-                          pool_ready_min=lambda: config.alert_pool_ready_min,
-                          task_failures=lambda: config.alert_task_failures,
-                          token_expiry_hours=lambda: config.alert_token_expiry_hours,
-                          error_rate_threshold=lambda: config.alert_error_rate_threshold,
-                          error_rate_min_requests=lambda: config.alert_error_rate_min_requests,
-                          error_rate_window_minutes=lambda: config.alert_error_rate_window_minutes,
-                          key_burst_tokens=lambda: config.alert_key_burst_tokens,
-                          key_burst_window_minutes=lambda: config.alert_key_burst_window_minutes,
-                          off_hours_start=lambda: config.alert_off_hours_start,
-                          off_hours_end=lambda: config.alert_off_hours_end,
-                          off_hours_min_requests=lambda: config.alert_off_hours_min_requests,
-                          budget_cny=lambda: config.alert_budget_cny,
-                          budget_levels=lambda: config.alert_budget_levels,
-                          channel_dead_min_requests=(
-                              lambda: config.alert_channel_dead_min_requests),
-                          channel_dead_window_minutes=(
-                              lambda: config.alert_channel_dead_window_minutes),
-                          checkin_fail_min_streak=(
-                              lambda: config.alert_checkin_fail_min_streak),
-                          checkin_fail_window_hours=(
-                              lambda: config.alert_checkin_fail_window_hours),
-                          checkins=checkin_events,
-                          silence_minutes=lambda: config.alert_silence_minutes,
-                          for_ticks=lambda: config.alert_for_ticks,
-                          clear_ticks=lambda: config.alert_clear_ticks,
-                          app_secret=lambda: config.app_secret)
+        alert = AlertTask(
+            credentials,
+            alerts,
+            stats_collector,
+            task_status=status_store,
+            enabled=lambda: config.alert_enabled,
+            webhook_url=lambda: config.alert_webhook_url,
+            feishu_url=lambda: config.alert_feishu_webhook_url,
+            slack_url=lambda: config.alert_slack_webhook_url,
+            pool_ready_min=lambda: config.alert_pool_ready_min,
+            task_failures=lambda: config.alert_task_failures,
+            token_expiry_hours=lambda: config.alert_token_expiry_hours,
+            error_rate_threshold=lambda: config.alert_error_rate_threshold,
+            error_rate_min_requests=lambda: config.alert_error_rate_min_requests,
+            error_rate_window_minutes=lambda: config.alert_error_rate_window_minutes,
+            key_burst_tokens=lambda: config.alert_key_burst_tokens,
+            key_burst_window_minutes=lambda: config.alert_key_burst_window_minutes,
+            off_hours_start=lambda: config.alert_off_hours_start,
+            off_hours_end=lambda: config.alert_off_hours_end,
+            off_hours_min_requests=lambda: config.alert_off_hours_min_requests,
+            budget_cny=lambda: config.alert_budget_cny,
+            budget_levels=lambda: config.alert_budget_levels,
+            channel_dead_min_requests=(lambda: config.alert_channel_dead_min_requests),
+            channel_dead_window_minutes=(lambda: config.alert_channel_dead_window_minutes),
+            checkin_fail_min_streak=(lambda: config.alert_checkin_fail_min_streak),
+            checkin_fail_window_hours=(lambda: config.alert_checkin_fail_window_hours),
+            checkins=checkin_events,
+            silence_minutes=lambda: config.alert_silence_minutes,
+            for_ticks=lambda: config.alert_for_ticks,
+            clear_ticks=lambda: config.alert_clear_ticks,
+            app_secret=lambda: config.app_secret,
+        )
     return TaskRunner(
         quota_probe=QuotaProbeTask(credentials, providers, pacer),
-        checkin=CheckinTask(credentials, providers, pacer=pacer,
-                            events=checkin_events,
-                            times=lambda: config.checkin_times,
-                            jitter_minutes=lambda: config.checkin_jitter_minutes,
-                            skip_providers=lambda: config.checkin_skip_providers,
-                            auto_login=lambda: config.raccoon_auto_login,
-                            on_success=on_checkin_success),
+        checkin=CheckinTask(
+            credentials,
+            providers,
+            pacer=pacer,
+            events=checkin_events,
+            times=lambda: config.checkin_times,
+            jitter_minutes=lambda: config.checkin_jitter_minutes,
+            skip_providers=lambda: config.checkin_skip_providers,
+            auto_login=lambda: config.raccoon_auto_login,
+            on_success=on_checkin_success,
+        ),
         growth=growth,
         activity=activity,
-        refresh=RefreshTask(credentials, providers, skew_seconds=config.refresh_skew_hours * 3600,
-                            now=lambda: int(time.time()), pacer=pacer),
-        retention=RetentionTask(stats_collector, credentials=credentials,
-                                credit_events=credit_events,
-                                checkin_events=checkin_events, audit=audit,
-                                alerts=alerts, growth_events=growth_events,
-                                logs=logs),
+        refresh=RefreshTask(
+            credentials,
+            providers,
+            skew_seconds=config.refresh_skew_hours * 3600,
+            now=lambda: int(time.time()),
+            pacer=pacer,
+        ),
+        retention=RetentionTask(
+            stats_collector,
+            credentials=credentials,
+            credit_events=credit_events,
+            checkin_events=checkin_events,
+            audit=audit,
+            alerts=alerts,
+            growth_events=growth_events,
+            logs=logs,
+            credential_events=credential_events,
+        ),
         quota_probe_minutes=lambda: config.quota_probe_minutes,
         refresh_interval_minutes=lambda: config.refresh_interval_minutes,
         growth_interval_minutes=lambda: config.growth_interval_minutes,
@@ -722,6 +776,9 @@ def build_runner(credentials, providers: dict, stats_collector, config,
         backup_interval_minutes=lambda: config.backup_interval_minutes,
         upstream_status=upstream_status,
         upstream_status_minutes=lambda: config.upstream_status_minutes,
+        otlp_export=otlp_export,
+        otlp_export_seconds=lambda: config.otlp_export_seconds,
+        otlp_export_enabled=otlp_export_enabled,
         model_probe=model_probe,
         model_probe_minutes=lambda: config.model_probe_minutes,
         activity_enabled=lambda: config.activity_report_enabled,

@@ -70,10 +70,18 @@ MIN_OPENCODE_VERSION = "1.18.0"
 # `bash/glob/grep/read` 四件套，本仓实测仍以两件套通过 —— 属移动靶，
 # 故做成配置而非硬编码（改完重启即换，无需改代码）。
 REQUIRED_TOOLS: tuple[str, ...] = ("bash", "read")
+# 导入时可接受的 Key 字段名（与 GenericProvider 同一套别名，方便批量脚本复用）。
+API_KEY_FIELDS: tuple[str, ...] = ("api_key", "apiKey", "token", "access_token")
 # 上游 API 根。`/zen/v1` 与 `/inference/v1` 当前都返回 200（2026-10-28 实测
 # `GET /models`），第三方实测称前者已死、后者可用 —— 结论冲突且免费额度耗尽
 # 无法端到端复验，故默认保持现状，另经 `ZEN_API_ROOT` 可切，随时回退。
 DEFAULT_API_ROOT = "/zen/v1"
+# 付费档（Console 充值 + API Key）：官方基址是 `https://opencode.ai/inference`，
+# OpenAI Chat Completions 的完整路径为 `/openai/v1/chat/completions`。与免费层
+# 的 `/zen/v1` 是两套端点，换认证方式必须连根一起换（见 docs/console/harnesses
+# 「Base URLs」表）。模型清单仍在 `/inference/v1`。
+PAID_API_ROOT = "/inference/openai/v1"
+PAID_MODELS_ROOT = "/inference/v1"
 # 客户端指纹档位：
 # - `legacy`：1.x 形态（UA `opencode/<version>` + 时间编码 session）；
 # - `v2`：2.x 形态（额外 4 个 session 头、client/project 头、b3/traceparent，
@@ -125,11 +133,17 @@ PROBE_DEAD_STATUSES = frozenset({400, 401, 403, 404})
 PROBE_PROMPT = "hi"
 # 探活结果缓存时长（秒）：探活是整条模型列表链路里最贵的一步——逐个真发一次
 # 推理，首字最慢的模型可占十几秒，而总耗时等于最慢那个。免费模型的增删却很慢，
-# 所以缓存判活结果，比服务层的 MODEL_LIST_TTL_SECONDS（300s）长一档：服务层每
-# 5 分钟到期重拉一次，此处直接复用上次判活集，只有超过本 TTL 才真的重探。
+# 所以缓存**判活结论**，比服务层的 MODEL_LIST_TTL_SECONDS（300s）长一档：服务层
+# 每 5 分钟到期重拉清单时直接复用上次判活集，只有超过本 TTL 才真的重探。
 # 代价：免费模型下线后，最多多留在列表里 30 分钟（选中会 400/401，由引擎按
 # 无效请求处理，不会误冷却凭证）。
-MODELS_CACHE_TTL_SECONDS = 1800.0
+#
+# **只给判活结论用，不给模型清单用**（P2-18）：清单本身必须跟着服务层 TTL 走，
+# 否则服务层「到期重拉」拿到的还是 30 分钟前的旧清单，两层周期倒挂。
+PROBE_CACHE_TTL_SECONDS = 1800.0
+# 清单请求去重窗口（秒）：纯粹挡「同一时刻的并发/紧邻多次调用」，恒小于服务层
+# 的 300s，故不会把列表刷新周期拖长。清单 GET 本身很便宜，不值得长缓存。
+MODEL_LIST_DEDUPE_SECONDS = 60.0
 
 # 流式无总超时防长流截断；短请求 30s 防悬挂（与 TRAE 同策略）
 # 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
@@ -427,6 +441,8 @@ def ensure_env_block(body: dict[str, Any]) -> bool:
 def prepare_body(payload: dict[str, Any], model: str,
                  required: tuple[str, ...] = REQUIRED_TOOLS,
                  profile: str = DEFAULT_CLIENT_PROFILE,
+                 *,
+                 gate: bool = True,
                  ) -> tuple[dict[str, Any], frozenset[str]]:
     """上游请求体：深拷 messages、强制 stream、注入门禁工具。
 
@@ -434,12 +450,19 @@ def prepare_body(payload: dict[str, Any], model: str,
     原地改写 messages，不能穿透回引擎持有的 `request.raw`（会话粘性指纹
     与续写都读它）。`stream` 无条件置 true——上游非流式会被门禁 403。
     `profile="v2"` 时再注入官方 2.x 的 `<env>` 块。
+
+    `gate=False` 用于**付费档**（Console API Key）：门禁工具与 `<env>` 块是
+    免费层才校验的伪装物，带 Key 的请求不需要；`stream` 仍强制（引擎按流式
+    解析）。此时 `injected` 为空集，调用方的 `_InjectedToolFilter` 不会误伤
+    用户真实声明的 bash/read。
     """
     body = dict(payload)
     body["messages"] = copy.deepcopy(payload.get("messages"))
     base.normalize_developer_role(body["messages"])
     body["model"] = model
     body["stream"] = True
+    if not gate:
+        return body, frozenset()
     if profile == "v2":
         ensure_env_block(body)
     injected = ensure_gate_tools(body, required)
@@ -509,7 +532,8 @@ class ZenClient(LazyClients):
         gate_tools: tuple[str, ...] = REQUIRED_TOOLS,
         user_agent: str = "",
         free_suffix: str = FREE_MODEL_SUFFIX,
-        models_cache_ttl: float = MODELS_CACHE_TTL_SECONDS,
+        models_cache_ttl: float = MODEL_LIST_DEDUPE_SECONDS,
+        probe_cache_ttl: float = PROBE_CACHE_TTL_SECONDS,
         stream_client: httpx.AsyncClient | None = None,
         short_client: httpx.AsyncClient | None = None,
         proxy: str | None = None,
@@ -528,29 +552,58 @@ class ZenClient(LazyClients):
         self.gate_tools = tuple(gate_tools) or REQUIRED_TOOLS
         self.user_agent = user_agent
         self.free_suffix = free_suffix
+        # **两层缓存，两个周期**（P2-18）：
+        # - 清单：短 TTL，只挡并发 / 紧邻调用，服务层 300s 到期即拿到新清单。
+        # - 判活：长 TTL（服务层 TTL 长一档），最贵的一步不必跟着列表重跑。
         self.models_cache_ttl = models_cache_ttl
+        self.probe_cache_ttl = probe_cache_ttl
         # v2 的 trace 每进程一条、span 每请求一条（官方抓包行为）
         self._trace_id = secrets.token_hex(16)
-        # 上次判活的 (monotonic 时间, 模型表)；TTL 内直接复用，不再重探。
+        # 上次**判活**的 (monotonic 时间, 探过的 id 集合, 其中判活的 id 集合)：
+        # TTL 内只探新增模型。与清单分开——清单必须跟着服务层刷新，判活结论可以
+        # 更长寿（探活是整条链路最贵的一步）。
+        self._probe_cache: tuple[float, frozenset[str], frozenset[str]] | None = None
+        # 上次拉到的免费档清单（单调时钟, 模型表）：只做短窗口去重。
         self._models_cache: tuple[float, list[Model]] | None = None
+        # 付费档清单单独缓存：带 Key 时上游返回全部付费模型、且不需要探活，
+        # 与免费档的缓存语义不同，混用会让「匿名 8 条 / 付费 70 条」互相覆盖。
+        self._paid_models_cache: tuple[float, list[Model]] | None = None
         self._stream_client = stream_client
         self._short_client = short_client
         self._proxy = proxy
 
-    def _chat_url(self) -> str:
-        return f"{self.host}{self.api_root}/chat/completions"
+    def _chat_url(self, api_key: str = "") -> str:
+        """对话端点：带 Key 走付费根，否则走配置的免费根。"""
+        root = PAID_API_ROOT if api_key else self.api_root
+        return f"{self.host}{root}/chat/completions"
 
-    def _models_url(self) -> str:
-        return f"{self.host}{self.models_root}/models"
+    def _models_url(self, api_key: str = "") -> str:
+        root = PAID_MODELS_ROOT if api_key else self.models_root
+        return f"{self.host}{root}/models"
 
-    def _gate_headers(self) -> dict[str, str]:
-        return gate_headers(version=self.version, user_agent=self.user_agent,
-                            profile=self.profile, trace_id=self._trace_id)
+    def _gate_headers(self, api_key: str = "") -> dict[str, str]:
+        """请求头：免费层门禁头 + 认证。
 
-    async def stream_chat(self, payload: dict[str, Any], model: str) -> AsyncIterator[Event]:
-        """POST chat/completions 并逐事件产出中立 Event。非 2xx 抛 UpstreamHTTPError。"""
+        带 Key 时把 `Authorization` 换成 `Bearer <key>`（官方付费档的鉴权），
+        其余门禁头保留——它们对上游是多余的，但改掉会让「同一条渠道两种档位」
+        出现两套行为，排障时难以对照。
+        """
+        headers = gate_headers(version=self.version, user_agent=self.user_agent,
+                               profile=self.profile, trace_id=self._trace_id)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    async def stream_chat(self, payload: dict[str, Any], model: str,
+                          api_key: str = "") -> AsyncIterator[Event]:
+        """POST chat/completions 并逐事件产出中立 Event。非 2xx 抛 UpstreamHTTPError。
+
+        `api_key` 非空 = 付费档：不带门禁工具/`<env>` 伪装，走 `/inference/openai/v1`
+        并以 `Bearer <key>` 鉴权；空 = 免费匿名档，行为与历史版本一致。
+        """
+        paid = bool(api_key)
         body, injected = prepare_body(payload, model, self.gate_tools,
-                                      profile=self.profile)
+                                      profile=self.profile, gate=not paid)
         tool_filter = _InjectedToolFilter(
             injected, gate_aliases(body.get("tools"), injected))
         # 有实际（保留或改写）tool_call 时才允许 finish_reason=tool_calls；
@@ -559,12 +612,14 @@ class ZenClient(LazyClients):
         attempt = 0
         while True:
             async with self._stream.stream(
-                "POST", self._chat_url(), json=body,
-                headers=self._gate_headers(),
+                "POST", self._chat_url(api_key), json=body,
+                headers=self._gate_headers(api_key),
             ) as response:
-                if response.status_code == 403 and attempt < GATE_403_RETRIES:
+                if (response.status_code == 403 and not paid
+                        and attempt < GATE_403_RETRIES):
                     # 门禁抖动重试：正文**不读**直接退避——httpx 退出 context 时
-                    # 关掉该连接，重发走新连接 + 新 session id（见 GATE_403_RETRIES）
+                    # 关掉该连接，重发走新连接 + 新 session id（见 GATE_403_RETRIES）。
+                    # 付费档的 403 是鉴权/区域判定，等待重试只会重复同一个拒绝。
                     attempt += 1
                     logger.warning(
                         "zen 上游 403（FreeTierError 抖动），%.1fs 后重试（第 %d 次）",
@@ -589,8 +644,11 @@ class ZenClient(LazyClients):
                         yield event
                 return
 
-    async def fetch_models(self) -> list[Model]:
-        """GET /zen/v1/models，只返回**免费候选**（探活确认不可用的才剔除）。
+    async def fetch_models(self, api_key: str = "") -> list[Model]:
+        """GET 模型清单，只返回**免费候选**（探活确认不可用的才剔除）。
+
+        `api_key` 非空 = 付费档，改走 `_fetch_paid_models`（全部模型、不探活）。
+        空 = 免费匿名档，口径如下：
 
         上游清单含全部（含付费）模型且无任何免费标记，直接透传会把 70 多个
         选不得的付费模型塞进 Playground（选中即 401）。此处按后缀收窄候选，
@@ -603,9 +661,14 @@ class ZenClient(LazyClients):
         `fetch_models` 的结果同时也是引擎登记模型归属的来源，过滤后扁平名
         请求不会再被路由到 zen 的付费模型上（否则 401 会误伤虚拟凭证）。
 
-        判活集按 `models_cache_ttl` 缓存：服务层每 300s 到期重拉一次列表，此处
-        直接复用上次判活结果，避免每 5 分钟就把十几个免费候选重探一遍。
+        判活集按 `probe_cache_ttl`（默认 1800s，比服务层 TTL 长一档）缓存：
+        服务层每 300s 到期重拉**清单**时直接复用上次判活结论，避免每 5 分钟
+        就把十几个免费候选重探一遍——探活是这条链路里最贵的一步（P2-18）。
+        **清单本身不跟着判活缓存**：清单另有 `models_cache_ttl`（60s）的短窗口
+        去重，恒短于服务层 TTL，故服务层到期重拉能拿到新清单。
         """
+        if api_key:
+            return await self._fetch_paid_models(api_key)
         if self._models_cache is not None:
             cached_at, cached_models = self._models_cache
             if time.monotonic() - cached_at < self.models_cache_ttl:
@@ -639,13 +702,93 @@ class ZenClient(LazyClients):
                                         credit_rate=0.0))
         if not candidates:
             raise zen_events.UpstreamProtocolViolation("models api returned no free candidates")
-        available = await self._probe_available([model.id for model in candidates])
+        available = await self._probe_cached([model.id for model in candidates])
         models = [model for model in candidates if model.id in available]
         if not models:
             # 候选全被**确定**判死（付费 401 / 下线 400 / 区域 403）：多半是上游
             # 真实下架或本机网络受限。抛出让上层用上次成功的缓存兜底。
             raise zen_events.UpstreamProtocolViolation("no free model passed liveness probe")
         self._models_cache = (time.monotonic(), list(models))
+        return models
+
+    async def _probe_cached(self, model_ids: list[str]) -> set[str]:
+        """判活结论按 `probe_cache_ttl` 缓存；只探**没探过**的 id。
+
+        缓存记两套 id：「这一轮探过谁」（`probed`）与「其中谁活着」（`alive`）。
+        TTL 内再来一轮时：
+
+        * 候选全在 `probed` 里 → 直接返回 `alive ∩ 候选`，一个请求都不发
+          （稳态：免费模型增删很慢，服务层每 300s 重拉清单也不该重探）。
+        * 出现没探过的 id（上游新上架的免费模型）→ **只探新增的那几个**，
+          并合并进缓存。既不会把新模型当成死号藏 30 分钟，也不会因为多一条
+          就让十几个老候选全部重探一遍（那是旧实现每 300s 白花的代价）。
+        """
+        now = time.monotonic()
+        cached = self._probe_cache
+        if cached is not None:
+            probed_at, probed, alive = cached
+            if now - probed_at < self.probe_cache_ttl:
+                fresh = [model_id for model_id in model_ids if model_id not in probed]
+                if not fresh:
+                    return set(model_ids) & set(alive)
+                newly_alive = await self._probe_available(fresh)
+                self._probe_cache = (
+                    probed_at, probed | frozenset(fresh), alive | frozenset(newly_alive))
+                return set(model_ids) & (set(alive) | set(newly_alive))
+        alive = await self._probe_available(model_ids)
+        self._probe_cache = (now, frozenset(model_ids), frozenset(alive))
+        return alive
+
+    async def _fetch_paid_models(self, api_key: str) -> list[Model]:
+        """带 Key 的模型清单：全部模型、不按 `-free` 收窄、不逐个探活。
+
+        免费档按后缀收窄，是为了把「选不得的付费模型」挡在池外；带 Key 时
+        这些付费模型正是用户买到的，收窄会让清单只剩免费几条。带 Key 也不
+        探活：上游按 Key 的账户返回可用集合，清单即权限，逐个真发一次对话
+        只是白花十几个请求。缓存与免费档分开（`_paid_models_cache`），TTL 同源。
+        """
+        if self._paid_models_cache is not None:
+            cached_at, cached = self._paid_models_cache
+            if time.monotonic() - cached_at < self.models_cache_ttl:
+                return list(cached)
+        response = await self._short.get(
+            self._models_url(api_key), headers=self._gate_headers(api_key))
+        if response.status_code >= 400:
+            raise UpstreamHTTPError(response.status_code,
+                                    await base.read_body_bounded(response))
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise zen_events.UpstreamProtocolViolation("non-JSON models response") from error
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise zen_events.UpstreamProtocolViolation("models response missing data list")
+        models: list[Model] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not (isinstance(model_id, str) and model_id):
+                continue
+            # 免费档模型带 Key 也用不了：上游对 `-free` 与零价模型仍回 429
+            # `FreeUsageLimitError`（官方口径：免费层只对 OpenCode 客户端开放）。
+            # 而这条 429 是按**账号**记的，留在清单里被选中一次就会把刚买的付费
+            # 凭证一起冷却 16h（实测 2026-11-21）。付费档宁可清单短，也不留必撞
+            # 的模型；账号一个付费模型都没开通时返回空表，让 zen 彻底不参与路由。
+            if model_id.lower().endswith(self.free_suffix):
+                continue
+            if input_price(item) == 0:
+                continue
+            # 上游付费清单带 `name`（免费清单也带），有就用；没有则从 id 派生，
+            # 保持与免费档同一套展示规则。
+            name = item.get("name")
+            models.append(Model(
+                id=model_id,
+                name=name.strip() if isinstance(name, str) and name.strip()
+                else pretty_model_name(model_id)))
+        if not models:
+            logger.info("zen 付费档无可用模型（账号未开通付费模型访问或余额为 0）")
+        self._paid_models_cache = (time.monotonic(), list(models))
         return models
 
     async def _probe_available(self, model_ids: list[str]) -> set[str]:
@@ -702,11 +845,37 @@ class ZenClient(LazyClients):
             return None
 
 
+def input_price(item: dict[str, Any]) -> float | None:
+    """清单条目的输入单价；字段缺失/畸形返回 None（无法判定，按可用保留）。
+
+    只用来识别**零价模型**——它们与 `-free` 一样属于官方客户端专属免费层，
+    带 Key 请求会被 429。单位无所谓（只判 0）。
+    """
+    cost = item.get("cost")
+    text = cost.get("text") if isinstance(cost, dict) else None
+    entry = text.get("input") if isinstance(text, dict) else None
+    price = entry.get("price") if isinstance(entry, dict) else entry
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    return float(price)
+
+
+def _api_key(credential_data: dict) -> str:
+    """凭证里的 Key：非字符串 / 空白一律当匿名档，避免把坏数据发成 `Bearer None`。"""
+    value = credential_data.get("api_key")
+    return value.strip() if isinstance(value, str) else ""
+
+
 @dataclass(slots=True)
 class ZenProvider:
     """Provider 协议实现（细接口）。
 
-    Zen 免费层无凭证、无额度、无签到/成长：只实现对话与模型列表三条能力，
+    两种档位由凭证内容决定：
+    * 空凭证 `{}` = 免费匿名层（门禁伪装、`/zen/v1`）；
+    * `{"api_key": "sk-…"}` = Console 付费档（`/inference/openai/v1` +
+      `Bearer <key>`，模型清单含付费模型）。
+
+    两个档位都没有额度接口、签到/成长：只实现对话与模型列表三条能力，
     其余任务靠「方法缺失」自然跳过（CheckinTask / GrowthTask / RefreshTask
     都用 getattr 探测，不需要为此改任务代码）。
     """
@@ -717,7 +886,19 @@ class ZenProvider:
     id: str = "zen"
 
     def import_credential(self, raw: dict) -> dict:
-        """无凭证渠道：忽略入参，落库空对象（凭证行只是调度占位）。"""
+        """导入：`{"api_key": "sk-…"}` / `{"apiKey": …}` / 裸字符串 → 落 Key。
+
+        其余入参一律落空对象（免费层虚拟凭证只是调度占位）。只认非空字符串：
+        `{"api_key": ""}` 不应把匿名档悄悄变成「有 Key 但空」的付费档。
+        """
+        if isinstance(raw, str):
+            raw = {"api_key": raw}
+        if not isinstance(raw, dict):
+            return {}
+        for key in API_KEY_FIELDS:
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return {"api_key": value.strip()}
         return {}
 
     def classify(self, status: int, body: bytes) -> ErrKind:
@@ -732,12 +913,13 @@ class ZenProvider:
         return Quota(probe_failed=True, probed_at=int(time.time()))
 
     async def list_models(self, credential_data: dict) -> list[Model]:
-        return await self.client.fetch_models()
+        return await self.client.fetch_models(_api_key(credential_data))
 
     async def stream_chat(self, credential_data: dict, payload: dict,
                           model: str) -> AsyncIterator[Event]:
+        api_key = _api_key(credential_data)
         async with paced(self.pacer, "zen"):
-            async for event in self.client.stream_chat(payload, model):
+            async for event in self.client.stream_chat(payload, model, api_key):
                 yield event
 
     async def aclose(self) -> None:

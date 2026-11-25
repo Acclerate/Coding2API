@@ -130,7 +130,8 @@ UNKNOWN = None; EXHAUSTED = -1   # 0-100 已知；None 未知；-1 已耗尽
 ### 3.6 模型元数据与黑名单
 
 - 元数据：`name` / `context_length` / 上下文窗口 / `supported_parameters` / `architecture.input_modalities` / 价格倍率；CB、TRAE 各自映射。
-- 黑名单 `MODEL_BLOCKLIST`（fnmatch glob，只影响展示）：内部 / 代理模型、被取代的老模型、已下架免费池与小模型、测试号与日期快照代号；在售主力刻意不加。
+- 黑名单 `MODEL_BLOCKLIST`（fnmatch glob，只影响展示）：内部 / 代理模型、被取代的老模型、已下架免费池与小模型、测试号与日期快照代号；在售主力刻意不加。**渠道内部的可见性 / 身份门槛不走黑名单**（黑名单是全局且可热更的，会误伤别的渠道的同名模型）：TRAE 按上游 `is_invisible_to_user` 与 `display_contact_config.access.data.identity_list` 在 `fetch_models` 里过滤，本账号身份由 `TRAE_ACCOUNT_IDENTITIES` 配置（默认 `0` 免费档，留空 = 不过滤）。
+- 静态兜底要**申报来源**：TRAE / CodeBuddy 动态拉取失败时回退内置静态表并照常返回，服务层据此记失败 + `coding2api_model_list_degraded{provider}` + `/api/models/probes` 的 `degraded`，否则「渠道一直没拿到上游真值」只能靠翻日志发现。
 - 自定义别名 `MODEL_ALIASES`（热更）：`对外名=模型@渠道;对外名2=模型`；解析宽容，注入期判撞名 / 目标不存在 → 该段 ERROR 跳过；无别名链。
 
 ### 3.7 Responses 出口（Codex CLI）
@@ -230,7 +231,7 @@ class Provider(Protocol):
 ```
 
 - 与 `src/provider/base.py` 严格一致；凭证以 dict 传递（解密后的 `data_enc`），provider 不接触 sqlite。
-- 可选能力**不实现即不定义**：调用方 `getattr` 探测，缺失 → 400「该凭证不支持此操作」。当前可选集：`start_auth`/`poll_auth`、`complete_callback`（仅 TRAE）、`list_accounts`/`switch_account`（仅 CB）、`credential_from`/`checkin_scope`、`checkin`/`checkin_status`、`growth`（仅 CB）、`host`。
+- **可选能力不实现即不定义**：调用方 `getattr` 探测，缺失 → 400「该凭证不支持此操作」。当前可选集：`start_auth`/`poll_auth`、`complete_callback`（仅 TRAE）、`list_accounts`/`switch_account`（仅 CB）、`credential_from`/`checkin_scope`、`checkin`/`checkin_status`、`growth`（仅 CB）、`host`、`model_list_source`（自带静态兜底表的渠道申报「本次是否降级 + 原因」）。
 - CodeBuddy / TRAE / Zen / Kilo / Qoder / OfficeAce 共用 `engine/sse.py`；CodeArts 自实现 `iter_data_lines`，只复用 `MAX_SSE_LINE_BYTES` / `SSEFrameTooLarge`。
 
 ## 5. 各渠道协议实现
@@ -324,6 +325,7 @@ WPS 账号 cookie + 一次对话三条请求。凭据接受整段 Cookie / 裸 `
 ### 5.10 TRAE SOLO（`trae`）
 
 - Host：Agent `https://trae-api-cn.mchost.guru`、UG `https://api.trae.cn`、OAuth `https://api.trae.com.cn`；聊天 `POST /api/agent/v3/llm_utils_chat`、模型 `POST /api/ide/v1/get_detail_param`，均仅流式。`apiHost` 用户可控 → 导入按白名单校验。
+- 模型清单：`get_detail_param` 的响应体是**正常业务数据**（实测 54 条 / 535,796 字节、无 `content-length`），成功路径上限独立为 `MODELS_BODY_LIMIT`（8MB），不复用错误体的 `BOUNDED_BODY_LIMIT`（256KB，否则动态拉取恒失败并静默回退静态表）。拉取时按上游权威字段过滤：`is_invisible_to_user is True`（内部模型）+ `identity_list` 不含本账号身份（会员模型，选中必回 1005）。静态兜底表只收客户端可见模型，且沿用上次的过滤结论。
 - 认证：浏览器登录 → 302 回调 → `ExchangeToken` → `GetUserInfo`；刷新 `POST /cloudide/api/v3/trae/oauth/ExchangeToken`（refreshToken 轮换）。签到 `/trae/api/v2/ug/checkin_credits/{status,claim}`；额度 `/trae/api/v2/pay/ide_user_ent_usage`。签到须确认到账：`claim` 对当天已签也回 `code:0` → `checked_in` 为真且回查 `credits` 有增加；`9074` 每次换 16 位数字串，一轮最多重试 2 次。
 - SSE 序列 `metadata` → `timing_cost` → `output`×N → `extra_info` → `token_usage` → `done`；`cache_read_input_tokens` / `cache_creation_input_tokens` → `cached_tokens`，无 per-request credit。流内 `1005` 权益不足、`4008` 配额耗尽（CREDIT，冷却到次日签到）、`4001` 参数 / 模型不可用；`developer` 归一 system。
 
@@ -352,7 +354,7 @@ ERR_THRESHOLD = 3
 
 ### 6.2 候选收窄
 
-`Executor._narrow_providers`：**候选只信模型目录缓存**。目录能证明归属 → 只保留它们；全不可用直接 503，不逐渠道试。目录未就绪或模型不在目录 → 全部候选；`模型@渠道` 与 Key 绑定不受影响。TTL 300s（`MODEL_LIST_TTL_SECONDS`）+ 后台兜底刷新。
+`Executor._narrow_providers`：**候选只信模型目录缓存**。目录能证明归属 → 只保留它们；全不可用直接 503，不逐渠道试。目录未就绪或模型不在目录 → 全部候选；`模型@渠道` 与 Key 绑定不受影响。缓存已收敛到服务层唯一一层（TTL 以服务层 `MODEL_LIST_TTL_SECONDS` 为准）+ 后台兜底刷新。
 
 ### 6.3 模型级冷却
 
@@ -409,9 +411,9 @@ ERR_THRESHOLD = 3
 
 ## 8. 数据库
 
-DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准。`SCHEMA_VERSION = 36`（v33 `web_cookie_state`、v34 `routing_weight`、v35 `login_secret`、v36 `log_events`），15 张表：
+DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准。`SCHEMA_VERSION = 39`（v33 `web_cookie_state`、v34 `routing_weight`、v35 `login_secret`、v36 `log_events`、v37 `credential_events`、v38 `access_freezes`、v39 `credentials.updated_at` + `credentials.allowed_models`），17 张表：
 
-`api_keys` / `credentials` / `credential_limits` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `checkin_events` / `credit_events` / `credential_model_cooldowns` / `model_probes` / `runtime_settings` / `alert_events` / `log_events`。
+`api_keys` / `credentials` / `credential_limits` / `users` / `audit_events` / `usage_events` / `usage_hourly` / `growth_events` / `checkin_events` / `credit_events` / `credential_model_cooldowns` / `credential_events` / `access_freezes` / `model_probes` / `runtime_settings` / `alert_events` / `log_events`。
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -426,6 +428,10 @@ PRAGMA foreign_keys = ON;   -- 库里没有外键，关系全在应用层校验
 - 模型目录不占表：进程内 TTL + `DATA_DIR/model_catalog.json` / `openrouter_catalog.json`（默认 `DATA_DIR=./data`）。
 - **备份**：`VACUUM INTO` + `PRAGMA integrity_check`，产物 0600 / 目录 0700；每 `BACKUP_INTERVAL_MINUTES`（默认 1440）备份，保留 `BACKUP_KEEP`（默认 7）。恢复 `scripts/restore_db.py`：校验 → `.pre-restore-<ts>` → `os.replace`；默认预览，`--apply` 才写。
 - **凭证标签**：逗号分隔，`MAX_TAGS=16` / `MAX_TAG_LENGTH=24`；写入校验、读取容错；不参与调度与鉴权。
+- **凭证级模型白名单**：`credentials.allowed_models`（fnmatch glob，逗号分隔，`''` = 不限制，与 `api_keys` 同语法）。在 `candidates(model=...)` 生成候选时收窄，**不硬禁用、不写冷却**——换个模型立刻可用。不传 `model` 的后台路径（签到 / 刷新 / 探活 / 额度 / 模型列表）看到全量。
+- **编辑版本号**：`credentials.updated_at` 只有**人工编辑**推进（`MAX(now, 旧值+1)`），后台自动写（冷却 / 额度 / 探活 / 心跳）不推进——否则 30s 轮询会让打开中的编辑页永远 409。编辑端点带 `expected_updated_at` 做乐观并发，不匹配回 409 + 当前行快照；不传 = 兼容旧调用方（最后写入者赢）。
+- **统计写入**：`record()` 先入队、由抢到写锁的写者一次写空（每批 20 行），保持 read-after-write；停机前 `flush()` 排空。失败行回填队首并计入 `stats_write_failures_total`（不再只留一行 WARNING）。
+- **救援判定索引**：`idx_usage_request_rescue (request_id, username, ok)`。刻意不改 SQL（先聚合成功集、把全表成功行物化出来反而更慢——实测 5 个场景 4 个更慢），改用覆盖索引消掉回表。
 - **迁移纪律**：`schema.sql` 只加不改；新增列走 `_MIGRATION_COLUMNS`，删表走 `_MIGRATION_DROPS`，删列走 `_MIGRATION_COLUMN_DROPS`，均 `SCHEMA_VERSION + 1`；版本记 `PRAGMA user_version`，库版本高于程序 → 启动报错；升级只在启动时发生。
 
 ## 9. 模型目录与模型名
@@ -451,7 +457,7 @@ PRAGMA foreign_keys = ON;   -- 库里没有外键，关系全在应用层校验
 ### 9.3 用量统计与成本
 
 - `overview` / `by_provider` / `by_model` / `by_user` / `timeline` / `model-timeline` 读 `usage_hourly`（永久），`events` 读明细（90 天）；凭证维度读明细表。
-- 双写：`record()` 写明细 + 增量累加当前小时；`rollup_hourly` 每 5 分钟全量重算，幂等。
+- 双写：`record()` 写明细 + 增量累加当前小时；`rollup_hourly` 每 5 分钟只重算最近 `ROLLUP_OVERLAP_SECONDS`（2h，整点对齐）而非全量，幂等。
 - 成本 = 刊例价 × token（输入 − 命中 / 命中 / 输出三段），写入时按 `USD_CNY_RATE` 折 CNY，历史不重算；匹配不到不计（`cost_known=0`）。
 - 失败归因：`failures` 是尝试口径，`rescued` 为同用户同 `request_id` 另有成功行，`failures − rescued` 为未救回次数。`BLOCKED` → `model_not_found`；`CONTEXT` → `context_overflow`；`CAPABILITY` → `model_capability`；`NETWORK` → `network_error`；`SOFT` → `rate_limit`。
 - 时序指标在聚合后相除，无样本给 `null`；时间轴补小时（上限 `MAX_DENSE_HOURS` 92 天）。实时流 `GET /api/stats/events/stream`：进程内广播，订阅者有界 200、上限 8，超出 429 + `Retry-After: 10`。列表排序 `sort` 白名单 + `order`，未知键回落默认；分页 `limit` + `offset` + `total`。

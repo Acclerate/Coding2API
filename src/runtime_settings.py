@@ -88,6 +88,12 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "fnmatch glob，逗号分隔；只影响 /v1/models 与 Playground 列表，"
                "直连指定不受影响。留空表示不过滤。",
                group="model_routing"),
+    HotSetting("trae_account_identities", str, "TRAE 账号身份",
+               "本账号拥有的访问身份编号（逗号分隔，`0`=免费档，`1/2/3/5/100` 为"
+               "付费会员/团队/内部档）。上游按身份授权模型：白名单不含本账号身份的"
+               "模型选中必回 1005，故拉取时直接过滤。默认 `0`；留空 = 不按身份过滤"
+               "（上游给什么就展示什么）。开通会员后填 `0,1,2,3,5` 即可放出会员模型。",
+               group="model_routing"),
     HotSetting("context_compress_enabled", bool, "上下文压缩",
                "按模型目录里的输入上限裁剪过长对话，避免撞上游硬限制"
                "（CodeBuddy 11115 prompt is too long）。目录里查不到上限的模型"
@@ -315,7 +321,7 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "Slack 入站 Webhook 地址；留空 = 不推 Slack。消息体为 {text}。",
                task="alert", section="基础与迟滞"),
     HotSetting("alert_interval_minutes", int, "运维告警周期（分钟）",
-               "后台评估七类规则的一轮间隔；下限 1 分钟。", minimum=1,
+               "后台评估九类规则的一轮间隔；下限 1 分钟。", minimum=1,
                task="alert", section="基础与迟滞", floor=1),
     HotSetting("alert_silence_minutes", int, "告警静默窗（分钟）",
                "同一条告警（规则 + 对象）在该窗口内只落库/推送一次，避免持续"
@@ -441,6 +447,18 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "**不写 query string、请求体、用户名**。5xx 记 WARNING、其余记 INFO。"
                "关闭后只剩 uvicorn 的裸 access log。",
                group="observability"),
+    HotSetting("expose_upstream_headers", bool, "上游尝试响应头",
+               "在响应上写 `X-Upstream-Attempts` / `X-Upstream-Degraded`，让调用方"
+               "看到本次请求换过几个号、是否走了 fallback 组。**默认关**：这两个头"
+               "会泄露账号池规模、成本与路由指纹；关闭时中间件还会主动剥离同名响应"
+               "头，防上游/中间盒回传伪造值。只建议自建、可信客户端时打开。",
+               group="observability"),
+    HotSetting("access_freeze_threshold", int, "内容拒绝冻结阈值",
+               "同一 (发起者, 渠道) 累计内容拒绝次数达到该值后，该发起者请求该渠道"
+               "在 preflight 直接 403 `provider_access_frozen`。**默认 0 = 只记录"
+               "不冻结**：一次内容拒绝可能是误判，第一次就冻结会很吵，且冻结需人工"
+               "解冻。达到阈值后只拦该发起者，不影响同渠道的其他凭证/用户。",
+               minimum=0, group="gateway_control"),
     # reasoning 控制：只给机制、不给策略（不内置默认矩阵——未核实就是编造）
     HotSetting("force_disable_thinking", bool, "剥离思考内容",
                "开启后出站响应不再包含模型的思考内容（chat 的 reasoning_content / "
@@ -787,6 +805,21 @@ class RuntimeSettings:
     @property
     def model_blocklist(self) -> str:
         return str(self.get("model_blocklist"))
+
+    @property
+    def trae_account_identities(self) -> str:
+        return str(self.get("trae_account_identities"))
+
+    @property
+    def trae_identities(self):
+        """TRAE 身份集合：与 `Settings.trae_identities` 同口径，但基于生效值重算。
+
+        不能委托 `Settings` 的 `cached_property`（那会把 env 值永久缓存，管理台
+        改完身份，模型列表仍按旧身份过滤）。
+        """
+        from .config import parse_identity_set
+
+        return parse_identity_set(self.trae_account_identities)
 
     @property
     def model_fallback_groups(self) -> str:
@@ -1142,6 +1175,14 @@ class RuntimeSettings:
     @property
     def request_log_enabled(self) -> bool:
         return bool(self.get("request_log_enabled"))
+
+    @property
+    def expose_upstream_headers(self) -> bool:
+        return bool(self.get("expose_upstream_headers"))
+
+    @property
+    def access_freeze_threshold(self) -> int:
+        return int(self.get("access_freeze_threshold"))
 
     # ------------------------------------------------------ reasoning 控制
 

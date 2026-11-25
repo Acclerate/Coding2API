@@ -21,12 +21,15 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 
+from ..auth.rbac import require_operator
 from ..compat.openai.errors import error_payload
-from .deps import Services
+from .context import COMPRESS_STATS
+from .deps import Services, principal_from_request
 
 # Prometheus 文本格式版本；抓取方据此选择解析器。
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -64,14 +67,17 @@ def render_metrics(
     task_failures: list[tuple[str, int]],
     latency: list[tuple[str, float, float, int]] | None = None,
     inflight: int | None = None,
+    compress: dict[str, int] | None = None,
+    stats_write_failures: int | None = None,
+    model_list_degraded: list[str] | None = None,
 ) -> str:
     """把各数据源的聚合结果渲染成 Prometheus text 格式（纯函数）。
 
     每个指标家族输出 `# HELP` + `# TYPE` + 样本行；样本次序由调用方保证稳定
     （数据源查询已排序），这里不再重排，保持输出可复现。
 
-    `latency` / `inflight` 为后加的可选输入：缺省时不输出对应家族（旧调用方
-    与测试逐字节不变）。
+    `latency` / `inflight` / `compress` / `model_list_degraded` 为后加的可选
+    输入：缺省时不输出对应家族（旧调用方与测试逐字节不变）。
     """
     lines: list[str] = []
 
@@ -131,6 +137,62 @@ def render_metrics(
     for task, count in task_failures:
         lines.append(_sample(f"{PREFIX}task_failures_total", [("task", task)], count))
 
+    if model_list_degraded is not None:
+        # 「渠道模型表来自静态兜底」是**看得见**的静默故障：provider 内部把
+        # 动态拉取失败转成静态表并照常返回，只靠日志（还会被退避压成 INFO）
+        # 时，管理台完全看不出这个渠道一直没拿到上游真值（issue #56）。
+        lines.append(f"# HELP {PREFIX}model_list_degraded 当前模型表来自静态兜底"
+                     "（非上游真值）的渠道，1=降级。")
+        lines.append(f"# TYPE {PREFIX}model_list_degraded gauge")
+        degraded = set(model_list_degraded)
+        for provider in sorted(degraded):
+            lines.append(_sample(f"{PREFIX}model_list_degraded",
+                                 [("provider", provider)], 1))
+
+    if stats_write_failures is not None:
+        # 统计写入失败是**看得见**的静默故障：`record()` 把异常吞掉以免拖垮
+        # 聊天响应，没有这个计数器时「用量丢了」在进程外完全不可见。
+        lines.append(f"# HELP {PREFIX}stats_write_failures_total 统计写入失败的行数"
+                     "（含重试前的每次失败；重启归零）。")
+        lines.append(f"# TYPE {PREFIX}stats_write_failures_total counter")
+        lines.append(_sample(f"{PREFIX}stats_write_failures_total", [],
+                             int(stats_write_failures)))
+
+    if compress is not None:
+        # 压缩收益与缓存命中率必须**同屏**：压缩省下的 token 只有在「前缀缓存
+        # 还命中」时才是净收益（每次裁剪都会让前缀边界前移）。这两个家族放在
+        # 同一份响应里，抓取端与统计页才能并排读。
+        lines.append(f"# HELP {PREFIX}compress_triggers_total 压缩实际改写载荷的次数"
+                     "（tool 输出压缩 + 上下文裁剪；重启归零）。")
+        lines.append(f"# TYPE {PREFIX}compress_triggers_total counter")
+        lines.append(_sample(f"{PREFIX}compress_triggers_total", [],
+                             int(compress.get("triggers", 0))))
+        lines.append(f"# HELP {PREFIX}compress_tool_triggers_total 其中由 tool 输出"
+                     "压缩触发的次数。")
+        lines.append(f"# TYPE {PREFIX}compress_tool_triggers_total counter")
+        lines.append(_sample(f"{PREFIX}compress_tool_triggers_total", [],
+                             int(compress.get("tool_triggers", 0))))
+        lines.append(f"# HELP {PREFIX}compress_context_trims_total 其中由上下文裁剪"
+                     "触发的次数（每次裁剪都会前移前缀边界，可能压低缓存命中率）。")
+        lines.append(f"# TYPE {PREFIX}compress_context_trims_total counter")
+        lines.append(_sample(f"{PREFIX}compress_context_trims_total", [],
+                             int(compress.get("context_trims", 0))))
+        lines.append(f"# HELP {PREFIX}compress_chars_saved_total 省下的字符数"
+                     "（整份 messages 字符串 content 长度差；重启归零）。")
+        lines.append(f"# TYPE {PREFIX}compress_chars_saved_total counter")
+        lines.append(_sample(f"{PREFIX}compress_chars_saved_total", [],
+                             int(compress.get("chars_saved", 0))))
+        lines.append(f"# HELP {PREFIX}compress_tokens_saved_total 省下的 token 估算"
+                     "（字符数 × 0.25 下界系数，仅用于量级判断）。")
+        lines.append(f"# TYPE {PREFIX}compress_tokens_saved_total counter")
+        lines.append(_sample(f"{PREFIX}compress_tokens_saved_total", [],
+                             int(compress.get("tokens_saved", 0))))
+        lines.append(f"# HELP {PREFIX}compress_unchanged_total 调用了压缩但载荷未变"
+                     "的次数（开关开着却无收益的证据）。")
+        lines.append(f"# TYPE {PREFIX}compress_unchanged_total counter")
+        lines.append(_sample(f"{PREFIX}compress_unchanged_total", [],
+                             int(compress.get("unchanged", 0))))
+
     return "\n".join(lines) + "\n"
 
 
@@ -147,6 +209,21 @@ def _token_matches(header: str, expected: str) -> bool:
     return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _is_loopback(request: Request) -> bool:
+    """对端是否回环地址（无令牌时的唯一放行条件）。
+
+    解析失败按**不放行**处理：`request.client` 在 ASGI 里允许为 None（如 UDS
+    或测试替身），拿不到可信对端就当外部访问，宁可 401 也不裸暴露。
+    """
+    client = request.client
+    if client is None:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
 def create_router(services: Services) -> APIRouter:
     router = APIRouter()
 
@@ -154,18 +231,25 @@ def create_router(services: Services) -> APIRouter:
     async def metrics(request: Request):
         """Prometheus 抓取端点。
 
-        默认**不鉴权**——与同样裸暴露的 `/healthz` 同口径，且指标已禁用高基数
-        标签（只有渠道 / 模型 / 状态等有限集合）。但端点会暴露渠道与模型清单、
-        凭证池四态计数，对外部署可设 `METRICS_TOKEN` 收口：配置后必须带
+        **未配置 `METRICS_TOKEN` 时只放行回环对端**：端点会暴露渠道与模型清单、
+        凭证池四态计数、延迟与失败分布，匿名裸暴露等于把侦察图送到公网。同机
+        抓取（Prometheus 与被抓服务共机、或经 sidecar 转发）从 `127.0.0.1` /
+        `::1` 来，天然放行；跨机抓取请显式设 `METRICS_TOKEN`，配置后必须带
         `Authorization: Bearer <token>`（缺失或错误一律 401，不回显差在哪）。
+        对端地址解析不出来（`request.client` 为空 / 非 IP 字面量）按**非回环**
+        处理——拿不到可信对端就不能当内网。
         """
         if not bool(services.settings.metrics_enabled):
             return JSONResponse(status_code=404,
                                 content=error_payload("metrics disabled",
                                                       "invalid_request", 404))
         token = str(services.settings.metrics_token or "")
-        if token and not _token_matches(
-                request.headers.get("authorization", ""), token):
+        if token:
+            if not _token_matches(request.headers.get("authorization", ""), token):
+                return JSONResponse(status_code=401,
+                                    content=error_payload("metrics unauthorized",
+                                                          "unauthorized", 401))
+        elif not _is_loopback(request):
             return JSONResponse(status_code=401,
                                 content=error_payload("metrics unauthorized",
                                                       "unauthorized", 401))
@@ -187,7 +271,58 @@ def create_router(services: Services) -> APIRouter:
             # 在途从调度器的租约跟踪器现读：它是「卡住」的唯一实时信号
             inflight=(services.inflight.total()
                       if services.inflight is not None else 0),
+            # 压缩收益与上面同一份响应：省下的 token 要跟命中率并排看
+            compress=_compress_snapshot(request),
+            # 统计写失败：`record()` 吞异常是刻意的（不能拖垮聊天响应），
+            # 所以这条必须出进程，否则「用量丢了」只在日志里留一行 WARNING。
+            stats_write_failures=stats.write_failures(),
+            # 模型表降级的渠道：静态兜底在 provider 内部是「正常返回」，
+            # 不出这个 gauge 时外部完全看不到（issue #56 第三条）。
+            model_list_degraded=sorted(
+                pid for pid, flag in services.model_list_degraded.items() if flag),
         )
         return Response(content=text, headers={"Content-Type": CONTENT_TYPE})
 
+    @router.get("/api/stats/compression")
+    async def compression_stats(request: Request,
+                                principal=Depends(principal_from_request),
+                                since: int | None = None,
+                                until: int | None = None):
+        """压缩收益 + 开关状态（统计页「压缩」面板的数据源）。
+
+        这里**只回计数与开关**，不含任何用户/凭证维度：它是运维判断「该开还是
+        该关」的进程级读数，任何已登录用户读到的事实相同。前端把这份数据与
+        同窗口的 `/api/stats/overview`（缓存命中率）并排展示——省下的 token
+        只有在缓存仍命中时才是净收益。
+
+        `since` / `until`：与其它统计端点同口径的半开小时窗 `[since, until)`，
+        只汇总落在窗口内的小时桶；两端都不给 → 本次进程运行的终身累计
+        （「全部」）。不传窗口就等于旧行为，`/metrics` 始终读终身累计。
+
+        刻意不做成 `/metrics` 的替代品，也不新增重型聚合：数据来自压缩闭包里的
+        进程内计数器，按小时桶求和（最多 90 天 × 24 桶），O(桶数)。
+
+        仅 operator+：计数是**池级/进程级**的，viewer 的个人视图做不了「与我的
+        命中率同窗口」的对比；给出全局数只会让两边口径错位。
+        """
+        require_operator(principal)
+        settings = services.settings
+        return {
+            "stats": _compress_snapshot(request, since=since, until=until),
+            "context_compress_enabled": bool(settings.context_compress_enabled),
+            "tool_output_compress_enabled": bool(settings.tool_output_compress_enabled),
+        }
+
     return router
+
+
+def _compress_snapshot(request: Request, *, since: int | None = None,
+                       until: int | None = None) -> dict[str, int]:
+    """压缩计数器快照：优先读 app.state 注入的实例（测试/多实例部署可隔离），
+    未装配时回落到进程级单例（与 `build_context_compressor` 默认值同一对象）。
+
+    `since` / `until` 透传 `CompressStats.as_dict`：给了就只汇总窗口内的小时桶。
+    """
+    stats = getattr(request.app.state, "compress_stats", None)
+    return (stats if stats is not None else COMPRESS_STATS).as_dict(
+        since=since, until=until)

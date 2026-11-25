@@ -421,7 +421,9 @@ def test_compressor_uses_per_channel_window_and_returns_fresh_payload():
 class _FakeCredentials:
     provider = "codebuddy"
 
-    def candidates(self, providers=None, *, selectable_only=False):
+    # `model` 由 `Executor._new_scope` 传入（账号级模型白名单收窄）；本替身不
+    # 模拟白名单，一律返回同一条候选。
+    def candidates(self, providers=None, *, selectable_only=False, model=None):
         from src.engine.scheduler import Candidate
 
         return [Candidate(credential_id="c1", provider=self.provider)]
@@ -619,3 +621,228 @@ async def test_executor_reports_prefix_on_nonstream_path():
     await executor.complete(request, username="alice")
     assert len(reports) == 1
     assert reports[0][3]["messages"] is messages
+
+
+# ------------------------------------------------- 压缩收益计数（P1-13）
+
+def test_compress_counters_grow_when_tool_compression_triggers():
+    """开关开 → 触发次数 / 省下的字符都增长（验收口径一）。"""
+    from src.api.context import CompressStats
+
+    stats = CompressStats()
+    noisy = {"role": "tool", "content": "fatal\n" * 500}
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True, tool_max_chars=100),
+        stats=stats)
+    out = compress("codebuddy", "m", {"messages": [{"role": "user", "content": "hi"},
+                                                   noisy]})
+
+    assert stats.triggers == 1
+    assert stats.tool_triggers == 1
+    assert stats.context_trims == 0
+    # 省下的字符 = 原文长度 − 压后长度（按整份 messages 的字符串 content 计）
+    before = len("hi") + len(noisy["content"])
+    after = sum(len(m["content"]) for m in out["messages"])
+    assert stats.chars_saved == before - after
+    assert stats.tokens_saved == int(stats.chars_saved * 0.25)
+
+
+def test_compress_counters_record_context_trims_separately():
+    from src.api.context import CompressStats
+
+    stats = CompressStats()
+    messages = [_user("old " * 500), _user("new")]
+    cache = {"qoder": {"m": Model(id="m", max_input_tokens=50)}}
+    compress = build_context_compressor(
+        cache, {"qoder": {"m": "m"}}, _SettingsStub(min_keep=1), stats=stats)
+    compress("qoder", "m", {"messages": messages})
+
+    assert stats.context_trims == 1
+    assert stats.triggers == 1
+    assert stats.tool_triggers == 0
+    assert stats.chars_saved == len("old " * 500)
+
+
+def test_counters_unchanged_tracks_switch_on_without_savings():
+    """开关开着但载荷未变（未超阈值 / 未知模型无窗口）→ 只记 unchanged。"""
+    from src.api.context import CompressStats
+
+    stats = CompressStats()
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True, tool_max_chars=100),
+        stats=stats)
+    payload = {"messages": [{"role": "tool", "content": "ok"}]}
+    assert compress("codebuddy", "m", payload) is payload
+
+    assert stats.triggers == 0
+    assert stats.chars_saved == 0
+    assert stats.unchanged == 1
+
+
+def test_counters_stay_zero_when_both_switches_off():
+    """两个开关都关 → 请求体**逐字节**不变且计数器恒 0（验收口径二）。"""
+    import json
+
+    from src.api.context import CompressStats
+
+    stats = CompressStats()
+    noisy = {"role": "tool", "content": "\x1b[31mfatal\x1b[0m\n" * 500}
+    messages = [{"role": "system", "content": "s"}, _user("x" * 9000), noisy]
+    payload = {"messages": messages, "model": "m", "stream": True}
+    snapshot = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    cache = {"qoder": {"m": Model(id="m", max_input_tokens=50)}}
+
+    compress = build_context_compressor(
+        cache, {"qoder": {"m": "m"}}, _SettingsStub(enabled=False), stats=stats)
+    out = compress("qoder", "m", payload)
+
+    assert out is payload
+    assert json.dumps(out, ensure_ascii=False, sort_keys=True) == snapshot
+    assert stats.as_dict() == {"triggers": 0, "tool_triggers": 0, "context_trims": 0,
+                               "chars_saved": 0, "tokens_saved": 0, "unchanged": 0}
+
+
+def test_default_counter_is_the_process_singleton():
+    """未显式传 stats 时写进程级单例（生产装配方式），且实例可被重置隔离。"""
+    from src.api.context import COMPRESS_STATS
+
+    before = COMPRESS_STATS.unchanged
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True, tool_max_chars=8000))
+    compress("codebuddy", "m", {"messages": [{"role": "tool", "content": "ok"}]})
+    assert COMPRESS_STATS.unchanged == before + 1
+
+
+def test_compressor_messages_missing_still_counts_unchanged():
+    """没有 messages 键（非 chat 形状）→ 不改载荷，记一次 unchanged。"""
+    from src.api.context import CompressStats
+
+    stats = CompressStats()
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True), stats=stats)
+    payload: dict = {}
+    assert compress("codebuddy", "m", payload) is payload
+    assert stats.unchanged == 1
+
+
+def test_compress_stats_as_dict_exposes_tokens_saved():
+    from src.api.context import CompressStats
+
+    stats = CompressStats(chars_saved=8000)
+    assert stats.tokens_saved == 2000
+    assert stats.as_dict()["tokens_saved"] == 2000
+
+
+def test_compress_counters_are_bucketed_by_hour():
+    """时间窗筛选读小时桶；终身标量仍供 `/metrics`（不被窗口裁剪影响）。"""
+    from src.api.context import CompressStats
+
+    now = {"t": 1_700_000_000.0}
+    stats = CompressStats(clock=lambda: now["t"])
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True, tool_max_chars=100),
+        stats=stats)
+    noisy = {"role": "tool", "content": "fatal\n" * 500}
+    compress("codebuddy", "m", {"messages": [noisy]})
+    first_hour = int(now["t"] // 3600) * 3600
+    now["t"] += 3600
+    compress("codebuddy", "m", {"messages": [noisy]})
+    second_hour = first_hour + 3600
+
+    # 两端都不给 → 终身累计
+    assert stats.as_dict()["triggers"] == 2
+    # [第一个小时, 第二个小时) → 只有第一小时的桶
+    windowed = stats.as_dict(since=first_hour, until=second_hour)
+    assert windowed["triggers"] == 1
+    assert windowed["tool_triggers"] == 1
+    assert windowed["chars_saved"] == stats.buckets[first_hour]["chars_saved"]
+    assert windowed["tokens_saved"] == int(windowed["chars_saved"] * 0.25)
+    # 只给下界（至今）→ 只有第二小时的桶；只给上界 → 只有第一小时
+    assert stats.as_dict(since=second_hour)["triggers"] == 1
+    assert stats.as_dict(until=second_hour)["triggers"] == 1
+    # 半开区间：since 落在桶中间时该桶整桶不计（与 usage_hourly 的 hour_utc 同口径）
+    assert stats.as_dict(since=first_hour + 1, until=second_hour)["triggers"] == 0
+
+
+def test_compress_buckets_prune_beyond_retention_but_lifetime_keeps():
+    """超 90 天的小时桶被丢弃；终身累计不倒退（Prometheus counter 语义）。"""
+    from src.api.context import CompressStats
+
+    now = {"t": 1_700_000_000.0}
+    stats = CompressStats(clock=lambda: now["t"])
+    compress = build_context_compressor(
+        {}, {}, _SettingsStub(enabled=False, tool_compress=True), stats=stats)
+    payload = {"messages": [{"role": "tool", "content": "ok"}]}
+    compress("codebuddy", "m", payload)
+    old_hour = int(now["t"] // 3600) * 3600
+    # 同一小时内再调：_pruned_hour 命中，不重复扫描（分支覆盖）
+    compress("codebuddy", "m", payload)
+    assert stats.buckets[old_hour]["unchanged"] == 2
+
+    now["t"] += 91 * 86400
+    compress("codebuddy", "m", payload)
+    assert old_hour not in stats.buckets
+    assert len(stats.buckets) == 1
+    assert stats.as_dict()["unchanged"] == 3
+    # 窗口落在被裁掉的小时上 → 0（保留期只有 90 天）
+    assert stats.as_dict(since=old_hour, until=old_hour + 3600)["unchanged"] == 0
+
+
+def test_compress_stats_persist_throttles_then_flushes_on_shutdown(tmp_path):
+    """落盘首次立即写、间隔内跳过；`flush()` 补写未落盘变化（关机路径）。"""
+    import json
+
+    from src.api.context import CompressStats
+
+    now = {"t": 1_700_000_000.0}
+    path = str(tmp_path / "compress_buckets.json")
+    stats = CompressStats(clock=lambda: now["t"], persist_path=path,
+                          persist_interval=60.0)
+    stats._bump(triggers=1)
+    with open(path, encoding="utf-8") as handle:
+        assert json.load(handle)["lifetime"]["triggers"] == 1
+
+    now["t"] += 30
+    stats._bump(triggers=1)
+    with open(path, encoding="utf-8") as handle:
+        # 未到间隔：内存是 2，盘上仍是 1
+        assert json.load(handle)["lifetime"]["triggers"] == 1
+    assert stats.triggers == 2
+
+    stats.flush()
+    with open(path, encoding="utf-8") as handle:
+        saved = json.load(handle)
+    assert saved["version"] == 1
+    assert saved["lifetime"]["triggers"] == 2
+    assert saved["buckets"][str(int(now["t"] // 3600) * 3600)]["triggers"] == 2
+    assert stats._dirty is False
+
+    stats.flush()  # 无变化：空操作，不重写
+    assert stats._dirty is False
+
+
+def test_compress_stats_persist_failure_keeps_dirty_for_retry(tmp_path):
+    """写盘失败不抛、不更新节流时刻，下一次变化还会重试。"""
+    from src.api.context import CompressStats
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    stats = CompressStats(clock=lambda: 1_700_000_000.0,
+                          persist_path=str(blocker / "snap.json"))
+    stats._bump(triggers=1)
+    assert stats._dirty is True
+    assert stats._last_persist_at is None
+
+
+def test_compress_stats_load_restores_lifetime_and_buckets(tmp_path):
+    from src.api.context import CompressStats
+
+    now = {"t": 1_700_000_000.0}
+    path = str(tmp_path / "compress_buckets.json")
+    stats = CompressStats(clock=lambda: now["t"], persist_path=path)
+    stats._bump(triggers=2, tool_triggers=2, chars_saved=800)
+    restored = CompressStats.load(path, clock=lambda: 1_700_000_100.0)
+    assert restored.triggers == 2
+    assert restored.chars_saved == 800
+    assert restored.buckets == stats.buckets
+    assert restored.persist_path == path

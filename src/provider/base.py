@@ -6,6 +6,8 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import math
 import re
@@ -83,6 +85,17 @@ class ErrKind(StrEnum):
     # 打成「无可用凭证」）。与 REQUEST/CONTEXT 同为**零动作**，但统计口径单独
     # 成类，避免归因面板把本机故障读成「上游超时」。
     NETWORK = "network"
+    # 上游响应不符合协议（非 JSON / 字段缺失 / 形状不符 / SSE 帧超限 /
+    # 会话票据失效）。
+    # **为什么这类错误不罚号**：坏的是上游这一路的响应，不是这个账号的额度、
+    # 状态或请求参数——冷却凭证只会把一个健康号打成不可用，六渠道同时抖动时
+    # 还会放大成「整池无可用凭证」（与 NETWORK 同一教训）。换号重试即可。
+    # **为什么必须留痕**：这类异常此前从 `_classify` 返回 None 直接上抛，被
+    # `stream_guarded` 兜成 500 `internal_error`：不冷却、不写 `usage_events`，
+    # 归因面板里连痕迹都没有，已出帧的 token（上游可能已真实计费）全部漏记。
+    # 零动作不等于零记录：与 REQUEST/CONTEXT 同为零惩罚，但统计必须单独成类，
+    # 让运维一眼看出是「渠道响应异常」而非自己参数写错。
+    UPSTREAM_PROTOCOL = "upstream_protocol"
 
 
 # 冷却作用域是「(凭证, 模型)」而非整个凭证的错误类别。
@@ -92,9 +105,13 @@ MODEL_SCOPED_KINDS = frozenset({ErrKind.MODEL, ErrKind.BLOCKED, ErrKind.CONCURRE
 
 # 零动作分类：不是账号/凭证的错，不冷却、不累计，只换号重试。
 # REQUEST = 请求体坏 / 渠道风控；CONTEXT = 上下文超限（11115）；
-# NETWORK = 本机 DNS/连接失败（连上游之前就失败，惩罚凭证只会放大网络抖动）。
+# NETWORK = 本机 DNS/连接失败（连上游之前就失败，惩罚凭证只会放大网络抖动）；
+# UPSTREAM_PROTOCOL = 上游响应不符合协议（非 JSON / 形状不符 / SSE 帧超限 /
+# 会话票据失效）——同样不罚号，但调用点仍要落一行 `usage_events` 留痕。
 # 与 INVALID 的区别：INVALID 跳过**整个上游**（换号也回同一条），这些只换号。
-NO_PENALTY_KINDS = frozenset({ErrKind.REQUEST, ErrKind.CONTEXT, ErrKind.NETWORK})
+NO_PENALTY_KINDS = frozenset({
+    ErrKind.REQUEST, ErrKind.CONTEXT, ErrKind.NETWORK, ErrKind.UPSTREAM_PROTOCOL,
+})
 
 # 「这次请求形态上游不接受」→ 换号无用，跳过整个上游。EXECUTOR 对这两类都
 # `_skip_provider` + 以 400 收尾；统计口径分开（invalid_request / model_capability）。
@@ -166,6 +183,16 @@ def body_hint(body: bytes, limit: int = 2048) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "…[truncated]"
+
+
+def body_text(body: bytes) -> str:
+    """上游响应体 → 小写文本（隔离非法 UTF-8，供不区分大小写的标记匹配）。
+
+    错误正文只用来对照标记串（`_RELOGIN_MARKERS` 等），故解码即统一小写；
+    非法字节按 `replace` 换成 U+FFFD 而不是抛错——上游返回半截二进制时宁可
+    匹配不到（回落到状态码分类），也不能让错误路径自己炸掉。
+    """
+    return body.decode("utf-8", errors="replace").lower()
 
 
 # 错误响应体的读取上限：只用于生成可读诊断，超出部分丢弃。防止恶意/异常
@@ -349,6 +376,120 @@ async def read_body_bounded(response: Any, limit: int = BOUNDED_BODY_LIMIT) -> b
         if len(collected) >= limit:
             break
     return bytes(collected[:limit])
+
+
+async def read_json_bounded(response: Any, *, what: str,
+                            public: str | None = None,
+                            limit: int = BOUNDED_BODY_LIMIT) -> Any:
+    """有界读取成功响应体并解析 JSON。
+
+    **成功路径**原先直接 `response.json()`（= 无上限 `aread()`）：被控上游或
+    中间盒回一个超大 body 就能把进程内存撑爆。这里与错误路径走同一套有界读取，
+    超过 `limit` 直接按协议违规处理——被截断的 JSON 本来也解析不出完整语义，
+    早失败好过先分配几 GB。
+
+    `what` 只用于日志/诊断（端点路径或 URL）；`public` 是可回显给客户端的
+    文案，缺省沿用 `UpstreamProtocolViolation`「等于 message」的口径。
+    """
+    # 多读 1 字节用于判「是否超限」：刚好等于上限的完整 body 不该被误杀。
+    raw = await read_body_bounded(response, limit + 1)
+    if len(raw) > limit:
+        raise UpstreamProtocolViolation(
+            f"response body from {what} exceeds {limit} bytes",
+            public="upstream returned an oversized response")
+    try:
+        return json.loads(raw)
+    except ValueError as error:
+        raise UpstreamProtocolViolation(
+            f"non-JSON response from {what}", public=public) from error
+
+
+#: 出口 DNS 校验结果的缓存 TTL（秒）。上游网关域名变更频率远低于聊天频率，
+#: 60s 足以挡掉「每次聊天都做一次 DNS」的开销，到期重解析也能跟上 DNS 变更。
+PUBLIC_HOST_CACHE_TTL = 60.0
+
+#: `host -> 上次校验通过的 monotonic 时刻`。只缓存**通过**的结果：解析失败与
+#: 命中黑名单都必须每次都重新判（失败不缓存，否则一次 DNS 抖动会把合法域名
+#: 锁死 60s）。
+_public_host_checked: dict[str, float] = {}
+
+#: RFC 6598 运营商级 NAT 共享地址段。值与
+#: `runtime_settings._CGNAT_SHARED` 相同，理由见 `_is_blocked_host_address`。
+_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_blocked_host_address(text: str) -> bool:
+    """单个解析结果是否指向禁止出站的地址（SSRF 黑名单）。
+
+    这里**复制**了一份 `runtime_settings._is_blocked_webhook_host` 的判定而不
+    直接 import 它：`provider/base.py` 是中立协议层，被九个渠道与测试替身
+    普遍 import；`runtime_settings` 依赖 `config.Settings`（pydantic-settings），
+    反向依赖会让协议层拖上配置模块的装载链，也让「provider 不 import config」
+    这条分层约定失效。两处口径必须保持一致，改动其一要同步另一处。
+    """
+    try:
+        # IPv6 链路本地地址带 `%en0` 作用域后缀（getaddrinfo 原样返回），
+        # 不剥掉 `ip_address` 会直接抛 ValueError——那等于把链路本地当公网放过。
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        # 解析结果不是 IP（畸形 DNS 应答）：宁可阻断也不赌它是公网地址。
+        return True
+    return (address.is_private or address.is_loopback or address.is_link_local
+            or address.is_reserved or address.is_multicast
+            or address.is_unspecified
+            # `is_private` 不覆盖 CGNAT 共享段 100.64.0.0/10（RFC 6598），
+            # 该段在部分云厂商内可达（实测 100.100.100.200 能通）。
+            or address in _CGNAT_SHARED
+            # 非 global 一律拦：覆盖 198.18.0.0/15 基准测试段等
+            # 「保留但 is_private=False」的网段。
+            or not address.is_global)
+
+
+async def _resolve_addresses(host: str) -> list[str]:
+    """异步解析主机名 → 地址文本列表（不阻塞事件循环）。
+
+    单列一个函数是为了让 TTL 缓存与测试都能围绕**一个**解析入口：
+    生产走 `loop.getaddrinfo`（由线程池执行，不占事件循环），测试替换本函数
+    即可模拟私网/混合/解析失败，不必去 patch `asyncio` 的全局状态。
+    """
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, None)
+    return [info[4][0] for info in infos]
+
+
+async def ensure_public_host(host: str) -> None:
+    """出口前校验主机名解析出的**每一个**地址都不指向内网（SSRF 出口校验）。
+
+    导入期只能判字面量 IP：域名要做 DNS，同步函数里解析会阻塞事件循环，也会
+    让 `POST /api/credentials` 卡在 DNS 上。可这个地址最终要带**不过期的**
+    `Authorization: Basic app_key:app_secret` 发出去，所以真正的出口必须补上
+    解析校验——一个解析到 10.x / 169.254.169.254 的域名就是一条 SSRF 跳板，
+    顺带把长期密钥递给内网主机。
+
+    口径与告警 webhook 的投递前复核一致：每个结果各自过黑名单，**任一**命中即
+    阻断；解析失败同样按阻断处理（宁可这次请求失败，也不把密钥发给一个解析不
+    出来的名字）。IPv6 链路本地带 `%en0` 后缀时先剥后缀再判。
+    """
+    normalized = (host or "").strip().lower()
+    if not normalized:
+        raise UpstreamProtocolViolation(
+            "url has no host", public="上游地址缺少主机名，已拒绝发送凭证")
+    now = time.monotonic()
+    checked_at = _public_host_checked.get(normalized)
+    if checked_at is not None and now - checked_at < PUBLIC_HOST_CACHE_TTL:
+        return
+    try:
+        addresses = await _resolve_addresses(normalized)
+    except OSError as error:
+        raise UpstreamProtocolViolation(
+            f"cannot resolve host {normalized}: {error}",
+            public="上游网关地址无法解析，已拒绝发送凭证") from error
+    # 空结果当阻断：一次「解析成功但没有任何地址」不该被读成「干净的公网主机」。
+    if not addresses or any(_is_blocked_host_address(item) for item in addresses):
+        raise UpstreamProtocolViolation(
+            f"host {normalized} resolves to a private/loopback/reserved address",
+            public="上游网关地址指向内网/回环/保留地址，已拒绝发送凭证")
+    _public_host_checked[normalized] = now
 
 
 # 上游「排队中」信号：`isQueued` 为真，或子码点名 RESOURCE_LIMIT。
@@ -891,3 +1032,10 @@ class Provider(Protocol):
     def classify(self, status: int, body: bytes) -> ErrKind: ...
     def list_models(self, credential_data: dict) -> list[Model]: ...
     async def aclose(self) -> None: ...
+
+    # 可选：`list_models` 的表来源申报（**不是**协议要求，缺省按上游真值处理）。
+    # 有静态兜底表的渠道（TRAE / CodeBuddy）实现它，返回
+    # `(是否降级, 一行原因)`；服务层据此把「这次拉到的其实是静态表」记成失败并
+    # 打 `model_list_degraded` 指标——否则 provider 在内部吞掉异常后，服务层以为
+    # 拉取成功，管理台完全看不出「这个渠道一直没拿到动态模型」（issue #56）。
+    # def model_list_source(self) -> tuple[bool, str]: ...

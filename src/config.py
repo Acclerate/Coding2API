@@ -8,11 +8,79 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import cached_property
 from typing import Any
+from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 只借用受信反代的**解析口径**（见 trusted_proxies_problem 的复用说明）。
+# access.py 不反向依赖 config，不构成循环导入。
+from .auth.access import _parse_networks, split_entries
+from .observability.otlp import endpoint_problem as otlp_endpoint_problem
 
 _CODEBUDDY_CN = "https://copilot.tencent.com"
 _CODEBUDDY_INTL = "https://www.codebuddy.ai"
+
+
+def public_base_url_problem(value: str) -> str | None:
+    """`PUBLIC_BASE_URL` 的形态问题（None = 合法）。
+
+    必须是 `http(s)://主机` 形态。它是 TRAE 回调的权威基址
+    （`admin_auth.resolve_public_callback_url`）：漏写 `://` 会让回调拼成
+    相对路径（`127.0.0.1:8000/authorize`），浏览器打开必然「网络错误」，而
+    服务本身照常 200——登录静默失败，没有报错可查。所以配置层直接挡下，
+    doctor 与运行期改写走同一份判定。
+    """
+    text = value.strip()
+    if not text.startswith(("http://", "https://")):
+        return ("PUBLIC_BASE_URL 必须以 http:// 或 https:// 开头"
+                f"（当前 {value!r}）；正确示例：https://ai.example.com")
+    try:
+        hostname = urlsplit(text).hostname
+    except ValueError as error:
+        return (f"PUBLIC_BASE_URL 无法解析（{error}）；"
+                "正确示例：https://ai.example.com")
+    if not hostname:
+        return (f"PUBLIC_BASE_URL 缺少主机名（当前 {value!r}）；"
+                "正确示例：https://ai.example.com")
+    return None
+
+
+def trusted_proxies_problem(*, trust_proxy: bool, trusted_proxies: str,
+                            require_trusted_proxies: bool) -> str | None:
+    """`TRUST_PROXY` / `TRUSTED_PROXIES` 组合的形态问题（None = 合法）。
+
+    `require_trusted_proxies`（默认 false）是**可选的启动硬拒开关**：默认不判，
+    因为存量部署大量是「前面恰好一层受信反代、名单留空」的旧形态
+    （`src/auth/access.py` 的 `_peer_trusted` 对空名单返回 True 就是为兼容它），
+    默认改成硬拒等于升级即起不来。只有运维明确知道不该留空时置 true。
+
+    置 true 后本函数挡两类配置：
+    - `TRUST_PROXY=true` 且名单为空：采信任意对端的 `X-Forwarded-For`，
+      该头由客户端可写 → API Key 的 `allowed_ips` 与登录限流失效。
+    - 名单非空但一条都解析不出：运行期是 fail closed（不采信 XFF），可运维
+      容易误以为名单已生效，写出「安全但其实全不走反代」的静默错配。
+
+    解析口径**复用** `src/auth/access.py` 的 `split_entries` / `_parse_networks`：
+    另写一份正则必然与运行期的容错规则漂移（比如 `10.0.0.1/24` 这种
+    `strict=False` 能收的写法），doctor 说「没问题」而实际不生效比不检查更糟。
+    """
+    if not require_trusted_proxies:
+        return None
+    if not trust_proxy:
+        # 不采信 XFF 就没有这条风险面，不该因为「名单没配」被拦。
+        return None
+    if not split_entries(trusted_proxies):
+        return ("TRUST_PROXY=true 但 TRUSTED_PROXIES 为空：X-Forwarded-For 可被"
+                "任意客户端伪造，API Key 的 allowed_ips 与登录限流都会失效；"
+                "修法二选一：配置 TRUSTED_PROXIES（受信反代对端的 IP/CIDR，"
+                "逗号分隔），或关闭 TRUST_PROXY")
+    if not _parse_networks(trusted_proxies):
+        return (f"TRUSTED_PROXIES 没有任何一条能解析成 IP/CIDR（当前 "
+                f"{trusted_proxies!r}）：运行期会 fail closed（不采信 "
+                "X-Forwarded-For），但 TRUST_PROXY 仍开着、容易误以为名单已生效；"
+                "请改成受信反代对端的 IP/CIDR（如 172.31.250.0/24），或关闭 TRUST_PROXY")
+    return None
 
 
 class Settings(BaseSettings):
@@ -48,6 +116,14 @@ class Settings(BaseSettings):
     # 有直连入口（如 docker 把 PORT 发布到 0.0.0.0）时必须显式配这一项，
     # 否则攻击者可自带 `X-Forwarded-For: <白名单IP>` 绕过 Key 的 allowed_ips。
     trusted_proxies: str = ""
+
+    # 是否把「TRUST_PROXY=true 但 TRUSTED_PROXIES 为空」当成启动失败。
+    # 环境变量 `REQUIRE_TRUSTED_PROXIES`。
+    # **默认 false = 保持旧行为**：存量部署大量是「前恰好一层受信反代 + 名单
+    # 留空」的形态（`_peer_trusted` 对空名单返回 True 正是为兼容它），默认硬拒
+    # 等于升级即起不来，只保留 doctor 的 WARN 主动提示。知道本部署不该留空时
+    # 置 true，可在启动期挡下「反代旁还有直连入口」这类配置失误。
+    require_trusted_proxies: bool = False
 
     # 上游（白名单内的地址才可接收真实 Token）
     codebuddy_api_endpoint: str = _CODEBUDDY_CN
@@ -144,6 +220,15 @@ class Settings(BaseSettings):
     # 默认模型：六条渠道都已上架 `deepseek-v4.1-flash`（CB / TRAE / CodeArts /
     # codebuddy_intl 同名，Qoder 走别名 `dfmodel`），故默认值取它而不是老模型
     default_model: str = "deepseek-v4.1-flash"
+    # TRAE 本账号拥有的访问身份（逗号分隔；`0` = 免费档，`1/2/3/5/100` 是各档
+    # 付费会员 / 团队 / 内部身份）。上游 `get_detail_param` 的每个模型带
+    # `display_contact_config.access.data.identity_list`：白名单不含 `0` 的模型
+    # 对免费账号一律回 1005（权益不足）——出现在列表里比看不到更糟，用户选中必失败。
+    # 因此按本值过滤：留空 = **不做身份过滤**（上游给什么就展示什么，老行为）；
+    # 默认 `0` = 免费档口径。开通会员后改成 `0,1,2,3,5` 即可把会员模型放出来。
+    # 只在 TRAE 渠道内生效——身份是渠道内属性，不能写进全局 MODEL_BLOCKLIST
+    # （同名模型在别的渠道可能正常可用，issue #56）。
+    trae_account_identities: str = "0"
     # token 预刷新的提前量（小时）：距 access token 到期 ≤ 该值就提前换新。
     # 注意它对**短寿命渠道**会被自行封顶（CodeArts STS 只有 2h，见
     # `CodeArtsCredential.refresh_skew_cap_seconds`），所以调大它不会让短寿命
@@ -223,7 +308,7 @@ class Settings(BaseSettings):
     # 也支持按 `request_id` 回溯一次请求。0 = 不落库（只保留上面的内存环）。
     # 默认 2000 行：SQLite 单表几千行对写延迟无感，够覆盖「昨天出的问题今天查」。
     log_persist_lines: int = 2000
-    # 运维告警：周期评估七类规则，命中即落 alert_events 并可选推送
+    # 运维告警：周期评估九类规则，命中即落 alert_events 并可选推送
     # webhook。webhook 留空 = 只留站内记录、不外推。
     alert_enabled: bool = True
     alert_webhook_url: str = ""
@@ -365,8 +450,8 @@ class Settings(BaseSettings):
     #      kimi-k3（→ kimi-k3.1-pro）、minimax-m2.5/m2.7/m3（→ m3.1-flash）、
     #      deepseek-v3-* / deepseek-v4-*（→ v4.1-flash）、qwen3.7-* / qwen3-* /
     #      qwen3.6*（→ qwen3.8-max）、gpt-5.4/5.5/5.6*（→ gpt-6-sol / 6.1-sol）、
-    #      hy3* / hy4-preview / hunyuan-*、seed-2.1* / seed-code-pro-* /
-    #      seed-evolving（豆包整族已停售，无后继）、qwen3-vl-235b。
+    #      hy3* / hy4-preview / hunyuan-*、seed-code-pro-*（TRAE 内部代号）、
+    #      qwen3-vl-235b。
     #   3. 已下架的免费池与开源小模型：space-bunny（Kilo 已退役）、
     #      nemotron-3* / lfm2* / laguna* / north-mini-code / inkling-small /
     #      xing4.0-29b-a4 / glyph-cluster（Kilo 两次 121s 后 408）/
@@ -380,6 +465,11 @@ class Settings(BaseSettings):
     #   openpangu-2.0-* / gpt-6-* / grok-4.7 / gemini-3.8-flash（在售）。
     #   `qwen3.8-flash`（Qoder qfmodel）2026-10-27 实测 chat 成功（63→117 token），
     #   原先按「400 Execution failed」滤掉的判断已失效，故移出黑名单。
+    #   豆包 Seed 2.1 族（`Seed-2.1-Pro-0915` / `Seed-2.1-Turbo` /
+    #   `Seed-Evolving`）2026-11-24 实测仍是客户端主推的在售模型，原先的
+    #   「整族已停售」判断已失效，故移出黑名单（issue #56）。内部代号
+    #   `seed-code-pro-*` / `Doubao-Seed-2.0-Code` 改由上游
+    #   `is_invisible_to_user` 过滤，不再靠这里兜。
     model_blocklist: str = (
         # ① 内部 / 代理模型与自动路由占位
         "custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,"
@@ -390,8 +480,7 @@ class Settings(BaseSettings):
         "minimax-m2.5,minimax-m2.7,minimax-m3,deepseek-v3-*,deepseek-v4-*,"
         "qwen3.7-*,qwen3-*,qwen3.6*,qwen3-vl-235b,"
         "gpt-5.4,gpt-5.5,gpt-5.6*,hy3*,hy4-preview,hunyuan-*,"
-        "seed-2.1*,seed-2-1-turbo,doubao-seed-2.1-turbo,seed-code-pro-*,"
-        "seed-evolving,"
+        "seed-code-pro-*,"
         # ③ 已下架的免费池 / 开源小模型
         "space-bunny,nemotron-3-*,nemotron-3*,lfm2*,laguna*,north-mini-code,"
         "inkling-small,xing4.0-29b-a4,glyph-cluster,openrouter-models-router,"
@@ -482,11 +571,33 @@ class Settings(BaseSettings):
     # **启动期项**，不进热更表：热更值会落 DB 并被 /api/settings 回显，
     # 令牌不该出现在管理台页面上。
     metrics_token: str = ""
+    # OTLP/HTTP JSON 指标出口（默认空 = 关闭，零出站）：指向 OTel Collector
+    # 的 base URL（导出 POST 到 `{endpoint}/v1/metrics`）。只接受 http/https，
+    # 非回环主机强制 https（见 observability/otlp.py 的 SSRF 校验）。
+    # **启动期项**：与 METRICS_TOKEN 同理，采集端令牌不进热更表。
+    otlp_endpoint: str = ""
+    # 导出周期（秒），默认 60；下限 15——比 15 秒更密只会让采集端收到重复的
+    # 累计快照，不会让数据更准。
+    otlp_export_seconds: int = 60
+    # 可选请求头（`k:v;k2:v2`）：采集端的 Authorization / X-Api-Key 等。
+    # 启动期项，不落库、不回显到管理台。
+    otlp_headers: str = ""
     # 请求级结构化日志（logfmt，见 src/webapp/access_log.py）：默认开启。
     # 只记 /api、/v1、/authorize 这些业务请求，每行含 request_id / 路由模板 /
     # 状态码 / 耗时；**不写 query string、请求体、用户名**（脱敏口径见
     # PROPOSAL §6）。关闭后回到只有 uvicorn 的裸 access log。可热更。
     request_log_enabled: bool = True
+    # 上游尝试响应头（X-Upstream-Attempts / X-Upstream-Degraded）：默认**关闭**。
+    # 这两个头会泄露账号池规模（一次请求换过几个号）、成本与路由指纹——对
+    # 任何拿到 API Key 的调用方都可见，而它本来只是本仓排障用的信息。关闭时
+    # 中间件不仅不写，还会主动剥离同名响应头（防上游/中间盒回传伪造值）。
+    # 只有自建、可信客户端的部署才建议打开。可热更。
+    expose_upstream_headers: bool = False
+    # 内容拒绝的发起者冻结阈值：同一 (发起者, 渠道) 的累计拒绝次数达到该值后，
+    # 该发起者请求这个渠道在 preflight 就被 403 `provider_access_frozen`。
+    # **默认 0 = 只记录不冻结**：一次内容拒绝可能是误判/客户端偶发，第一次就
+    # 冻结会很吵，且冻结是人工才能解除。可热更。
+    access_freeze_threshold: int = 0
     # 全局剥离响应里的思考内容（`EventKind.REASONING`）：默认关闭。开启后
     # **只过滤出站响应**、不改写请求体——上游仍照常思考（`reasoning_effort`
     # 原样透传），只是不再把思考交给客户端。刻意不做请求侧改写：实测 CB
@@ -512,6 +623,35 @@ class Settings(BaseSettings):
     # 阈值则不映射。Anthropic 只规定 budget ≥1024、未给档位对应表，故阈值表
     # 必须由使用者显式给出，不内置默认。可热更。
     anthropic_thinking_efforts: str = ""
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, value: str) -> str:
+        problem = public_base_url_problem(value)
+        if problem is not None:
+            raise ValueError(problem)
+        return value
+
+    @field_validator("otlp_export_seconds")
+    @classmethod
+    def _validate_otlp_export_seconds(cls, value: int) -> int:
+        # 下限 15 秒：更密只是让采集端收到更多重复的累计快照。写错成 0/负数
+        # 会让 TaskRunner 的循环变成忙等（每轮 sleep 0），必须在启动期挡下。
+        if value < 15:
+            raise ValueError("OTLP_EXPORT_SECONDS 不能小于 15（当前 "
+                             f"{value}）；到期导出的是累计快照，更密不会更准")
+        return value
+
+    @field_validator("otlp_endpoint")
+    @classmethod
+    def _validate_otlp_endpoint(cls, value: str) -> str:
+        # 启动期就拒掉非 http(s) / 明文 http 打公网：导出请求带 OTLP_HEADERS
+        # 里的采集端令牌，配错等于把令牌明文发出去。校验实现在 otlp 模块，
+        # 幂等且纯函数（不建连接），启动期调用不增加装配负担。
+        problem = otlp_endpoint_problem(value)
+        if problem is not None:
+            raise ValueError(problem)
+        return value
 
     @cached_property
     def admin_set(self) -> frozenset[str]:
@@ -577,6 +717,11 @@ class Settings(BaseSettings):
     def blocklist_patterns(self) -> tuple[str, ...]:
         return tuple(p.strip() for p in self.model_blocklist.split(",") if p.strip())
 
+    @cached_property
+    def trae_identities(self) -> frozenset[int] | None:
+        """TRAE 本账号身份集合；留空 = None（不做身份过滤，老行为）。"""
+        return parse_identity_set(self.trae_account_identities)
+
     def is_admin(self, username: str) -> bool:
         return username in self.admin_set
 
@@ -592,6 +737,18 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if env is None:
         return Settings()  # type: ignore[call-arg]
     return Settings(_env_file=None, **env)  # type: ignore[call-arg]
+
+
+def parse_identity_set(text: str) -> frozenset[int] | None:
+    """身份白名单配置 → 集合；空串 / 全是非法项 = None（不做身份过滤）。
+
+    非整数项静默丢弃而不是报错：这是运维手写的逗号串，一个笔误（`0, 1,2`、
+    `0、1`）不该让整条渠道的模型列表拉取失败。全非法（等价于没配）按「不过滤」
+    处理，与留空同口径——宁可多展示几个模型，也不要静默清空清单。
+    """
+    parsed = {int(chunk) for chunk in (part.strip() for part in text.split(","))
+              if chunk.lstrip("+-").isdigit()}
+    return frozenset(parsed) if parsed else None
 
 
 def validate_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
@@ -638,18 +795,40 @@ def validate_kilo_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
 
 
 def validate_generic_endpoint_allowed(endpoint: str, settings: Settings) -> bool:
-    """通用上游端点校验：白名单为空时只要求 http(s)（用户自己填的上游）。
+    """通用上游端点校验：白名单为空时放行任意 **https**（或回环 http）。
 
-    之所以允许「白名单为空 = 放行任意 http(s)」：这个渠道的用途就是接任意
-    OpenAI 兼容端点（含内网自建），写死主机等于不让他用。但凭证是真实 API
-    key，所以仍拒绝非 http(s)（`file://` / `gopher://` 之类会让 httpx 出网
+    之所以允许「白名单为空 = 放行」：这个渠道的用途就是接任意 OpenAI 兼容
+    端点（含内网自建），写死主机等于不让他用。但凭证是真实 API key：明文
+    http 会让 key 在链路上裸奔，所以**非回环主机强制 https**；`http://` 只允许
+    回环（`localhost` / `127.0.0.1` / `::1`），且命中白名单时仍受白名单约束。
+    内网自建服务请配 https（自签证书可走反代）或只监听回环 + 隧道，不要用
+    明文 http 打内网——同网段的任何人都能抓到 key。
+
+    任何情况下都拒绝非 http(s)（`file://` / `gopher://` 之类会让 httpx 出网
     到非 HTTP 目标）。
     """
     text = endpoint.strip().rstrip("/")
     if not text.startswith(("http://", "https://")):
         return False
     allowed = settings.generic_allowed
-    return not allowed or text in allowed
+    if allowed and text not in allowed:
+        return False
+    scheme, _, rest = text.partition("://")
+    # 明文 http 仅限回环：非回环主机上的 key 会在链路上裸奔。
+    return scheme != "http" or _is_loopback_endpoint_host(rest)
+
+
+def _is_loopback_endpoint_host(rest: str) -> bool:
+    """端点 URL 的主机部分是不是回环（`localhost` / `127.0.0.1` / `::1`）。
+
+    `rest` 是去掉 scheme 后的整段（可能带端口、userinfo、路径）。
+    用 `urlsplit` 而不是字符串切分：IPv6 字面量带方括号，切分会截错。
+    """
+    try:
+        hostname = urlsplit(f"//{rest}").hostname or ""
+    except ValueError:
+        return False
+    return hostname.strip("[]").lower() in ("localhost", "127.0.0.1", "::1")
 
 
 def validate_raccoon_endpoint_allowed(endpoint: str, settings: Settings) -> bool:

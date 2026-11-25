@@ -72,7 +72,7 @@ docker compose up -d --build
 docker compose exec coding2api python scripts/create_user.py admin --role admin
 ```
 
-Pull the image: `docker compose pull` (or `docker pull ghcr.io/robbsluo/coding2api:v0.14.1`). Pushing a `v*` tag to main runs `.github/workflows/publish.yml` → publishes `<tag>` + `:latest`. For https on a VPS with a public IP see "[Public deployment](#public-deployment-docker--caddy-automatic-https)".
+Pull the image: `docker compose pull` (or `docker pull ghcr.io/robbsluo/coding2api:v0.14.3`). Pushing a `v*` tag to main runs `.github/workflows/publish.yml` → publishes `<tag>` + `:latest`. For https on a VPS with a public IP see "[Public deployment](#public-deployment-docker--caddy-automatic-https)".
 
 ## Users and roles
 
@@ -352,6 +352,7 @@ Never probed successfully → `balance_known` = `false` (unknown, not zero).
 - `GET /healthz`: adds pool counts, `ready == 0` → 503 (readiness / alerting).
 - Neither requires auth; both accept `HEAD`. The four counts are mutually exclusive (`ready` / `cooling` / `paused` / `disabled`) and sum to `total`. **Upgrade note**: `/healthz` changed from always-200 to 503 when `ready == 0`.
 - `GET /metrics` (Prometheus): on by default and **unauthenticated**; `METRICS_ENABLED=false` (hot-reloadable) → 404; with `METRICS_TOKEN` set, requests need `Authorization: Bearer <token>`.
+- **OTLP export (optional)**: with `OTLP_ENDPOINT` set, every `OTLP_EXPORT_SECONDS` seconds the service `POST`s `{endpoint}/v1/metrics` (OTLP/HTTP JSON, **no SDK**). Only `gen_ai.*` metrics (provider / model / tokens / latency / TTFT / error type); it **never** exports `gen_ai.input.messages` / `output.messages` / `system_instructions` or any content. Non-loopback endpoints must be https; failures log once and never take the service down.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
@@ -386,6 +387,8 @@ No `credential_id` / `api_key_id` / `username` (high cardinality). `requests_tot
 ### Credential limits and in-flight cap
 
 - **Limit guards** (*Set limits* in the row menu; four independent, all empty = unlimited, evaluated before selection): reserve credits (remaining ≤ value → disable the whole credential, unknown balance is never guessed), daily token cap, daily credit cap, per-model token cap (`{model: limit}`, disables that model only). "Today" = Beijing calendar day. Written via `PUT /api/credentials/{id}/limits` (full replace, immediate, audited as `credential.limits`).
+- **Credential-level model allowlist** (same dialog): `allowed_models` = comma-separated fnmatch globs, `''` = unrestricted, same syntax as API Key allowlists. It only narrows **chat / inference** candidate selection: a credential is skipped for models outside its list, but it is **not** disabled and no cooldown is written, so switching models works immediately. Background paths (check-in / refresh / probes / quota / model lists) ignore it. Undeterminable model names (empty / `auto`) are allowed, so the pool is never emptied.
+- **Concurrent edit conflicts**: the edit endpoint takes `expected_updated_at` (already returned on every list row); a mismatch returns `409 credential_conflict` with the current row snapshot, and the console tells the user to refresh. The version only advances on **manual edits** — background polling and cooldown writes never bump it, so an open editor never becomes stale by itself.
 - **In-flight cap** `MAX_INFLIGHT_PER_CREDENTIAL` (default 0 = unlimited, hot-reloadable): a credential stops being selected once it reaches that concurrency. Counted in-process, leases released at request end with a 600s TTL fallback. **Also acts as the load key**: placed after "free first" and before "expiring quota", so concurrency spreads to idle credentials.
 - **Exhaustion semantics**: all candidates skipped by limits / in-flight → `no_healthy_credential` 503; model-level cooldown → `model_unavailable`; upstream rate-limit / quota cooldowns are recorded as `rate_limit` in stats (external code stays `no_healthy_credential`).
 
@@ -401,7 +404,7 @@ No `credential_id` / `api_key_id` / `username` (high cardinality). `requests_tot
 `GET /v1/models` and the Playground dropdown merge only **channels with a usable credential** (cooling ones still count). Order: CodeBuddy (China → international), TRAE, Qoder, CodeArts, OfficeAce, Raccoon, Lingxi, with Zen / Kilo last; alphabetical within a group; a model on multiple channels belongs to the highest-priority one (`_PROVIDER_RANK` in `src/api/model_merge.py`).
 
 - **Routing only trusts this cache**: if the catalog proves ownership, only those channels are candidates, and none usable → 503; a model absent from the catalog routes across all candidates; explicit `@channel` and key channel binding are unaffected.
-- **Snapshot and startup**: besides the in-process TTL cache (300s), every successful fetch writes `DATA_DIR/model_catalog.json`, read synchronously at startup; a corrupt snapshot or one older than 7 days just drops the cache. The `MODEL_CATALOG_MINUTES` task keeps it fresh.
+- **Snapshot and startup**: besides the single service-layer in-process TTL cache (TTL = `MODEL_LIST_TTL_SECONDS`), every successful fetch writes `DATA_DIR/model_catalog.json`, read synchronously at startup; a corrupt snapshot or one older than 7 days just drops the cache. The `MODEL_CATALOG_MINUTES` task keeps it fresh.
 - **Stale-while-revalidate**: cached lists return immediately, refresh happens in the background at TTL; failures back off as 2^(n-1)×TTL (capped at 2 hours) with WARNING only on the first failure.
 - **Admin *Model list* page** (`GET /api/model-catalog`): read-only view of the public OpenRouter catalog (list prices, context / output limits, modalities, capabilities, knowledge cutoff, three AA indices — not measured here), with `available` and an off-by-default "current channels only" toggle. Floating aliases take the score of the newest snapshot in the same family (by `canonical_slug` date).
 - **Suspected-retirement view** (`GET /api/models/availability`, operator): aggregates `upstream_blocked` / `model_not_found` / `invalid_request` over the last N days (default 7) by `(channel, model)`; *Add to blocklist* appends to `model_blocklist` with an audit entry.
@@ -439,17 +442,21 @@ Default is the **last 24 hours** (also 7 / 30 days, all time, custom). Custom us
 
 - **Failure types** (`CONTROLLED_ERROR_TYPES`): the closing row carries the **real attribution of the last error** — `model_unavailable` / `rate_limit` / `upstream_timeout` / `network_error` (local DNS / connect failure, no cooldown) / `context_overflow` (11115) / `model_capability` (CodeArts 001001020) / `model_not_found` (retired model, distinct from "bad request"). Only when **no credential was ever selected** does it fall back to `no_healthy_credential`. External codes are identical; only stats semantics differ.
 - **Request ID**: responses carry `X-Request-ID`; a valid inbound value is reused, otherwise generated (`[A-Za-z0-9._:-]`, 1–128 chars); stored in `usage_events.request_id` and **never forwarded upstream**.
+- **Attempt-chain headers** (only with `EXPOSE_UPSTREAM_HEADERS=true`, off by default): `X-Upstream-Attempts` = credentials actually tried, `X-Upstream-Degraded` = whether `MODEL_FALLBACK_GROUPS` fallback was used. When off, the middleware strips same-named headers (including forged values from upstreams or middleboxes). Off by default because these headers hand out pool size, cost and routing fingerprints. For streams they only reflect attempts **before** the response head is sent; later rotations cannot rewrite an already-sent head.
+- **Content-refusal freeze**: upstream content-safety refusals (currently only CodeBuddy `11128`) do not rotate or cool a credential; a hit is attributed to the requester (username first, API Key id otherwise). Once `ACCESS_FREEZE_THRESHOLD=N` (default `0` = record only) is reached, requests from that requester × provider get `403 provider_access_frozen` before reaching upstream; `GET /api/access-freezes` shows hits/frozen state and `POST /api/access-freezes/unfreeze` clears it (operator+, audited).
 - **Credit**: CodeBuddy uses upstream truth; TRAE is derived from official unit prices and marked `≈` (`src/provider/trae/pricing.py`, unlisted models are not derived). Backfill with `scripts/backfill_trae_credit.py`.
 - **Cost (estimated ≈)**: tokens × public list price, not the actual upstream charge. `(input−cached)×input + cached×cache + output×output` in USD → converted to CNY at write time using `USD_CNY_RATE`; history is not recomputed. Unmatched models are not priced (cost is a lower bound); channel-specific ids map to base models only via explicit equivalence rules.
 - **Cache hit rate**: cached tokens ÷ input tokens (one decimal); unreported or zero input → `—`.
 - **Output speed** = total tokens ÷ total generation time (not an average of per-request ratios). Two views: **body speed** `output_tokens - reasoning_tokens` and **total throughput** including reasoning. Only successful requests routed through this service with ≥1 output token; generation time = `latency_ms - ttfb_ms`; samples under 200ms or above 1000 tok/s are dropped. No samples → estimated mode (prefixed `≈`); neither → `—`.
 - **Charts**: requests / tokens / cost / cost per request / latency / TTFB / success rate / cache hit rate. Derived metrics are `sum ÷ sum`, no samples render as `—` (gap) not 0; latency and TTFB also get a percentile chart (P50 + P95 from details, 90 days only). The time axis is filled hourly. Out-of-domain `metric` is an explicit 400; an invalid custom range pauses fetching.
+- **Compression gains panel**: trigger counts (tool output / context trimming), characters and tokens saved (lower-bound estimate), the concurrent prefix-cache hit rate, and both compression switches, on one screen. Savings must be read next to the cache cost, otherwise "keep it on or turn it off" is unanswerable; `GET /api/stats/compression?since=&until=` (operator+, hourly buckets summed over the same window as the overview; omit both ends for the lifetime total). Hourly buckets and lifetime totals are persisted to `DATA_DIR/compress_buckets.json` (60s throttle, flushed on shutdown), surviving restarts for 90 days.
 
 ### Credits and check-in records
 
 - **Change ledger** (arrow after the quota figure) = **net change between two quota probes**, not per-action attribution (check-in, growth and chat all move the balance and upstream logs nothing → the UI says "net change"). The first probe only establishes a baseline; unchanged balances are not recorded; a change to "unknown" is recorded without a delta; retained 90 days.
 - **Split by ledger**: entries carry `ledger` (`pool` / `credits`); CodeArts and Raccoon use `credits` (both are credit-based), everything else `pool`. `GET /api/credentials/{id}/credit-events?ledger=`.
 - **Check-in records** (*More → Check-in records*) = the check-in audit log, one row per round (time / result / credits claimed / upstream business code / message / trigger), retained 90 days; `GET /api/credentials/{id}/checkin-events?limit=`. This is the **per-action result**, independent of balance diffs, so "shows success but no credits" can be checked directly against the upstream reply.
+- **Availability timeline** (*credential detail → View timeline*) = history of state transitions (cooldown start / cooldown end / hard failure / revived / enabled / disabled), each row carrying the model (for model-level cooldowns), a redacted reason, a readable detail and the triggering request ID; `GET /api/credentials/{id}/timeline?since=&until=&limit=` (operator+), retained 30 days. Complements the **current state** in `credential_model_cooldowns`: answering "why was this credential unavailable at 14:00 yesterday" no longer requires digging through server logs.
 - **Today's check-in summary**: `GET /api/credentials` attaches `checkin_today` (the latest entry for today from the local audit log, `null` if none). `null` means "no conclusion yet" (task not due / paused / channel has no check-in), not failure.
 
 ### Grouping
@@ -584,6 +591,8 @@ The authoritative list is `src/config.py`; every item is passed through `docker-
 | `ALLOWED_HOSTS` | empty | Host allowlist (DNS rebinding defense) |
 | `ALLOW_TEST_HOST` | `false` | Allow `testserver`, tests only |
 | `TRUST_PROXY` | `false` | Trust `X-Forwarded-For`; only behind exactly one trusted proxy |
+| `TRUSTED_PROXIES` | empty | With `TRUST_PROXY=true`, only parse XFF from peers in this list (IP/CIDR, comma-separated); empty = any peer |
+| `REQUIRE_TRUSTED_PROXIES` | `false` | When `true`, `TRUST_PROXY=true` with an empty/unparsable list makes startup fail. Default `false` keeps existing "empty list" deployments working; doctor still reports a WARN |
 | `ENABLE_DOCS` | `false` | Expose `/docs` and `/openapi.json` |
 | `DUMP_REQUEST_BODIES` | `false` | Dump raw `/v1` request bodies (contains conversations, debugging only). Hot-reloadable, dir 0700 / files 0600 / ≤200 files and ≤24h; changes audited |
 | `GATEWAY_PAUSED` | `false` | Global kill switch: every key-authenticated `/v1` endpoint returns 503 (`code=service_paused`), admin console unaffected. Hot-reloadable, audited and logged as WARNING |
@@ -656,6 +665,11 @@ The authoritative list is `src/config.py`; every item is passed through `docker-
 | `MAX_INFLIGHT_PER_CREDENTIAL` | `0` | Per-account in-flight cap; `0` = unlimited. 600s TTL fallback |
 | `METRICS_ENABLED` | `true` | Expose `/metrics`. Hot-reloadable |
 | `METRICS_TOKEN` | empty | When set, `/metrics` requires `Authorization: Bearer <token>`; empty = public. Startup-time |
+| `EXPOSE_UPSTREAM_HEADERS` | `false` | Adds `X-Upstream-Attempts` / `X-Upstream-Degraded`. Off by default: leaks pool size, cost and routing fingerprint; when off, same-named headers are stripped. Hot-reloadable |
+| `ACCESS_FREEZE_THRESHOLD` | `0` | Content-refusal freeze threshold: after N hits from the same requester × provider, requests get 403 `provider_access_frozen`; `0` = record only. Hot-reloadable |
+| `OTLP_ENDPOINT` | empty | OTLP/HTTP JSON metric export (`POST {endpoint}/v1/metrics`); empty = disabled, zero egress. Only `gen_ai.*` metrics, never prompts/answers. Non-loopback requires https. Startup-time |
+| `OTLP_EXPORT_SECONDS` | `60` | OTLP export interval in seconds (min 15) |
+| `OTLP_HEADERS` | empty | Extra OTLP headers, `k:v;k2:v2` |
 | `REQUEST_LOG_ENABLED` | `true` | Request-level structured logs (logfmt); no query, body or username. Hot-reloadable |
 | `FORCE_DISABLE_THINKING` | `false` | Strip reasoning from outbound responses; response filtering only. Hot-reloadable |
 | `REASONING_EFFORT_MAP` | `""` | Outbound effort mapping `channel=from:to;*=from:to` (`KNOWN_PROVIDERS`); `none` removes the key. Hot-reloadable |
