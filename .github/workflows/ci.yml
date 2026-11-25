@@ -53,20 +53,21 @@ jobs:
           python-version: "3.12"
       - name: 无 fcntl 时模块仍可导入（否则 build_app / scripts 全线起不来）
         shell: bash
+        # fork 差异：Windows 由 msvcrt 区域锁覆盖（见 src/instance_lock.py），
+        # 故断言与上游相反——LOCK_SUPPORTED 在 Windows 上必须为 True。
         run: |
-          PYTHONPATH=. python -c "import src.instance_lock as m; assert m.LOCK_SUPPORTED is False"
-      - name: 入口必须给一句可读中文而不是 ModuleNotFoundError
+          PYTHONPATH=. python -c "import src.instance_lock as m; assert m.LOCK_SUPPORTED is True; print('LOCK_SUPPORTED ok')"
+      - name: 平台入口不炸（issue #46 回归防线）
         shell: bash
+        # win32 在 SUPPORTED_PLATFORMS 里：入口应静默返回（退出码 0），
+        # 且任何平台都不得出现 ModuleNotFoundError（import 阶段直接崩）。
         run: |
           set +e
           output=$(PYTHONPATH=. python -c "from src.platform_support import require_supported_platform; require_supported_platform()" 2>&1)
           code=$?
           set -e
           echo "$output"
-          test "$code" -ne 0
-          # 只断言 ASCII 片段：Windows 英文区域设置下中文会被转义成 \uXXXX，
-          # 用中文 grep 会因编码而假失败（PYTHONUTF8 只管本项目自己的输出）。
-          echo "$output" | grep -q "Linux / macOS"
+          test "$code" -eq 0
           if echo "$output" | grep -q "ModuleNotFoundError"; then
             echo "::error::Windows 上仍出现 ModuleNotFoundError（issue #46 回归）"
             exit 1
