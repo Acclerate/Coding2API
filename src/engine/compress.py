@@ -13,7 +13,9 @@
    其实装不下」，压缩根本不触发。
 2. 超过「模型上限 × safety_ratio − reserve_for_output」时从**最老**的消息
    开始丢弃；`system` 永远保留（丢了会改变模型行为），至少保留最近 N 条
-   （保证当前这轮对话完整）。回填从最新往最老，装不下就跳过继续往前看。
+   （保证当前这轮对话完整）。保留集合**必须是连续后缀**：跳着留（捞更老的
+   小消息）会在集合里留洞，下一轮重算时洞变了，发往上游的前缀整段失效，
+   上游前缀缓存只能命中 system 段。
 3. `assistant.tool_calls` 与其 `tool` 结果同生共死：按「组」处理，只删一半
    会让上游报 tool_call_id 找不到。
 4. 裁剪后仍超限（system / 最近 N 条本身太大）→ 截断最长的那条消息内容
@@ -61,30 +63,78 @@ def estimate_tokens(text: str) -> float:
     return total
 
 
-def _content_text(content: Any) -> str:
-    """一条 message 的 content（字符串或 part 数组）→ 纯文本（仅用于估算）。
+def _part_text(part: Any) -> str:
+    """单个 content part 的估算用文本。
 
-    非文本 part（图片/文件）按 100 字符占位计入，避免被当成 0 而低估体积到
-    「永远不触发压缩」。
+    图片 part 按 base64 正文长度计入：早期实现对非文本 part 一律记 100 字符，
+    而一张 1MB 的图 base64 后约 1.4M 字符，按 100 估等于「永远不触发压缩」——
+    图片会话会一路撞上游输入上限。上游按图片的实际 token 计费，这里用 base64
+    长度作代理（`estimate_tokens` 仍按字符类型加权）。
     """
+    if not isinstance(part, dict):
+        return part if isinstance(part, str) else ""
+    text = part.get("text")
+    if isinstance(text, str):
+        return text
+    if part.get("type") == "image_url":
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else None
+        if isinstance(url, str):
+            return url
+    return ""
+
+
+def _content_text(content: Any) -> str:
+    """一条 message 的 content（字符串或 part 数组）→ 估算用文本。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                parts.append(text if isinstance(text, str) else "x" * 100)
-            elif isinstance(part, str):
-                parts.append(part)
-        return "".join(parts)
+        return "".join(_part_text(part) for part in content)
     if content is None:
         return ""
     return str(content)
 
 
+def _part_tokens(part: Any) -> float:
+    """单个 content part 的 token 估算。
+
+    图片 part 按 base64 正文长度线性计入：早期实现对非文本 part 一律记 100
+    字符，而一张 1MB 的图 base64 后约 1.4M 字符，按 100 估等于「永远不触发
+    压缩」——图片会话会一路撞上游输入上限。上游按图片的实际 token 计费，
+    这里用 base64 长度作代理。
+
+    **按长度一次算完，不逐字符加权**：请求体上限 16MB
+    （`BodySizeLimitMiddleware`），逐字符跑 `estimate_tokens` 是千万级 Python
+    迭代，会在事件循环里阻塞整个进程。base64 字符集只有字母数字 `+/=`，
+    按 `_OTHER_WEIGHT` 记与逐字符加权（中文/数字权重）的偏差在纯启发式估算
+    里可忽略。
+    """
+    if not isinstance(part, dict):
+        return estimate_tokens(part) if isinstance(part, str) else 0.0
+    text = part.get("text")
+    if isinstance(text, str):
+        return estimate_tokens(text)
+    if part.get("type") == "image_url":
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else None
+        if isinstance(url, str):
+            return _OTHER_WEIGHT * len(url)
+    return 0.0
+
+
+def _content_tokens(content: Any) -> float:
+    """一条 message 的 content（字符串或 part 数组）→ 估算 token 数。"""
+    if isinstance(content, str):
+        return estimate_tokens(content)
+    if isinstance(content, list):
+        return sum(_part_tokens(part) for part in content)
+    if content is None:
+        return 0.0
+    return estimate_tokens(str(content))
+
+
 def _message_tokens(message: dict[str, Any]) -> float:
-    total = estimate_tokens(_content_text(message.get("content")))
+    total = _content_tokens(message.get("content"))
     reasoning = message.get("reasoning_content")
     if isinstance(reasoning, str):
         total += estimate_tokens(reasoning)
@@ -103,8 +153,21 @@ def estimate_messages(messages: list[dict[str, Any]]) -> float:
     return sum(_message_tokens(message) for message in messages)
 
 
+def _has_non_text_part(content: Any) -> bool:
+    """content 是否含非文本 part（图片等）。"""
+    return isinstance(content, list) and any(
+        not (isinstance(part, dict) and isinstance(part.get("text"), str))
+        for part in content)
+
+
 def _truncate_content(content: Any) -> Any:
-    """单条消息内容截断：字符串直接截；part 数组整体降级为纯文本。"""
+    """单条消息内容截断：字符串直接截；part 数组整体降级为纯文本。
+
+    **含图片的 content 不截**：截 base64 只会得到一段无效 data URL（上游照样
+    400），不如原样留给上游裁决；返回同一对象，调用方据此 `continue` 跳过。
+    """
+    if _has_non_text_part(content):
+        return content
     text = _content_text(content)
     if len(text) <= _TRUNCATE_HEAD + _TRUNCATE_TAIL:
         return content
@@ -166,6 +229,56 @@ def _group_atomic(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return groups
 
 
+def trim_to_budget(
+    messages: list[dict[str, Any]],
+    *,
+    budget: float,
+    min_keep_messages: int = DEFAULT_MIN_KEEP_MESSAGES,
+) -> tuple[list[dict[str, Any]], int]:
+    """按预算保留尾部；返回 `(结果, 第一条被保留正文消息在 body 中的绝对序号)`。
+
+    `system` 全部保留且不计入 body 序号；`assistant.tool_calls` 与其后连续
+    `tool` 结果同生共死；至少保留最近 `min_keep_messages` 条；保留集合是**连续
+    后缀**（装不下就停，不跳着捞更老的小消息，否则前缀带洞、缓存无法复用）。
+    仍超预算时按单条内容截断（`_truncate_to_budget`）。
+
+    序号是给**粘性裁剪**记窗口起点用的（见 `engine/sticky_trim.py`）：下一轮
+    只要该位置的消息没变、且裁后总量仍在预算内，就能复用同一前缀，上游前缀
+    缓存才命中得上。调用方保证 `budget > 0`。
+    """
+    system_messages = [m for m in messages if m.get("role") == "system"]
+    body = [m for m in messages if m.get("role") != "system"]
+
+    groups = _group_atomic(body)
+    starts: list[int] = []
+    cursor = 0
+    for group in groups:
+        starts.append(cursor)
+        cursor += len(group)
+
+    running = estimate_messages(system_messages)
+    kept_groups: list[list[dict[str, Any]]] = []
+    kept_count = 0
+    start_index = len(body)
+    # 从最新往最老回填，**只保留连续后缀**：装不下就停，不再跳过去捞更老的
+    # 小消息。跳着留会让「保留集合」带洞，下一轮重算时洞的位置一变，发往上游
+    # 的前缀就整段失效（前缀缓存只能命中 system 段）；连续后缀则只会在尾部
+    # 增长，配合粘性裁剪可以长期复用同一前缀。
+    # 最近 min_keep_messages 条无条件保留（保证当前这轮对话完整）。
+    for position in range(len(groups) - 1, -1, -1):
+        group = groups[position]
+        cost = estimate_messages(group)
+        if kept_count >= min_keep_messages and running + cost > budget:
+            break
+        kept_groups.append(group)
+        running += cost
+        kept_count += len(group)
+        start_index = starts[position]
+    kept_groups.reverse()
+    result = [*system_messages, *[m for group in kept_groups for m in group]]
+    return _truncate_to_budget(result, budget), start_index
+
+
 def compress_messages(
     messages: list[dict[str, Any]],
     *,
@@ -184,20 +297,6 @@ def compress_messages(
     if budget <= 0 or estimate_messages(messages) <= budget:
         return messages
 
-    system_messages = [m for m in messages if m.get("role") == "system"]
-    body = [m for m in messages if m.get("role") != "system"]
-
-    running = estimate_messages(system_messages)
-    kept_groups: list[list[dict[str, Any]]] = []
-    kept_count = 0
-    # 从最新往最老回填：最近 min_keep_messages 条无条件保留（保证当前这轮对话
-    # 完整），其后再装得下就继续往前留；装不下就跳过看更老的（贪心）
-    for group in reversed(_group_atomic(body)):
-        cost = estimate_messages(group)
-        if kept_count < min_keep_messages or running + cost <= budget:
-            kept_groups.append(group)
-            running += cost
-            kept_count += len(group)
-    kept_groups.reverse()
-    result = [*system_messages, *[m for group in kept_groups for m in group]]
-    return _truncate_to_budget(result, budget)
+    trimmed, _start = trim_to_budget(messages, budget=budget,
+                                     min_keep_messages=min_keep_messages)
+    return trimmed

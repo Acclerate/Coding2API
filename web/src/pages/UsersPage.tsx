@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Copy, KeyRound, Plus, RefreshCw, UserRoundCheck, UserRoundX, X } from "lucide-react";
+import { Check, Copy, KeyRound, Plus, RefreshCw, SlidersHorizontal, UserRoundCheck, UserRoundX, X } from "lucide-react";
 import { api, ApiError } from "../api/client";
 import { formatTime } from "../api/display";
 import { useSessionContext } from "../Layout";
@@ -10,7 +10,11 @@ import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
+import { copyText } from "../lib/clipboard";
+import { errorText } from "../lib/errors";
 import {
   Badge,
   Button,
@@ -19,6 +23,7 @@ import {
   Input,
   Notice,
   Panel,
+  QueryErrorState,
   Select,
   Table,
   TableBody,
@@ -37,10 +42,13 @@ function TokenCard({
   onDismiss: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const link = `${window.location.origin}/activate?token=${encodeURIComponent(issued.activate_token)}`;
   const copy = async () => {
-    await navigator.clipboard.writeText(link);
-    setCopied(true);
+    const ok = await copyText(link);
+    setCopied(ok);
+    // 局域网 http 部署没有 Clipboard API：必须明说，否则用户以为已经复制走
+    setCopyFailed(!ok);
   };
   return (
     <Panel title={`${issued.username} 的激活链接`}>
@@ -63,6 +71,11 @@ function TokenCard({
           我已转交
         </Button>
       </div>
+      {copyFailed && (
+        <p className="mt-2 text-xs text-danger" data-testid="copy-activation-failed">
+          浏览器不允许自动复制，请手动选中上方链接复制。
+        </p>
+      )}
     </Panel>
   );
 }
@@ -71,7 +84,10 @@ export function UsersPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("username", "asc",
     { created_at: "desc", enabled: "desc" });
-  const { data, isLoading } = useUsers(session.username, sort, order);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const { data, isLoading, isError, error: queryError, refetch, isFetching } =
+    useUsers(session.username, sort, order, pageSize, page * pageSize);
   const [username, setUsername] = useState("");
   const [role, setRole] = useState<Role>("viewer");
   const [issued, setIssued] = useState<ActivationIssued | null>(null);
@@ -82,6 +98,14 @@ export function UsersPage() {
   const createDialogRef = useDialogFocus<HTMLDivElement>(
     () => setCreateOpen(false),
     createOpen,
+  );
+  // 策略对话框：当前编辑的用户（null = 关闭）+ 两个可编辑字段
+  const [policyUser, setPolicyUser] = useState<UserRow | null>(null);
+  const [policyModels, setPolicyModels] = useState("");
+  const [policyQuota, setPolicyQuota] = useState("");
+  const policyDialogRef = useDialogFocus<HTMLDivElement>(
+    () => setPolicyUser(null),
+    policyUser !== null,
   );
 
   const create = useUserMutation(
@@ -101,15 +125,30 @@ export function UsersPage() {
     (args: { username: string }) => api.resetUserPassword(args.username),
     session.username,
   );
+  // 用户级策略（Playground 直连的模型白名单 + 配额）
+  const setPolicy = useUserMutation(
+    (args: { username: string; allowedModels: string; quota: string }) =>
+      api.setUserPolicy(args.username, args.allowedModels, args.quota),
+    session.username,
+  );
 
   const users = data?.users ?? [];
 
+  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
+  const toggleSort = (columnKey: string) => {
+    toggle(columnKey);
+    setPage(0);
+  };
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+  };
   const report = (caught: unknown, fallback: string) => {
     const message = caught instanceof ApiError ? caught.message : "";
     if (message.includes("last active admin")) {
-      setError("不能移除最后一个活跃管理员，否则将无人能管理此系统。");
+      setError("不能移除最后一个活跃管理员，否则无人能管理系统。");
     } else if (/your own|yourself/.test(message)) {
-      setError("不能对自己执行此操作，请让另一位管理员处理。");
+      setError("不能对自己执行此操作，请让另一位管理员处理");
     } else {
       setError(fallback);
     }
@@ -167,12 +206,38 @@ export function UsersPage() {
     }
   };
 
+  const openPolicy = (user: UserRow) => {
+    setError(null);
+    setPolicyModels(user.allowed_models ?? "");
+    setPolicyQuota(user.quota ?? "");
+    setPolicyUser(user);
+  };
+
+  const submitPolicy = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!policyUser) return;
+    setError(null);
+    setBusy(policyUser.username);
+    try {
+      await setPolicy.mutateAsync({
+        username: policyUser.username,
+        allowedModels: policyModels.trim(),
+        quota: policyQuota.trim(),
+      });
+      setPolicyUser(null);
+    } catch (caught) {
+      report(caught, "保存用户策略失败：配额需为 JSON 对象（如 {\"daily_requests\": 200}）。");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="space-y-6" data-testid="users-page">
       <PageHeader
         eyebrow="管理"
         title="用户管理"
-        description="创建账号、分配角色、停用或重置密码。新建账号会得到一次性激活链接，由本人自设密码——系统里不存在管理员已知的共享密码。"
+        description="创建账号、分配角色、停用或重置密码。新建账号得到一次性激活链接、由本人自设密码——没有管理员已知的共享密码。"
         icon={<KeyRound className="size-5" />}
       />
 
@@ -207,40 +272,48 @@ export function UsersPage() {
       >
         {isLoading ? (
           <PageSkeleton variant="table" rows={6} />
+        ) : isError ? (
+          <QueryErrorState
+            title="用户列表加载失败"
+            description={errorText(queryError, "拿不到用户列表，请稍后重试。")}
+            onRetry={() => void refetch()}
+            data-testid="users-error-state"
+          />
         ) : users.length === 0 ? (
           <EmptyState
             icon={<KeyRound className="size-5" />}
             title="还没有用户"
-            description="点右上角「新建用户」创建账号，系统会生成一次性激活链接由本人自设密码。"
+            description="点右上角「新建用户」创建账号，系统生成一次性激活链接由本人自设密码。"
             data-testid="no-users"
           />
         ) : (
-          <Table data-testid="users-table">
+          <>
+          <Table data-testid="users-table" cards>
             <TableHeader>
               <TableRow>
                 <SortableHead label="用户名" columnKey="username" active={sort === "username"}
-                              direction={order} onToggle={toggle} testId="sort-username" />
+                              direction={order} onToggle={toggleSort} testId="sort-username" />
                 <SortableHead label="角色" columnKey="role" active={sort === "role"}
-                              direction={order} onToggle={toggle} testId="sort-role" />
+                              direction={order} onToggle={toggleSort} testId="sort-role" />
                 <SortableHead label="状态" columnKey="enabled" active={sort === "enabled"}
-                              direction={order} onToggle={toggle} testId="sort-enabled" />
+                              direction={order} onToggle={toggleSort} testId="sort-enabled" />
                 <SortableHead label="创建者" columnKey="created_by" active={sort === "created_by"}
-                              direction={order} onToggle={toggle} testId="sort-created_by" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_by" />
                 <SortableHead label="创建时间" columnKey="created_at" active={sort === "created_at"}
-                              direction={order} onToggle={toggle} testId="sort-created_at" />
+                              direction={order} onToggle={toggleSort} testId="sort-created_at" />
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {users.map((user) => (
                 <TableRow key={user.username} data-testid={`user-row-${user.username}`}>
-                  <TableCell className="font-medium">
+                  <TableCell label="用户名" className="font-medium">
                     {user.username}
                     {user.username === session.username && (
                       <span className="ml-1.5 text-xs text-muted-foreground">（我）</span>
                     )}
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="角色">
                     <Select
                       value={user.role}
                       disabled={busy === user.username}
@@ -255,7 +328,7 @@ export function UsersPage() {
                       ))}
                     </Select>
                   </TableCell>
-                  <TableCell>
+                  <TableCell label="状态">
                     {user.enabled ? (
                       <Badge tone="ok">启用</Badge>
                     ) : (
@@ -272,12 +345,24 @@ export function UsersPage() {
                       </span>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
+                  <TableCell label="创建者" className="text-xs text-muted-foreground">
                     {user.created_by ?? "引导导入"}
                   </TableCell>
-                  <TableCell className="text-xs">{formatTime(user.created_at)}</TableCell>
-                  <TableCell className="text-right">
+                  <TableCell label="创建时间" className="text-xs tabular-nums">
+                    {formatTime(user.created_at)}
+                  </TableCell>
+                  <TableCell label="操作" className="text-right">
                     <span className="inline-flex gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy === user.username}
+                        data-testid={`policy-${user.username}`}
+                        onClick={() => openPolicy(user)}
+                      >
+                        <SlidersHorizontal className="mr-1 size-3.5" />
+                        策略
+                      </Button>
                       <Button
                         size="sm"
                         variant="ghost"
@@ -313,13 +398,100 @@ export function UsersPage() {
               ))}
             </TableBody>
           </Table>
+          <Pagination
+            testId="users"
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            busy={isFetching}
+            onPageChange={setPage}
+            onPageSizeChange={changePageSize}
+          />
+          </>
         )}
       </Panel>
 
       <Notice tone="muted">
         角色：{ROLE_LABELS.admin} 可管理用户与配置；{ROLE_LABELS.operator}{" "}
-        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码都会立即使其所有会话失效。
+        可增删凭证；{ROLE_LABELS.viewer} 只读。禁用、改角色与重置密码会立即令其所有会话失效。
       </Notice>
+
+      {policyUser && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm"
+          onClick={() => setPolicyUser(null)}
+        >
+          <div
+            ref={policyDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="用户策略"
+            data-testid="user-policy-dialog"
+            onClick={(event) => event.stopPropagation()}
+            className="max-h-[90vh] w-full max-w-lg animate-in overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl fade-in-0 zoom-in-95"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <SlidersHorizontal className="size-4 text-muted-foreground" />
+                {policyUser.username} 的策略
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="关闭"
+                data-testid="user-policy-close"
+                onClick={() => setPolicyUser(null)}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+            <form onSubmit={submitPolicy} className="space-y-3">
+              <Notice tone="muted">
+                只约束该用户在 Playground 的会话直连（不约束其 API Key）：没设过策略时
+                任何登录用户都能直调任意模型，绕过 Key 的模型白名单与配额。
+              </Notice>
+              <Field label="模型白名单（逗号分隔，留空不限制）" htmlFor="user-policy-models">
+                <Input
+                  id="user-policy-models"
+                  value={policyModels}
+                  data-testid="user-policy-models"
+                  placeholder="例如 glm-5.3*,deepseek-v4.1-flash"
+                  autoComplete="off"
+                  onChange={(event) => setPolicyModels(event.target.value)}
+                />
+              </Field>
+              <Field label="配额（JSON 对象，留空不限制）" htmlFor="user-policy-quota">
+                <Input
+                  id="user-policy-quota"
+                  value={policyQuota}
+                  data-testid="user-policy-quota"
+                  placeholder={'例如 {"daily_requests": 200, "rpm": 5}'}
+                  autoComplete="off"
+                  onChange={(event) => setPolicyQuota(event.target.value)}
+                />
+              </Field>
+              <p className="text-xs text-muted-foreground">
+                配额项与 Key 一致：daily_requests / daily_tokens / daily_cost_usd /
+                rpm / tpm / max_concurrency。用量按用户名聚合——该用户经由任何入口的
+                流量都计入。
+              </p>
+              {error && (
+                <div data-testid="user-policy-error" role="alert">
+                  <Notice tone="danger">{error}</Notice>
+                </div>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="ghost" onClick={() => setPolicyUser(null)}>
+                  取消
+                </Button>
+                <Button type="submit" variant="primary" disabled={setPolicy.isPending}>
+                  保存
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {createOpen && (
         <div
@@ -351,8 +523,9 @@ export function UsersPage() {
               </Button>
             </div>
             <form onSubmit={submitCreate} className="space-y-3">
-              <Field label="用户名">
+              <Field label="用户名" htmlFor="new-user-name-input">
                 <Input
+                  id="new-user-name-input"
                   value={username}
                   data-testid="new-user-name"
                   placeholder="例如 alice"
@@ -360,8 +533,9 @@ export function UsersPage() {
                   onChange={(event) => setUsername(event.target.value)}
                 />
               </Field>
-              <Field label="角色">
+              <Field label="角色" htmlFor="new-user-role-select">
                 <Select
+                  id="new-user-role-select"
                   value={role}
                   data-testid="new-user-role"
                   onChange={(event) => setRole(event.target.value as Role)}

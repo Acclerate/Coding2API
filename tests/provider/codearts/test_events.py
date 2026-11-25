@@ -193,6 +193,80 @@ def test_events_classify_error_code_branches():
     assert classify("APIG.0301 decrypt token fail") is ErrKind.DEAD
     assert classify("ChatAgent.99999999") is ErrKind.OTHER
 
+def test_events_classify_request_marker_is_not_credential_fault():
+    """`InferHub.001001020.406 not multimodal` 是模型能力拒绝 → CAPABILITY。
+
+    判成 OTHER 会让正常用户带图请求 3 次后把整条渠道拉进 10min 冷却；判成
+    REQUEST 则会**逐个号去撞**（2026-11-01 22:18–22:20 实测：4 个带图请求在
+    codearts 的 3 条凭证上各失败一次，`MAX_ROTATE = 3` 被同一渠道吃满，请求
+    永远轮不到支持图片的 codebuddy）。正确语义是「这个模型收不了图片」——
+    同渠道换号无用，跳过整个上游继续试其它渠道。
+
+    处置与 INVALID 相同（`REJECT_KINDS` 一起进「跳过上游」分支）；统计口径
+    独立成 `model_capability`，归因面板才不会把「模型能力不支持」写成
+    「请求写错了」（2026-11-03 从 INVALID 里独立出来）。
+    """
+    classify = codearts_events.classify_error_code
+    assert classify("InferHub.001001020.406") is ErrKind.CAPABILITY
+    assert classify(
+        "InferHub.001001020.406 The request model is not multimodal"
+    ) is ErrKind.CAPABILITY
+    assert classify("The request model is not multimodal") is ErrKind.CAPABILITY
+
+
+def test_events_param_invalid_is_not_plan():
+    """`InferHub.001001005.400 param is invalid` 是请求侧错误 → INVALID，不是 PLAN。
+
+    `001001005` 是点分错误码前缀，子串里含 `1005`；此前靠
+    `"1005" in text` 判据直接落到「权益耗尽」→ **12h 账号级冷却**。实测
+    2026-11-03 14:41–14:55 三条 codearts 凭证相继命中，整条渠道静默下线 12h
+    （见 docs/oss-feature-migration-scan-2026-11-03.md §0.1）。
+
+    判 INVALID 的处置是「换号无用、跳过整个上游、以 400 收尾」，与「等额度」
+    完全相反；同时真正的业务码 1005（权益耗尽）必须仍然判 PLAN。
+    """
+    classify = codearts_events.classify_error_code
+    assert classify(
+        "InferHub.001001005.400 The request param is invalid, Please check it"
+    ) is ErrKind.INVALID
+    assert classify("001001005") is ErrKind.INVALID
+    assert classify("The request param is invalid") is ErrKind.INVALID
+    # 防回归：真 PLAN 不能被放宽的 marker 抢走（`00001005` 只含 1005 子串）
+    assert classify("1005") is ErrKind.PLAN
+    assert classify("1005 quota exceeded") is ErrKind.PLAN
+    assert classify("insufficient balance") is ErrKind.PLAN
+
+
+def test_events_role_invalid_is_request_side_not_other():
+    """`InferHub.001001044.400 Message role cannot empty` → INVALID，不是 OTHER。
+
+    触发源是 OpenAI 的 `developer` 角色（上游只认 system/user/assistant/tool）。
+    实测 2026-11-17 20:00–20:51 同一报文在 codearts 三条凭证上相继命中：判
+    OTHER 会每次请求干掉 3 个号、累计 3 次把整条渠道冷却 10min，而归因面板
+    还会把它读成「上游渠道错误」。判 INVALID 的处置是「跳过上游 + 400 收尾」。
+    """
+    classify = codearts_events.classify_error_code
+    assert classify(
+        "InferHub.001001044.400 Message role cannot empty") is ErrKind.INVALID
+    assert classify("001001044") is ErrKind.INVALID
+    assert classify("Message role cannot empty") is ErrKind.INVALID
+
+
+def test_events_param_invalid_status_path_is_invalid():
+    """HTTP 400 形态的同一错误也判 INVALID（`classify_status` 与流内同口径）。"""
+    body = (b'{"error_code":"InferHub.001001005.400",'
+            b'"error_msg":"The request param is invalid, Please check it"}')
+    assert codearts_events.classify_status(400, body) is ErrKind.INVALID
+
+
+def test_events_multimodal_rejection_skips_provider_instead_of_rotating():
+    """HTTP 400 与流内两条路径对同一错误给出同一分类（都跳过该上游）。"""
+    body = (b'{"error_code":"InferHub.001001020.406",'
+            b'"error_msg":"The request model is not multimodal"}')
+    assert codearts_events.classify_status(400, body) is ErrKind.CAPABILITY
+    assert codearts_events.classify_error_code(
+        "InferHub.001001020.406 The request model is not multimodal") is ErrKind.CAPABILITY
+
 def test_events_relogin_required_markers():
     """令牌端点终态判定：只有点名的一次性票据失效类错误才算不可自愈。"""
     burned = codearts_events.relogin_required(
@@ -255,3 +329,17 @@ async def test_events_iter_data_lines_skips_non_data_lines_only():
         yield b"event: ping\n"
         yield b": comment\n"
     assert [line async for line in codearts_events.iter_data_lines(gen())] == []
+
+
+def test_parse_line_attaches_upstream_reported_model():
+    """CodeArts 载荷带 model 时挂到事件上（观测用，不改语义）。"""
+    snapshot = codearts_events.TextSnapshot()
+    events = codearts_events.parse_line(json.dumps({
+        "model": "DeepSeek-V4.1",
+        "choices": [{"delta": {"content": "hi"}}],
+    }), snapshot)
+    assert events[0].content == "hi"
+    assert events[0].model == "DeepSeek-V4.1"
+    # 不报模型时保持 None
+    plain = codearts_events.parse_line('{"text": "hi"}', snapshot)
+    assert plain[0].model is None

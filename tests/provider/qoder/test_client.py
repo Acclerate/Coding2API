@@ -47,6 +47,181 @@ def test_build_chat_body_empty_and_alternate_effort_shapes():
     assert nested["parameters"] == {"max_tokens": 10, "reasoning_effort": "low"}
     assert "parameters" not in build_chat_body({"max_tokens": 0, "tools": None}, "m")
 
+def test_build_chat_body_keeps_well_formed_tool_sequence(caplog):
+    """user → assistant(tool_calls) → tool 是合法序列，原样转发且不记 warning。"""
+    messages = [
+        {"role": "user", "content": "查天气"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function",
+             "function": {"name": "weather", "arguments": ""}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "晴"},
+    ]
+    with caplog.at_level("WARNING", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+    assert "孤立 tool" not in caplog.text
+
+def test_build_chat_body_drops_orphan_tool_and_keeps_order(caplog):
+    """前面没有带 tool_calls 的 assistant：孤立 tool 丢弃，其余顺序不变。"""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "孤儿结果"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "再来"},
+    ]
+    with caplog.at_level("WARNING", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[2], messages[3]]
+    assert any("孤立 tool 消息" in r.getMessage() and "1" in r.getMessage()
+               for r in caplog.records)
+
+def test_build_chat_body_drops_tool_with_unmatched_id():
+    """assistant 声明 id=a，tool 回 id=b：id 对不上也算孤立。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "call_b", "content": "错配"},
+        {"role": "tool", "content": "缺 tool_call_id"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "对上了"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[3]]
+
+def test_build_chat_body_keeps_parallel_tool_results():
+    """并行 tool_calls 的多条 tool 结果都跟在同一个 assistant 后，全部保留。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}},
+            {"id": "b", "type": "function", "function": {"name": "g"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "1"},
+        {"role": "tool", "tool_call_id": "b", "content": "2"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+
+def test_build_chat_body_unions_consecutive_assistant_tool_calls():
+    """`/v1/responses` 的并行 function_call 拆成多条 assistant，声明需并集。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "b", "type": "function", "function": {"name": "g"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "1"},
+        {"role": "tool", "tool_call_id": "b", "content": "2"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == messages
+
+def test_build_chat_body_normalizes_null_assistant_content():
+    """带 tool_calls 的 assistant 的 `content: null` 归一为空串。
+
+    上游把 null content 的 assistant 当成空消息跳过，其后的 tool 结果就成了
+    孤儿，并以 400「Messages with role 'tool' must be a response to a preceding
+    message with 'tool_calls'」拒绝——报文指向 tool 配对，真实原因是 null
+    content（2026-10-23 实测：只把 null 换成 "" 即从 400 变 200）。
+    """
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "reasoning_content": "想想",
+         "tool_calls": [{"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "结果"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"][1]["content"] == ""
+    assert body["messages"][1]["reasoning_content"] == "想想"
+    assert body["messages"][2] == messages[2]
+    # 入参不被改写（build_chat_body 深拷贝）
+    assert messages[1]["content"] is None
+
+def test_build_chat_body_normalizes_null_tool_content(caplog):
+    """tool 消息的 null content 同样归一，且计入日志条数。"""
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": None},
+        {"role": "assistant", "content": None},
+    ]
+    with caplog.at_level("DEBUG", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert [m["content"] for m in body["messages"]] == ["", "", ""]
+    assert any("null content" in r.getMessage() and "3" in r.getMessage()
+               for r in caplog.records)
+
+def test_build_chat_body_normalizes_developer_role(caplog):
+    """`role:"developer"` 归一为 `system`：上游不认这个变体（实测 400）。
+
+    Qoder 的 400 原文：`messages[0].role: unknown variant 'developer', expected
+    one of 'system', 'user', 'assistant', 'tool', 'latest_reminder'`。
+    """
+    messages = [
+        {"role": "developer", "content": "你是助手"},
+        {"role": "user", "content": "hi"},
+    ]
+    with caplog.at_level("DEBUG", logger=qoder_client.__name__):
+        body = build_chat_body({"messages": messages}, "m")
+    assert [m["role"] for m in body["messages"]] == ["system", "user"]
+    assert any("developer" in r.getMessage() and "1" in r.getMessage()
+               for r in caplog.records)
+    # 入参不被改写（build_chat_body 深拷贝）
+    assert messages[0]["role"] == "developer"
+
+def test_build_chat_body_leaves_other_roles_content_untouched():
+    """只归一 assistant/tool：user/system 的 null 原样交给上游裁决。"""
+    messages = [
+        {"role": "system", "content": None},
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": "有正文"},
+        {"role": "junk", "content": None},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert [m["content"] for m in body["messages"]] == [None, None, "有正文", None]
+
+def test_normalize_null_content_skips_non_dict_entries():
+    """畸形历史（非 dict 消息）跳过，不改写也不计数。"""
+    messages = ["junk", {"role": "assistant", "content": None}]
+    assert qoder_client._normalize_null_content(messages) == 1
+    assert messages == ["junk", {"role": "assistant", "content": ""}]
+
+def test_build_chat_body_plain_assistant_resets_declared_ids():
+    """中间夹了一条不带 tool_calls 的 assistant：它打断了配对，其后的 tool 孤立。"""
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "f"}}]},
+        {"role": "assistant", "content": "我先说一句"},
+        {"role": "tool", "tool_call_id": "a", "content": "晚到的结果"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0], messages[1]]
+
+def test_build_chat_body_tool_after_empty_tool_calls_is_orphan():
+    """`tool_calls: []` 的 assistant 没有声明任何 id，其后的 tool 视为孤立。"""
+    messages = [
+        {"role": "assistant", "content": "无调用", "tool_calls": []},
+        {"role": "tool", "tool_call_id": "call_a", "content": "孤儿"},
+    ]
+    body = build_chat_body({"messages": messages}, "m")
+    assert body["messages"] == [messages[0]]
+
+def test_drop_orphan_tool_messages_tolerates_junk_entries():
+    """畸形历史（非 dict 消息、畸形 tool_calls 元素）不参与匹配，但原样保留。"""
+    messages = [
+        "junk",
+        {"role": "assistant", "content": "", "tool_calls": [
+            "junk", {"id": 1}, {"id": ""}, {"id": "call_a"}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "ok"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "孤儿"},
+        {"role": "tool", "content": "缺 tool_call_id"},
+        {"role": "tool", "tool_call_id": ["unhashable"], "content": "畸形 id"},
+    ]
+    kept, dropped = qoder_client._drop_orphan_tool_messages(messages)
+    assert kept == [messages[0], messages[1], messages[2]]
+    assert dropped == 3
+
+def test_build_chat_body_passes_through_non_list_messages():
+    """畸形 payload（messages 非数组）不做结构假设，原样交给上游裁决。"""
+    body = build_chat_body({"messages": {"role": "tool"}}, "m")
+    assert body["messages"] == {"role": "tool"}
+
 def test_openapi_headers_use_stable_device_ids():
     headers = build_openapi_headers(cred())
     assert headers["Authorization"] == "Bearer dt-token-1"
@@ -104,12 +279,132 @@ async def test_stream_chat_inner_error_frame_is_classified():
     assert events[1].error_code == 418
     assert events[1].error_kind is ErrKind.SOFT
 
+async def test_stream_chat_queue_envelope_yields_queue_event():
+    """排队信封（403 + `isQueued`）必须归 QUEUE。
+
+    按状态码分类会把 403 当事务级失败硬禁用凭证，而排队恰恰说明号是好的；
+    上游点名的等待秒数要原样带给 executor（原号重开）。
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=envelope(
+            {"isQueued": True, "retryAfterSeconds": 6}, status=403))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert len(events) == 1
+    assert events[0].kind is EventKind.ERROR
+    assert events[0].error_kind is ErrKind.QUEUE
+    assert events[0].error_code == 403
+    assert events[0].retry_after_seconds == 6
+
+
+async def test_inner_error_message_keeps_nested_details():
+    """错误正文放宽到 2000：200 字符会截在转义的 details 中间，根因丢失。"""
+    detail = json.dumps({"error": {"message": "Messages with role 'tool' must be a "
+                                             "response to a preceding message with "
+                                             "'tool_calls'", "padding": "y" * 1400}})
+    body = json.dumps({"code": "400", "details": detail})
+    assert 200 < len(body) < 2000
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=envelope(body, status=400))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert events[0].error_message == body
+    assert "preceding message with 'tool_calls'" in events[0].error_message
+
 async def test_stream_chat_top_level_done_and_blank_frames():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="data: \n\ndata: [DONE]\n\n")
 
     events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
     assert events == []
+
+async def test_stream_chat_skips_keepalive_null_body():
+    """上游保活帧 `body:"null"`（外层 200）必须跳过，不能打断正常输出。
+
+    实测（2026-10-26 16:29-16:53）：上游在流中发
+    `{"headers":…,"body":"null","statusCodeValue":200,"statusCode":"OK"}`。
+    早先把它当「内层不是对象」→ 抛 `UpstreamProtocolViolation` → 整条流
+    判失败（连续 13 次「流式响应失败: Qoder inner chunk is not an object」），
+    而模型其实已在正常输出。这正是「静默出错」：客户端只看到回复被截断。
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=(
+            envelope(inner({"content": "part"}))
+            + envelope("null")
+            + envelope("null")
+            + envelope(inner({"content": "more"}))
+            + envelope("[DONE]")))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert [e.kind for e in events] == [EventKind.CONTENT, EventKind.CONTENT]
+    assert "".join(e.content or "" for e in events) == "partmore"
+
+async def test_stream_chat_keeps_content_after_empty_object_body():
+    """空对象 / 空数组内层同样是保活：跳过但不终止流。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=(
+            envelope("{}")
+            + envelope("[]")
+            + envelope(inner({"content": "ok"}))
+            + envelope("[DONE]")))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert [e.kind for e in events] == [EventKind.CONTENT]
+    assert events[0].content == "ok"
+
+def test_is_keepalive_body_shape_table():
+    """保活判据用结构而非字符串前缀：非空对象 / 坏 JSON 都不是保活。"""
+    assert qoder_events.is_keepalive_body("null") is True
+    assert qoder_events.is_keepalive_body("{}") is True
+    assert qoder_events.is_keepalive_body("[]") is True
+    assert qoder_events.is_keepalive_body("  null  ") is True
+    assert qoder_events.is_keepalive_body('{"choices":[]}') is False
+    assert qoder_events.is_keepalive_body('{"code":"403"}') is False
+    assert qoder_events.is_keepalive_body("nope") is False
+    assert qoder_events.is_keepalive_body('"text"') is False
+    assert qoder_events.is_keepalive_body("0") is False
+
+async def test_stream_chat_queue_envelope_from_real_upstream_frame():
+    """上游真实排队帧（2026-10-26 抓取）：排队标记在**两层序列化字符串**里。
+
+    早先 `parse_queue_hint` 只认 dict/list，漏判 → 403 被 `classify_error_code`
+    判成 DEAD → **好凭证被硬禁用**。这里守两件事：归 QUEUE、且拿到上游点名的
+    等待秒数（最内层的 `retryAfterSeconds:30`，不是兜底 5s）。
+    """
+    inner_payload = json.dumps({
+        "isQueued": True, "modelKey": "kmodel_latest", "queueCount": 454,
+        "queueType": "p3", "retryAfterSeconds": 30, "serviceAvailable": True,
+        "subCode": "RESOURCE_LIMIT", "waitTime": 205})
+    body = json.dumps({
+        "code": "403",
+        "message": json.dumps({
+            "code": "10605",
+            "message": inner_payload,
+            "subCode": "RESOURCE_LIMIT"})})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=envelope(body, status=403))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert len(events) == 1
+    assert events[0].kind is EventKind.ERROR
+    assert events[0].error_kind is ErrKind.QUEUE
+    assert events[0].error_code == 403
+    # 上游点名 30s：不是兜底值 5s（兜底只用于「上游没给秒数」）
+    assert events[0].retry_after_seconds == 30.0
+
+def test_classify_status_recognizes_serialized_queue_envelope():
+    """HTTP 层（`classify_status`）同样要认出串了两层的排队报文。"""
+    inner_payload = json.dumps({"isQueued": True, "retryAfterSeconds": 30,
+                                "subCode": "RESOURCE_LIMIT"})
+    body = json.dumps({"code": "403",
+                       "message": json.dumps({"code": "10605",
+                                              "message": inner_payload})})
+    # 排队优先于状态码：403 不是硬失败
+    assert qoder_events.classify_status(403, body.encode()) is ErrKind.QUEUE
+    # 排队报文绝不能落到 DEAD（会把可自愈的凭证打进冷宫）
+    assert qoder_events.classify_error_code(403, body) is not ErrKind.DEAD
 
 async def test_stream_chat_http_error_is_classified():
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -346,6 +641,70 @@ def test_node_failure_400_is_model_scoped_transient():
     assert qoder_events.classify_error_code(400, "bad request") is ErrKind.INVALID
     assert qoder_events.classify_status(400, body.encode()) is ErrKind.MODEL
 
+def test_classify_status_queue_hint_wins_over_403():
+    """排队标记优先于状态码：403 不再当硬失败（会把健康凭证打进冷宫）。"""
+    body = b'{"isQueued": true, "retryAfterSeconds": 9}'
+    assert qoder_events.classify_status(403, body) is ErrKind.QUEUE
+    # 没有排队标记的 403 仍是 SOFT：实测多为瞬时/风控抖动，可自愈
+    assert qoder_events.classify_status(403, b"") is ErrKind.SOFT
+
+
+def test_401_stays_dead_while_403_is_relaxed():
+    """401 一律 DEAD，只有 403 放宽——401 是凭据失效的确定信号，不能 fail-open。
+
+    放宽 401 会让已被吊销的 token 在 60s 轮换里反复撞上游（凭证永不退出
+    候选池），而 401 从未出现「瞬时抖动」形态。排队信封仍优先于 401。
+    """
+    assert qoder_events.classify_error_code(401, b"") is ErrKind.DEAD
+    assert qoder_events.classify_status(401, b"") is ErrKind.DEAD
+    assert qoder_events.classify_error_code(401, "some other failure") is ErrKind.DEAD
+    queued = b'{"isQueued": true, "retryAfterSeconds": 3}'
+    assert qoder_events.classify_error_code(401, queued) is ErrKind.QUEUE
+
+
+def test_inner_403_without_session_marker_is_soft_not_dead():
+    """流内 403 未带会话失效标记 → SOFT，和 HTTP 层同一判据。
+
+    早先 `_decode_frame` 直接调 `classify_error_code`，403 不看标记就判 DEAD，
+    把一个还能用的号永久禁用（2026-10-27 实测）。
+    """
+    body = '{"code":"403","message":"upstream risk control"}'
+    assert qoder_events.classify_error_code(403, body) is ErrKind.SOFT
+    assert qoder_events.classify_status(403, body.encode()) is ErrKind.SOFT
+    # 带会话失效标记才是真的 DEAD
+    dead = '{"code":"403","message":"Offline user session not found"}'
+    assert qoder_events.classify_error_code(403, dead) is ErrKind.DEAD
+    assert qoder_events.classify_status(403, dead.encode()) is ErrKind.DEAD
+
+
+def test_daily_quota_exceeded_is_credit_not_dead():
+    """「每日计费次数用尽」→ CREDIT（冷却到次日），不是 session 死亡。
+
+    实测 2026-10-27：403 `{"code":"110","message":"Billing daily count exceeded"}`
+    被流内分类判成 DEAD，qoder 号 nick5080166916 被硬禁用后需人工 revive。
+    """
+    body = '{"code":"110","message":"Billing daily count exceeded"}'
+    assert qoder_events.is_daily_quota_exceeded(body) is True
+    assert qoder_events.is_daily_quota_exceeded("ordinary error") is False
+    assert qoder_events.classify_error_code(403, body) is ErrKind.CREDIT
+    assert qoder_events.classify_error_code(403, body.encode()) is ErrKind.CREDIT
+    assert qoder_events.classify_status(403, body.encode()) is ErrKind.CREDIT
+
+
+async def test_stream_chat_daily_quota_envelope_yields_credit():
+    """流内 403 每日计费耗尽 → CREDIT 事件（不硬禁用凭证）。"""
+    body = json.dumps({"code": "110", "message": "Billing daily count exceeded"})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=envelope(body, status=403))
+
+    events = [e async for e in handler_for(handler).stream_chat(cred(), {}, "m")]
+    assert len(events) == 1
+    assert events[0].kind is EventKind.ERROR
+    assert events[0].error_kind is ErrKind.CREDIT
+    assert events[0].error_code == 403
+
+
 def test_to_status_variants():
     assert qoder_events._to_status(None) == 200
     assert qoder_events._to_status(True) == 502
@@ -514,3 +873,104 @@ async def test_stream_chat_succeeds_on_middle_gateway():
     assert [e.kind for e in events] == [EventKind.CONTENT, EventKind.FINISH]
     assert seen == ["gw1.test", "gw2.test"]                   # 中途主机成功即止
     await client.aclose()
+
+
+def test_parse_inner_chunk_attaches_upstream_reported_model():
+    events = qoder_events.parse_inner_chunk(json.dumps({
+        "model": "qwen3-coder",
+        "choices": [{"delta": {"content": "hi"}}],
+    }))
+    assert events[0].content == "hi"
+    assert events[0].model == "qwen3-coder"
+    # 不报模型时保持 None
+    plain = qoder_events.parse_inner_chunk(
+        json.dumps({"choices": [{"delta": {"content": "hi"}}]}))
+    assert plain[0].model is None
+
+
+# ------------------------------------------------- 网页额度接口（逐包到期）
+
+WEB_QUOTA = {
+    "quota_key": "big_model_credits",
+    "plan_quota": {
+        "quota_summary": {"limit_value": 0, "used_value": 0, "remaining_value": 0},
+        "quota_detail": [{"limit_value": 0, "used_value": 0, "remaining_value": 0,
+                          "expires_at": 0, "is_active": True, "source": "PLAN"}],
+    },
+    "resource_package_quota": {
+        "quota_summary": {"limit_value": 200, "used_value": 0, "remaining_value": 200},
+        "quota_detail": [
+            {"limit_value": 100, "used_value": 0, "remaining_value": 100,
+             "expires_at": 1_795_000_000_000, "is_active": True,
+             "source": "RESOURCE_PACKAGE_SOURCE_BONUS"},
+            {"limit_value": 100, "used_value": 0, "remaining_value": 100,
+             "expires_at": 1_796_000_000_000, "is_active": True,
+             "source": "RESOURCE_PACKAGE_SOURCE_BONUS"},
+        ],
+    },
+}
+
+DEVICE_QUOTA = {
+    "userQuota": {"total": 0, "used": 0, "remaining": 0},
+    "addOnQuota": {"total": 999, "used": 0, "remaining": 999},
+    "expiresAt": 253_402_214_400_000,
+}
+
+
+def _web_cookie_cred():
+    return cred(web_cookie="qoder_session_cookie=abc; other=1")
+
+
+def _web_handler(web_response, device_response=DEVICE_QUOTA):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == qoder_events.EP_CREDITS_WEB:
+            assert request.url.host == "qoder.cn"      # cn 区域网页站
+            assert request.headers["Cookie"] == "qoder_session_cookie=abc; other=1"
+            # 网页接口按浏览器会话鉴权：不能带 CLI 的 Go UA，也不带 Bearer
+            assert request.headers["User-Agent"] == qoder_events.WEB_ACCOUNT_UA
+            assert "Authorization" not in request.headers
+            return web_response(request)
+        assert request.url.path == qoder_events.EP_QUOTA
+        return httpx.Response(200, json=device_response)
+    return handler
+
+
+async def test_probe_quota_prefers_web_endpoint_when_cookie_present():
+    client = handler_for(_web_handler(lambda _r: httpx.Response(200, json=WEB_QUOTA)))
+    quota = await client.probe_quota(_web_cookie_cred())
+    # 逐包到期：cycle_end 是最早的包到期日，而不是 9999 哨兵
+    assert quota.remaining == 200 and quota.total == 200
+    assert quota.cycle_end == 1_795_000_000
+    assert quota.expiry_ladder == [(1_795_000_000, 100.0),
+                                   (1_796_000_000, 100.0)]
+
+
+async def test_probe_quota_falls_back_when_web_cookie_expired():
+    """Cookie 过期（401）只丢明细，不冷却也不硬禁用：回退汇总接口继续出号。"""
+    client = handler_for(_web_handler(
+        lambda _r: httpx.Response(401, content=b'{"errorCode":"Unauthorized"}')))
+    quota = await client.probe_quota(_web_cookie_cred())
+    assert quota.remaining == 999 and quota.total == 999
+    assert quota.cycle_end is None          # 9999 哨兵归一成未知
+
+
+async def test_probe_quota_falls_back_when_web_endpoint_unusable():
+    """形状变了 / 非 JSON / 网络错误都只回退，不把探测判失败。"""
+    for bad in (
+        lambda _r: httpx.Response(404, content=b"gone"),
+        lambda _r: httpx.Response(200, text="nope"),
+        lambda _r: httpx.Response(200, json={"quota_key": "big_model_credits"}),
+        lambda request: (_ for _ in ()).throw(httpx.ConnectError("boom",
+                                                                 request=request)),
+    ):
+        quota = await handler_for(_web_handler(bad)).probe_quota(_web_cookie_cred())
+        assert quota.remaining == 999
+
+
+async def test_probe_quota_skips_web_endpoint_without_cookie():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == qoder_events.EP_QUOTA   # 不出网到网页接口
+        return httpx.Response(200, json=DEVICE_QUOTA)
+
+    quota = await handler_for(handler).probe_quota(cred())
+    assert quota.remaining == 999

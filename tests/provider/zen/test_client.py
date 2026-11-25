@@ -10,7 +10,14 @@ import pytest
 
 from src.provider.base import ErrKind, EventKind
 from src.provider.zen import events as zen_events
-from src.provider.zen.client import EP_CHAT, EP_MODELS, UpstreamHTTPError, ZenClient
+from src.provider.zen.client import (
+    EP_CHAT,
+    EP_MODELS,
+    PAID_API_ROOT,
+    PAID_MODELS_ROOT,
+    UpstreamHTTPError,
+    ZenClient,
+)
 from tests.helpers.http import chunk_payload as chunk
 from tests.helpers.http import sse_text_done as _sse
 from tests.provider.zen._support import SESSION_RE
@@ -217,19 +224,67 @@ def test_pretty_model_name_plain_numeric_segment():
     assert _pretty_segment("2.5") == "2.5"
     assert _pretty_segment("3") == "3"
 
-async def test_fetch_models_custom_suffix_and_probe_network_error():
-    """后缀可覆盖；探活连接异常按不可用处理。"""
+async def test_fetch_models_probe_network_error_keeps_candidates():
+    """后缀可覆盖；探活连接异常（暂不可判定）→ 保留候选，不清空渠道。"""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == EP_MODELS:
             return httpx.Response(200, json={"data": [
                 {"id": "m1-free"}, {"id": "m2-lite"}]})
         raise httpx.ConnectError("boom")
 
-    with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free model"):
-        await _client(handler, free_suffix="-lite").fetch_models()
+    models = await _client(handler, free_suffix="-lite").fetch_models()
+    assert [m.id for m in models] == ["m2-lite"]
 
-async def test_fetch_models_probe_timeout_is_unavailable(monkeypatch):
-    """探活首字超时按不可用：整体套 `asyncio.timeout`，不拖垮模型列表。"""
+async def test_fetch_models_probe_429_keeps_candidates():
+    """429（匿名免费额度耗尽）属暂不可判定 → 保留候选。
+
+    实测 2026-11-03 匿名探测全线 429：旧口径要求 2xx 会让 Zen 整渠道显示
+    「无模型」，而模型本身并未下架。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+
+    models = await _client(handler).fetch_models()
+    assert [m.id for m in models] == ["a-free"]
+
+async def test_fetch_models_probe_429_does_not_log_warning(caplog):
+    """429 是已知稳态，只记 DEBUG：否则每轮 8 条 WARNING 淹没真问题。
+
+    实测 2026-11-08 一天 224 条 `zen 探活 … 暂不可判定：HTTP 429`，占全部
+    WARNING 的 73%；而 zen 渠道自 10-23 后无流量，纯噪声。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+
+    with caplog.at_level("DEBUG", logger="src.provider.zen.client"):
+        await _client(handler).fetch_models()
+
+    levels = {record.levelname for record in caplog.records
+              if "zen 探活" in record.getMessage()}
+    assert "WARNING" not in levels
+    assert "DEBUG" in levels
+
+async def test_fetch_models_probe_5xx_logs_warning(caplog):
+    """非 429 的暂不可判定（5xx）仍打 WARNING：那才是要人看的信号。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(503, json={"error": {"type": "ServerError"}})
+
+    with caplog.at_level("DEBUG", logger="src.provider.zen.client"):
+        models = await _client(handler).fetch_models()
+
+    assert [m.id for m in models] == ["a-free"]
+    warnings = [record for record in caplog.records
+                if record.levelname == "WARNING" and "zen 探活" in record.getMessage()]
+    assert warnings and "HTTP 503" in warnings[0].getMessage()
+
+async def test_fetch_models_probe_timeout_keeps_candidates(monkeypatch):
+    """探活首字超时按「暂不可判定」保留：不拖垮启动，也不清空渠道。"""
     from src.provider.zen import client as zen_client
 
     monkeypatch.setattr(zen_client, "PROBE_TIMEOUT", 0.01)
@@ -239,11 +294,11 @@ async def test_fetch_models_probe_timeout_is_unavailable(monkeypatch):
             await asyncio.sleep(1)   # 首字过慢，超过 PROBE_TIMEOUT
         return httpx.Response(200, json={"data": [{"id": "slow-free"}]})
 
-    with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free model"):
-        await _client(handler).fetch_models()
+    models = await _client(handler).fetch_models()
+    assert [m.id for m in models] == ["slow-free"]
 
 async def test_fetch_models_reuses_probe_result_within_ttl():
-    """判活结果在 models_cache_ttl 内复用：服务层每 300s 重拉列表不会重探上游。"""
+    """判活结论在 probe_cache_ttl 内复用：服务层每 300s 重拉清单也不会重探上游。"""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -264,8 +319,8 @@ async def test_fetch_models_reuses_probe_result_within_ttl():
     assert [m.id for m in second] == ["a-free"]
     assert len(calls) == upstream_calls      # 命中判活缓存，没再打上游
 
-async def test_fetch_models_cache_expiry_reprobes():
-    """超过 models_cache_ttl（此处设为 0）后重新拉清单并重探。"""
+async def test_fetch_models_cache_expiry_reprobes_list_only():
+    """清单 TTL 到期只重拉**清单**，判活结论仍在 probe_cache_ttl 内复用（P2-18）。"""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -276,9 +331,66 @@ async def test_fetch_models_cache_expiry_reprobes():
 
     client = _client(handler, models_cache_ttl=0)
     await client.fetch_models()
+    assert calls == [EP_MODELS, EP_CHAT]
+    await client.fetch_models()
+    # 清单重拉了一次；判活命中长 TTL 缓存，不再真发对话探活
+    assert calls == [EP_MODELS, EP_CHAT, EP_MODELS]
+
+
+async def test_fetch_models_probe_cache_expiry_reprobes():
+    """超过 probe_cache_ttl（此处设为 0）后重探：判活不留永久结论。"""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"}]})
+        return httpx.Response(200, text="")
+
+    client = _client(handler, models_cache_ttl=0, probe_cache_ttl=0)
+    await client.fetch_models()
     assert len(calls) == 2
     await client.fetch_models()
     assert len(calls) == 4
+
+
+async def test_fetch_models_probes_only_newly_listed_models():
+    """TTL 内新增的免费模型只探它自己，不把老候选全部重探一遍。"""
+    listed = [{"id": "a-free"}]
+    probed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": listed})
+        import json as _json
+        probed.append(_json.loads(request.content)["model"])
+        return httpx.Response(200, text="")
+
+    client = _client(handler, models_cache_ttl=0)
+    assert [m.id for m in await client.fetch_models()] == ["a-free"]
+    assert probed == ["a-free"]
+
+    listed.append({"id": "b-free"})
+    models = await client.fetch_models()
+    assert sorted(m.id for m in models) == ["a-free", "b-free"]
+    assert probed == ["a-free", "b-free"]        # 只探新增的那个
+
+
+async def test_fetch_models_drops_model_marked_dead_within_probe_ttl():
+    """判活结论（含判死）在 TTL 内复用：清单里仍在的模型不会因为缓存而复活。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == EP_MODELS:
+            return httpx.Response(200, json={"data": [{"id": "a-free"},
+                                                      {"id": "b-free"}]})
+        # b-free 确定不可用（403 = 区域限制）
+        status = 403 if b"b-free" in request.content else 200
+        return httpx.Response(status, text="")
+
+    client = _client(handler, models_cache_ttl=0)
+    first = await client.fetch_models()
+    assert [m.id for m in first] == ["a-free"]
+    second = await client.fetch_models()
+    assert [m.id for m in second] == ["a-free"]   # 判死结论没被清单重拉洗掉
 
 async def test_fetch_models_errors():
     def http_error(_request: httpx.Request) -> httpx.Response:
@@ -313,21 +425,154 @@ async def test_fetch_models_errors():
     with pytest.raises(zen_events.UpstreamProtocolViolation, match="no free candidates"):
         await _client(no_candidates).fetch_models()
 
-    # 候选都有，但探活全军覆没（上游整体故障）→ 交给上层缓存兜底
+    # 候选都有，但全部被**确定**判死（付费 401 / 下线 400 / 区域 403）→ 抛出让上层缓存兜底
     def all_dead(request: httpx.Request) -> httpx.Response:
         if request.url.path == EP_MODELS:
             return httpx.Response(200, json={"data": [{"id": "a-free"},
                                                       {"id": "b-free"}]})
-        return httpx.Response(500, text="down")
+        return httpx.Response(403, text="not available in your country")
 
     with pytest.raises(zen_events.UpstreamProtocolViolation, match="liveness probe"):
         await _client(all_dead).fetch_models()
 
+async def test_stream_chat_paid_uses_paid_root_and_bearer():
+    """带 Key：换付费根 + `Bearer <key>`，且不注入门禁工具/`<env>` 块。"""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text=_sse(chunk({"content": "x"}, finish="stop")))
+
+    client = _client(handler, profile="v2")
+    events = [e async for e in client.stream_chat(
+        {"messages": [{"role": "user", "content": "hi"}]}, "m", "sk-zen")]
+    assert any(e.kind is EventKind.CONTENT for e in events)
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.url.path == f"{PAID_API_ROOT}/chat/completions"
+    assert request.headers["Authorization"] == "Bearer sk-zen"
+    body = json.loads(request.content)
+    assert body["stream"] is True
+    assert "tools" not in body                       # 门禁工具是免费层专用伪装
+    assert body["messages"] == [{"role": "user", "content": "hi"}]   # 无 <env> 注入
+    await client.aclose()
+
+
+async def test_stream_chat_paid_403_is_not_retried():
+    """付费档 403 是鉴权/区域判定：不套门禁抖动重试，立刻抛。"""
+    calls: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(403, text="region blocked")
+
+    client = _client(handler)
+    with pytest.raises(UpstreamHTTPError) as caught:
+        _ = [e async for e in client.stream_chat({"messages": []}, "m", "sk-zen")]
+    assert caught.value.status == 403
+    assert len(calls) == 1
+    await client.aclose()
+
+
+async def test_fetch_models_paid_lists_all_models_and_caches():
+    """带 Key：清单含付费模型、不按 -free 收窄、不探活，TTL 内复用缓存。"""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer sk-zen"
+        return httpx.Response(200, json={"data": [
+            {"id": "gpt-6-luna", "name": "GPT 6 Luna"},
+            {"id": "deepseek-v4.1-flash", "name": "  "},
+            {"id": ""},
+            "junk",
+        ]})
+
+    client = _client(handler)
+    models = await client.fetch_models("sk-zen")
+    assert [m.id for m in models] == ["gpt-6-luna", "deepseek-v4.1-flash"]
+    assert models[0].name == "GPT 6 Luna"
+    assert models[1].name == "DeepSeek V4.1 Flash"      # 无 name → 从 id 派生
+    assert calls == [f"{PAID_MODELS_ROOT}/models"]      # 没有逐个探活
+
+    again = await client.fetch_models("sk-zen")
+    assert [m.id for m in again] == ["gpt-6-luna", "deepseek-v4.1-flash"]
+    assert len(calls) == 1                              # 命中付费档缓存
+    await client.aclose()
+
+
+async def test_fetch_models_paid_skips_free_and_zero_price_models():
+    """带 Key 时摘掉 `-free` 与零价模型：它们仍回 429，会把付费凭证一起冷却。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [
+            {"id": "deepseek-v4.1-flash", "cost": {"text": {"input": {"price": 0.15}}}},
+            {"id": "mimo-v2.6-flash-free", "cost": {"text": {"input": {"price": 0}}}},
+            {"id": "big-pickle", "cost": {"text": {"input": {"price": 0}}}},
+            {"id": "flat-price", "cost": {"text": {"input": 0.2}}},   # 旧结构：input 直接是数字
+            {"id": "no-cost"},                                        # 缺字段 → 保留
+        ]})
+
+    client = _client(handler)
+    models = await client.fetch_models("sk-zen")
+    assert [m.id for m in models] == ["deepseek-v4.1-flash", "flat-price", "no-cost"]
+    await client.aclose()
+
+
+async def test_fetch_models_paid_empty_when_no_access():
+    """账号没开通付费模型：返回空表（而不是抛错留旧清单）。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "big-pickle",
+                                                   "cost": {"text": {"input": {"price": 0}}}}]})
+
+    client = _client(handler)
+    assert await client.fetch_models("sk-zen") == []
+    await client.aclose()
+
+
+async def test_fetch_models_paid_cache_expiry_and_errors():
+    calls: list[int] = []
+
+    def ok(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json={"data": [{"id": "m",
+                                                   "cost": {"text": {"input": {"price": 1}}}}]})
+
+    client = _client(ok, models_cache_ttl=0)
+    await client.fetch_models("k")
+    await client.fetch_models("k")
+    assert len(calls) == 2                              # TTL=0 → 每次都重拉
+    await client.aclose()
+
+    def http_error(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, content=b"bad gateway")
+
+    with pytest.raises(UpstreamHTTPError):
+        await _client(http_error).fetch_models("k")
+
+    def non_json(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json")
+
+    with pytest.raises(zen_events.UpstreamProtocolViolation):
+        await _client(non_json).fetch_models("k")
+
+    def no_list(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list"})
+
+    with pytest.raises(zen_events.UpstreamProtocolViolation):
+        await _client(no_list).fetch_models("k")
+
+    def no_models(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": ["junk", {"id": ""}]})
+
+    assert await _client(no_models).fetch_models("k") == []   # 没有可解析条目 → 空表
+
+
 async def test_client_lazy_clients_and_aclose():
     """未注入 client 时惰性创建；aclose 释放两侧连接池。"""
     client = ZenClient()
-    assert client._stream() is client._stream()      # noqa: SLF001 - 惰性复用同一实例
-    assert client._short() is client._short()        # noqa: SLF001
+    assert client._stream is client._stream      # noqa: SLF001 - 惰性复用同一实例
+    assert client._short is client._short        # noqa: SLF001
     await client.aclose()
 
     # 都没创建过：aclose 不报错（两个分支都为 None）
@@ -342,3 +587,16 @@ async def test_client_host_trailing_slash_stripped():
     assert client.host == "https://opencode.ai"
     _ = [e async for e in client.stream_chat({"messages": []}, "m")]
     await client.aclose()
+
+def test_input_price_shapes():
+    """单价解析的各种畸形形状：判不了的一律 None（保留模型，不误删）。"""
+    from src.provider.zen.client import input_price
+
+    assert input_price({}) is None
+    assert input_price({"cost": "junk"}) is None
+    assert input_price({"cost": {"text": "junk"}}) is None
+    assert input_price({"cost": {"text": {"input": {"price": 1.5}}}}) == 1.5
+    assert input_price({"cost": {"text": {"input": 2}}}) == 2.0
+    assert input_price({"cost": {"text": {"input": {"price": True}}}}) is None
+    assert input_price({"cost": {"text": {"input": {"price": "1"}}}}) is None
+    assert input_price({"cost": {"text": {"input": [1]}}}) is None

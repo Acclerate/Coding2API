@@ -25,6 +25,7 @@ from src.db.migrate import apply_schema
 from src.db.repo import CredentialRepository, GrowthRepository
 from src.main import build_app
 from tests.helpers.constants import SECRET, USERS
+from tests.helpers.startup import wait_for_startup
 
 # 常量迁到 tests/helpers/constants.py；此处 re-export 以兼容既有
 # `from tests.conftest import SECRET` 调用点（新代码请直接 import helpers）。
@@ -84,6 +85,10 @@ def admin_client(tmp_path):
 
     5 个文件曾各写一份逐字节等价的实现，收敛到这里；需要替身 provider 或
     自定义 Settings 的文件仍保留自己的局部 `admin_client`（会覆盖本夹具）。
+
+    **等启动任务跑完再交出**：`start()` 的首轮 retention 会删过期行，与测试体
+    并发时会让「1970 年时间戳」的测试数据随机消失（本地绿、CI 红）。见
+    `tests/helpers/startup.py`。
     """
     settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
@@ -91,6 +96,7 @@ def admin_client(tmp_path):
     client = TestClient(app)
     client.cookies.set("coding2api_session", create_session_token("root", SECRET))
     with client:
+        wait_for_startup(app, client)
         yield app, client
 
 
@@ -106,6 +112,7 @@ def client(tmp_path):
     app = build_app(settings)
     with TestClient(app) as test_client:
         test_client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+        wait_for_startup(app, test_client)
         yield test_client
 
 
@@ -179,7 +186,10 @@ def zen_models_offline(monkeypatch, request):
     if "zen" not in real:
         from src.provider.zen.client import ZenClient
 
-        async def fake_zen_models(self) -> list[_Model]:
+        # 签名必须与 `ZenClient.fetch_models(api_key="")` 一致：少一个参数时
+        # `ZenProvider.list_models` 调用会 TypeError，被服务层记成「拉取失败」
+        # 而静默跳过 zen——测试里曾经一直是这样（实测 2026-11-25）。
+        async def fake_zen_models(self, _api_key: str = "") -> list[_Model]:
             return [_Model(id="offline-free", name="opencode")]
 
         monkeypatch.setattr(ZenClient, "fetch_models", fake_zen_models)
@@ -210,6 +220,25 @@ def price_catalog_offline(monkeypatch, request):
         return {}
 
     monkeypatch.setattr(main, "fetch_openrouter_models", fake_fetch)
+
+
+@pytest.fixture(autouse=True)
+def upstream_status_offline(monkeypatch):
+    """一律不真连状态源：把任务用的 `fetch_all` 换成「什么都抓不到」。
+
+    `build_app()` 启动时会后台预热一次上游状态页（`_warm_upstream_status`），
+    每个用真实装配的用例都会打 8 个外部端点。这里掐的是**任务侧**的抓取入口
+    （`src.tasks.upstream_status.fetch_all`），返回空快照——不打外网、也不凭空
+    编造状态。真实抓取 / 解析由 `tests/test_upstream_status.py`（直接调
+    `src.upstream_status.fetch_all`，走 MockTransport）与
+    `tests/tasks/test_upstream_status.py`（自己的 autouse 夹具换回真实现）覆盖。
+    """
+    from src.tasks import upstream_status as task_module
+
+    async def fake_fetch_all(specs, *, timeout, client=None):
+        return ()
+
+    monkeypatch.setattr(task_module, "fetch_all", fake_fetch_all)
 
 
 def _real_upstream(request) -> set[str]:

@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../SettingsPage";
 import { jsonResponse, renderPage, settle, userEvent } from "@/test-utils";
-import { body, mockAll, switchTab } from "@/test-utils/settings";
+import { body, mockAll, openGateway, openTask } from "@/test-utils/settings";
 
 describe("SettingsPage 保存与热更", () => {
   beforeEach(() => {
@@ -35,7 +35,7 @@ describe("SettingsPage 保存与热更", () => {
     await userEvent.type(input, "15");
 
     // 换到另一个任务的 tab 再改，草稿跨 tab 保留，保存按钮统一汇总
-    await switchTab("settings-tabs-activity");
+    await openTask("account", "activity");
     await userEvent.selectOptions(screen.getByTestId("input-activity_report_enabled"), "true");
 
     expect(screen.getByTestId("dirty-count")).toHaveTextContent("2 项待保存");
@@ -58,7 +58,7 @@ describe("SettingsPage 保存与热更", () => {
 
     renderPage(<SettingsPage />);
     await settle();
-    await switchTab("settings-tabs-gateway-pacer");
+    await openGateway("gateway-pacer");
     await userEvent.click(screen.getByTestId("reset-pacer_max_seconds"));
 
     expect(await screen.findByTestId("settings-notice")).toHaveTextContent("恢复 .env 默认值");
@@ -71,8 +71,36 @@ describe("SettingsPage 保存与热更", () => {
 
     expect(screen.getByTestId("reset-quota_probe_minutes")).toBeDisabled();
 
-    await switchTab("settings-tabs-gateway-pacer");
+    await openGateway("gateway-pacer");
     expect(screen.getByTestId("reset-pacer_max_seconds")).toBeEnabled();
+  });
+
+  it("恢复某一项默认值不清掉其它 tab 里未保存的草稿", async () => {
+    mockAll();
+    renderPage(<SettingsPage />);
+    await settle();
+
+    // 第一个 tab 里改一项
+    const input = screen.getByTestId("input-quota_probe_minutes");
+    await userEvent.clear(input);
+    await userEvent.type(input, "15");
+    expect(screen.getByTestId("dirty-count")).toHaveTextContent("1 项待保存");
+
+    // 另一个 tab 里改一项，再恢复其中一项的默认值
+    await openGateway("gateway-pacer");
+    const pacer = screen.getByTestId("input-pacer_max_seconds");
+    await userEvent.clear(pacer);
+    await userEvent.type(pacer, "30");
+    expect(screen.getByTestId("dirty-count")).toHaveTextContent("2 项待保存");
+
+    await userEvent.click(screen.getByTestId("reset-pacer_max_seconds"));
+    expect(await screen.findByTestId("settings-notice")).toHaveTextContent("恢复 .env 默认值");
+
+    // 只丢掉被 reset 的那一项：另一项的草稿与 dirty 计数都还在
+    await waitFor(() =>
+      expect(screen.getByTestId("dirty-count")).toHaveTextContent("1 项待保存"));
+    await openTask("account", "quota_probe");
+    expect(screen.getByTestId("input-quota_probe_minutes")).toHaveValue("15");
   });
 
   it("非法输入（非数字）阻止保存并给出提示", async () => {

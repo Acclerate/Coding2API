@@ -53,8 +53,12 @@ def test_models_merge_by_readable_name_across_channels(tmp_path):
     各渠道同一模型内部代号互不相同（`kimi-k3-1` / `kimi-k3` /
     `kmodel_latest`），只有可读名能对齐；请求转发到某渠道时再经别名表
     换回该渠道自己的原 id（Qoder 仍发 `kmodel_latest`）。
+
+    `kimi-k3` 已被默认黑名单滤掉（→ `kimi-k3.1-pro`），本用例只验合并口径，
+    故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -147,6 +151,49 @@ def test_models_synonym_merges_qoder_deepseek_flash(tmp_path):
     aliases = app.state.services.model_aliases
     assert aliases["qoder"]["deepseek-v4.1-flash"] == "dfmodel"
     assert aliases["qoder"]["dfmodel"] == "dfmodel"
+
+def test_models_synonym_merges_cb_xiaomi_mimo_pro(tmp_path):
+    """CB 的 `Xiaomi MiMo-V2.6-Pro` 与 TRAE 的 `MiMo-V2.6-Pro` 并成一条。
+
+    CB 上游名带厂商前缀（空格式），清洗规则削不到，归一键会多出 `xiaomi-`，
+    同一模型拆成两条、对外多出 `xiaomi-mimo-v2.6-pro`。`MODEL_SYNONYMS` 把
+    两者收敛到同一个规范键与展示名，请求 `mimo-v2.6-pro` 也能路由到 CB。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+
+    class Stub:
+        def __init__(self, pid: str, models):
+            self.id = pid
+            self._models = models
+
+        async def list_models(self, _data):
+            return list(self._models)
+
+        def import_credential(self, raw):  # pragma: no cover - 未使用
+            return raw
+
+    from src.provider.base import Model
+
+    app = build_app(settings, providers={
+        "codebuddy": Stub("codebuddy", [Model(id="mimo-v2.6-pro",
+                                              name="Xiaomi MiMo-V2.6-Pro",
+                                              credit_rate=0.13)]),
+        "trae": Stub("trae", [Model(id="mimo-v2.6-pro", name="MiMo-V2.6-Pro",
+                                    credit_rate=0.15)]),
+    })
+    for provider_id in ("codebuddy", "trae"):
+        app.state.credentials.add(provider=provider_id, credential_data={"t": "x"})
+    key = app.state.api_keys.create("root")["api_key"]
+    with TestClient(app) as client:
+        data = client.get("/v1/models", headers={
+            "Authorization": f"Bearer {key}"}).json()["data"]
+
+    assert [m["id"] for m in data] == ["mimo-v2.6-pro"]      # 两渠道并成一条
+    assert data[0]["providers"] == ["codebuddy", "trae"]
+    assert data[0]["name"] == "MiMo V2.6 Pro"
+    aliases = app.state.services.model_aliases
+    assert aliases["codebuddy"]["mimo-v2.6-pro"] == "mimo-v2.6-pro"
+    assert aliases["trae"]["mimo-v2.6-pro"] == "mimo-v2.6-pro"
 
 def test_models_name_merge_includes_zen_and_guards_colliding_names(tmp_path):
     """六条渠道统一按归一键合并；同渠道内归一键重复的退回原 id。
@@ -305,9 +352,10 @@ def test_models_single_channel_outward_id_is_normalized(tmp_path):
     """单渠道条目的对外 id 也是归一键（Qoder `kmodel_latest` → `kimi-k3`）。
 
     原代号只留在别名表与 `by_provider.raw_id`，转发时换回；用户按原代号直连
-    仍能命中。
+    仍能命中。`kimi-k3` 已被默认黑名单滤掉，本用例只验归一口径，故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -332,6 +380,8 @@ def test_models_single_channel_outward_id_is_normalized(tmp_path):
             "Authorization": f"Bearer {key}"}).json()["data"]
     assert [m["id"] for m in data] == ["kimi-k3"]      # 对外 id 用归一键
     assert data[0]["name"] == "Kimi K3"                # 展示名统一清洗
+    # 单渠道也下发 by_provider（原代号对外可见，PROPOSAL §3.4）
+    assert data[0]["by_provider"] == {"qoder": {"raw_id": "kmodel_latest"}}
     aliases = app.state.services.model_aliases
     assert aliases["qoder"]["kimi-k3"] == "kmodel_latest"    # 对外 id → 原代号
     assert aliases["qoder"]["kmodel_latest"] == "kmodel_latest"  # 原代号也能直连
@@ -395,8 +445,12 @@ def test_models_sentinel_names_not_merged_across_channels(tmp_path):
     kilo 的 `kilo-auto/free`（上游名 `Auto Free`）与 Qoder 的 `auto` 都归一成
     `auto`，但一个是 kilo 的自动路由、一个是 Qoder 的默认模型，语义只在本渠道
     内成立。若合并，调度会把请求错误地路由到另一个上游。
+
+    这两个哨兵名在默认黑名单里（列表不展示占位模型），本用例只验证合并规则，
+    故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -431,9 +485,11 @@ def test_models_outward_id_disambiguated_on_collision(tmp_path):
     （这里 TRAE 的 `glm-5` 归一键 `glm-5`，而 kilo 有个原 id 就叫 `glm-5` 的
     模型）。撞车时两条 entry 会共用一个 id，前端选择器的 key 与别名表都会
     互相覆盖，故后来的那条退回自己的原 id。保留谁按渠道优先级：TRAE 优先于
-    未排名的 kilo。
+    未排名的 kilo。`glm-5` 是默认黑名单里的老模型，本用例只验证撞车消歧，
+    故清空黑名单。
     """
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
 
     class Stub:
         def __init__(self, pid: str, models):
@@ -509,3 +565,95 @@ def test_models_outward_id_collision_falls_back_to_numeric_suffix():
     ]
     _disambiguate(entries)
     assert [e["id"] for e in entries] == ["x", "y", "y-p1", "x-2", "x-3"]
+
+
+def test_entry_response_omits_by_provider_when_empty():
+    """`provider_meta` 为空 → 不下发 `by_provider` 键（而不是给空对象）。
+
+    空对象会被前端读成「这个模型没有任何渠道」，与「渠道信息缺失」混淆。
+    """
+    from src.api.model_merge import _entry_response
+
+    entry = {
+        "id": "m", "providers": {"codebuddy"},
+        "meta": {"name": "M", "credit_rate": None, "max_input_tokens": None,
+                 "max_output_tokens": None, "supports_images": None,
+                 "supports_tool_call": None, "supports_reasoning": None,
+                 "default_effort": None},
+        "provider_meta": {}, "raw_ids": {}, "labels": {"M"},
+    }
+    result = _entry_response(entry)
+    assert "by_provider" not in result
+    assert result["id"] == "m"
+
+
+def test_models_exposes_openrouter_token_aliases(tmp_path):
+    """`/v1/models` 每个条目同值双发 OpenRouter 风格别名。
+
+    Claude Code 的 auto-compact 窗口按 `context_length` 定、各家 SDK 用
+    `max_completion_tokens` 作输出上限；只发本仓字段时它们只能按模型 id 猜，
+    别名模型（`kilo-auto/free`、`kmodel_latest`）最容易被猜错。别名与内部字段
+    **同值**，任一缺失都算丢字段。
+    """
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        MODEL_BLOCKLIST="")
+
+    class Stub:
+        def __init__(self, pid: str, models):
+            self.id = pid
+            self._models = models
+
+        async def list_models(self, _data):
+            return list(self._models)
+
+        def import_credential(self, raw):  # pragma: no cover - 未使用
+            return raw
+
+    from src.provider.base import Model
+
+    app = build_app(settings, providers={
+        "kilo": Stub("kilo", [Model(id="kilo-auto/free", name="Auto Free",
+                                    max_input_tokens=131072,
+                                    max_output_tokens=8192)]),
+        "qoder": Stub("qoder", [Model(id="kmodel_latest", name="Kimi K3",
+                                      max_input_tokens=180000,
+                                      max_output_tokens=16384)]),
+    })
+    for provider_id in ("kilo", "qoder"):
+        app.state.credentials.add(provider=provider_id, credential_data={"t": "x"})
+    key = app.state.api_keys.create("root")["api_key"]
+    with TestClient(app) as client:
+        data = {m["id"]: m for m in client.get(
+            "/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]}
+
+    assert set(data) == {"kilo-auto", "kimi-k3"}
+    for item in data.values():
+        # 三个键同时存在：内部输入字段 + 两个 OpenRouter 风格别名
+        assert {"max_input_tokens", "context_length",
+                "max_completion_tokens"} <= set(item)
+        assert item["context_length"] == item["max_input_tokens"]
+        assert item["max_completion_tokens"] == item["max_output_tokens"]
+    assert (data["kilo-auto"]["context_length"],
+            data["kilo-auto"]["max_completion_tokens"]) == (131072, 8192)
+    assert (data["kimi-k3"]["context_length"],
+            data["kimi-k3"]["max_completion_tokens"]) == (180000, 16384)
+
+
+def test_entry_response_omits_token_aliases_when_absent():
+    """源字段缺省（None / 空串）时不发别名——不填 0 或空值。
+
+    解析器会把 `context_length: 0` 读成「窗口为零」，比缺字段更糟。
+    """
+    from src.api.model_merge import _entry_response
+
+    entry = {
+        "id": "m", "providers": {"codebuddy"},
+        "meta": {"name": "M", "credit_rate": None, "max_input_tokens": None,
+                 "max_output_tokens": "", "supports_images": None,
+                 "supports_tool_call": None, "supports_reasoning": None,
+                 "default_effort": None},
+        "provider_meta": {}, "raw_ids": {}, "labels": {"M"},
+    }
+    result = _entry_response(entry)
+    assert "context_length" not in result
+    assert "max_completion_tokens" not in result

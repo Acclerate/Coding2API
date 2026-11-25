@@ -9,6 +9,7 @@ import {
   formatChartValue,
   formatCredit,
   formatMoney,
+  formatSpeed,
   METRIC_AXIS_UNIT,
   QUOTA_UNIT,
   taskReportLabel,
@@ -17,7 +18,11 @@ import {
   credentialState,
   formatDuration,
   formatNumber,
+  formatRate,
   formatTime,
+  formatTimeParts,
+  upstreamLevelLabel,
+  upstreamLevelTone,
   hasQuotaProbe,
   healthView,
   modelCooldownLabel,
@@ -106,8 +111,41 @@ describe("formatChartValue", () => {
     expect(formatChartValue(12.34, "cost")).toBe("¥12.34 (元)");
   });
 
+  it("比率指标：0..1 转百分比（一位小数）；空值给 —", () => {
+    expect(formatChartValue(0.9567, "success_rate")).toBe("95.7%");
+    expect(formatChartValue(0.4, "cache_rate")).toBe("40.0%");
+  });
+
+  it("单请求成本：金额 + 「/ 次」", () => {
+    expect(formatChartValue(0.0312, "cost_per_request")).toBe("¥0.0312 / 次");
+  });
+
   it("未知指标回退请求次数", () => {
     expect(formatChartValue(12, "bogus")).toBe("12 (次)");
+  });
+});
+
+describe("formatRate", () => {
+  it("比率乘 100 保留一位小数", () => {
+    expect(formatRate(0.9)).toBe("90.0%");
+    expect(formatRate(1)).toBe("100.0%");
+    expect(formatRate(0)).toBe("0.0%");
+  });
+
+  it("无样本给 —（不渲染成 0%）", () => {
+    expect(formatRate(null)).toBe("—");
+    expect(formatRate(undefined)).toBe("—");
+  });
+});
+
+describe("formatSpeed", () => {
+  it("输出速度带 tok/s；估算值前置 ≈；无样本显示 —", () => {
+    expect(formatSpeed(94.1)).toBe("94.1 tok/s");
+    expect(formatSpeed(94.1, false)).toBe("94.1 tok/s");
+    expect(formatSpeed(76.4, true)).toBe("≈76.4 tok/s");
+    expect(formatSpeed(0)).toBe("0.0 tok/s");
+    expect(formatSpeed(null)).toBe("—");
+    expect(formatSpeed(undefined)).toBe("—");
   });
 });
 
@@ -128,6 +166,17 @@ describe("formatAxisValue", () => {
     expect(formatAxisValue(1500.5, "cost")).toBe("1,500.5");
   });
 
+  it("单请求成本：按量级给 3–4 位小数（两位会让相邻刻度都显示 0.03）", () => {
+    expect(formatAxisValue(0.028, "cost_per_request")).toBe("0.028");
+    expect(formatAxisValue(0.0312, "cost_per_request")).toBe("0.0312");
+    expect(formatAxisValue(0.5, "cost_per_request")).toBe("0.5");
+  });
+
+  it("比率：整数百分比（轴宽有限）", () => {
+    expect(formatAxisValue(0.9, "success_rate")).toBe("90%");
+    expect(formatAxisValue(1, "cache_rate")).toBe("100%");
+  });
+
   it("轴顶单位映射：耗时/首字不重复标单位", () => {
     expect(METRIC_AXIS_UNIT.requests).toBe("次");
     expect(METRIC_AXIS_UNIT.tokens).toBe("tokens");
@@ -138,18 +187,18 @@ describe("formatAxisValue", () => {
 });
 
 describe("expiringQuotaLabel", () => {
-  it("窗口内有过期积分时给出量级与剩余时间", () => {
-    expect(expiringQuotaLabel(100, 129600)).toBe("100 积分将在 1.5 天内过期");
-    expect(expiringQuotaLabel(25.5, 3600)).toBe("25.5 积分将在 1.0 小时内过期");
+  it("窗口内有过期积分时给出量级与窗口（措辞点明是窗口，非倒计时）", () => {
+    expect(expiringQuotaLabel(100, 129600)).toBe("100 积分将在 1.5 天窗口内到期");
+    expect(expiringQuotaLabel(25.5, 3600)).toBe("25.5 积分将在 1.0 小时窗口内到期");
   });
 
   it("次窗口措辞区分开，避免两行同句式分不出优先级", () => {
-    expect(expiringQuotaLabel(140, 604800, "secondary")).toBe("7.0 天内共 140 积分将过期");
+    expect(expiringQuotaLabel(140, 604800, "secondary")).toBe("7.0 天窗口内共 140 积分将到期");
   });
 
   it("CodeArts 折成积分后与其余渠道同单位（默认措辞即为积分）", () => {
-    expect(expiringQuotaLabel(999.5, 3600)).toBe("999.5 积分将在 1.0 小时内过期");
-    expect(expiringQuotaLabel(140, 604800, "secondary")).toBe("7.0 天内共 140 积分将过期");
+    expect(expiringQuotaLabel(999.5, 3600)).toBe("999.5 积分将在 1.0 小时窗口内到期");
+    expect(expiringQuotaLabel(140, 604800, "secondary")).toBe("7.0 天窗口内共 140 积分将到期");
   });
 
   it("无到期信息、窗口关闭或零积分时不展示", () => {
@@ -319,9 +368,10 @@ describe("display helpers", () => {
     expect(hasQuotaProbe("zen")).toBe(false);
     expect(hasQuotaProbe("kilo")).toBe(false);
     expect(hasQuotaProbe("trae")).toBe(true);
-    // Qoder / CodeArts 都有额度接口，属「需探测」
+    // Qoder / CodeArts / officeAce 都有额度接口，属「需探测」
     expect(hasQuotaProbe("qoder")).toBe(true);
     expect(hasQuotaProbe("codearts")).toBe(true);
+    expect(hasQuotaProbe("officeace")).toBe(true);
   });
 
   it("周期语义按渠道类型判定，而不是看 cycle_end 是否存在", () => {
@@ -347,16 +397,36 @@ describe("display helpers", () => {
       provider: "kilo", quota_cycle_end: null }) as never);
     expect(kilo).toBe("免费层（无额度接口）");
 
-    // Qoder 与 CodeBuddy 同属周期重置（未探测到重置时间时退化口径）
+    // Qoder：签到/赠送积分逐笔到期；cycle_end 是最早到期日，不是重置日
     const qoder = quotaSemantics(makeCredential({
+      provider: "qoder", quota_cycle_end: 1_800_000_000 }) as never);
+    expect(qoder).toContain("逐笔到期");
+    expect(qoder).toContain("最早");
+    expect(qoder).not.toContain("重置");
+    const qoderNoEnd = quotaSemantics(makeCredential({
       provider: "qoder", quota_cycle_end: null }) as never);
-    expect(qoder).toContain("本周期剩余");
-    expect(qoder).not.toContain("单调递减");
+    expect(qoderNoEnd).toBe("积分余额（签到/赠送逐笔到期）");
 
-    // CodeArts 是每日 token 池折算的额度池（0 点清零），不看 cycle_end，也不套用周期口径
+    // CodeArts 是积分余额（内置模型按积分计费），按积分包到期日作废；
+    // 有 cycle_end 时点出最早到期日，不说「本周期」也不套「每日额度池」
     const codearts = quotaSemantics(makeCredential({
       provider: "codearts", quota_cycle_end: 1_800_000_000 }) as never);
-    expect(codearts).toBe("每日额度池（token 折算，当日 0 点清零）");
+    expect(codearts).toContain("积分余额（内置模型计费）");
+    expect(codearts).toContain("最早");
+    expect(codearts).not.toContain("每日额度池");
+
+    // 未探测到到期时间：退化为不带日期的积分口径
+    const codeartsNoEnd = quotaSemantics(makeCredential({
+      provider: "codearts", quota_cycle_end: null }) as never);
+    expect(codeartsNoEnd).toBe("积分余额（内置模型计费，按积分包到期日作废）");
+
+    // officeAce 的积分是主账，逐笔到期（新用户福利 + 每日签到各自计时），
+    // 不能说成「本周期剩余」（那是统一重置的语义）
+    const officeace = quotaSemantics(makeCredential({
+      provider: "officeace", quota_cycle_end: 1_800_000_000 }) as never);
+    expect(officeace).toContain("积分余额");
+    expect(officeace).toContain("逐笔到期");
+    expect(officeace).not.toContain("本周期");
 
     // 国际版 Qoder 无旧签到接口，但额度语义不变（不在此断言）
   });
@@ -382,7 +452,7 @@ describe("display helpers", () => {
 
   it("探测失败原因有中文文案，且未知值有兜底", () => {
     expect(probeFailureLabel("credential_rejected")).toContain("重新登录");
-    expect(probeFailureLabel("upstream_unavailable")).toContain("与本账号凭证无关");
+    expect(probeFailureLabel("upstream_unavailable")).toContain("与凭证无关");
     expect(probeFailureLabel("network_unreachable")).toContain("连不上渠道服务器");
     expect(probeFailureLabel(undefined)).toBe("未知错误");
     expect(probeFailureLabel("something_new" as never)).toBe("未知错误");
@@ -392,7 +462,16 @@ describe("display helpers", () => {
     expect(usageErrorLabel("rate_limit")).toBe("额度耗尽");
     expect(usageErrorLabel("client_disconnect")).toBe("客户端中断");
     expect(usageErrorLabel("model_unavailable")).toBe("该模型暂时不可用");
+    expect(usageErrorLabel("network_error")).toBe("本机网络故障");
     expect(usageErrorLabel("no_healthy_credential")).toBe("无可用凭证");
+    // 「上游没这个模型」与「请求无效」是两回事（2026-10-26 独立成类）
+    expect(usageErrorLabel("model_not_found")).toBe("上游无此模型");
+    expect(usageErrorLabel("invalid_request")).toBe("请求无效");
+    // A1 流式超时：两个新枚举都要有中文文案（不能落到兜底「失败（xxx）」）
+    expect(usageErrorLabel("upstream_first_event_timeout")).toBe("上游首字超时");
+    expect(usageErrorLabel("upstream_idle_timeout")).toBe("上游流中断");
+    // 截断流：上游正常关闭但没走到终态（2026-10-28 新增，不冷却凭证）
+    expect(usageErrorLabel("truncated_stream")).toBe("上游截断");
     expect(usageErrorLabel(null)).toBe("失败");
     expect(usageErrorLabel(undefined)).toBe("失败");
     // 后端新增枚举时前端不能显示空白：兜底文案带原值便于对照排查
@@ -404,6 +483,17 @@ describe("display helpers", () => {
     expect(formatTime(1_700_000_000)).not.toBe("—");
     expect(formatNumber(null)).toBe("—");
     expect(formatNumber(1234)).toBe("1,234");
+  });
+
+  it("时间拆成日期 / 时刻两段（明细表两行显示），空值只给一个破折号", () => {
+    // 1700000000 = 2023-11-15 06:13:20 UTC，本地时区换算后两段都要补齐 0
+    const [date, clock] = formatTimeParts(1_700_000_000);
+    expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(clock).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    // 与 formatTime 同一时刻（同一天，同一时区口径）
+    expect(formatTime(1_700_000_000)).toContain(String(Number(date.slice(0, 4))));
+    expect(formatTimeParts(null)).toEqual(["—", ""]);
+    expect(formatTimeParts(0)).toEqual(["—", ""]);
   });
 
   it("模型级冷却只展示生效中的条目，按剩余时长升序", () => {
@@ -428,5 +518,26 @@ describe("display helpers", () => {
       { model: "m", cooling_until: 1, hits: 1, reason: "model" })).toContain("其它模型不受影响");
     expect(modelCooldownLabel(
       { model: "m", cooling_until: 1, hits: 1, reason: "blocked" })).toContain("无此模型");
+  });
+
+  it("上游档位：六档各有中文名，未知取值不原样透传", () => {
+    expect(upstreamLevelLabel("operational")).toBe("正常");
+    expect(upstreamLevelLabel("degraded")).toBe("性能下降");
+    expect(upstreamLevelLabel("partial")).toBe("部分中断");
+    expect(upstreamLevelLabel("major")).toBe("重大故障");
+    expect(upstreamLevelLabel("maintenance")).toBe("维护中");
+    expect(upstreamLevelLabel("unknown")).toBe("未知");
+    // 后端新增档位时前端不显示空白
+    expect(upstreamLevelLabel("brand_new_level")).toBe("未知");
+  });
+
+  it("上游档位色调：partial / major 同为 danger，unknown 用 muted", () => {
+    expect(upstreamLevelTone("operational")).toBe("ok");
+    expect(upstreamLevelTone("degraded")).toBe("warn");
+    expect(upstreamLevelTone("maintenance")).toBe("warn");
+    expect(upstreamLevelTone("partial")).toBe("danger");
+    expect(upstreamLevelTone("major")).toBe("danger");
+    // 抓取失败不是「上游挂了」，不该抢真实故障的红色
+    expect(upstreamLevelTone("unknown")).toBe("muted");
   });
 });

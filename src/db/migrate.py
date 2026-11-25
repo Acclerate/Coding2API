@@ -4,6 +4,7 @@ schema.sql 只含 CREATE TABLE IF NOT EXISTS，已存在的表不会被改动：
 - 新增列 → `_MIGRATION_COLUMNS`（ALTER TABLE ADD COLUMN，列已存在时忽略）
 - 删除表 → `_MIGRATION_DROPS`（DROP TABLE IF EXISTS；schema.sql 里删定义
   不会作用于老库，遗留表必须在这里显式删，否则 schema.sql 与实际库不一致）
+- 删除列 → `_MIGRATION_COLUMN_DROPS`（ALTER TABLE DROP COLUMN，列不存在时忽略）
 
 schema 版本记在 SQLite 的 `PRAGMA user_version` 里，便于运维判断
 "这个库是哪一代"；旧库（user_version=0）在升级时只补列/删表不丢数据。
@@ -42,7 +43,72 @@ SCHEMA_NAME = "schema.sql"
 # EXISTS 对老库同样生效），无需迁移动作；缺行 = 不受限，老库行为不变。
 # 21：alert_events 新增 resolved_at（告警迟滞状态机确认恢复后写入；老库补列
 # 后历史行为 NULL，不影响既有记录展示与静默去重）。
-SCHEMA_VERSION = 21
+# 22：credentials 新增 tags（逗号分隔的运维标签，仅用于列表展示与筛选，
+# 不参与调度/鉴权）。默认 ''，老库补列后全部凭证「无标签」，行为不变。
+# 23：credentials 新增 quota_credits_remaining / quota_credits_total（CodeArts
+# 第二本账：积分＝内置模型计费单位，与每日 token 池并行）。老库补列后为 NULL
+# ＝「无积分账」，展示层隐藏该行，health / 选号行为不变。第 29 版已删除
+# （福利链路下线，积分账成为唯一额度来源）。
+# 24：credit_events 新增 ledger（区分两本账：pool＝每日 token 池 / credits＝
+# 积分账）。老库补列后默认 'pool'——历史流水全部由主账（每日池）的 diff 产生，
+# 归入 pool 即为事实，不需要回填；积分账流水从补列后的下一轮探测开始记。
+# 25：credentials 新增 quota_credits_expiry_ladder（积分账到期阶梯，仅 CodeArts，
+# 供管理台按账本展示到期积分：福利组＝每日池 / 内置组＝积分账）。老库补列后为
+# NULL ＝「无积分到期信息」，展示层按「无到期积分」处理，health / 选号不受影响
+# （选号读的是两本账合并的 quota_expiry_ladder，不读这一列）。第 29 版已删除。
+# 26：usage_events 新增 api_key_id（发起请求的 API Key id，供按 Key 计量与
+# 自助用量）。老库补列后历史行为 NULL ＝「未归属到具体 Key」，读路径按未归属
+# 处理，与补列前行为一致；索引 idx_usage_key 在补列之后建（见 _MIGRATION_INDEXES）。
+# 27：api_keys 新增 quota（Key 级配额 JSON 文本：当日请求/当日 token/当日成本/
+# RPM/TPM/并发，''=不限制）。老库补列后为 '' ＝「所有 Key 不受配额约束」，
+# 出口行为与补列前完全一致。
+# 28：新增 model_probes 表（主动探活结论 + 人工接管标记）。新增表只需进
+# schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作；
+# 老库升级后表为空 ＝「从未探活」，管理台显示「—」，行为与补表前一致。
+# 29：移除福利链路（每日千万 token 免费池已下线）：credentials 删三列积分账
+# （`quota_credits_remaining` / `quota_credits_total` / `quota_credits_expiry_ladder`）。
+# 积分账成为 CodeArts 唯一的额度来源，直接落在通用列（`quota_remaining` 等）上，
+# 故这三列不再有读者；见 `_MIGRATION_COLUMN_DROPS`。
+# 30：users 新增 allowed_models / quota（用户级策略：约束管理台 Playground 的
+# 会话直连，补上「viewer 用 Cookie 直调任意模型」绕过 Key 白名单与配额的口子）。
+# 两列默认 '' = 不限制，老库补列后 Playground 行为与补列前完全一致。
+# 31：新增 checkin_events 表（每日签到的逐次审计日志：时间/结果/领取积分/上游
+# 业务码/文案/触发方式）。新增表只需进 schema.sql（CREATE TABLE IF NOT EXISTS
+# 对老库同样生效），无需迁移动作；老库升级后表为空 =「升级前无签到日志」，
+# 不影响签到本身（去重仍是 CheckinTask 当日作用域集合）。与已删除的 `checkins`
+# 去重表无关（`_MIGRATION_DROPS` 里的那张）。
+# 32：credentials 新增 cooling_kind（冷却来源 ErrKind）。老库补 NULL = 来源未知，
+# `revive` 按补列前行为清除冷却；新写入的冷却带上来源，`revive` 保留
+# 「上游点名恢复时刻」的那些（soft/credit/plan/restricted），避免人工恢复后
+# 立刻再撞一次上游 429（实测 2026-11-03 12:22–12:23 三次 revive + 三次 429）。
+# 33：credentials 新增 web_cookie_state（网页 Cookie 状态：NULL/ok/expired）。
+# 只在管理台提示「网页会话已失效，重贴 Cookie」，不参与调度；老库补 NULL =
+# 未知（下次探测写入）。额度本身仍以 statistics 汇总口径为准。
+# 34：credentials 新增 routing_weight（调度权重）。NULL/0 = 默认，正数越大越先
+# 被选中，用于管理员的显式偏好（灰度、保留备用号）。老库补 NULL 后选号顺序与
+# 补列前完全一致（所有比较键相等时仍按原链 cid 排序）。
+# 35：credentials 新增 login_secret（账号密码是否已保存：NULL=未配置，1=已保存）。
+# 只记「有没有」——账号密码本体在 data_enc 里（导出剔除），列表页据此显示
+# 「已保存」而不必为每一行解密。老库补 NULL =「未配置」，与补列前一致
+# （补列前按需登录只能靠导入时带 phone/password，无 UI 入口可显示）。
+# 36：新增 log_events（日志环形表，持久化最近 N 行）。老库由 schema.sql 的
+# CREATE TABLE IF NOT EXISTS 建表，无补列需求；`seq` 用 AUTOINCREMENT 保证
+# 跨重启单调，前端仍按它排序/去重。
+# 37：新增 credential_events 表（凭证可用性时间线：冷却开始/结束、硬禁用、
+# 人工恢复、启停的逐次审计）。新增表只需进 schema.sql（CREATE TABLE IF NOT
+# EXISTS 对老库同样生效），无需迁移动作；老库升级后表为空 =「升级前没有
+# 时间线」，管理台按「还没有记录」展示，调度/选号行为完全不变。
+# 38：新增 access_freezes 表（内容拒绝的发起者归因与冻结）。新增表只需进
+# schema.sql（CREATE TABLE IF NOT EXISTS 对老库同样生效），无需迁移动作；
+# 老库升级后表为空 =「升级前没有拒绝记录」，调度/选号行为完全不变。
+# 39：credentials 新增 updated_at / allowed_models（编辑并发 + 模型白名单）。
+# - `updated_at`：管理面编辑版本号（补 0 =「从未编辑」）。编辑端点用
+#   `expected_updated_at` 做乐观并发，不一致回 409 + 当前快照；老库补 0 后
+#   首次编辑照常成功（不传版本 = 兼容口子）。
+# - `allowed_models`：账号级模型白名单（fnmatch glob，''=不限制，与 api_keys
+#   同语法）。请求模型不匹配时该凭证不参与**选号**（不硬禁用、不写冷却），
+#   后台任务（签到/刷新/探活）看不到这层过滤，故老库补 '' 后行为完全不变。
+SCHEMA_VERSION = 39
 
 # (表, 列定义)：历史库升级时逐条补列
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -63,6 +129,11 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 额度包明细（展示用，含包名）：与选号指标 quota_expiry_ladder 分开，
     # 避免为管理台展示改动调度排序行为
     ("credentials", "quota_packages TEXT"),
+    ("credentials", "web_cookie_state TEXT"),  # 网页明细源状态：NULL/ok/expired
+    # 调度权重：NULL/0 = 默认；正数越大越优先（管理员显式偏好，见 Scheduler.select）
+    ("credentials", "routing_weight INTEGER"),
+    # 账号密码状态：NULL=未配置，1=已保存（仅小浣熊按需登录用，见 tasks/checkin）
+    ("credentials", "login_secret INTEGER"),
     # access token 签发/到期时间：上游显式 expires_at 缺失时回落
     # JWT 的 iat/exp；NULL=老库未回填（列表读到按需派生），0=确实未知
     ("credentials", "token_expires_at INTEGER"),
@@ -89,11 +160,64 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     # 告警恢复时刻（迟滞状态机确认恢复后写入）：老库补列后历史行为 NULL
     # （全部视为「仍在告警中」/未恢复，不影响既有记录展示）。
     ("alert_events", "resolved_at INTEGER"),
+    # 运维标签（仅列表展示与筛选，不参与调度）：老库补 '' 后全部凭证无标签，
+    # 筛选界面默认「全部标签」下行为与补列前一致。
+    ("credentials", "tags TEXT NOT NULL DEFAULT ''"),
+    # 变动流水按账本分流：老库补 'pool'——历史行全部由主账（每日池）diff 产生，
+    # 归入 pool 即为事实；CodeArts 今后写 'credits'（见 repo.quota_ledger）。
+    ("credit_events", "ledger TEXT NOT NULL DEFAULT 'pool'"),
+    # 发起请求的 API Key（按 Key 计量 / 自助用量）：老库补列后历史行为 NULL
+    # ＝「未归属到具体 Key」，读路径按未归属处理，与补列前一致。
+    ("usage_events", "api_key_id TEXT"),
+    # Key 级配额（JSON 文本）：老库补 '' ＝「不限制」，出口行为不变。
+    ("api_keys", "quota TEXT NOT NULL DEFAULT ''"),
+    # 用户级策略（仅约束 Playground 会话直连）：老库补 '' ＝「不限制」，
+    # Playground 行为与补列前一致（原先不校验任何按人策略）。
+    ("users", "allowed_models TEXT NOT NULL DEFAULT ''"),
+    ("users", "quota TEXT NOT NULL DEFAULT ''"),
+    # 冷却来源（ErrKind 值）：老库补列后为 NULL = 未知来源，人工 revive 照旧
+    # 清除冷却（与补列前行为一致），不把历史冷却误判成上游点名的那种。
+    ("credentials", "cooling_kind TEXT"),
+    # 编辑版本号（乐观并发）：老库补 0 =「从未编辑」，首次编辑不传版本照常成功。
+    ("credentials", "updated_at INTEGER NOT NULL DEFAULT 0"),
+    # 账号级模型白名单（''=不限制）：老库补 '' 后所有凭证参与全部模型的选号，
+    # 与补列前完全一致。
+    ("credentials", "allowed_models TEXT NOT NULL DEFAULT ''"),
 )
 
 # 已废弃的表：schema.sql 里已删定义，但老库里可能还留着，必须显式清理。
 # 签到去重改为当日内存态、模型列表改为进程内 TTL 缓存后这两张表零引用。
 _MIGRATION_DROPS: tuple[str, ...] = ("checkins", "model_cache")
+
+# (表, 列)：已废弃的列，schema.sql 里已删定义，但老库里可能还留着。
+# `ALTER TABLE ADD COLUMN` 只加不删，故必须显式 DROP；列不存在时忽略
+# （新库本就没有这些列）。删列要求 SQLite ≥ 3.35（2021，本机 3.54）。
+_MIGRATION_COLUMN_DROPS: tuple[tuple[str, str], ...] = (
+    # 福利链路下线：积分账成为 CodeArts 唯一的额度来源，直接落在通用列上。
+    ("credentials", "quota_credits_remaining"),
+    ("credentials", "quota_credits_total"),
+    ("credentials", "quota_credits_expiry_ladder"),
+)
+
+# (索引名, 表, 列)：**建在补列之后**的索引。
+# 为什么不能只放 schema.sql：`CREATE INDEX` 在 `executescript` 阶段执行，而老库
+# 此时还没补上新列，会直接 `no such column` 报错（见 idx_alert_unresolved 的
+# resolved_at——它本身是第 21 版迁移补的列）。放这里 = 先补列再建索引。
+_MIGRATION_INDEXES: tuple[tuple[str, str, str], ...] = (
+    # 侧栏角标只数「仍在告警中」（resolved_at IS NULL）：避免每次轮询全表扫。
+    ("idx_alert_unresolved", "alert_events", "resolved_at"),
+    # 按 Key 计量 / 自助用量只查「某把 Key + 时间窗」，必须走索引不能全表扫；
+    # api_key_id 是第 26 版才补的列，索引只能在这里建。
+    ("idx_usage_key", "usage_events", "api_key_id, ts"),
+    # 失败归因的「换号救回」按 request_id 关联同一请求的成功行（见
+    # stats.query.errors）：request_id 是第 19 版补的列，索引只能在这里建。
+    ("idx_usage_request", "usage_events", "request_id"),
+    # 覆盖「救援判定」的完整关联条件（request_id + username + ok）：只带
+    # request_id 时 SQLite 取到候选行后还要回表比对 username 与 ok，热数据下
+    # 是 46k 次回表（实测 117ms → 79ms，约 1.5x）。这是**而不是**改写
+    # `errors()` 的 SQL：改成先聚合成功集全表物化反而更慢（见该函数 docstring）。
+    ("idx_usage_request_rescue", "usage_events", "request_id, username, ok"),
+)
 
 
 def _read_schema() -> str:
@@ -125,6 +249,14 @@ def apply_schema(conn) -> None:
                 raise
     for table in _MIGRATION_DROPS:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for table, column in _MIGRATION_COLUMN_DROPS:
+        try:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        except conn.OperationalError as error:  # 列不存在（新库 / 已删过）
+            if "no such column" not in str(error).lower():
+                raise
+    for name, table, column in _MIGRATION_INDEXES:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({column})")
     # PRAGMA 不支持参数绑定，版本号来自本模块常量（非外部输入）
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

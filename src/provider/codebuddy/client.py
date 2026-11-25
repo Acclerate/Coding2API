@@ -6,7 +6,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import gzip
+import hashlib
+import json
 import logging
 import time
 import weakref
@@ -20,13 +24,16 @@ if TYPE_CHECKING:
 
 import httpx
 
+from ...engine.affinity import resolve_explicit
 from ...engine.sse import iter_frames
+from ...error_text import error_text
 from ...provider import base
 from ...provider.base import ErrKind, Event, GrowthResult, Model, Quota
-from ...provider.proxy import build_client
+from ...tasks.pacer import paced
+from ..lazy_clients import LazyClients
 from . import events as cb_events
 from .credential import CodeBuddyCredential, parse_credential
-from .events import UpstreamProtocolViolation
+from .events import MODEL_BLOCKED_CODES, UpstreamProtocolViolation
 from .headers import (
     CN_ENDPOINT,
     EP_CHAT,
@@ -36,15 +43,46 @@ from .headers import (
     generate_headers,
     host_of,
 )
+from .model_access_store import ModelAccessStore
+from .tools import CodeBuddyTools
 
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
-SHORT_TIMEOUT = httpx.Timeout(30.0)
+# 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
+# 经代理链路 10s 会稳定超时；首字等待由 read=None +
+# stream_first_event_timeout_seconds 负责，两者不要混为一谈。
+
 
 DEFAULT_MODELS: tuple[str, ...] = ("glm-5.2", "deepseek-v4-pro")
 EP_CONFIG = "/v3/config"
-MODEL_CACHE_TTL_SECONDS = 600
+# 模型清单缓存 TTL：**只在服务层 TTL 之内做请求去重**，不是第二层生命周期。
+# 服务层 `api/models.MODEL_LIST_TTL_SECONDS`（300s）到期会重新调 `list_models`；
+# 这里若比它长（历史值 600s），服务层「到期重拉」拿到的还是这份旧缓存，列表
+# 实际刷新周期被拖到 10 分钟且与服务层口径倒挂（P2-18）。取 60s：并发 / 紧邻
+# 的多次调用不重复打上游，同时恒小于服务层 TTL，刷新周期由服务层说了算。
+MODEL_CACHE_TTL_SECONDS = 60
 # 模型缓存条目上限（LOW）：key 含 token 前缀，凭证轮换后旧条目永不命中。
 MODEL_CACHE_MAX_ENTRIES = 256
+
+# ---------------------------------------------------------------- 模型可用性
+# 国际站 `/v3/config` 返回**全部**模型，但账号套餐决定能否真正调用：
+# 免费号请求 gpt-5.5 / gpt-5.6-luna 等模型时上游回 400 / 11158
+# `model [...] is not allowed for user type [personal_free_user]`。
+# 与 Zen 的免费层一样，列表只保留**实际探活通过**的模型；差异是这里没有
+# 「免费/付费」后缀可收窄，必须逐个真发一次请求。
+#
+# 判活只认两个业务码：11158（套餐不允许）与 11102（后端无此模型）。429 /
+# 5xx / 超时 / 认证失败一律视为 **inconclusive** 并保留模型——把限流误判成
+# 「模型不存在」会让列表随上游抖动闪没，代价比多显示一个模型大得多。
+MODEL_ACCESS_CACHE_TTL_SECONDS = 6 * 3600
+MODEL_ACCESS_CACHE_MAX_ENTRIES = 256
+MODEL_ACCESS_PROBE_TIMEOUT = 5.0
+MODEL_ACCESS_PROBE_CONCURRENCY = 4
+# 判活与错误分类共用同一个业务码集合（`events.MODEL_BLOCKED_CODES`）：两边
+# 各写一份曾让 11158 在探活里算「不可用」、在请求里算「请求无效」。
+MODEL_ACCESS_DENIED_CODES = MODEL_BLOCKED_CODES
+_MODEL_ACCESS_CACHE: dict[tuple[str, str], tuple[float, dict[str, bool | None]]] = {}
+_PROBE_PROMPT = "hi"
+
+logger = logging.getLogger(__name__)
 
 # 上游内容风控（11128）已确认的指纹串：出现在 system/assistant 消息正文
 # （含行中）即整单拒绝。清单来自 2026-09 对真实上游的确定性复现实验。
@@ -52,6 +90,12 @@ CHANNEL_MARKERS: tuple[str, ...] = (
     "You are Claude Code, Anthropic's official CLI for Claude.",
     "x-anthropic-billing-header",
     "Main branch (you will usually use this for PRs):",
+    # `@路径` 指纹族（2026-10-31 `mmqz/cpa-multi-plugins` 真机复现）：
+    # 这两句各自单独出站不会触发，只有**同时**出现在同一个 system/assistant
+    # 字段块里才被 11128 拒绝。本仓是逐串独立替换，天然把配对拆散，故单串
+    # 入表即可；`9Ashwin/flow-one` e8aa939 用「同现」判据做 A/B 也证实了这点。
+    "Tokens prefixed with @ are paths the user explicitly referenced",
+    "Relative paths resolve from the workspace root",
 )
 _CHANNEL_MARKER_STANDIN = "[external-client-identity]"
 
@@ -143,11 +187,16 @@ def sanitize_channel_markers(body: dict[str, Any]) -> int:
     见 TECHNICAL.md §3.2）。content 为文本块列表（{"type": "text", ...}）
     时逐块处理——块形态指纹同样触发（2026-09-21 直证）。只改写出站副本，
     客户端会话历史保持原样。返回替换处数（用于日志与测试）。
+
+    除 message 正文，`tools[].function.description` 也是同一类指纹的高发区
+    （客户端把「你是 Claude Code…」写进工具说明）：不洗的话，只要客户端带
+    自定义工具就会被上游整单拒。**只洗 description**，不碰 `parameters`
+    schema——那是模型调用契约，逐串替换会把枚举/示例值改坏。
     """
+    replaced_total = _sanitize_tool_descriptions(body.get("tools"))
     messages = body.get("messages")
     if not isinstance(messages, list):
-        return 0
-    replaced_total = 0
+        return replaced_total
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -171,18 +220,78 @@ def sanitize_channel_markers(body: dict[str, Any]) -> int:
     return replaced_total
 
 
+def _sanitize_tool_descriptions(tools: Any) -> int:
+    """洗工具说明里的厂商指纹；返回命中处数。
+
+    只处理 OpenAI 形状（`{"type":"function","function":{...,"description":…}}`），
+    不碰 `parameters`：JSON Schema 里的逐串替换会改坏枚举与示例值。
+    """
+    if not isinstance(tools, list):
+        return 0
+    hits_total = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        description = function.get("description")
+        if not isinstance(description, str):
+            continue
+        replaced, hits = _neutralize_text(description)
+        if hits:
+            hits_total += hits
+            function["description"] = replaced
+    return hits_total
+
+
 def build_headers(credential: CodeBuddyCredential, endpoint: str, *,
-                  quota_only: bool = False) -> dict[str, str]:
-    """头构造统一入口：X-Domain 与 Host 由同一 endpoint 派生。"""
+                  quota_only: bool = False, intl: bool = False,
+                  conversation_seed: str | None = None,
+                  model: str | None = None) -> dict[str, str]:
+    """头构造统一入口：X-Domain 与 Host 由同一 endpoint 派生。
+
+    intl=True 走国际站指纹（版本常量、稳定会话 id、官方会话/模型头、JWT uid
+    回退），国内站默认参数下逐字节不变。
+    """
     return generate_headers(
         endpoint=endpoint, bearer_token=credential.bearer_token,
         user_id=credential.user_id or None, account_uid=credential.account_uid or None,
         domain=credential.domain or None, enterprise_id=credential.enterprise_id or None,
-        department_full_name=credential.department_full_name or None, quota_only=quota_only,
+        department_full_name=credential.department_full_name or None,
+        quota_only=quota_only, intl=intl,
+        conversation_seed=conversation_seed, model=model,
     )
 
 
-class CodeBuddyClient:
+def conversation_seed(payload: dict[str, Any]) -> str | None:
+    """请求体 → 会话种子（用于国际站稳定的 `X-Conversation-ID`）。
+
+    优先级：显式会话键 / 会话头（`engine.affinity.resolve_explicit`）→
+    首条非 system 消息的哈希。多轮对话每轮都会重发完整历史，首条用户消息
+    不变，故两者都能让同一对话在重试、换号、重启后仍得到同一个 id；都没有
+    （空 messages）时返回 None，调用方回落随机 id。
+
+    与 `retry`/换号无关：conversation id 属于**对话**，不属于某次请求或某个
+    凭证，换号重试必须沿用同一个。
+    """
+    explicit = resolve_explicit(payload)
+    if explicit is not None:
+        return explicit
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in ("system", "developer"):
+            continue
+        canonical = json.dumps(message, ensure_ascii=False, sort_keys=True)
+        return "first:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return None
+
+
+class CodeBuddyClient(LazyClients):
     def __init__(
         self,
         *,
@@ -192,6 +301,9 @@ class CodeBuddyClient:
         sanitize_markers: bool = True,
         require_leading_system: bool = False,
         proxy: str | None = None,
+        intl: bool = False,
+        gzip_body: bool = False,
+        access_cache_path: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self._stream_client = stream_client
@@ -199,23 +311,31 @@ class CodeBuddyClient:
         self.sanitize_markers = sanitize_markers
         self.require_leading_system = require_leading_system
         self._proxy = proxy
+        # 国际站指纹开关：版本常量、稳定会话 id、官方会话/模型头、uid 回退
+        self.intl = intl
+        # 官方 CLI 用 Content-Encoding: gzip 发请求；只在显式开启时压缩
+        self.gzip_body = gzip_body
+        # 探活结果落盘缓存（None = 纯进程内，行为与历史一致）
+        self._access_store = (
+            ModelAccessStore(access_cache_path, MODEL_ACCESS_CACHE_TTL_SECONDS)
+            if access_cache_path else None)
 
     @property
-    def _stream(self) -> httpx.AsyncClient:
-        if self._stream_client is None:
-            self._stream_client = build_client(timeout=STREAM_TIMEOUT, proxy=self._proxy)
-        return self._stream_client
+    def tools(self) -> Any:
+        """内置检索工具（search / webfetch）。懒建一次，共用 `_short` 连接池。"""
+        cached = getattr(self, "_tools", None)
+        if cached is None:
+            cached = CodeBuddyTools(self)
+            self._tools = cached
+        return cached
 
-    @property
-    def _short(self) -> httpx.AsyncClient:
-        if self._short_client is None:
-            self._short_client = build_client(timeout=SHORT_TIMEOUT, proxy=self._proxy)
-        return self._short_client
-
-    async def aclose(self) -> None:
-        for client in (self._stream_client, self._short_client):
-            if client is not None:
-                await client.aclose()
+    def _headers(self, credential: CodeBuddyCredential, *,
+                 conversation_seed: str | None = None,
+                 model: str | None = None) -> dict[str, str]:
+        """按渠道指纹构造请求头；intl 通道补稳定会话 id 与当前模型。"""
+        return build_headers(
+            credential, self.endpoint, intl=self.intl,
+            conversation_seed=conversation_seed, model=model)
 
     # ------------------------------------------------------------- 聊天流
 
@@ -266,12 +386,28 @@ class CodeBuddyClient:
             "include_usage": True,
         }
         url = f"{self.endpoint}{EP_CHAT}"
-        async with self._stream.stream(
-            "POST", url, json=body, headers=build_headers(credential, self.endpoint),
-        ) as response:
+        headers = self._headers(credential,
+                                conversation_seed=conversation_seed(payload),
+                                model=model)
+        if self.gzip_body:
+            # 官方 CLI 发 gzip 体；只在 intl 通道开启（见 main.py 装配）
+            headers["Content-Encoding"] = "gzip"
+            content = gzip.compress(
+                json.dumps(body, ensure_ascii=False).encode("utf-8"))
+            request = self._stream.stream(
+                "POST", url, content=content, headers=headers)
+        else:
+            request = self._stream.stream(
+                "POST", url, json=body, headers=headers)
+        async with request as response:
             if response.status_code >= 400:
                 raw = await base.read_body_bounded(response)
-                raise UpstreamHTTPError(response.status_code, raw)
+                # body 兜底：国际站 429+6004 只把重置时刻写在正文（`reset at
+                # … UTC+8`），不给 Retry-After 头；不传 body 就只能回落 600s
+                # 基数，到期重试再撞一次 429（实测同一号一天被爆 42 次）。
+                raise UpstreamHTTPError(response.status_code, raw,
+                                        **base.retry_hints(response.headers,
+                                                           body=raw))
             async for frame in iter_frames(response.aiter_bytes()):
                 for event in cb_events.parse_all_events(frame):
                     yield event
@@ -316,8 +452,9 @@ class CodeBuddyClient:
             remaining += package_remaining
             end = _cycle_end_epoch(account.get("CycleEndTime"))
             # 展示明细：比调度阶梯（下面的 ladder）宽——已用完但仍有效的包
-            # 也要显示。但「已过期且已用完」的包既不携带积分也不可能再被
-            # 消耗，只是上游的历史残留，不堆进弹层。
+            # 也会下发（前端按「剩余 0」再过滤掉，只保留还有余额的）。但
+            # 「已过期且已用完」的包既不携带积分也不可能再被消耗，只是上游
+            # 的历史残留，连数据都不留。
             if package_remaining > 0 or (end is not None and end > now_epoch):
                 packages.append({
                     "name": str(account.get("PackageName") or ""),
@@ -355,14 +492,19 @@ class CodeBuddyClient:
                      probed_at=int(time.time()))
 
     async def fetch_models(self, credential: CodeBuddyCredential) -> list[Model]:
-        """动态拉取模型列表（/v3/config），带 10 分钟缓存。失败抛错由调用方兜底。"""
+        """动态拉取模型列表（/v3/config），带 60s 请求去重缓存。
+
+        缓存只做「同一账号的并发/紧邻调用不重复打上游」，恒短于服务层的
+        列表 TTL（300s）——否则服务层到期重拉拿到的仍是旧值（P2-18）。
+        失败抛错由调用方兜底。
+        """
         cache_key = (credential.bearer_token[:64], self.endpoint)
         cached = _MODEL_CACHE.get(cache_key)
         now = time.time()
         if cached and now - cached[0] < MODEL_CACHE_TTL_SECONDS:
             return cached[1]
 
-        headers = build_headers(credential, self.endpoint)
+        headers = self._headers(credential)
         host = host_of(self.endpoint)
         headers.update({
             "Host": host,
@@ -424,10 +566,121 @@ class CodeBuddyClient:
         _MODEL_CACHE[cache_key] = (now, models)
         return models
 
+    async def filter_available_models(
+            self, credential: CodeBuddyCredential,
+            models: list[Model]) -> list[Model]:
+        """只保留当前账号**实际可用**的模型（国际站套餐门禁）。
+
+        上游 `/v3/config` 返回全量模型，套餐限制只在真正调用时以
+        400 / 11158 暴露。这里像 Zen 免费层一样逐个探活，但判据更保守：
+        只有 11158 / 11102 才判不可用，限流 / 超时 / 5xx 都保留模型。
+        探活结果按账号缓存 6 小时——套餐变化很慢，而每轮 20 个模型全探
+        一次，不值得按 5 分钟的列表 TTL 重跑。
+        """
+        if not models or not credential.bearer_token:
+            return models
+        cache_key = self._model_access_cache_key(credential)
+        now = time.time()
+        cached = _MODEL_ACCESS_CACHE.get(cache_key)
+        if cached is None and self._access_store is not None:
+            # 重启后从落盘缓存恢复：进程内缓存清空即重打 20 连发探活，而那一刻
+            # 的「同 IP + 秒级窗口 + 并发 4」正是上游风控的自动化特征
+            stored = self._access_store.get(cache_key)
+            if stored is not None:
+                cached = stored
+                _MODEL_ACCESS_CACHE[cache_key] = stored
+        if cached and now - cached[0] < MODEL_ACCESS_CACHE_TTL_SECONDS:
+            access = cached[1]
+        else:
+            access = await self._probe_model_accesses(
+                credential, [model.id for model in models])
+            self._remember_model_access(cache_key, now, access)
+            if self._access_store is not None:
+                self._access_store.put(cache_key, now, access)
+        kept = [model for model in models if access.get(model.id) is not False]
+        if not kept:
+            # 全被拒绝多半是探活整体异常或账号刚降级：保留全量，避免渠道
+            # 从列表里凭空消失（调用时仍会由上游给出准确错误）。
+            logger.warning("CodeBuddy 模型可用性探活全部失败，回退全量列表")
+            return models
+        return kept
+
+    def _model_access_cache_key(
+            self, credential: CodeBuddyCredential) -> tuple[str, str]:
+        """可用性缓存按**账号**隔离，不能按 token 前缀。
+
+        同一 realm 签发的 access token 前 64 字符完全相同（JWT 头 + payload
+        开头），按前缀取 key 会让付费号与免费号共享同一份探活结果——正是
+        最需要区分套餐的场景。OAuth 凭证有稳定 nickname，直接用它；手动
+        凭证无昵称时回退到整 token 的 SHA-256，既不碰撞也不把明文 token
+        当 key 长期挂在模块字典里。
+        """
+        identity = credential.nickname or hashlib.sha256(
+            credential.bearer_token.encode("utf-8")).hexdigest()
+        return identity, self.endpoint
+
+    async def _probe_model_accesses(
+            self, credential: CodeBuddyCredential,
+            model_ids: list[str]) -> dict[str, bool | None]:
+        """并发探活一批模型；返回值 None 表示不确定（保留该模型）。"""
+        semaphore = asyncio.Semaphore(MODEL_ACCESS_PROBE_CONCURRENCY)
+
+        async def one(model_id: str) -> tuple[str, bool | None]:
+            async with semaphore:
+                return model_id, await self._probe_model_access(credential, model_id)
+
+        return dict(await asyncio.gather(*(one(model_id) for model_id in model_ids)))
+
+    async def _probe_model_access(
+            self, credential: CodeBuddyCredential, model_id: str) -> bool | None:
+        """发一次最小流式请求，只看响应状态行就断开。
+
+        200 说明套餐允许；11158 / 11102 说明模型不可用。其余状态码与网络
+        异常一律返回 None——不能把限流或上游故障当成「模型不存在」。
+        """
+        body = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": DEFAULT_LEADING_SYSTEM},
+                {"role": "user", "content": _PROBE_PROMPT},
+            ],
+            "max_tokens": 1,
+            "stream": True,
+            "enable_thinking": True,
+            "reasoning_effort": "medium",
+            "stream_options": {"include_usage": True},
+        }
+        try:
+            async with asyncio.timeout(MODEL_ACCESS_PROBE_TIMEOUT):
+                async with self._short.stream(
+                        "POST", f"{self.endpoint}{EP_CHAT}", json=body,
+                        headers=self._headers(credential, model=model_id)) as response:
+                    if response.status_code < 400:
+                        return True
+                    raw = await base.read_body_bounded(response)
+        except (httpx.HTTPError, TimeoutError):
+            return None
+        codes = base.business_codes(raw.decode("utf-8", errors="replace"))
+        return False if codes & MODEL_ACCESS_DENIED_CODES else None
+
+    @staticmethod
+    def _remember_model_access(cache_key: tuple[str, str], now: float,
+                               access: dict[str, bool | None]) -> None:
+        """写入探活缓存，并按模型缓存同样的策略限制条目数。"""
+        if len(_MODEL_ACCESS_CACHE) >= MODEL_ACCESS_CACHE_MAX_ENTRIES:
+            cutoff = now - MODEL_ACCESS_CACHE_TTL_SECONDS
+            for key in [k for k, value in _MODEL_ACCESS_CACHE.items()
+                        if value[0] < cutoff]:
+                del _MODEL_ACCESS_CACHE[key]
+            if len(_MODEL_ACCESS_CACHE) >= MODEL_ACCESS_CACHE_MAX_ENTRIES:
+                _MODEL_ACCESS_CACHE.clear()
+        _MODEL_ACCESS_CACHE[cache_key] = (now, access)
+
     async def _post_json(self, url: str, payload: dict[str, Any],
                          credential: CodeBuddyCredential, *,
                          quota_only: bool = False) -> dict[str, Any]:
-        headers = build_headers(credential, self.endpoint, quota_only=quota_only)
+        headers = build_headers(credential, self.endpoint, quota_only=quota_only,
+                                intl=self.intl)
         response = await self._short.post(url, json=payload, headers=headers)
         if response.status_code >= 400:
             raise UpstreamHTTPError(response.status_code,
@@ -645,39 +898,80 @@ class CodeBuddyProvider:
 
     id: str = "codebuddy"
 
+    # 上次动态拉取失败的原因（一行文本）；成功即清空。供 `model_list_source`
+    # 把「本次回的是静态表」申报给服务层（与 TRAE 同口径）。
+    _last_dynamic_error: str = field(default="", init=False)
+
     def import_credential(self, raw: dict) -> dict:
         return parse_credential(raw, auth_source="manual").to_dict()
 
     def classify(self, status: int, body: bytes) -> ErrKind:
         return cb_events.classify_status(status, body)
 
+    def disabled_reason(self, body: bytes) -> str:
+        """401/403 的账号级可操作原因（管理台 `disabled_reason` 用）。"""
+        return cb_events.disabled_reason(body)
+
     async def probe_quota(self, credential_data: dict) -> Quota:
         return await self.client.fetch_quota(CodeBuddyCredential.from_dict(credential_data))
 
     async def list_models(self, credential_data: dict) -> list[Model]:
-        """动态拉取上游模型；失败回退静态表（保证 Play grounds/客户端始终有列表）。"""
+        """动态拉取上游模型；失败回退静态表（保证 Playground/客户端始终有列表）。
+
+        回退走静态表时记下原因，`model_list_source` 会把它申报给服务层——否则
+        服务层以为拉取成功，管理台与 `/metrics` 看不出渠道一直在降级。
+        """
         try:
-            return await self.client.fetch_models(
+            models = await self.client.fetch_models(
                 CodeBuddyCredential.from_dict(credential_data))
         except Exception as error:  # noqa: BLE001 - 兜底不是静默：错误会带上抛路径
-            import logging
-
-            logging.getLogger(__name__).warning("动态模型拉取失败，回退静态表: %s", error)
+            self._last_dynamic_error = error_text(error)
+            logger.warning("动态模型拉取失败，回退静态表: %s", error_text(error))
             return [Model(id=mid) for mid in DEFAULT_MODELS]
+        self._last_dynamic_error = ""
+        return models
+
+    def model_list_source(self) -> tuple[bool, str]:
+        """最近一次 `list_models` 的表来源：`(是否静态兜底, 失败原因)`。"""
+        error = self._last_dynamic_error
+        return (bool(error), error)
 
     async def stream_chat(self, credential_data: dict, payload: dict,
                           model: str) -> AsyncIterator[Event]:
         credential = CodeBuddyCredential.from_dict(credential_data)
         key = _pacer_key(self.id, credential)
-        if self.pacer is not None:
-            await self.pacer.wait_turn(key)
-        try:
+        async with paced(self.pacer, key):
             async for event in self.client.stream_chat(credential, payload, model):
                 yield event
-        finally:
-            # 并发模式必须归还名额，否则该凭证被当成永远在途而失去节流
-            if self.pacer is not None:
-                self.pacer.release(key)
+
+    # ------------------------------------------------------- 内置检索工具
+
+    async def search_web(self, credential_data: dict, *, query: str,
+                         max_results: int = 5,
+                         allowed_domains: list[str] | None = None,
+                         blocked_domains: list[str] | None = None,
+                         freshness: str | None = None) -> dict[str, Any]:
+        """上游内置 web search（`/agenttool/v1/search`）。
+
+        放在 provider 上而不是 API 层直连：只有渠道知道怎么拼自己的头族与凭证。
+        与聊天共用 `paced` 节流桶——搜索同样打同一个上游网关。
+        """
+        credential = CodeBuddyCredential.from_dict(credential_data)
+        async with paced(self.pacer, _pacer_key(self.id, credential)):
+            return await self.client.tools.search(
+                credential, query=query, max_results=max_results,
+                allowed_domains=allowed_domains, blocked_domains=blocked_domains,
+                freshness=freshness)
+
+    async def fetch_url(self, credential_data: dict, *, url: str,
+                        prompt: str = "", max_length: int | None = None,
+                        timeout: float | None = None) -> dict[str, Any]:
+        """上游内置网页抓取（`/agenttool/v1/webfetch`，只接受文本页）。"""
+        credential = CodeBuddyCredential.from_dict(credential_data)
+        async with paced(self.pacer, _pacer_key(self.id, credential)):
+            return await self.client.tools.fetch(
+                credential, url=url, prompt=prompt, max_length=max_length,
+                timeout=timeout)
 
     def host(self) -> str:
         return host_of(self.client.endpoint)

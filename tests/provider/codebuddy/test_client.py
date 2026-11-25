@@ -44,19 +44,44 @@ def test_classify_body_markers():
     # 「该后端无此模型」：(账号, 模型) 负缓存
     (400, b'{"code": 11102}', ErrKind.BLOCKED),
     (404, b'{"code": 11102}', ErrKind.BLOCKED),
-    # 请求级错误：不罚号，仍换号（请求体坏 / 上下文超限 / 渠道风控 / 图片无效）
+    # 「套餐不允许」：对**当前凭证**与 11102 等价（重试无意义、换号才有用）
+    (400, b'{"code": 11158, "msg": "model [gpt-6-luna] is not allowed for user '
+          b'type [personal_free_user]"}', ErrKind.BLOCKED),
+    (404, b'{"code": 11158}', ErrKind.BLOCKED),
+    # 请求级错误：不罚号，仍换号（请求体坏 / 渠道风控 / 图片无效）
     (400, b'{"code": 11101}', ErrKind.REQUEST),
     (400, b'{"code": 500, "msg": "Unmarshal chat params failed"}', ErrKind.REQUEST),
-    (400, b'{"code": 11115, "msg": "prompt is too long"}', ErrKind.REQUEST),
+    # 上下文超限（11115）：处置同请求级错误，统计独立成 CONTEXT
+    (400, b'{"code": 11115, "msg": "prompt is too long"}', ErrKind.CONTEXT),
     # 渠道风控（瞬时，窗口内自愈）：曾误落 INVALID → 零重试直接 400，实测误伤
     (400, b'{"code": 11128, "msg": "Illegal API invocation from an unapproved channel"}',
      ErrKind.REQUEST),
     (400, b'{"code": 11135, "msg": "Invalid image data"}', ErrKind.REQUEST),
+    # 工具 schema 拒收（11129）：客户端请求形态错误，跳过整家上游 → INVALID；
+    # 403 形态同样必须拦在 DEAD 之前（一次 schema 错误不能硬禁用整池号）
+    (400, b'{"code": 11129, "msg": "tool schema rejected"}', ErrKind.INVALID),
+    (400, b'{"code": "11129"}', ErrKind.INVALID),
+    (403, b'{"code": 11129, "msg": "invalid_function_call_parameters"}', ErrKind.INVALID),
+    # 紧凑子串不误判：111290 不是 11129 → 403 仍按凭据失效处理
+    (403, b'{"code": 111290}', ErrKind.DEAD),
     # 裸数字不误伤：111020 不是 11102（要求带 "code": 键值形态）
     (400, b'{"trace": 1110201}', ErrKind.INVALID),
     (400, b'{"code": 111020}', ErrKind.INVALID),
+    (400, b'{"code": 111580}', ErrKind.INVALID),
     # 嵌套信封：业务码在内层，按集合成员判断不漏
     (400, b'{"code": 0, "data": {"code": 11102}}', ErrKind.BLOCKED),
+    # 字符串形态的业务码（2026-11-02 上游已这么发）
+    (400, b'{"code": "11128"}', ErrKind.REQUEST),
+    (400, b'{"code": "14018"}', ErrKind.CREDIT),
+    # 403 上的渠道风控：必须拦在 DEAD 之前，否则一次命中硬禁用整池好号
+    (403, b'{"code":"11-128","msg":"request illegal"}', ErrKind.REQUEST),
+    (403, b'{"code": 11128}', ErrKind.REQUEST),
+    # 403 的其他形态仍是凭据失效；401 不受上面那条影响
+    (403, b'{"code": 1001, "msg": "session expired"}', ErrKind.DEAD),
+    (403, b"forbidden", ErrKind.DEAD),
+    (401, b'{"code":"11-128"}', ErrKind.DEAD),
+    # 11140 的风控优先级仍高于 403 的请求级分支
+    (403, b'{"code": 11140, "msg": "request illegal"}', ErrKind.RESTRICTED),
     (404, b"not json at all", ErrKind.SOFT),
     (500, b'{"code": 9999}', ErrKind.OTHER),
 ])
@@ -159,3 +184,75 @@ def test_error_type_for_invalid():
     from src.engine.executor import _error_type_for
 
     assert _error_type_for(ErrKind.INVALID) == "invalid_request"
+
+
+# ------------------------------------------- 国际站指纹（2026-10-29）
+
+def test_conversation_seed_prefers_explicit_then_first_message():
+    from src.provider.codebuddy.client import conversation_seed
+
+    explicit = conversation_seed({
+        "prompt_cache_key": "p1",
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert explicit == "prompt_cache_key:p1"
+
+    seeded = conversation_seed({"messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "同一个问题"}]})
+    assert seeded is not None and seeded.startswith("first:")
+    # 多轮追加后首条用户消息不变 → 仍是同一个会话种子（换号/重试不换 id）
+    grown = conversation_seed({"messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "同一个问题"},
+        {"role": "assistant", "content": "答"},
+        {"role": "user", "content": "追问"}]})
+    assert grown == seeded
+
+    assert conversation_seed({}) is None
+    assert conversation_seed({"messages": "not a list"}) is None
+    # 脏消息（非 dict）跳过，继续找第一条可用的
+    assert conversation_seed({"messages": ["junk", {"role": "user", "content": "x"}]}
+                             ).startswith("first:")
+    assert conversation_seed({"messages": [{"role": "system", "content": "s"}]}) is None
+
+
+async def test_stream_chat_intl_gzips_body_and_keeps_conversation_id():
+    """官方 CLI 形态：gzip 体 + 同一会话复用 conversation id、每轮换 request id。"""
+    import gzip
+
+    from tests.helpers.http import provider_client
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text=fixture("chat-basic.sse"))
+
+    client = provider_client(CodeBuddyClient, handler, intl=True, gzip_body=True)
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    for _ in range(2):
+        [event async for event in client.stream_chat(
+            CodeBuddyCredential(bearer_token="t"), payload, "glm-5.2")]
+
+    first, second = seen
+    assert first.headers["content-encoding"] == "gzip"
+    assert json.loads(gzip.decompress(first.content))["stream"] is True
+    assert first.headers["x-conversation-id"] == second.headers["x-conversation-id"]
+    assert first.headers["x-request-id"] != second.headers["x-request-id"]
+    assert first.headers["x-model-id"] == "glm-5.2"
+    assert first.headers["user-agent"].startswith("CLI/2.185.0")
+
+
+async def test_stream_chat_cn_keeps_plain_json_body():
+    """国内站不受国际指纹改动影响：明文 JSON、无 Content-Encoding。"""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["encoding"] = request.headers.get("content-encoding")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, text=fixture("chat-basic.sse"))
+
+    [event async for event in _client(handler).stream_chat(
+        CodeBuddyCredential(bearer_token="t"), {"messages": []}, "glm-5.2")]
+    assert seen["encoding"] is None
+    assert seen["body"]["model"] == "glm-5.2"

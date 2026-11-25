@@ -11,8 +11,12 @@ from __future__ import annotations
 import logging
 
 from ..config import live
+from ..db.crypto import CredentialDecryptError
 from ..db.repo import CredentialRepository, GrowthRepository
+from ..error_text import error_text
+from ..request_context import credential_scope
 from . import TaskReport
+from .account_shape import is_enterprise_account
 from .pacer import Pacer
 
 logger = logging.getLogger(__name__)
@@ -50,11 +54,26 @@ class GrowthTask:
             if growth is None:
                 report.skipped += 1                 # 该渠道没有成长中心（TRAE）
                 continue
-            if candidate.disabled:
+            # `enabled=0`（用户软暂停）同样跳过：口径与调度器 is_selectable、
+            # 签到/刷新/额度探测一致。漏判会让「暂停」只停调度不停后台任务——
+            # 号已经不想用了，成长中心还在替它领积分、活跃上报还在替它打卡。
+            if candidate.disabled or not candidate.enabled:
                 report.skipped += 1
                 continue
-            data = self._credentials.credential_data(candidate.credential_id)
+            # 解不开（APP_SECRET 换过 / 密文损坏）→ 跳过这条凭证：一条坏凭证
+            # 不该让整轮成长中心失败（早先直接冒泡 → 整轮任务挂掉）。
+            try:
+                data = self._credentials.credential_data(candidate.credential_id)
+            except CredentialDecryptError:
+                logger.error("成长中心跳过 %s：凭证解密失败（APP_SECRET 是否被更换过？）",
+                             candidate.credential_id)
+                report.skipped += 1
+                continue
             if data is None:
+                report.skipped += 1
+                continue
+            # 企业版账号没有成长中心（个人版活动）：跳过，别白耗 Pacer。
+            if is_enterprise_account(data):
                 report.skipped += 1
                 continue
             # 同上游账号多凭证共享一轮：重复领会被上游拒绝，但要额外打一串请求
@@ -69,9 +88,11 @@ class GrowthTask:
             if self._pacer is not None:
                 await self._pacer.wait_turn()
             try:
-                result = await growth(data, allow_irreversible=self.allow_irreversible)
+                with credential_scope(candidate.credential_id):
+                    result = await growth(data, allow_irreversible=self.allow_irreversible)
             except Exception as error:  # noqa: BLE001 - 一个凭证失败不拖累其余
-                logger.warning("growth failed for %s: %s", candidate.credential_id, error)
+                logger.warning("growth failed for %s: %s", candidate.credential_id,
+                               error_text(error))
                 report.failed += 1
                 continue
             if result.ok and not result.session_dead:

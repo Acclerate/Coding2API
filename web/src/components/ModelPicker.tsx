@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
-import { Check, RefreshCw, Search } from "lucide-react";
+import { Check, RefreshCw, Search, Shuffle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ModelBenchmarks, ModelInfo } from "../api/types";
+import { aliasTitle, isCustomAlias } from "../api/modelExtras";
 import { providerChartColor, providerLabel, providerRank } from "../api/providers";
 import { ProviderIcon } from "./ProviderIcon";
-import { Input } from "../ui";
+import { Badge, Input } from "../ui";
 
 /** 列表条目：原始 ModelInfo + 受控选中值。 */
 export type PickableModel = ModelInfo & { value: string };
@@ -136,44 +137,148 @@ export function displayName(item: { id: string; name?: string }): string {
   return name === "" ? item.id : name;
 }
 
+/** 倍率文案：`0` 是免费额度（上游给 0 表示不计费），不能显示成 `x0`。 */
+export function rateLabel(rate: number): string {
+  if (rate === 0) return "免";
+  // 上游倍率是浮点，可能带长尾（0.1+0.2 → 0.30000000000000004）。取 6 位有效
+  // 数字够覆盖真实倍率，又不像 toFixed(2) 那样把 0.004 压成 0（会显示成「免」）。
+  return `x${Number(rate.toPrecision(6))}`;
+}
+
+/** 凭证页组头「模型 N 个」用的条目：id 供排障，label 是展示名，rate 是该渠道的消耗倍率。 */
+export interface ProviderModel {
+  id: string;
+  label: string;
+  /** 该渠道下的倍率（`by_provider` 优先，单渠道回退合并值）；上游没给则为 undefined */
+  rate?: number;
+}
+
+/**
+ * 按渠道归类模型（凭证页渠道组头用）。
+ *
+ * 数据源是 `/api/playground/models`：它只含「有可用凭证且过当前黑名单」的渠道，
+ * 与 `/v1/models` 同口径，所以组里「有凭证」和「有模型」不必各算一套。
+ *
+ * **倍率按渠道取**（复用 `providerRate`，与模型选择器同一口径）：多渠道模型
+ * 各渠道倍率不同，拿合并值冒充会把某个渠道的倍率错标到别的渠道上。
+ * 排序按展示名（人类可读名优先），同名再按 id 兜底——凭证页 30s 轮询，
+ * 顺序必须稳定，不能随上游返回顺序跳动。
+ */
+export function groupModelsByProvider(models: ModelInfo[]): Map<string, ProviderModel[]> {
+  const grouped = new Map<string, ProviderModel[]>();
+  for (const item of models) {
+    // 自定义别名是**同一模型**的另一个可请求名字（后端克隆目标条目生成），
+    // 目标条目本身也在列表里；算进来会让「N 个模型」虚高、清单里同一模型出现两次。
+    if (isCustomAlias(item)) continue;
+    for (const provider of item.providers) {
+      const entry: ProviderModel = {
+        id: item.id, label: displayName(item), rate: providerRate(item, provider),
+      };
+      const bucket = grouped.get(provider);
+      if (bucket) bucket.push(entry);
+      else grouped.set(provider, [entry]);
+    }
+  }
+  for (const bucket of grouped.values()) {
+    bucket.sort((left, right) =>
+      left.label.localeCompare(right.label, "zh-CN") || left.id.localeCompare(right.id));
+  }
+  return grouped;
+}
+
+/**
+ * 组头「最低倍率」的文案（`null` = 一条倍率都没有，整块不显示）。
+ *
+ * **免费额度不参与取最低**：渠道里常混着 1~2 个 0 倍率模型（CodeBuddy 33 个里
+ * 2 个、Qoder 11 个里 2 个），按字面取最小会显示「最低 免」，读起来像整个渠道
+ * 免费——实际其余几十个都在收费。全渠道都免费时才说「全免」。
+ */
+export function rateSummary(models: ProviderModel[]): string | null {
+  const rates = models
+    .map((model) => model.rate)
+    .filter((rate): rate is number => rate !== undefined);
+  if (rates.length === 0) return null;
+  const paid = rates.filter((rate) => rate > 0);
+  if (paid.length === 0) return "全免";
+  return `最低 ${rateLabel(Math.min(...paid))}`;
+}
+
 /** 渠道徽章的展示顺序（CB → TR → 其余），与全站展示顺序一致。 */
 function sortProviders(providers: string[]): string[] {
   return [...providers].sort((left, right) => providerRank(left) - providerRank(right));
 }
 
 /**
- * 品牌着色渠道徽章：底/边/字都取自该渠道的图表主色，渠道一眼可辨。
+ * 品牌着色渠道徽章：品牌图标保持彩色，文字/底色压低饱和，一组徽章并排时
+ * 不会变成一条彩虹墙。
  *
- * 倍率作为其内的加粗数字块单独强调（`x0.29`；免费额度显示「免费」）。
- * `rawId` 非空时作为 tooltip：该渠道实际请求的 key。
+ * 形态统一为**分体两段**：左段渠道名用品牌浅底，右段倍率用同品牌深一档的底
+ * + 左侧分隔线。单渠道、多渠道、列表行都用同一种形态——倍率是独立的第二段，
+ * 不再当渠道名后面的小附注，扫视时「渠道 | 倍率」的分界始终在同一位置。
+ * 没有倍率数据的渠道只渲染左段（成一个普通圆角徽章）。
+ *
+ * **尺寸全局只有一档**：`text-[10px]` / `leading-4`、上下不加 padding、左右
+ * `px-1.5`，成稿高 18px（含 1px 边框）。列表行、当前选择条、单/多渠道都一致；
+ * 宽度才按渠道名自适应。原先列表行用 11px、选择条用 10px 两档，同一页上下
+ * 两处大小不一，且与旁边的「智 xx」能力分徽章（10px）也不齐。
+ *
+ * 选中态由 `active` 传入（外层的渠道按钮把 `pinnedProvider === provider` 交给
+ * 这里）：高亮画在徽章自身的边框/底色上，不再用外层 `ring` + `ring-offset`。
+ * ring 会在徽章外撑出一圈空缝，折行时行高忽大忽小；内联高亮则尺寸恒定。
  */
 function ChannelPill({
   provider,
   rate,
   rawId,
+  active = false,
 }: {
   provider: string;
   rate?: number;
   rawId?: string;
+  active?: boolean;
 }) {
   const color = providerChartColor(provider);
+  const borderColor = `color-mix(in oklch, ${color} ${active ? 65 : 28}%, transparent)`;
+  const textColor = `color-mix(in oklch, ${color} ${active ? 70 : 50}%, var(--ink))`;
   return (
     <span
       data-testid={`channel-pill-${provider}`}
       title={rawId}
-      className="inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-semibold"
+      className={cn(
+        // overflow-hidden 让两段的背景被父级 rounded-full 裁齐；父级只负责外轮廓，
+        // 两段各自铺底色，接缝处由右段的 border-l 画分隔线。
+        "inline-flex items-stretch overflow-hidden rounded-full border text-[10px] leading-4 font-medium transition-colors",
+      )}
       style={{
-        borderColor: `color-mix(in oklch, ${color} 45%, transparent)`,
-        backgroundColor: `color-mix(in oklch, ${color} 14%, transparent)`,
-        // 文字往 ink 混 25%：纯渠道色在自身浅底上对比不足（≈3.1~4.4）
-        color: `color-mix(in oklch, ${color} 75%, var(--ink))`,
+        // 未选中也留一条很淡的渠道色描边：纯底色在白底上几乎看不见，徽章会散成
+        // 一排没有轮廓的文字；选中时描边加粗到能一眼看出「锁的是这个渠道」。
+        borderColor,
+        fontWeight: active ? 600 : undefined,
       }}
     >
-      <ProviderIcon provider={provider} size={13} />
-      {providerLabel(provider)}
+      <span
+        className="flex items-center gap-1 py-0 pr-1 pl-1"
+        style={{
+          backgroundColor: `color-mix(in oklch, ${color} ${active ? 20 : 10}%, transparent)`,
+          // 文字往 ink 混：纯渠道色在浅底上对比不足，混太多又失去品牌感。
+          color: textColor,
+        }}
+      >
+        <ProviderIcon provider={provider} size={11} />
+        {providerLabel(provider)}
+      </span>
       {rate !== undefined && (
-        <span className="rounded bg-background/70 px-1 font-bold tabular-nums">
-          {rate === 0 ? "免费" : `x${rate}`}
+        // 倍率段：深一档的品牌底 + 左分隔线。数值用 tabular-nums，折行/换渠道
+        // 时宽度不抖。
+        <span
+          className="flex items-center border-l px-1.5 font-bold tabular-nums"
+          style={{
+            borderColor,
+            backgroundColor: `color-mix(in oklch, ${color} ${active ? 32 : 24}%, transparent)`,
+            color: `color-mix(in oklch, ${color} ${active ? 80 : 70}%, var(--ink))`,
+          }}
+        >
+          {rateLabel(rate)}
         </span>
       )}
     </span>
@@ -274,6 +379,11 @@ function ModelRow({
           自身 `flex-wrap`，多渠道放不下时**在右侧区域内折行**，而不是整组掉到
           名称下方独占一行（内层 `justify-end` 让每行都贴右）。 */}
       <span className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+        {isCustomAlias(item) && (
+          <span data-testid="model-alias-badge" title={aliasTitle(item)}>
+            <Badge tone="accent">自定义别名</Badge>
+          </span>
+        )}
         <BenchmarkBadge item={item} />
         {providers.map((provider) => (
           <ChannelPill
@@ -325,6 +435,13 @@ export function ModelPicker({
   const selectedItem =
     models.find((item) => item.value === value) ??
     models.find((item) => item.id === baseValue);
+  // 可强制指定渠道：多渠道 + 传了 onPin。此时「当前选择」条里的渠道徽章
+  // 本身就是按钮，不再另起一行重复列渠道。
+  const pinnable = Boolean(onPin) && (selectedItem?.providers.length ?? 0) > 1;
+  // 单渠道模型的 value 本身带 @provider（见 modelValue），pinnedProvider 因此
+  // 恒非空——但它不是「用户强制指定的」，只是这条模型只有这一个渠道。第三栏
+  // 和它的列位只应出现在真的有多渠道可选时。
+  const showPin = pinnable && Boolean(pinnedProvider);
 
   return (
     <div className="space-y-3" data-testid="model-picker">
@@ -361,22 +478,86 @@ export function ModelPicker({
       </div>
 
       {selectedItem && (
+        /* 三栏：当前选择 | 渠道 | 强制。三栏同一行（窄屏堆叠），中间渠道栏吃剩余
+           宽度并在自己栏内折行。第三栏只在真的指定了渠道时渲染 —— 未指定（自动
+           路由）时整栏不存在，不留空位、不画空框。 */
         <div
           data-testid="model-current"
-          className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-primary/40 bg-primary/[0.06] px-3 py-2"
+          className={cn(
+            "grid gap-x-4 gap-y-2 rounded-lg border border-primary/40 bg-primary/[0.06] px-2.5 py-1.5",
+            showPin
+              ? "sm:grid-cols-[auto_minmax(0,1fr)_auto]"
+              : "sm:grid-cols-[auto_minmax(0,1fr)]",
+          )}
         >
-          <span className="text-[11px] font-medium text-muted-foreground">当前选择</span>
-          <span className="flex flex-col">
-            <span className="text-sm font-semibold">{displayName(selectedItem)}</span>
-            {displayName(selectedItem) !== selectedItem.id && (
-              <span className="font-mono text-[11px] text-muted-foreground">
-                {selectedItem.id}
+          {/* 第一栏：当前选择 = 模型名 + 原始 id + 别名/能力分徽章 */}
+          <div className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-1">
+            <span className="text-[10px] leading-4 font-medium text-muted-foreground">当前选择</span>
+            <span className="flex flex-col">
+              <span className="text-sm leading-tight font-semibold">{displayName(selectedItem)}</span>
+              {displayName(selectedItem) !== selectedItem.id && (
+                <span className="font-mono text-[10px] leading-tight text-muted-foreground">
+                  {selectedItem.id}
+                </span>
+              )}
+            </span>
+            {isCustomAlias(selectedItem) && (
+              <span data-testid="model-current-alias" title={aliasTitle(selectedItem)}>
+                <Badge tone="accent">自定义别名</Badge>
               </span>
             )}
-          </span>
-          <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
             <BenchmarkBadge item={selectedItem} />
-            {sortProviders(selectedItem.providers).map((provider) => (
+          </div>
+
+          {/* 第二栏：渠道。多渠道是「自动路由 + 每个渠道一个按钮」（徽章即按钮，
+              点选即强制该渠道）；单渠道 / 未传 onPin 时是同款外观的静态徽章。
+              `provider-pin` testid 只挂在可点的那组上——单渠道没有可选渠道，
+              测试据此断言「不显示强制指定渠道控件」。 */}
+          <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
+            <span className="mt-0.5 shrink-0 text-[10px] font-medium text-muted-foreground">
+              渠道
+            </span>
+            <div
+              className="flex min-w-0 flex-1 flex-wrap items-center gap-1"
+              data-testid={pinnable && onPin ? "provider-pin" : "model-current-channels"}
+            >
+            {pinnable && onPin ? (
+              <>
+                <button
+                  type="button"
+                  data-testid="provider-pin-auto"
+                  aria-pressed={pinnedProvider === ""}
+                  onClick={() => onPin(baseValue)}
+                  className={cn(
+                    "mr-0.5 inline-flex items-center gap-1 rounded-full border px-2 py-0 text-[10px] leading-4 font-medium transition-colors focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:outline-none",
+                    pinnedProvider === ""
+                      ? "border-primary/50 bg-primary/15 text-primary-ink"
+                      : "border-transparent bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
+                  )}
+                >
+                  <Shuffle className="size-3" />
+                  自动路由
+                </button>
+                {sortProviders(selectedItem.providers).map((provider) => (
+                  <button
+                    key={provider}
+                    type="button"
+                    data-testid={`provider-pin-${provider}`}
+                    aria-pressed={pinnedProvider === provider}
+                    title={`只走 ${providerLabel(provider)}`}
+                    onClick={() => onPin(`${baseValue}@${provider}`)}
+                    className="rounded-full transition-transform hover:-translate-y-px focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:outline-none"
+                  >
+                    <ChannelPill
+                      provider={provider}
+                      rate={providerRate(selectedItem, provider)}
+                      rawId={providerRawId(selectedItem, provider)}
+                      active={pinnedProvider === provider}
+                    />
+                  </button>
+                ))}
+              </>
+            ) : sortProviders(selectedItem.providers).map((provider) => (
               <ChannelPill
                 key={provider}
                 provider={provider}
@@ -384,61 +565,28 @@ export function ModelPicker({
                 rawId={providerRawId(selectedItem, provider)}
               />
             ))}
-          </span>
-          {/* 右侧统一区：多渠道放渠道指定控件，已强制时追加「已强制 XX」标；
-              单渠道模型 value 天然带 @provider，也走「已强制」标显示在右侧 */}
-          {((onPin && selectedItem.providers.length > 1) || pinnedProvider) && (
-            <span className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
-              {onPin && selectedItem.providers.length > 1 && (
-                <>
-                  <span className="text-[11px] font-medium text-muted-foreground">渠道</span>
-                  <span className="flex flex-wrap items-center gap-1" data-testid="provider-pin">
-                    <button
-                      type="button"
-                      data-testid="provider-pin-auto"
-                      aria-pressed={pinnedProvider === ""}
-                      onClick={() => onPin(baseValue)}
-                      className={cn(
-                        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
-                        pinnedProvider === ""
-                          ? "border-primary/40 bg-primary/10 text-primary-ink"
-                          : "border-border text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      自动路由
-                    </button>
-                    {sortProviders(selectedItem.providers).map((provider) => (
-                      <button
-                        key={provider}
-                        type="button"
-                        data-testid={`provider-pin-${provider}`}
-                        aria-pressed={pinnedProvider === provider}
-                        onClick={() => onPin(`${baseValue}@${provider}`)}
-                        className={cn(
-                          "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
-                          pinnedProvider === provider
-                            ? "border-primary/40 bg-primary/10 text-primary-ink"
-                            : "border-border text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        <ProviderIcon provider={provider} size={11} />
-                        {providerLabel(provider)}
-                      </button>
-                    ))}
-                  </span>
-                </>
-              )}
-              {pinnedProvider && (
-                <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-[11px] font-semibold text-primary-ink">
-                  已强制 {providerLabel(pinnedProvider)}
-                </span>
-              )}
-            </span>
+            </div>
+          </div>
+
+          {/* 第三栏：强制。有选择才出现，内容就是「哪个渠道被锁定」。
+              这里刻意不用渠道栏的品牌胶囊：那一栏是可点的筛选控件，这里是只读
+              状态，同形状会让人以为能点。中性描边 + 品牌图标即可一眼对上号。 */}
+          {showPin && (
+            <div className="flex items-center gap-1.5" data-testid="model-current-pinned">
+              <span className="text-[10px] font-medium text-muted-foreground">强制</span>
+              <span className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/50 pr-2 pl-1 py-0 text-[10px] leading-4 font-semibold text-foreground">
+                <ProviderIcon provider={pinnedProvider} size={11} />
+                {providerLabel(pinnedProvider)}
+              </span>
+            </div>
           )}
-          {!pinnedProvider && !onPin && selectedItem.providers.length > 1 && (
-            <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground">
-              自动路由
-            </span>
+          {!pinnedProvider && !pinnable && selectedItem.providers.length > 1 && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-medium text-muted-foreground">强制</span>
+              <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                自动路由
+              </span>
+            </div>
           )}
         </div>
       )}
@@ -446,7 +594,7 @@ export function ModelPicker({
       <div
         role="listbox"
         data-testid="model-list"
-        className="max-h-80 space-y-4 overflow-y-auto pr-1"
+        className="max-h-80 space-y-4 overflow-y-auto rounded-lg border border-border/60 p-2"
       >
         {sections.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">没有匹配的模型</p>

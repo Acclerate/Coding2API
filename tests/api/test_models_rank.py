@@ -21,7 +21,7 @@ def test_models_by_provider_rates_when_dual_upstream(tmp_path):
         async def list_models(self, _data):
             from src.provider.base import Model
 
-            return [Model(id="glm-5.2", credit_rate=self._rate)]
+            return [Model(id="glm-5.3", credit_rate=self._rate)]
 
         def import_credential(self, raw):
             return raw
@@ -34,13 +34,13 @@ def test_models_by_provider_rates_when_dual_upstream(tmp_path):
     with TestClient(app) as client:
         item = next(m for m in client.get("/v1/models", headers={
             "Authorization": f"Bearer {key}"}).json()["data"]
-            if m["id"] == "glm-5.2")
+            if m["id"] == "glm-5.3")
     assert item["providers"] == ["codebuddy", "trae"]
     assert item["credit_rate"] == 0.29          # 合并值：先到先填
     # by_provider 同时给出各渠道的 raw_id（渠道请求 key）与倍率
     assert item["by_provider"] == {
-        "codebuddy": {"raw_id": "glm-5.2", "credit_rate": 0.29},
-        "trae": {"raw_id": "glm-5.2", "credit_rate": 0.17}}
+        "codebuddy": {"raw_id": "glm-5.3", "credit_rate": 0.29},
+        "trae": {"raw_id": "glm-5.3", "credit_rate": 0.17}}
 
 def test_models_list_orders_cb_then_trae_first(tmp_path):
     """展示顺序：CB → TR → 其余渠道，组内按模型名字典序。
@@ -67,15 +67,18 @@ def test_models_list_orders_cb_then_trae_first(tmp_path):
         # 故意让 zen 的模型名字典序最小、CB 的最大，证明排序按渠道权重而非名字
         "codebuddy": Stub("codebuddy", ["z-cb", "a-cb"]),
         "trae": Stub("trae", ["m-trae"]),
+        "lingxi": Stub("lingxi", ["aaa-lingxi"]),
         "zen": Stub("zen", ["aaa-zen"]),
     })
-    for provider_id in ("codebuddy", "trae", "zen"):
+    for provider_id in ("codebuddy", "trae", "lingxi", "zen"):
         app.state.credentials.add(provider=provider_id, credential_data={"t": "x"})
     key = app.state.api_keys.create("root")["api_key"]
     with TestClient(app) as client:
         ids = [item["id"] for item in client.get(
             "/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]]
-    assert ids == ["a-cb", "z-cb", "m-trae", "aaa-zen"]
+    # lingxi 有专属权重（7）→ 排在 zen/kilo 这类「其余」渠道（8）之前，
+    # 即使名字字典序更大
+    assert ids == ["a-cb", "z-cb", "m-trae", "aaa-lingxi", "aaa-zen"]
 
 def test_models_list_orders_dual_provider_by_highest_rank(tmp_path):
     """多渠道模型按最高优先级渠道归位：含 CB 进第一段，仅 TR 的进第二段。"""

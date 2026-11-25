@@ -23,6 +23,19 @@ from src.tasks.runner import TaskRunner, build_runner
 from tests.helpers.constants import SECRET
 
 
+def _cn_epoch_of(year: int, month: int, day: int, hour: int, minute: int = 0) -> int:
+    """北京时间某刻的 epoch 秒（签到日界固定 Asia/Shanghai，与进程 TZ 无关）。
+
+    不能用 `time.mktime`：它按本地时区解释，CI（UTC）上会差 8 小时，让
+    「封账未到期」的用例假失败。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return int(datetime(year, month, day, hour, minute,
+                        tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+
 class StubProvider:
     id = "codebuddy"
 
@@ -282,6 +295,168 @@ async def test_runner_starts_backup_loop_when_assembled(repo, tmp_path):
         await runner.stop()
 
 
+async def test_runner_start_primes_backup_and_retention(repo, tmp_path):
+    """首轮立即跑 backup / retention：先睡后跑的循环会让短命进程永远错过。
+
+    backup 默认 1440 分钟、retention 首轮 5 分钟，每天重启一次的部署若不在
+    start() 抢先跑一轮，就永远等不到备份（README 承诺「每日」）。
+    """
+    from src.tasks.backup import BackupTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        backup=BackupTask(db.path),
+    )
+    await runner.start()
+    try:
+        assert runner.status.runs("backup") == 1
+        assert runner.status.runs("retention") == 1
+        assert runner.status.get("backup").ok is True
+        assert list((tmp_path / "backups").glob("t-*.sqlite3"))
+        # 循环仍全部建立（首轮抢先跑不影响周期循环接线）
+        assert len(runner._tasks) == 5
+    finally:
+        await runner.stop()
+
+
+async def test_runner_start_primes_are_independent(repo, tmp_path):
+    """一个首轮抛错不影响另一个，也不影响后续循环建立。"""
+    from src.tasks.backup import BackupTask
+
+    class ExplodingRetention(RetentionTask):
+        def run_once(self, **_kwargs):
+            raise RuntimeError("retention blown up")
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=ExplodingRetention(StatsCollector(db)),
+        backup=BackupTask(db.path),
+    )
+    await runner.start()
+    try:
+        # backup 照常跑完
+        assert runner.status.get("backup").ok is True
+        # retention 失败被记成失败而不是静默跳过
+        assert runner.status.get("retention").ok is False
+        assert "blown up" in (runner.status.get("retention").error or "")
+        # 循环仍然全部建立，且没有一个已退出
+        assert len(runner._tasks) == 5
+        assert all(not task.done() for task in runner._tasks)
+    finally:
+        await runner.stop()
+
+
+def test_build_runner_wires_upstream_status(repo):
+    """upstream_status 传入时接线：周期从配置读，开关与对象原样挂上。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET,
+                      UPSTREAM_STATUS_MINUTES=7, UPSTREAM_STATUS_ENABLED=False)
+    task = UpstreamStatusTask(UpstreamStatusStore(),
+                              enabled=lambda: config.upstream_status_enabled)
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          upstream_status=task)
+
+    assert runner._upstream_status is task
+    assert runner._upstream_status_interval == 7 * 60
+    assert runner._task_enabled("upstream_status") is False
+    assert "upstream_status" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("upstream_status") == 7 * 60
+
+
+def test_upstream_status_interval_has_floor(repo):
+    """周期下限 1 分钟（与热更项 minimum 对齐）。"""
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, UPSTREAM_STATUS_MINUTES=0)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._upstream_status_interval == 60
+
+
+def test_upstream_status_not_assembled_by_default(repo):
+    """老调用方不传 upstream_status 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._upstream_status is None
+    assert "upstream_status" not in {spec.key for spec in runner._loop_specs()}
+    assert "upstream_status" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_upstream_status_without_task_raises(repo):
+    """未装配时 _sync_upstream_status 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="upstream status task not configured"):
+        await runner._sync_upstream_status()
+
+
+async def test_runner_upstream_status_loop_runs_task(repo):
+    """循环体委托给任务对象；任务关闭时 no-op 不入账（页面显示「未运行」）。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore, spec_by_key
+
+    credentials, _db = repo
+    provider = StubProvider()
+    flag = {"on": False}
+    store = UpstreamStatusStore()
+    spec = spec_by_key("kilo")
+    assert spec is not None
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(store, specs=(spec,),
+                                           enabled=lambda: flag["on"]),
+    )
+
+    # 关着：返回 None，不覆盖运行态
+    assert await runner._sync_upstream_status() is None
+    assert runner.status.runs("upstream_status") == 0
+
+    flag["on"] = True
+    ok = await runner._guarded(runner._sync_upstream_status(), "上游状态页",
+                               key="upstream_status")
+    assert ok is True
+    assert runner.status.runs("upstream_status") == 1
+    assert runner.status.get("upstream_status").report == {
+        "sources": 0, "abnormal": 0, "failed": 0}
+
+
+async def test_runner_starts_upstream_status_loop_when_assembled(repo):
+    """装配后必须真的多起一条循环。"""
+    from src.tasks.upstream_status import UpstreamStatusTask
+    from src.upstream_status import UpstreamStatusStore
+
+    credentials, _db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(_db)),
+        upstream_status=UpstreamStatusTask(UpstreamStatusStore(), specs=()),
+    )
+    await runner.start()
+    try:
+        assert len(runner._tasks) == 5
+        assert "upstream_status" in {item["key"] for item in runner.task_status()}
+    finally:
+        await runner.stop()
+
+
 async def test_providers_release_http_pools_on_shutdown(tmp_path):
     """lifespan 关闭时必须释放 provider 的连接池。"""
     from src.provider.codebuddy.client import CodeBuddyProvider
@@ -291,13 +466,63 @@ async def test_providers_release_http_pools_on_shutdown(tmp_path):
     trae = TraeProvider()
     # 触发惰性客户端创建
     assert codebuddy.client._stream is not None
-    assert trae.client._stream() is not None
+    assert trae.client._stream is not None
 
     await codebuddy.aclose()
     await trae.aclose()
     # 关闭后再次调用必须幂等
     await codebuddy.aclose()
     await trae.aclose()
+
+
+def test_lifespan_starts_task_runner_in_background(monkeypatch, tmp_path):
+    """lifespan 必须把 runner.start() 放到后台，不能在 startup 里 await。
+
+    `start()` 首轮是两个真实的上游网络调用（额度探测 + token 预刷新），最慢
+    十几秒；内联会让 lifespan startup 不结束 → uvicorn 尚未 accept，容器健康
+    探针在窗口内判 unhealthy。放后台后 /health 在 start 完成前就是可达的；
+    关闭期则先收尾 start 再 stop（否则 stop 先跑会产生孤儿循环任务）。
+    """
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from src.main import build_app
+    from tests.helpers.auth import isolated_settings
+
+    # 探测预算（远大于一次 /health 往返）：请求返回时首轮探测「仍在跑」
+    SLOW_START_SECONDS = 0.5
+
+    class FakeRunner:
+        """只实现 lifespan 用到的面：start / stop（与 state 引用）。"""
+
+        def __init__(self):
+            self.start_entered = asyncio.Event()
+            self.start_completed = False
+            self.stopped = False
+            self.stop_after_start = False        # stop 必须晚于 start 完成
+
+        async def start(self):
+            self.start_entered.set()
+            await asyncio.sleep(SLOW_START_SECONDS)   # 模拟首轮上游 IO
+            self.start_completed = True
+
+        async def stop(self):
+            self.stopped = True
+            self.stop_after_start = self.start_completed
+
+    fake = FakeRunner()
+    monkeypatch.setattr("src.main.build_runner", lambda *a, **k: fake)
+
+    app = build_app(isolated_settings(tmp_path))
+    with TestClient(app) as http:
+        http.get("/health")
+        # start 已被调度（create_task 执行过至少一次调度点），但仍在首轮探测中
+        assert fake.start_entered.is_set(), "runner.start 未被调度"
+        assert not fake.start_completed, "startup 又变成了内联 await"
+
+    # 关闭期：先等 start 收尾，再 stop（顺序即不产生孤儿循环）
+    assert fake.start_completed and fake.stopped and fake.stop_after_start
 
 
 def test_run_entry_point_exists_and_is_callable():
@@ -353,7 +578,7 @@ async def test_runner_checkin_fires_when_due(repo, monkeypatch):
     provider = StubProvider()
     calls: list[int] = []
 
-    async def fake_run_once(*, now=None):
+    async def fake_run_once(*, now=None, trigger="auto"):
         calls.append(1)
         from src.tasks import TaskReport
 
@@ -423,8 +648,133 @@ def test_run_entry_point_starts_uvicorn(monkeypatch, tmp_path):
     assert captured["port"] == 9123
     assert captured["log_level"] == "warning"
     assert captured["app"] is not None
+    # uvicorn 自带 access log 与 RequestLogMiddleware 重复（且无时间戳 /
+    # request_id），必须关掉
+    assert captured["access_log"] is False
     # 停机排空：不给 timeout_graceful_shutdown 就是无限等（长流卡住直到 SIGKILL）
     assert captured["timeout_graceful_shutdown"] == main.GRACEFUL_SHUTDOWN_SECONDS
+    # uvicorn 自带 proxy_headers=True 会把回环对端请求的 scope["client"] 改写成
+    # X-Forwarded-For 尾条目，绕过应用层 `TRUST_PROXY` 判定（来源 IP 白名单 /
+    # 登录限流可被回环调用方伪造）。必须显式关掉，来源解析只归 access.client_ip。
+    assert captured["proxy_headers"] is False
+
+
+def test_run_releases_instance_lock_after_uvicorn_returns(monkeypatch, tmp_path):
+    """uvicorn 退出后必须释放锁，否则重启永远起不来。"""
+    import sys
+    import types
+
+    from src import main
+    from src.instance_lock import LOCK_NAME, InstanceLock
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda app, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setenv("APP_SECRET", SECRET)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    main.run()
+
+    # 能再次取到锁 = 上次确实释放了
+    lock = InstanceLock(tmp_path)
+    lock.acquire()
+    lock.release()
+    assert (tmp_path / LOCK_NAME).is_file()
+
+
+def test_run_aborts_when_another_instance_holds_lock(monkeypatch, tmp_path, capsys):
+    """已有实例持锁时 run() 干净返回，绝不进 build_app（避免双写库）。
+
+    这是崩溃循环的止损点：若这里以非零退出，launchd（SuccessfulExit=false）/
+    systemd（Restart=on-failure）会把「另一个实例在跑」当成崩溃每 10s 重拉，
+    实测刷过 2377 条 `[Errno 48]`。所以必须退出码 0。
+    """
+    import sys
+    import types
+
+    from src import main
+    from src.instance_lock import InstanceLock
+
+    started: list[int] = []
+
+    def fake_run(app, **kwargs):
+        started.append(1)
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = fake_run  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setenv("APP_SECRET", SECRET)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    holder = InstanceLock(tmp_path)
+    holder.acquire()
+    try:
+        main.run()          # 不得抛 SystemExit（非零退出会触发重拉循环）
+    finally:
+        holder.release()
+
+    assert started == [], "取锁失败时不得启动 uvicorn"
+    err = capsys.readouterr().err
+    assert "启动中止" in err
+    assert "另一个实例" in err
+
+
+def test_run_releases_lock_when_build_app_raises(monkeypatch, tmp_path):
+    """build_app 抛异常也要释放锁（finally 覆盖，不是只在正常路径）。"""
+    import sys
+    import types
+
+    from src import main
+    from src.instance_lock import InstanceLock
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda app, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setenv("APP_SECRET", SECRET)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    def boom(_config):
+        raise RuntimeError("组装失败")
+
+    monkeypatch.setattr(main, "build_app", boom)
+
+    with pytest.raises(RuntimeError):
+        main.run()
+
+    lock = InstanceLock(tmp_path)
+    lock.acquire()
+    lock.release()
+
+
+def test_run_refuses_to_start_on_unsupported_platform(monkeypatch, tmp_path, capsys):
+    """未收录平台（#46）：入口给可读中文后退出，绝不靠静默 no-op 起服务。
+
+    这里走真实的 `require_supported_platform()`（只 patch `sys.platform`），
+    确保「platform_support → run」这条链路是通的，而不是各自单测通过、串起来错。
+    fork 收录了 win32（msvcrt 锁），所以替身用真正未收录的 freebsd13。
+    """
+    import sys
+    import types
+
+    from src import main
+
+    started: list[int] = []
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda app, **kwargs: started.append(1)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setenv("APP_SECRET", SECRET)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "platform", "freebsd13")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main.run()
+
+    text = str(excinfo.value.code)
+    assert "本平台暂不支持" in text
+    assert "WSL2" in text or "Docker" in text
+    assert "README" in text
+    assert started == [], "不支持的平台上不得启动 uvicorn"
+    assert not (tmp_path / ".instance.lock").exists()
 
 
 async def test_loop_executes_runner_after_interval(repo):
@@ -481,17 +831,18 @@ async def test_checkin_task_soft_failure_retries_same_day(repo, monkeypatch):
     runner, _collector = _runner(repo, provider)
     task = runner._checkin
     task._done_scopes.clear()
-    now = _time.localtime()
+    now = _time.struct_time((2026, 9, 11, 10, 0, 0, 3, 254, 0))
     report = await task.run_once(now=now)
     assert report.failed == 1 and report.succeeded == 0
     assert task._day_key(now) not in task._done_scopes   # 未封账 → 下轮重试
 
-    # 下一轮成功 → 封账
+    # 下一轮（退避 10 分钟后）成功 → 封账
     async def ok_checkin(_data):
         return CheckinResult(ok=True, credit=200, code=0)
 
     provider.checkin = ok_checkin
-    report2 = await task.run_once(now=now)
+    retry_at = _time.struct_time((2026, 9, 11, 10, 10, 0, 3, 254, 0))
+    report2 = await task.run_once(now=retry_at)
     assert report2.succeeded == 1 and report2.failed == 0
     assert any(key.startswith(f"{task._day_key(now)}:") for key in task._done_scopes)
 
@@ -513,7 +864,9 @@ async def test_checkin_seal_until_shortens_day_and_prunes_stale_days(repo):
                              message="今日已签到", seal_until=window_end)
 
     midnight = time.struct_time((2026, 10, 8, 0, 5, 0, 0, 1, -1))
-    window_end = int(time.mktime((2026, 10, 8, 10, 5, 0, 0, 1, -1)))
+    # 期望值按北京时间算：`_sealed` 用 `_cn_epoch` 解释 struct_time，CI（UTC）
+    # 上若用 time.mktime 会整体差 8 小时，封账立刻过期 → 用例假失败
+    window_end = _cn_epoch_of(2026, 10, 8, 10, 5)
     provider.checkin = sealed_checkin
     task = CheckinTask(credentials, {"codebuddy": provider})
 
@@ -546,7 +899,7 @@ async def test_checkin_seal_expired_entry_is_not_treated_as_sealed(repo):
     async def checkin(_data):
         calls.append(1)
         return CheckinResult(ok=True, credit=1, code=0,
-                             seal_until=int(time.mktime((2026, 10, 8, 0, 10, 0, 0, 1, -1))))
+                             seal_until=_cn_epoch_of(2026, 10, 8, 0, 10))
 
     provider.checkin = checkin
     task = CheckinTask(credentials, {"codebuddy": provider})
@@ -557,11 +910,14 @@ async def test_checkin_seal_expired_entry_is_not_treated_as_sealed(repo):
     assert len(calls) == 2
 
 
-def test_checkin_day_end_is_next_local_midnight():
-    """默认封账截止 = 当日 24:00（渠道不给 seal_until 时的兜底）。"""
+def test_checkin_day_end_is_next_beijing_midnight():
+    """默认封账截止 = 当日 24:00（渠道不给 seal_until 时的兜底）。
+
+    日界是**北京时间**，与进程 TZ 无关（CI runner 是 UTC）。
+    """
     task = CheckinTask.__new__(CheckinTask)
     now = time.struct_time((2026, 10, 8, 23, 30, 0, 0, 1, -1))
-    assert task._day_end(now) == int(time.mktime((2026, 10, 9, 0, 0, 0, 0, 1, -1)))
+    assert task._day_end(now) == _cn_epoch_of(2026, 10, 9, 0, 0)
 
 
 class RecordingPacer:
@@ -623,3 +979,180 @@ async def test_sync_helpers_raise_when_optional_tasks_unwired(repo):
     for sync in (runner._sync_growth, runner._sync_activity, runner._sync_alert):
         with pytest.raises(RuntimeError, match="not configured"):
             await sync()
+
+
+class _Store:
+    """最小 SettingsStore：只实现读写，避免测试依赖数据库。"""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, str] = {}
+
+    def load(self) -> dict[str, str]:
+        return dict(self.rows)
+
+    def set(self, key: str, value: str, now: int | None = None) -> None:
+        self.rows[key] = value
+
+    def delete(self, key: str) -> None:
+        self.rows.pop(key, None)
+
+
+def _runtime(**overrides):
+    from src.runtime_settings import RuntimeSettings
+
+    base = Settings(_env_file=None, APP_SECRET=SECRET, **overrides)
+    store = _Store()
+    return RuntimeSettings(base, store), store
+
+
+def test_checkin_interval_follows_schedule_config(repo):
+    """签到时点是否配置决定醒转周期：留空 10 分钟，配了则 1 分钟。
+
+    抖动=0 时 due() 窗口只有「恰好那一分钟」，10 分钟周期下醒来时刻几乎必然
+    错开，结果是一天一次都不签——比旧的全天轮询更糟。
+    """
+    credentials, db = repo
+    config, store = _runtime()
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+    assert runner._interval_seconds("checkin") == 600.0
+
+    store.set("checkin_times", "09:37")
+    config.reload()
+    assert runner._checkin.has_times() is True
+    assert runner._interval_seconds("checkin") == 60.0
+
+    # 全是坏段等同留空：退回旧行为，不让一条笔误锁死签到
+    store.set("checkin_times", "25:00,bad")
+    config.reload()
+    assert runner._checkin.has_times() is False
+    assert runner._interval_seconds("checkin") == 600.0
+
+
+def test_build_runner_wires_checkin_schedule(repo):
+    """时点与抖动从热更项接线（零参 callable，改动立刻生效）。"""
+    credentials, db = repo
+    config, store = _runtime(CHECKIN_TIMES="09:37,21:10", CHECKIN_JITTER_MINUTES=5)
+    runner = build_runner(credentials, {}, StatsCollector(db), config)
+
+    assert runner._checkin._times() == "09:37,21:10"
+    assert runner._checkin._jitter() == 5
+    store.set("checkin_times", "")
+    config.reload()
+    assert runner._checkin._times() == ""
+
+
+def test_build_runner_wires_model_probe(repo):
+    """model_probe 传入时接线：周期从配置读，循环与间隔都挂上。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    config = Settings(_env_file=None, APP_SECRET=SECRET, MODEL_PROBE_MINUTES=90)
+    task = ModelProbeTask(credentials, {}, ModelProbeRepository(db))
+    runner = build_runner(credentials, {}, StatsCollector(db), config,
+                          model_probe=task,
+                          model_probe_minutes=lambda: config.model_probe_minutes)
+
+    assert runner._model_probe is task
+    assert runner._model_probe_interval == 90 * 60
+    assert "model_probe" in {spec.key for spec in runner._loop_specs()}
+    assert runner._interval_seconds("model_probe") == 90 * 60
+    assert "model_probe" in {item["key"] for item in runner.task_status()}
+
+
+def test_model_probe_interval_floor(repo):
+    """周期下限 1 分钟：填 0（关闭）时循环仍在，只是每轮判成 no-op。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET,
+                                   MODEL_PROBE_MINUTES=0))
+
+    assert runner._model_probe_interval == 60
+
+
+def test_model_probe_not_assembled_by_default(repo):
+    """老调用方不传 model_probe 时整条循环不出现（保持原行为）。"""
+    credentials, db = repo
+    runner = build_runner(credentials, {}, StatsCollector(db),
+                          Settings(_env_file=None, APP_SECRET=SECRET))
+
+    assert runner._model_probe is None
+    assert "model_probe" not in {spec.key for spec in runner._loop_specs()}
+    assert "model_probe" not in {item["key"] for item in runner.task_status()}
+
+
+async def test_runner_model_probe_without_task_raises(repo):
+    """未装配时 _sync_model_probe 报错（不会被静默当 no-op）。"""
+    runner, _ = _runner(repo, StubProvider())
+    with pytest.raises(RuntimeError, match="model probe task not configured"):
+        await runner._sync_model_probe()
+
+
+async def test_runner_model_probe_disabled_is_noop(repo):
+    """周期 0（默认）= 关闭：返回 None 且不记运行态（页面显示「未运行」）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 0,
+    )
+
+    assert await runner._sync_model_probe() is None
+    assert runner.status.runs("model_probe") == 0
+
+
+async def test_runner_model_probe_runs_task_when_enabled(repo):
+    """周期 > 0 时委托给任务对象（无负缓存行 → 空报告也算跑过一轮）。"""
+    from src.db.repo import ModelProbeRepository
+    from src.tasks.model_probe import ModelProbeTask
+
+    credentials, db = repo
+    provider = StubProvider()
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600),
+        retention=RetentionTask(StatsCollector(db)),
+        model_probe=ModelProbeTask(credentials, {"codebuddy": provider},
+                                   ModelProbeRepository(db)),
+        model_probe_minutes=lambda: 60,
+    )
+
+    ok = await runner._guarded(runner._sync_model_probe(), "模型探活",
+                               key="model_probe")
+
+    assert ok is True
+    assert runner.status.runs("model_probe") == 1
+    assert runner.status.get("model_probe").report == {
+        "attempted": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+
+
+async def test_sync_growth_delegates_to_task(repo):
+    """成长中心装配后 `_sync_growth` 委托给任务对象（返回值原样透传）。"""
+    credentials, db = repo
+    collector = StatsCollector(db)
+
+    class FakeGrowth:
+        calls = 0
+
+        async def run_once(self):
+            FakeGrowth.calls += 1
+            return {"gifts": 1}
+
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {}, None),
+        checkin=CheckinTask(credentials, {}),
+        refresh=RefreshTask(credentials, {}, skew_seconds=3600),
+        retention=RetentionTask(collector),
+        growth=FakeGrowth(),
+    )
+    assert await runner._sync_growth() == {"gifts": 1}
+    assert FakeGrowth.calls == 1

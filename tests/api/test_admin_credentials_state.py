@@ -62,6 +62,11 @@ def test_credentials_endpoint_exposes_expiring_credits(tmp_path):
     assert rows["codebuddy"]["quota_expiring_credits_secondary"] == 140.0
     assert rows["codebuddy"]["quota_expiry_ladder"] == [
         [now + 3600, 100.0], [now + 3 * 86400, 40.0], [now + 999_999, 50.0]]
+    # 福利链路下线后不再下发任何积分账派生字段
+    for row in (rows["codebuddy"], rows["trae"]):
+        for key in ("quota_credits_expiring", "quota_credits_expiring_secondary",
+                    "quota_credits_health", "quota_credits_expiry_ladder"):
+            assert key not in row
     assert rows["trae"]["quota_expiring_credits"] is None
     assert rows["trae"]["quota_expiring_credits_secondary"] is None
     assert rows["trae"]["quota_expiry_ladder"] is None

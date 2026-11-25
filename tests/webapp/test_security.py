@@ -8,7 +8,6 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from src.auth.csrf import X_REQUESTED_WITH
 from src.auth.session import create_session_token
 from src.auth.throttle import LoginThrottle, ThrottleLimits
 from src.config import Settings
@@ -125,16 +124,32 @@ def test_csrf_allows_same_origin(admin_client):
     assert response.status_code == 200
 
 
-def test_csrf_allows_custom_header(admin_client):
+def test_csrf_custom_header_alone_does_not_bypass(admin_client):
+    """`X-Requested-With` 不再豁免同源校验。
+
+    该头此前是「浏览器无法跨源设置」的推论，一旦将来引入允许非同源自定义
+    头的 CORS，它立刻变成 CSRF 绕过面。现在只有 Origin/Referer 同源才算数，
+    跨源请求带上这个头也必须被拒。
+    """
     response = admin_client.post(
         "/api/credentials",
         json={
             "provider": "trae",
             "credential": {"accessToken": "t", "uid": "u", "refreshToken": "r"},
         },
-        headers={X_REQUESTED_WITH: "XMLHttpRequest"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
     )
-    assert response.status_code == 200
+    assert response.status_code == 200          # 无 Origin/Referer：非浏览器客户端
+
+    cross = admin_client.post(
+        "/api/credentials",
+        json={
+            "provider": "trae",
+            "credential": {"accessToken": "t", "uid": "u", "refreshToken": "r"},
+        },
+        headers={"X-Requested-With": "XMLHttpRequest", "Origin": "https://evil.example"},
+    )
+    assert cross.status_code == 403
 
 
 def test_csrf_allows_headerless_non_browser(admin_client):
@@ -173,6 +188,9 @@ def test_login_body_limit_8kb(app):
         "/api/auth/login", content=payload, headers={"Content-Type": "application/json"}
     )
     assert response.status_code == 413
+    # content-length 路径：回填声明的字节数与配置上限
+    assert response.json()["error"]["message"] == (
+        f"request body {len(payload)} bytes exceeds limit 8192 bytes")
 
 
 def test_chat_body_limit_16mb(app):
@@ -182,6 +200,28 @@ def test_chat_body_limit_16mb(app):
         "/v1/chat/completions", content=oversized, headers={"Content-Type": "application/json"}
     )
     assert response.status_code == 413
+    assert response.json()["error"]["message"] == (
+        f"request body {len(oversized)} bytes exceeds limit 16777216 bytes")
+
+
+def test_chunked_body_limit_reports_actual_size(app):
+    """分块请求没有 content-length：回填 receive 层累计的实际字节数。
+
+    httpx 对迭代器形式的 body 走 `Transfer-Encoding: chunked`，中间件只能靠
+    receive 计数发现超限——这条路径的 size 是实测值，不是声明值。
+    """
+    _app, client = app
+
+    def chunks():
+        yield b"x" * (8 * 1024)      # 刚好到上限，不触发
+        yield b"y"                   # 超 1 字节 → 413
+
+    response = client.post(
+        "/api/auth/login", content=chunks(), headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 413
+    assert response.json()["error"]["message"] == (
+        "request body 8193 bytes exceeds limit 8192 bytes")
 
 
 # -------------------------------------------------------------- 安全响应头
@@ -336,26 +376,92 @@ def test_csrf_referer_same_origin_allows_write():
 
 
 def test_login_throttle_prunes_expired_and_global_cap():
-    """过期事件被清理；全局窗口超限抛 ThrottledError；空用户名成功不清空。"""
+    """过期事件被清理；全局窗口**不再**用于拒绝（防全站登录锁死）。"""
     import time as _time
 
-    from src.auth.throttle import LoginThrottle, ThrottledError, ThrottleLimits
+    from src.auth.throttle import LoginThrottle, ThrottleLimits
 
     throttle = LoginThrottle(ThrottleLimits(max_global=40, max_per_ip=8, max_per_user=5))
     # 塞一条过期失败记录，check 的 _prune 应清理它（popleft 分支）
     throttle._events[("g", "")].append(_time.monotonic() - 61)
     throttle.check(ip="1.2.3.4", username="alice")            # 不抛
 
-    # 全局窗口：塞满 max_global 条新失败 → 任意 IP/用户都被拒
+    # 全局窗口满 ≠ 拒绝：未认证攻击者能把它打满，据它拒绝等于远程 DoS
     global_throttle = LoginThrottle(
         ThrottleLimits(max_global=1, max_per_ip=100, max_per_user=100))
     global_throttle.record_failure(ip="9.9.9.9", username="ghost")
-    with pytest.raises(ThrottledError):
-        global_throttle.check(ip="1.2.3.4", username="alice")
+    global_throttle.check(ip="1.2.3.4", username="alice")     # 干净 IP 仍放行
+    global_throttle.check_transport_windows(ip="1.2.3.4")     # 哈希前同样放行
 
     # 空用户名的成功登录不清空任何计数
     throttle.record_success(username="")
     assert len(throttle._events[("g", "")]) == 0              # 上一行 check 已清
+
+
+def test_login_throttle_per_ip_still_blocks():
+    """IP 窗口是真正的拒绝判据（全局窗口退出后仍要挡住单来源爆破）。"""
+    from src.auth.throttle import LoginThrottle, ThrottledError, ThrottleLimits
+
+    throttle = LoginThrottle(ThrottleLimits(max_per_ip=2, max_per_user=100))
+    throttle.record_failure(ip="9.9.9.9", username="a")
+    throttle.record_failure(ip="9.9.9.9", username="b")
+    with pytest.raises(ThrottledError):
+        throttle.check_transport_windows(ip="9.9.9.9")
+    with pytest.raises(ThrottledError):
+        throttle.check(ip="9.9.9.9", username="c")
+    # 同名不同 IP 不受牵连
+    throttle.check(ip="8.8.8.8", username="c")
+
+
+def test_login_throttle_loopback_never_blocked():
+    """回环地址永不被限流：反代/隧道下所有请求共用 127.0.0.1。
+
+    限它等于把所有用户塞进同一个桶——哪怕桶本身就是攻击者打满的。
+    """
+    from src.auth.throttle import LoginThrottle, ThrottleLimits
+
+    for loopback in ("127.0.0.1", "::1", "127.0.0.2"):
+        throttle = LoginThrottle(ThrottleLimits(max_per_ip=1, max_per_user=100))
+        for _ in range(10):
+            throttle.record_failure(ip=loopback, username="x")
+        throttle.check_transport_windows(ip=loopback)   # 不抛
+        throttle.check(ip=loopback, username="other")   # 用户名窗口也干净
+
+
+def test_login_throttle_loopback_helper_handles_bad_input():
+    """IP 解析失败按「非回环」处理（不能因一条脏数据把所有人当本机放行）。"""
+    from src.auth.throttle import _is_loopback
+
+    assert _is_loopback("127.0.0.1") is True
+    assert _is_loopback("::1") is True
+    assert _is_loopback("10.0.0.1") is False
+    assert _is_loopback("") is False
+    assert _is_loopback("not-an-ip") is False
+    assert _is_loopback("  ::1  ") is True
+
+
+def test_login_throttle_eviction_keeps_at_limit_keys():
+    """容量淘汰不能挤掉已限流的键。
+
+    否则攻击者先撞满目标用户名的 max_per_user，再灌一批唯一用户名把容量
+    挤爆，就能通过淘汰把它清零、继续爆破。
+    """
+    import time as _time
+
+    from src.auth.throttle import LoginThrottle, ThrottleLimits
+
+    throttle = LoginThrottle(ThrottleLimits(max_per_user=2, max_per_ip=100))
+    throttle._MAX_KEYS = 3
+    now = _time.monotonic()
+    # 目标用户名已限流，且它的最近失败时间最早（旧实现会第一个淘汰它）
+    throttle._events[("u", "target")].extend([now - 10, now - 9])
+    throttle._events[("u", "fresh1")].append(now)
+    throttle._events[("u", "fresh2")].append(now)
+    throttle._events[("u", "fresh3")].append(now)
+    throttle._evict_over_capacity(now)
+    assert len(throttle._events) == 3
+    assert ("u", "target") in throttle._events
+    assert ("u", "fresh1") not in throttle._events
 
 
 def test_login_throttle_evicts_keys_over_capacity():
@@ -384,16 +490,76 @@ def test_login_throttle_evicts_keys_over_capacity():
     assert ("g", "") in throttle._events
 
 
+def _request(headers: dict[str, str]):
+    """构造只带指定头的 Request（用于 session_cookie_secure 分支测试）。"""
+    from starlette.requests import Request
+
+    return Request(scope={"type": "http",
+                          "headers": [(k.lower().encode(), v.encode())
+                                      for k, v in headers.items()]})
+
+
+def test_session_cookie_secure_follows_forwarded_proto():
+    """有 XFP 时以第一个条目为准；非法值落到 Host 判定分支。"""
+    from src.webapp.security import session_cookie_secure
+
+    http_settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                             PUBLIC_BASE_URL="http://127.0.0.1:8000")
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "https"}),
+        http_settings) is True
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "http"}),
+        http_settings) is False
+    # 多值取第一段（隧道叠加多级代理时会追加）
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "HTTPS, http"}),
+        http_settings) is True
+    # 非法协议视为无该头 → 明文部署一律不 Secure
+    assert session_cookie_secure(
+        _request({"host": "any.example", "x-forwarded-proto": "ftp"}),
+        http_settings) is False
+
+
+def test_session_cookie_secure_without_forwarded_proto():
+    """无 XFP：仅当 Host 命中 https 的 PUBLIC_BASE_URL 主机才判 Secure。"""
+    from src.webapp.security import session_cookie_secure
+
+    https_settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                              PUBLIC_BASE_URL="https://ai-api.robbs.work")
+    assert session_cookie_secure(_request({"host": "ai-api.robbs.work"}),
+                                 https_settings) is True
+    assert session_cookie_secure(_request({"host": "ai-api.robbs.work:443"}),
+                                 https_settings) is True
+    # 直连其它地址（LAN IP）视为明文
+    assert session_cookie_secure(_request({"host": "192.168.124.35:8000"}),
+                                 https_settings) is False
+    assert session_cookie_secure(_request({}), https_settings) is False
+    # https 但 base 主机解析为空（无 scheme / 无 host）→ 不 Secure
+    # Settings 现在会拒绝非法形态，这里模拟升级前写进 .env 的坏值
+    empty = Settings.model_construct(
+        app_secret=SECRET, public_base_url="https:///oops")
+    assert session_cookie_secure(_request({"host": "oops"}), empty) is False
+
+
 def test_host_allowed_public_base_url_edge_shapes():
-    """PUBLIC_BASE_URL 无 scheme / path_host 为空时不炸也不误放行。"""
+    """PUBLIC_BASE_URL 无 scheme / path_host 为空时不炸也不误放行。
+
+    非法形态已由 `Settings` 的 field_validator 拒绝；这里用 model_construct
+    模拟升级前写入的老 `.env`，确认下游仍能安全降级。
+    """
     from src.config import Settings
     from src.main import _host_allowed
 
     # 无 scheme：startswith 分支不命中，主机仍进白名单
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, PUBLIC_BASE_URL="localhost:8000")
+    settings = Settings.model_construct(
+        app_secret=SECRET, public_base_url="localhost:8000",
+        allowed_hosts="", allow_test_host=False)
     assert _host_allowed("localhost", settings)
     # base 主机为空：path_host 分支不命中，仅默认白名单生效
-    empty = Settings(_env_file=None, APP_SECRET=SECRET, PUBLIC_BASE_URL="/oops")
+    empty = Settings.model_construct(
+        app_secret=SECRET, public_base_url="/oops",
+        allowed_hosts="", allow_test_host=False)
     assert _host_allowed("localhost", empty)
     assert not _host_allowed("evil.example", empty)
 
@@ -456,3 +622,11 @@ def test_host_allowed_excludes_testserver_unless_enabled():
     assert _host_allowed("localhost", off) is True          # 本地回环仍放行
     on = Settings(_env_file=None, APP_SECRET=SECRET, ALLOW_TEST_HOST="true")
     assert _host_allowed("testserver", on) is True
+
+
+def test_at_limit_returns_false_for_global_key():
+    """全局键不参与淘汰降级判定（它始终保留，也不需要「已限流」标记）。"""
+    from src.auth.throttle import LoginThrottle
+
+    throttle = LoginThrottle()
+    assert throttle._at_limit(("g", "")) is False

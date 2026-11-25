@@ -53,9 +53,11 @@ def activity_repo(tmp_path):
     apply_schema(db.connect())
     return CredentialRepository(db, CredentialCipher(SECRET))
 
-def _add(repo, *, provider="codebuddy", token="t", disabled=False):
+def _add(repo, *, provider="codebuddy", token="t", disabled=False, enabled=True):
     credential_id = repo.add(provider=provider,
                              credential_data={"bearer_token": token})
+    if not enabled:
+        repo.set_enabled(credential_id, False)
     if disabled:
         from src.engine.scheduler import Candidate, Scheduler
         from src.provider.base import ErrKind
@@ -99,6 +101,21 @@ async def test_activity_task_skips_unsupported_and_disabled(activity_repo):
     assert report.succeeded == 1
     assert report.skipped == 2
     assert provider.calls == 1
+
+async def test_activity_task_skips_soft_disabled_credentials(activity_repo):
+    """`enabled=0`（用户软暂停）不参与活跃上报：暂停不能只停调度。
+
+    与 checkin / refresh / quota_probe / growth 同口径。此前只判 `disabled`，
+    于是「暂停」的号仍被拿去打卡。
+    """
+    _add(activity_repo, token="a")
+    _add(activity_repo, token="b", enabled=False)
+    provider = _FakeProvider()
+    task = ActivityTask(activity_repo, {"codebuddy": provider}, hour=10)
+    report = await task.run_once()
+    assert report.attempted == 1 and report.skipped == 1
+    assert provider.calls == 1
+
 
 async def test_activity_task_skips_missing_provider_and_data():
     """provider 不认识该渠道、或凭证数据缺失 → 跳过（不调上游）。"""
@@ -146,6 +163,23 @@ async def test_activity_task_failure_retries_and_does_not_abort(activity_repo):
     again = await task.run_once()
     assert again.attempted == 2
 
+async def test_activity_task_exception_log_keeps_class_name(activity_repo, caplog):
+    """抛出的异常必须记成 `类名: 消息`，不能只剩一个空尾巴。
+
+    回归 2026-11-09：日志是
+    `activity report failed for cred_x: `（冒号后为空）——上游 `ConnectError`
+    的 `str()` 为空，运维无法判断是代理抖动还是上游拒绝。与 checkin /
+    quota_probe 统一走 `error_text`。
+    """
+    _add(activity_repo, token="b")
+    task = ActivityTask(activity_repo, {"codebuddy": _DispatchProvider()}, hour=10)
+    with caplog.at_level("WARNING", logger="src.tasks.activity"):
+        await task.run_once()
+    messages = [record.getMessage() for record in caplog.records
+                if "activity report failed" in record.getMessage()]
+    assert messages, "未记录失败日志"
+    assert any("RuntimeError: boom" in message for message in messages)
+
 async def test_activity_task_records_growth_event_on_success(activity_repo):
     _add(activity_repo)
     events = GrowthRepository(activity_repo._db)  # noqa: SLF001
@@ -170,6 +204,18 @@ def test_activity_task_day_key_is_cn_local():
     task = ActivityTask.__new__(ActivityTask)
     task._now = _cn(0, 30)
     assert task._day_key() == "2026-09-21"
+
+async def test_activity_task_prunes_stale_done_scopes(activity_repo):
+    """跨天后清掉前一天的封账记录：长驻进程否则每天每账号各攒一条（无上限）。"""
+    _add(activity_repo, token="a")
+    task = ActivityTask(activity_repo, {"codebuddy": _FakeProvider()},
+                        hour=10, now=_cn(10, 5))
+    task._done_scopes = {"2026-09-20:s1", "2026-09-21:s1", "2026-09-19:s1"}
+
+    await task.run_once()
+
+    # 非当天两条被清掉；当天那条保留（本轮已成功会重新写入同键）
+    assert task._done_scopes == {"2026-09-21:s1"}
 
 def test_build_runner_activity_toggle(tmp_path):
     """活跃上报恒建对象，开关只决定跑不跑（开关可热更）。

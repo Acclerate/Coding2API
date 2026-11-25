@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.provider.base import Quota
@@ -19,7 +21,7 @@ from src.tasks.quota_probe import QuotaProbeTask
 from src.tasks.refresh import RefreshTask
 from src.tasks.retention import RetentionTask
 from src.tasks.runner import TaskRunner, build_runner
-from src.tasks.status import TASK_BY_KEY, TASK_SPECS, TaskStatusStore
+from src.tasks.status import TASK_BY_KEY, TASK_GROUPS, TASK_SPECS, TaskStatusStore
 from tests.helpers.constants import SECRET
 
 
@@ -186,6 +188,8 @@ def test_task_status_lists_assembled_tasks_with_intervals(repo):
         "quota_probe", "refresh", "checkin", "retention"]
     by_key = {item["key"]: item for item in status}
     assert by_key["quota_probe"]["interval_seconds"] == 3600.0
+    assert by_key["quota_probe"]["group"] == "account"
+    assert by_key["retention"]["group"] == "ops"
     assert by_key["checkin"]["interval_seconds"] == 600.0
     assert by_key["retention"]["interval_seconds"] == 300.0
     assert by_key["quota_probe"]["enabled"] is True
@@ -286,8 +290,11 @@ def test_runner_reuses_injected_status_store(repo):
 
 def test_task_specs_are_unique_and_named():
     assert len({spec.key for spec in TASK_SPECS}) == len(TASK_SPECS)
+    group_keys = {key for key, _ in TASK_GROUPS}
     for spec in TASK_SPECS:
         assert spec.name and spec.description
+        # 分组必须真实存在：否则管理台二级 tab 里会出现「无主」任务
+        assert spec.group in group_keys, spec.key
         assert TASK_BY_KEY[spec.key] is spec
 
 
@@ -313,10 +320,16 @@ def test_tasks_returns_runtime_snapshot(admin_client):
     _app, client = admin_client
     body = client.get("/api/tasks").json()
     assert isinstance(body["server_time"], int) and body["server_time"] > 0
+    assert body["groups"] == [
+        {"value": "account", "label": "账号维护"},
+        {"value": "model", "label": "模型与渠道"},
+        {"value": "ops", "label": "运维与数据"},
+    ]
     keys = [item["key"] for item in body["tasks"]]
     assert "quota_probe" in keys and "retention" in keys
     probe = next(item for item in body["tasks"] if item["key"] == "quota_probe")
     assert probe["name"] == "额度探测"
+    assert probe["group"] == "account"
     assert probe["interval_seconds"] == 3600.0
     assert probe["last_ok"] is True            # 启动首轮探测（zen/kilo 虚拟凭证）也是真实执行
     assert probe["last_report"] == {
@@ -356,9 +369,16 @@ def test_settings_snapshot_carries_task_owner(tmp_path):
     assert by_key["activity_report_enabled"]["task"] == "activity"
     assert by_key["default_model"]["task"] is None
     # 无任务归属的项带网关卡组，供前端分一级 tab
-    assert by_key["default_model"]["group"] == "routing"
-    assert by_key["codebuddy_chat_min_interval"]["group"] == "channels"
+    assert by_key["default_model"]["group"] == "model_routing"
+    assert by_key["context_compress_enabled"]["group"] == "compress"
+    assert by_key["stream_idle_timeout_seconds"]["group"] == "stream_thinking"
+    assert by_key["gateway_paused"]["group"] == "gateway_control"
+    assert by_key["codebuddy_chat_min_interval"]["group"] == "chat_throttle"
+    assert by_key["codearts_chat_min_interval"]["group"] == "codearts_throttle"
     assert by_key["quota_probe_minutes"]["group"] is None
+    # 卡片内分节只对任务项下发
+    assert by_key["alert_for_ticks"]["section"] == "基础与迟滞"
+    assert by_key["default_model"]["section"] is None
 
 
 def test_build_runner_accepts_shared_status_store(repo):
@@ -368,3 +388,242 @@ def test_build_runner_accepts_shared_status_store(repo):
     config = Settings(_env_file=None, APP_SECRET=SECRET)
     runner = build_runner(credentials, {}, StatsCollector(db), config, status=store)
     assert runner.status is store
+
+
+# ------------------------------------------------------- 手动触发（run_task）
+
+async def test_run_task_executes_and_returns_fresh_status(repo):
+    """手动触发跑真一轮并回最新运行态：ran=True、runs 递增、带 report。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+
+    result = await runner.run_task("quota_probe")
+
+    assert result["key"] == "quota_probe"
+    assert result["ran"] is True and result["busy"] is False
+    assert result["runs"] == 1
+    assert result["last_ok"] is True
+    assert result["last_report"] == {
+        "attempted": 1, "succeeded": 1, "failed": 0, "skipped": 0}
+    # 回读的与 store 里的是同一份
+    assert runner.status.runs("quota_probe") == 1
+
+
+async def test_run_task_unknown_key_raises(repo):
+    """未装配 / 不存在的 key 显式报错，由端点翻成 400。"""
+    from src.tasks.runner import UnknownTaskError
+
+    runner = _runner(repo, StubProvider())
+    with pytest.raises(UnknownTaskError) as caught:
+        await runner.run_task("ghost")
+    assert caught.value.key == "ghost"
+    # growth 未装配 → 同样不在清单里
+    with pytest.raises(UnknownTaskError):
+        await runner.run_task("growth")
+
+
+async def test_run_task_reports_noop_as_not_ran(repo):
+    """开关关着的任务手动触发记 ran=False：不把「关了」谎报成「跑过了」。"""
+    credentials, db = repo
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": StubProvider()}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": StubProvider()}),
+        refresh=RefreshTask(credentials, {"codebuddy": StubProvider()}, skew_seconds=1),
+        retention=RetentionTask(StatsCollector(db)),
+        activity=ActivityTask(credentials, {"codebuddy": StubProvider()}),
+        activity_enabled=lambda: False,
+    )
+
+    result = await runner.run_task("activity")
+
+    assert result["ran"] is False and result["busy"] is False
+    assert result["runs"] == 0
+    assert runner.status.get("activity") is None
+
+
+async def test_run_task_bypasses_activity_hour_window(repo):
+    """手动触发绕过 due() 时点窗口：窗口外也真跑（开关开着）。"""
+    credentials, db = repo
+    provider = _ActivityProvider()
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = TaskRunner(
+        quota_probe=QuotaProbeTask(credentials, {"codebuddy": provider}, None),
+        checkin=CheckinTask(credentials, {"codebuddy": provider}),
+        refresh=RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=1),
+        retention=RetentionTask(StatsCollector(db)),
+        activity=ActivityTask(credentials, {"codebuddy": provider}),
+        activity_enabled=lambda: True,
+    )
+    # 构造一个恒不到点的 due（时点窗口外）
+    runner._activity.due = lambda: False
+
+    result = await runner.run_task("activity")
+
+    assert result["ran"] is True
+    assert provider.activity_calls == 1
+
+
+async def test_run_task_bypasses_checkin_window(repo):
+    """手动触发签到同样绕过 due() 时点窗口：窗口外也真跑。
+
+    回归：此前只有 activity 特判 manual，签到恒走 `_sync_checkin`，
+    管理台点「立即运行签到」在非时点窗口返回 ran=False（与文档契约不符）。
+    """
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+    calls: list[str] = []
+
+    async def fake_run_once(**kwargs):
+        calls.append("ran")
+        return {"succeeded": 1}
+
+    runner._checkin.due = lambda: False
+    runner._checkin.run_once = fake_run_once  # type: ignore[method-assign]
+
+    result = await runner.run_task("checkin")
+
+    assert result["ran"] is True
+    assert calls == ["ran"]
+
+
+async def test_run_task_skips_when_already_running(repo):
+    """同一任务已在跑时立刻返回 busy，不排队、不并发打上游。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+    runner._running.add("quota_probe")          # 模拟周期循环正在跑
+
+    result = await runner.run_task("quota_probe")
+
+    assert result["ran"] is False and result["busy"] is True
+    assert runner.status.runs("quota_probe") == 0
+
+
+async def test_run_task_records_failure_with_error(repo):
+    """手动触发失败同样算「跑了一轮」：ran=True 但 last_ok=False 带 error。"""
+    runner = _runner(repo, StubProvider())
+
+    def boom() -> dict:
+        raise RuntimeError("磁盘写满")
+
+    runner._retention.run_once = boom  # type: ignore[method-assign]
+
+    result = await runner.run_task("retention")
+
+    assert result["ran"] is True and result["busy"] is False
+    assert result["last_ok"] is False and result["last_error"] == "磁盘写满"
+    assert result["runs"] == 1
+
+
+async def test_run_task_releases_running_flag_after_run(repo):
+    """跑完必须释放「运行中」标记，否则该任务再也触发不了。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t"})
+    runner = _runner(repo, StubProvider())
+
+    await runner.run_task("quota_probe")
+
+    assert "quota_probe" not in runner._running
+
+
+async def test_run_guarded_skips_when_key_busy(repo):
+    """周期循环撞上手动触发（或反之）时跳过本轮，不并发跑同一任务。"""
+    runner = _runner(repo, StubProvider())
+    calls: list[int] = []
+
+    async def body():
+        calls.append(1)
+        return TaskReport(attempted=1)
+
+    runner._running.add("quota_probe")          # 该 key 正被占用
+
+    ok, ran = await runner._run_guarded(body, "额度探测", key="quota_probe")
+
+    assert (ok, ran) == (False, False)
+    assert calls == []                          # 根本没跑
+    assert runner.status.runs("quota_probe") == 0
+
+
+async def test_run_guarded_without_key_runs_and_reports(repo):
+    """无 key 的路径（测试 / 一次性任务）照跑，且 ran 跟随 ok。"""
+    runner = _runner(repo, StubProvider())
+    calls: list[int] = []
+
+    async def body():
+        calls.append(1)
+        return None
+
+    ok, ran = await runner._run_guarded(body, "一次性")
+
+    assert (ok, ran) == (True, True)
+    assert calls == [1]
+
+
+def test_task_item_reports_running_flag(repo):
+    """task_status 的 running 字段与内部集合一致：前端据此禁用按钮。"""
+    runner = _runner(repo, StubProvider())
+    assert runner.task_status()[0]["running"] is False
+    runner._running.add("quota_probe")
+    assert runner.task_status()[0]["running"] is True
+
+
+class _ActivityProvider(StubProvider):
+    """支持活跃上报的最小 provider 桩。"""
+
+    def __init__(self) -> None:
+        self.activity_calls = 0
+
+    def activity_scope(self, _data):
+        return "scope"
+
+    async def activity(self, _data):
+        from src.provider.codebuddy.activity import ActivityResult
+
+        self.activity_calls += 1
+        return ActivityResult(ok=True, message="")
+
+
+async def test_run_task_is_exposed_by_the_endpoint(admin_client):
+    """端点把 runner 的手动触发结果原样回给管理台。"""
+    _app, client = admin_client
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["key"] == "quota_probe"
+    assert body["ran"] is True and body["busy"] is False
+    assert body["runs"] == 2      # 启动首轮 + 手动一轮
+
+
+def test_run_task_endpoint_requires_admin(admin_client):
+    _app, client = admin_client
+    client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 403
+
+
+def test_run_task_endpoint_rejects_unknown_key(admin_client):
+    _app, client = admin_client
+    response = client.post("/api/tasks/ghost/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 400
+    assert "unknown task" in response.json()["error"]["message"]
+
+
+def test_run_task_endpoint_without_runner_returns_400(tmp_path):
+    """lifespan 未运行时 app.state 上没有 runner，不能 500。"""
+    from fastapi.testclient import TestClient
+
+    from src.main import build_app
+
+    app = build_app(Settings(_env_file=None, APP_SECRET=SECRET,
+                             ADMIN_USERNAMES="root", DATA_DIR=str(tmp_path)))
+    client = TestClient(app)
+    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+    response = client.post("/api/tasks/quota_probe/run",
+                           headers={"x-requested-with": "XMLHttpRequest"})
+    assert response.status_code == 400
+    assert "not available" in response.json()["error"]["message"]

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import build_app
-from src.provider.base import Quota
+from src.provider.base import Quota, UpstreamHTTPError
 from src.provider.codebuddy.checkin import CheckinResult
 from src.provider.codebuddy.refresh import Account
 from tests.helpers.constants import SECRET
@@ -78,6 +78,38 @@ def test_credential_probe_and_checkin_endpoints(admin_client):
     assert client.post("/api/credentials/ghost/probe").status_code == 400
     assert client.post("/api/credentials/ghost/checkin").status_code == 400
 
+def test_credential_checkin_upstream_error_is_failed_result_not_500(admin_client):
+    """上游拒绝（账号被禁用 / 登录过期）→ `ok=False` 的正常结果，不是 500。
+
+    实测 2026-10-26 14:47：管理台点「签到」回 500 + 一整屏 ASGI traceback，
+    前端只弹「签到失败」，看不出真实原因（账号已被禁用）。上游对这条凭证的
+    答复是**正常结果**，前端本来就按 `ok` / `message` 渲染。
+    """
+    app, client = admin_client
+
+    class FailingCheckin:
+        id = "codebuddy"
+        endpoint = "https://e"
+
+        async def probe_quota(self, _data):
+            return Quota(remaining=7, total=10, probed_at=1)
+
+        async def checkin(self, _data):
+            raise UpstreamHTTPError(
+                403, '{"code":40302,"message":"账号已被禁用"}'.encode())
+
+    app.state.services.registry["codebuddy"] = FailingCheckin()
+    credential_id = app.state.credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "t"})
+    response = client.post(f"/api/credentials/{credential_id}/checkin")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["already_checked_in"] is False
+    # 403 → 「凭证失效，需要重新登录」；且不得回显上游原文
+    assert body["message"] == "签到失败：credential_rejected"
+    assert "账号已被禁用" not in body["message"]
+
 def test_credential_account_endpoints_unsupported_for_trae(admin_client):
     app, client = admin_client
     credential_id = app.state.credentials.add(provider="trae",
@@ -86,6 +118,33 @@ def test_credential_account_endpoints_unsupported_for_trae(admin_client):
     assert client.post(f"/api/credentials/{credential_id}/accounts/select",
                        json={"account_id": "a"}).status_code == 400
     assert client.get("/api/credentials/ghost/accounts").status_code == 400
+
+
+def test_credential_export_returns_importable_json_and_audits(admin_client):
+    """单条导出：与批量导入同形的明文条目 + 存文件头 + 审计留痕。"""
+    from src.audit.actions import ACTION_CREDENTIAL_EXPORT
+
+    app, client = admin_client
+    credential_id = app.state.credentials.add(
+        provider="codebuddy", credential_data={"bearer_token": "secret-token"},
+        nickname="主账号", tags=["团队", "备用"])
+    response = client.get(f"/api/credentials/{credential_id}/export")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert response.json() == {
+        "provider": "codebuddy", "nickname": "主账号", "tags": ["团队", "备用"],
+        "credential": {"bearer_token": "secret-token"},
+    }
+    rows = app.state.services.audit.query(action=ACTION_CREDENTIAL_EXPORT)
+    assert len(rows) == 1
+    assert rows[0]["actor"] == "root" and rows[0]["target"] == credential_id
+
+    assert client.get("/api/credentials/ghost/export").status_code == 400
+
+    # viewer 不能把令牌带出系统（与写操作同一道 require_operator）
+    client.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+    assert client.get(f"/api/credentials/{credential_id}/export").status_code == 403
 
 def test_select_account_rejects_vanished_credential(admin_client):
     """provider 支持切换但持锁后凭证已消失 → 400，不拿 None 去打上游。"""
@@ -117,6 +176,36 @@ def test_select_account_rejects_vanished_credential(admin_client):
     finally:
         app.state.credentials.credential_data = original  # type: ignore[method-assign]
     assert response.status_code == 400
+
+def test_upstream_auth_start_forwards_force_login_when_supported(admin_client):
+    """`force_login` 只传给支持的渠道，其余渠道仍按单参调用。"""
+    from src.provider.base import AuthFlow, AuthSession
+
+    app, client = admin_client
+    seen: dict[str, object] = {}
+    oauth = app.state.upstream_auth["codebuddy"]
+
+    async def with_flag(username: str, *, force_login: bool = False) -> AuthSession:
+        seen["flagged"] = (username, force_login)
+        return AuthSession(flow=AuthFlow.POLL, state="s1", auth_url="https://a")
+
+    async def plain(username: str) -> AuthSession:
+        seen["plain"] = username
+        return AuthSession(flow=AuthFlow.POLL, state="s2", auth_url="https://a")
+
+    original = oauth.start
+    try:
+        oauth.start = with_flag  # type: ignore[method-assign]
+        client.post("/api/auth/upstream/start",
+                    json={"provider": "codebuddy", "force_login": True})
+        assert seen["flagged"] == ("root", True)
+        oauth.start = plain  # type: ignore[method-assign]
+        client.post("/api/auth/upstream/start",
+                    json={"provider": "codebuddy", "force_login": True})
+        assert seen["plain"] == "root"
+    finally:
+        oauth.start = original  # type: ignore[method-assign]
+
 
 def test_upstream_auth_cancel_endpoint(admin_client):
     app, client = admin_client
@@ -255,6 +344,209 @@ def test_upstream_auth_poll_unknown_provider(admin_client):
     response = client.post("/api/auth/upstream/poll",
                            json={"provider": "trae", "state": "x"})
     assert response.status_code == 400
+
+def test_probe_endpoint_disables_on_dead_login(admin_client):
+    """额度探测拿到 401 → 硬禁用并写可操作原因，不再停在「未知」。"""
+    from src.provider.lingxi.client import UpstreamHTTPError as LingxiHTTPError
+
+    app, client = admin_client
+    credential_id = app.state.credentials.add(
+        provider="lingxi", credential_data={"wps_sid": "sid", "uid": "u1"})
+
+    class Boom:
+        id = "lingxi"
+        endpoint = "https://e"
+
+        async def probe_quota(self, _data):
+            raise LingxiHTTPError(401, b"")
+
+    app.state.executor._deps.providers["lingxi"] = Boom()
+    body = client.post(f"/api/credentials/{credential_id}/probe").json()
+
+    assert body["probed"] is False
+    row = next(r for r in app.state.credentials.list_all() if r["id"] == credential_id)
+    assert row["disabled"]
+    assert "WPS" in row["disabled_reason"]
+
+
+def test_lingxi_import_merges_same_uid(admin_client):
+    """手工导入即灵犀的重新登录：uid 相同更新既有行，不新增重复凭证。"""
+    from src.provider.base import Quota
+    from src.provider.lingxi.credential import LingxiCredential
+
+    app, client = admin_client
+
+    class Stub:
+        id = "lingxi"
+        endpoint = "https://e"
+
+        def import_credential(self, raw):
+            return LingxiCredential.from_import(raw).to_dict()
+
+        async def probe_quota(self, _data):
+            return Quota(remaining=1, total=2, probed_at=1)
+
+    app.state.executor._deps.providers["lingxi"] = Stub()
+    first = client.post("/api/credentials", json={
+        "provider": "lingxi", "credential": {"cookie": "wps_sid=a; uid=42"}}).json()
+    second = client.post("/api/credentials", json={
+        "provider": "lingxi", "credential": {"cookie": "wps_sid=b; uid=42"}}).json()
+
+    assert first["merged"] is False
+    assert second["merged"] is True
+    assert second["id"] == first["id"]
+    rows = [r for r in app.state.credentials.list_all() if r["provider"] == "lingxi"]
+    assert len(rows) == 1
+    assert app.state.credentials.credential_data(first["id"])["wps_sid"] == "b"
+
+
+def test_lingxi_import_falls_back_when_merge_misses(admin_client, monkeypatch):
+    """命中了身份但合并失败（并发删除）→ 退回新增，不能丢导入。"""
+    from src.provider.base import Quota
+    from src.provider.lingxi.credential import LingxiCredential
+
+    app, client = admin_client
+
+    class Stub:
+        id = "lingxi"
+        endpoint = "https://e"
+
+        def import_credential(self, raw):
+            return LingxiCredential.from_import(raw).to_dict()
+
+        async def probe_quota(self, _data):
+            return Quota(remaining=1, total=2, probed_at=1)
+
+    app.state.executor._deps.providers["lingxi"] = Stub()
+    client.post("/api/credentials", json={
+        "provider": "lingxi", "credential": {"cookie": "wps_sid=a; uid=42"}})
+    monkeypatch.setattr(app.state.credentials, "merge_login_credential",
+                        lambda *_args, **_kwargs: False)
+
+    second = client.post("/api/credentials", json={
+        "provider": "lingxi", "credential": {"cookie": "wps_sid=b; uid=42"}}).json()
+
+    assert second["merged"] is False
+    rows = [r for r in app.state.credentials.list_all() if r["provider"] == "lingxi"]
+    assert len(rows) == 2
+
+
+def test_lingxi_import_disables_kicked_siblings(admin_client):
+    """导入新会话后复探旧灵犀号：401 的旧号立刻硬禁用，不误伤仍有效的号。"""
+    from src.provider.base import Quota
+    from src.provider.lingxi.client import UpstreamHTTPError as LingxiHTTPError
+    from src.provider.lingxi.credential import LingxiCredential
+
+    app, client = admin_client
+    dead = app.state.credentials.add(
+        provider="lingxi", credential_data={"wps_sid": "old", "uid": "u-old"})
+    alive = app.state.credentials.add(
+        provider="lingxi", credential_data={"wps_sid": "alive", "uid": "u-alive"})
+
+    class Stub:
+        id = "lingxi"
+        endpoint = "https://e"
+
+        def import_credential(self, raw):
+            return LingxiCredential.from_import(raw).to_dict()
+
+        async def probe_quota(self, data):
+            if data.get("wps_sid") == "old":
+                raise LingxiHTTPError(401, b"")
+            return Quota(remaining=1, total=2, probed_at=1)
+
+    app.state.executor._deps.providers["lingxi"] = Stub()
+    created = client.post("/api/credentials", json={
+        "provider": "lingxi", "credential": {"cookie": "wps_sid=new; uid=u-new"}})
+    assert created.status_code == 200
+
+    for _ in range(50):
+        row = next(r for r in app.state.credentials.list_all() if r["id"] == dead)
+        if row["disabled"]:
+            break
+        time.sleep(0.02)
+    assert row["disabled"]
+    assert "WPS" in row["disabled_reason"]
+    alive_row = next(r for r in app.state.credentials.list_all() if r["id"] == alive)
+    assert not alive_row["disabled"]
+
+
+def test_raccoon_import_merges_same_uid(admin_client):
+    """小浣熊手工重取 JWT（约 30 天到期）同样是「重新登录」：uid 相同更新
+    既有行，不能每次换 token 就多一条重复凭证（重复行会被当两个号并发）。"""
+    from src.provider.base import Quota
+    from src.provider.raccoon.credential import RaccoonCredential
+
+    app, client = admin_client
+
+    class Stub:
+        id = "raccoon"
+        endpoint = "https://e"
+
+        def import_credential(self, raw):
+            credential = RaccoonCredential.from_import(raw)
+            if not credential.access_token:
+                raise ValueError("missing access token")
+            return credential.to_dict()
+
+        async def probe_quota(self, _data):
+            return Quota(remaining=1, total=2, probed_at=1)
+
+    app.state.executor._deps.providers["raccoon"] = Stub()
+    first = client.post("/api/credentials", json={
+        "provider": "raccoon",
+        "credential": {"access_token": _jwt({"sub": "pu-1", "exp": 1})}}).json()
+    second = client.post("/api/credentials", json={
+        "provider": "raccoon",
+        "credential": {"access_token": _jwt({"sub": "pu-1", "exp": 2})}}).json()
+
+    assert first["merged"] is False
+    assert second["merged"] is True
+    assert second["id"] == first["id"]
+    rows = [r for r in app.state.credentials.list_all() if r["provider"] == "raccoon"]
+    assert len(rows) == 1
+    assert app.state.credentials.credential_data(first["id"])["expires_at"] == 2
+
+
+def test_raccoon_import_without_uid_does_not_merge(admin_client):
+    """解不出 uid（非 JWT / claims 坏）→ 无法安全合并，退回新增（绝不猜）。"""
+    from src.provider.base import Quota
+    from src.provider.raccoon.credential import RaccoonCredential
+
+    app, client = admin_client
+
+    class Stub:
+        id = "raccoon"
+        endpoint = "https://e"
+
+        def import_credential(self, raw):
+            return RaccoonCredential.from_import(raw).to_dict()
+
+        async def probe_quota(self, _data):
+            return Quota(remaining=1, total=2, probed_at=1)
+
+    app.state.executor._deps.providers["raccoon"] = Stub()
+    client.post("/api/credentials", json={
+        "provider": "raccoon", "credential": {"access_token": "opaque-a"}})
+    second = client.post("/api/credentials", json={
+        "provider": "raccoon", "credential": {"access_token": "opaque-b"}}).json()
+
+    assert second["merged"] is False
+    rows = [r for r in app.state.credentials.list_all() if r["provider"] == "raccoon"]
+    assert len(rows) == 2
+
+
+def _jwt(claims: dict) -> str:
+    """构造只带 claims 的 JWT（不验签，测试只需要中间段可解析）。"""
+    import base64
+    import json
+
+    def segment(data: dict) -> str:
+        text = json.dumps(data).encode("utf-8")
+        return base64.urlsafe_b64encode(text).decode("ascii").rstrip("=")
+
+    return f"{segment({'alg': 'HS256', 'typ': 'JWT'})}.{segment(claims)}.sig"
+
 
 def test_probe_endpoint_returns_quota_fields(admin_client):
     """探测成功路径的响应字段（main 271-272）。"""
@@ -400,3 +692,169 @@ def test_schedule_probe_returns_early_when_credential_unreadable(admin_client):
     assert created.status_code == 200
     time.sleep(0.05)
     assert len(app.state.pending_probes) == before
+
+
+def test_schedule_probe_returns_early_when_credential_undecryptable(admin_client):
+    """凭证解不开（APP_SECRET 换过 / 密文损坏）→ 不建探测任务，也不抛。
+
+    实测 2026-10-26 14:48：解密失败直接冒泡 → 导入凭证后的即时探测整个挂掉。
+    """
+    from src.db.crypto import CredentialDecryptError
+
+    app, client = admin_client
+    before = len(app.state.pending_probes)
+
+    def _boom(_cid):
+        raise CredentialDecryptError("credential decryption failed")
+
+    app.state.credentials.credential_data = _boom  # type: ignore[method-assign]
+    created = client.post("/api/credentials", json={
+        "provider": "codebuddy", "credential": {"token": "x"}})
+    assert created.status_code == 200
+    time.sleep(0.05)
+    assert len(app.state.pending_probes) == before
+
+def test_zen_api_key_import_replaces_single_slot(admin_client):
+    """zen 单槽：带 Key 导入更新既有虚拟凭证（匿名 → 付费），并清掉旧冷却。
+
+    不合并的话会并存「匿名行 + Key 行」，调度先选匿名行撞 429、冷却后才轮到
+    Key 行，每轮换档都白丢一次请求。
+    """
+    from src.provider.base import Quota
+    from src.provider.zen.client import ZenProvider
+
+    app, client = admin_client
+
+    class Stub:
+        id = "zen"
+
+        def import_credential(self, raw):
+            return ZenProvider().import_credential(raw)
+
+        async def probe_quota(self, _data):
+            return Quota(probe_failed=True, probed_at=1)
+
+    app.state.executor._deps.providers["zen"] = Stub()
+    seeded = app.state.credentials.candidates(["zen"])[0].credential_id
+    app.state.credentials.cool_provider("zen", until=int(time.time()) + 3600)
+
+    imported = client.post("/api/credentials", json={
+        "provider": "zen", "credential": {"api_key": "sk-zen"},
+        "nickname": "OpenCode Zen"}).json()
+
+    assert imported["merged"] is True
+    assert imported["id"] == seeded
+    rows = [r for r in app.state.credentials.list_all() if r["provider"] == "zen"]
+    assert len(rows) == 1
+    assert app.state.credentials.credential_data(seeded) == {"api_key": "sk-zen"}
+    assert app.state.credentials.candidates(["zen"])[0].cooling_until is None
+
+
+def test_zen_anonymous_import_still_adds_when_slot_absent(admin_client):
+    """不带 Key 的导入仍走「补回虚拟凭证」老路（不触发单槽合并）。"""
+    app, client = admin_client
+    seeded = app.state.credentials.candidates(["zen"])[0].credential_id
+    assert app.state.credentials.delete(seeded)
+
+    created = client.post("/api/credentials", json={
+        "provider": "zen", "credential": {}, "nickname": "OpenCode Zen"}).json()
+    assert created["merged"] is False
+    assert len(app.state.credentials.candidates(["zen"])) == 1
+
+def test_zen_api_key_import_adds_when_slot_missing(admin_client):
+    """池里没有 zen 行时，带 Key 导入直接新增（无单槽可合并）。"""
+    app, client = admin_client
+    for candidate in app.state.credentials.candidates(["zen"]):
+        assert app.state.credentials.delete(candidate.credential_id)
+
+    created = client.post("/api/credentials", json={
+        "provider": "zen", "credential": {"api_key": "sk-zen"}}).json()
+    assert created["merged"] is False
+    assert app.state.credentials.credential_data(created["id"]) == {"api_key": "sk-zen"}
+
+
+def test_zen_api_key_import_falls_back_when_merge_fails(admin_client, monkeypatch):
+    """单槽合并失败（并发删除）→ 退回新增，不能丢导入的 Key。"""
+    app, client = admin_client
+    monkeypatch.setattr(app.state.credentials, "merge_login_credential",
+                        lambda *_args, **_kwargs: False)
+
+    created = client.post("/api/credentials", json={
+        "provider": "zen", "credential": {"api_key": "sk-zen"}}).json()
+    assert created["merged"] is False
+    assert app.state.credentials.credential_data(created["id"]) == {"api_key": "sk-zen"}
+
+
+def test_zen_import_merges_earliest_row_and_warns_on_duplicates(admin_client, caplog):
+    """多行 zen 时确定性地合并到**最早创建**的那条，并留一条 warning。
+
+    原来是 `candidates(["zen"])[0]`——裸 `SELECT` 无 `ORDER BY`，插库顺序变了
+    合并目标就变；插入顺序也故意与此相反（先建晚的），确保不是「取第一行」。
+    多余旧行不删除（不擅自删数据），但必须留痕，否则僵尸行无人知晓。
+    """
+    app, client = admin_client
+    for candidate in app.state.credentials.candidates(["zen"]):
+        assert app.state.credentials.delete(candidate.credential_id)
+    later = app.state.credentials.add(provider="zen", credential_data={"stage": "b"},
+                                      now=2_000_000)
+    earlier = app.state.credentials.add(provider="zen", credential_data={"stage": "a"},
+                                        now=1_000_000)
+
+    with caplog.at_level("WARNING", logger="src.api.admin_credentials"):
+        imported = client.post("/api/credentials", json={
+            "provider": "zen", "credential": {"api_key": "sk-zen"}}).json()
+
+    assert imported["merged"] is True
+    assert imported["id"] == earlier
+    assert app.state.credentials.credential_data(earlier) == {"api_key": "sk-zen"}
+    assert app.state.credentials.credential_data(later) == {"stage": "b"}
+    warnings = [record for record in caplog.records
+                if "zen" in record.getMessage() and record.levelname == "WARNING"]
+    assert warnings and "2 条" in warnings[0].getMessage()
+
+
+def test_zen_import_single_slot_does_not_warn(admin_client, caplog):
+    """只有一条 zen 时是正常状态：不得刷「检测到多行」的告警。"""
+    app, client = admin_client
+    assert len(app.state.credentials.candidates(["zen"])) == 1
+
+    with caplog.at_level("WARNING", logger="src.api.admin_credentials"):
+        imported = client.post("/api/credentials", json={
+            "provider": "zen", "credential": {"api_key": "sk-zen"}}).json()
+
+    assert imported["merged"] is True
+    assert not [record for record in caplog.records
+                if "检测到 zen" in record.getMessage()]
+
+
+def test_zen_import_holds_edit_lock_around_merge(admin_client, monkeypatch):
+    """「读 → 合并 → revive」持凭证级编辑锁，与账号登录同口径。
+
+    否则预刷新 / 账号切换的整份覆写会在 await 点与本次合并互相覆盖。
+    """
+    app, client = admin_client
+    credentials = app.state.credentials
+    seeded = credentials.candidates(["zen"])[0].credential_id
+    acquired: list[str] = []
+    real_edit_lock = credentials.edit_lock
+    real_merge = credentials.merge_login_credential
+
+    def tracking_lock(credential_id):
+        acquired.append(credential_id)
+        return real_edit_lock(credential_id)
+
+    def tracking_merge(credential_id, data, nickname=""):
+        locked_while_merging.append(real_edit_lock(credential_id).locked())
+        return real_merge(credential_id, data, nickname)
+
+    locked_while_merging: list[bool] = []
+    monkeypatch.setattr(credentials, "edit_lock", tracking_lock)
+    monkeypatch.setattr(credentials, "merge_login_credential", tracking_merge)
+
+    imported = client.post("/api/credentials", json={
+        "provider": "zen", "credential": {"api_key": "sk-zen"}}).json()
+
+    assert imported["merged"] is True
+    assert imported["id"] == seeded
+    assert acquired and set(acquired) == {seeded}
+    assert locked_while_merging == [True]

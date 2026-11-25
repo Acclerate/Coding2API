@@ -5,37 +5,99 @@ on:
     branches: [main]
   pull_request:
 
+# 最小权限：CI 只需要读代码（checkout），不发布任何制品。
+# GitHub Actions 的默认 GITHUB_TOKEN 是 repo 写权限，被恶意 workflow 改写
+# （或第三方 action 被投毒）时能直接推 main；只读权限把爆炸半径限到零。
+permissions: read-all
+
+# 同分支推送/PR 只保留最新的那一轮 CI：hotfix 连推几发时旧 run 全部取消，
+# 不再空烧 runner 额度。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # 挂死保险丝：覆盖率全量跑 ≈ 4 分钟，给 15 分钟足够；无此限一个死循环
+    # 测试会烧 6 小时（GitHub 默认 360 分钟）。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
       - run: uv sync --frozen
       - name: Ruff
         run: uv run ruff check src tests scripts
       - name: 测试与覆盖率（门槛 100%）
         run: uv run pytest -q --cov=src --cov-report=term --cov-fail-under=100
 
-  security:
-    runs-on: ubuntu-latest
+  # 平台门禁必须有真机验证：其余 job 全在 ubuntu-latest，正是 issue #46 的
+  # 成因——Windows 上的 `ModuleNotFoundError: No module named 'fcntl'` 在
+  # Linux CI 里永远看不见。这个 job 不装项目依赖：两个断言都只用标准库，
+  # 跑得快，且正好验证「导入期不炸、入口给可读中文」这两条。
+  platform:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    env:
+      # 中文文案在英文区域设置下会被 Python 的 backslashreplace 转义成 \uXXXX，
+      # 打开 UTF-8 模式让日志里看到的是人能读的中文（不影响被测逻辑）。
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: 无 fcntl 时模块仍可导入（否则 build_app / scripts 全线起不来）
+        shell: bash
+        # fork 差异：Windows 由 msvcrt 区域锁覆盖（见 src/instance_lock.py），
+        # 故断言与上游相反——LOCK_SUPPORTED 在 Windows 上必须为 True。
+        run: |
+          PYTHONPATH=. python -c "import src.instance_lock as m; assert m.LOCK_SUPPORTED is True; print('LOCK_SUPPORTED ok')"
+      - name: 平台入口不炸（issue #46 回归防线）
+        shell: bash
+        # win32 在 SUPPORTED_PLATFORMS 里：入口应静默返回（退出码 0），
+        # 且任何平台都不得出现 ModuleNotFoundError（import 阶段直接崩）。
+        run: |
+          set +e
+          output=$(PYTHONPATH=. python -c "from src.platform_support import require_supported_platform; require_supported_platform()" 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          test "$code" -eq 0
+          if echo "$output" | grep -q "ModuleNotFoundError"; then
+            echo "::error::Windows 上仍出现 ModuleNotFoundError（issue #46 回归）"
+            exit 1
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
       - run: uv sync --frozen
       - name: bandit（中危及以上，配置见 pyproject [tool.bandit]）
         run: uvx bandit -c pyproject.toml -r src scripts -ll
       - name: pip-audit（已知漏洞，含 dev 依赖）
-        run: uvx pip-audit --skip-editable
+        # 必须用 `uv run --with`：`uvx pip-audit` 会在**自己的临时环境**里跑，
+        # 扫到的是 pip-audit 的依赖树（实测 28 个包，含 pip-audit/rich/requests），
+        # 项目依赖（fastapi/uvicorn/httpx/cryptography）一个都不在内 —— 门一直是
+        # 绿的，但没有任何防线。`uv run --with` 注入项目 .venv，实测扫到 58 个包。
+        run: uv run --with pip-audit pip-audit --skip-editable
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115  # v6.1.1
         with:
           version: 10
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
@@ -45,19 +107,76 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - name: 依赖漏洞（生产依赖，high 及以上阻断）
-        run: pnpm audit --prod --audit-level=high
+        run: |
+          # registry.npmjs.org 的审计端点偶发 ERR_SOCKET_TIMEOUT（实测连续两次
+          # 在 2 分钟超时后失败，同期 registry 本身可正常拉包）。重试 3 次：
+          # 真漏洞会稳定复现、三次都非零；网络抖动大概率第二次就过。
+          for i in 1 2 3; do
+            if pnpm audit --prod --audit-level=high; then exit 0; fi
+            echo "::warning::pnpm audit 第 $i 次失败（可能是 registry 网络抖动），15s 后重试"
+            sleep 15
+          done
+          exit 1
+      - name: 依赖漏洞（全量含 devDependencies，critical 及以上告警）
+        # 为什么 dev 依赖也要扫：Dockerfile 的构建阶段真的执行 devDeps
+        # （vite / esbuild / rollup 跑 `pnpm exec vite build`），它们的漏洞在
+        # 构建期可被触发（esbuild 的 dev server / rollup 插件链是历史高发区），
+        # 只是不进运行时产物。--prod 审计看不到这一层。
+        # 门槛用 critical（比 prod 的 high 更高）且失败只告警不全红：dev 依赖
+        # 的公告噪声明显更大（多为低利用门槛的 DoS），全红会让人开始无视审计。
+        # 同样带 3 次重试（同一个审计端点，同样的网络抖动）。
+        run: |
+          for i in 1 2 3; do
+            if pnpm audit --audit-level=critical; then exit 0; fi
+            echo "::warning::全量 pnpm audit 第 $i 次失败（可能是 registry 网络抖动），15s 后重试"
+            sleep 15
+          done
+          echo "::warning::全量 pnpm audit 未通过（devDependencies 有 critical 漏洞，或审计端点持续不可用）；不阻断，请人工确认"
+          exit 0
       - run: pnpm exec tsc --noEmit
       - run: pnpm exec vitest run
       - run: pnpm build
 
   compose:
     runs-on: ubuntu-latest
+    # 真实构建 + 启动探活（pnpm install ×2 与 docker build），最重的一环
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: 校验 compose 语法
         run: docker compose config --quiet
         env:
           APP_SECRET: ci-placeholder-secret
+      - name: 校验 compose 公网覆盖文件语法（Caddy 入口，两种 TLS 模式）
+        env:
+          APP_SECRET: ci-placeholder-secret
+        run: |
+          # acme（域名）：PUBLIC_DOMAIN + ACME_EMAIL
+          PUBLIC_DOMAIN=ai-api.example.com ACME_EMAIL=ops@example.com \
+            docker compose -f docker-compose.yml -f docker-compose.public.yml config --quiet
+          # internal（公网 IP、自签）：不设 ACME_EMAIL——自签模式用不到，必须能拼出来
+          PUBLIC_DOMAIN=203.0.113.10 TLS_MODE=internal \
+            docker compose -f docker-compose.yml -f docker-compose.public.yml config --quiet
+          # 缺 PUBLIC_DOMAIN 必须报错（覆盖文件里 :? 断言的回归保护）
+          if docker compose -f docker-compose.yml -f docker-compose.public.yml config --quiet 2>/dev/null; then
+            echo "::error::缺 PUBLIC_DOMAIN 时 compose 本应报错，却通过了"
+            exit 1
+          fi
+      - name: 校验 Caddyfile 语法（域名 / 自签两种模式）
+        run: |
+          # 只 validate、不起服务：占位域名不申请证书（validate 不联网签发）
+          for mode in acme internal; do
+            case "$mode" in
+              acme)     domain=ai-api.example.com; email=ops@example.com ;;
+              # 自签模式站址是公网 IP，且刻意不传 ACME_EMAIL（tls_internal 片段不引用它）
+              internal) domain=203.0.113.10;       email= ;;
+            esac
+            docker run --rm \
+              -e PUBLIC_DOMAIN="$domain" -e ACME_EMAIL="$email" \
+              -e PORT=8000 -e TLS_MODE="$mode" \
+              -v "$PWD/deploy/caddy:/etc/caddy:ro" \
+              caddy:2.11.7-alpine caddy validate --config /etc/caddy/Caddyfile
+          done
       - name: 构建镜像并启动（验证 compose 可真实运行）
         run: |
           mkdir -p data secrets

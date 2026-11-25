@@ -9,12 +9,15 @@ import type { Provider } from "./types";
  */
 export const PROVIDER_LABEL: Record<Provider, string> = {
   codebuddy: "CodeBuddy",
-  codebuddy_intl: "CodeBuddy 国际版",
+  codebuddy_intl: "CodeBuddy 国际",
   trae: "TRAE",
   zen: "OpenCode Zen",
-  kilo: "Kilo Gateway",
+  kilo: "Kilo",
   qoder: "Qoder",
   codearts: "CodeArts",
+  officeace: "OfficeAce",
+  raccoon: "小浣熊",
+  lingxi: "灵犀",
 };
 
 /** 模型下拉里的渠道缩写（如 `CB x0.29`）。 */
@@ -26,6 +29,9 @@ export const PROVIDER_ABBR: Record<Provider, string> = {
   kilo: "KL",
   qoder: "QD",
   codearts: "CA",
+  officeace: "OA",
+  raccoon: "RC",
+  lingxi: "LX",
 };
 
 /**
@@ -42,6 +48,9 @@ export const PROVIDER_CHART_COLOR: Record<Provider, string> = {
   kilo: "var(--chart-2)",
   qoder: "var(--chart-5)",
   codearts: "var(--chart-6)",
+  officeace: "var(--chart-8)",
+  raccoon: "var(--chart-9)",
+  lingxi: "var(--chart-10)",
 };
 
 /** 未知渠道（老数据/未来渠道）的兜底色。 */
@@ -51,7 +60,7 @@ export const FALLBACK_CHART_COLOR = "var(--chart-5)";
  * 模型列表 / 下拉的渠道展示顺序：CodeBuddy、TRAE 优先，其余渠道在后。
  *
  * 注意：这**不是**后端 `/v1/models` 的排序权重（`src/api/models.py` 的
- * `_PROVIDER_RANK` 把 zen/kilo 与 qoder/codearts 同归「其他 4」）。前端把
+ * `_PROVIDER_RANK` 把 zen/kilo 与 qoder/codearts 同归「其他」）。前端把
  * zen/kilo 提到 qoder/codearts 之前是有意的 UI 取舍（免费渠道更常被翻），
  * 因此 Playground 的分组顺序与接口返回的 data 顺序并不保证一致。
  */
@@ -63,7 +72,29 @@ export const PROVIDER_ORDER: Provider[] = [
   "kilo",
   "qoder",
   "codearts",
+  "officeace",
+  "raccoon",
+  "lingxi",
 ];
+
+/**
+ * 支持每日签到的渠道（与后端能力探测同口径：provider 上有 `checkin` /
+ * `checkin_scope` 才会被签到任务跑到）。
+ *
+ * Zen / Kilo 最薄，没有签到接口；CodeBuddy 国际站上游活动为空
+ * （`active: false`，后端把 `checkin*` 三项置 None）。其余渠道都接了签到。
+ * 集中在这里而不是在页面里写死：组头汇总、行内按钮、批量操作都按同一份
+ * 判定，否则会出现「组头算它是未签、行内却没有签到按钮」的错配。
+ */
+export const CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
+  "codebuddy",
+  "trae",
+  "qoder",
+  "codearts",
+  "officeace",
+  "raccoon",
+  "lingxi",
+]);
 
 /** 渠道排序权重；未知渠道排在已知渠道之后。 */
 export function providerRank(provider: string): number {

@@ -12,8 +12,9 @@ export default defineConfig({
   build: { outDir: "dist", emptyOutDir: true },
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8000",
-      "/v1": "http://127.0.0.1:8000",
+      // 注意：`/api` 前缀会连带吞掉 /api-keys 等同前缀路径，逐条精确匹配
+      "^/api/": "http://127.0.0.1:8000",
+      "^/v1/": "http://127.0.0.1:8000",
       "/authorize": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000",
     },

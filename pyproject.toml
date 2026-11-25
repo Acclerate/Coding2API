@@ -1,15 +1,17 @@
 [project]
 name = "coding2api"
-version = "0.4.3"
-description = "把 CodeBuddy（国内站 + 国际版）、TRAE SOLO、OpenCode Zen、Kilo Gateway、Qoder、CodeArts 七个上游渠道统一封装为 OpenAI / Responses / Anthropic 兼容 API"
+version = "0.14.3"
+description = "把 CodeBuddy（国内站 + 国际）、TRAE SOLO、OpenCode Zen、Kilo、Qoder、CodeArts、OfficeAce、小浣熊 九个上游渠道统一封装为 OpenAI / Responses / Anthropic 兼容 API"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cryptography>=44",
+    "defusedxml>=0.7.1",
     "fastapi>=0.115",
     "httpx[socks]>=0.28",
     "itsdangerous>=2.2",
     "pydantic-settings>=2.7",
+    "tzdata>=2026.6 ; sys_platform == 'win32'",
     "uvicorn>=0.34",
 ]
 
@@ -28,6 +30,10 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

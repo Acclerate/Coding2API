@@ -28,7 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.audit.actions import ACTION_USER_CREATE, ACTION_USER_DELETE  # noqa: E402
 from src.auth.rbac import ROLE_ADMIN, ROLES  # noqa: E402
-from src.auth.users import create_password_hash  # noqa: E402
+from src.auth.users import (  # noqa: E402
+    FORBIDDEN_USERNAME_CHARS,
+    create_password_hash,
+)
 from src.db.conn import Database  # noqa: E402
 from src.db.migrate import apply_schema  # noqa: E402
 from src.db.repo import AuditRepository, UserRepository  # noqa: E402
@@ -44,7 +47,16 @@ def resolve_db_path(explicit: str | None) -> Path:
 
 
 def open_repos(db_path: Path, *, migrate: bool = True,
+               require_existing: bool = True,
                ) -> tuple[UserRepository, AuditRepository, Database]:
+    """打开库并返回 (users, audit, database)。
+
+    `require_existing=True`（默认）时库文件不存在直接抛 `FileNotFoundError`：
+    `--db` 写错一个路径就静默建出空库并「成功」建号，是最难发现的一类误操作
+    （人会以为账号建在了生产库上）。首次初始化走 `--init`，或先启动一次服务。
+    """
+    if require_existing and not db_path.is_file():
+        raise FileNotFoundError(f"数据库不存在: {db_path}")
     database = Database(db_path)
     if migrate:
         apply_schema(database.connect())
@@ -132,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="列出全部用户后退出")
     parser.add_argument("--delete", action="store_true", help="硬删用户（需 --force）")
     parser.add_argument("--force", action="store_true", help="确认硬删不可逆")
+    parser.add_argument("--init", action="store_true",
+                        help="库不存在时新建并建表（默认拒绝，防止 --db 写错静默建空库）")
     args = parser.parse_args(argv)
 
     db_path = resolve_db_path(args.db)
@@ -146,15 +160,24 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             database.close()
 
-    users, audit, database = open_repos(db_path)
+    if not db_path.is_file() and not args.init:
+        # 静默新建空库会让人以为账号建到了生产库上：显式拒绝并指出两条出路。
+        print(f"数据库不存在: {db_path}\n"
+              "先启动一次服务让它初始化，或加 --init 新建并建表（确认路径正确再执行）。",
+              file=sys.stderr)
+        return 1
+    users, audit, database = open_repos(db_path, require_existing=not args.init)
     try:
         username = (args.username or "").strip()
         if not username:
             parser.error("缺少用户名（或用 --list）")
         if username != args.username:
             parser.error("用户名不能包含首尾空白")
-        if any(ch in username for ch in ("\n", "\r")):
-            parser.error("用户名不能包含换行/回车")
+        # 禁字符与写 users.txt 的脚本同源（`src/auth/users.py`）：冒号会截断
+        # `用户名:hash` 字段、换行会注入额外记录（PROPOSAL §6）。
+        for char in FORBIDDEN_USERNAME_CHARS:
+            if char in username:
+                parser.error(f"用户名不能包含 {char!r}")
 
         if args.delete:
             if not args.force:

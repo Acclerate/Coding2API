@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from pathlib import Path
+import time
 
 import httpx
 import pytest
@@ -48,7 +48,7 @@ def test_models_endpoint_skips_disabled_credentials(settings):
 
         async def list_models(self, credential_data):
             calls.append(credential_data)
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover - 未使用
             return raw
@@ -72,7 +72,7 @@ def test_models_endpoint_reuses_cache_within_ttl(settings):
 
         async def list_models(self, credential_data):
             calls.append(1)
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover - 未使用
             return raw
@@ -218,6 +218,28 @@ def test_revive_credential_endpoint(client):
 def test_revive_unknown_credential_is_400(client):
     assert client.post("/api/credentials/cred_missing/revive").status_code == 400
 
+
+def test_revive_keeps_upstream_cooldown_unless_forced(client):
+    """默认「恢复」保留上游点名的冷却；`force=true` 才清除（见 repo.revive）。"""
+    created = client.post("/api/credentials", json={
+        "provider": "codebuddy", "credential": {"token": "t"}}).json()["id"]
+    db = client.app.state.credentials._db
+    future = int(time.time()) + 3600
+    db.connect().execute(
+        "UPDATE credentials SET disabled = 1, cooling_until = ?, cooling_kind = 'soft' "
+        "WHERE id = ?", (future, created))
+    db.connect().commit()
+
+    client.post(f"/api/credentials/{created}/revive")
+    row = db.connect().execute("SELECT disabled, cooling_until FROM credentials "
+                               "WHERE id = ?", (created,)).fetchone()
+    assert row["disabled"] == 0 and row["cooling_until"] == future
+
+    client.post(f"/api/credentials/{created}/revive", json={"force": True})
+    row = db.connect().execute("SELECT cooling_until FROM credentials "
+                               "WHERE id = ?", (created,)).fetchone()
+    assert row["cooling_until"] is None
+
 # ------------------------------------------------------------- #24 429
 
 
@@ -250,13 +272,14 @@ def test_transport_error_maps_to_502(client, monkeypatch):
     key = client.post("/api/api-keys", json={"name": "t"}).json()["api_key"]
     executor = client.app.state.executor
 
-    async def boom(request, *, username="unknown", provider_binding=None):
+    async def boom(request, *, username="unknown", provider_binding=None,
+                   is_disconnected=None):
         raise httpx.ConnectError("no route to host")
 
     monkeypatch.setattr(executor, "complete", boom)
     response = client.post("/v1/chat/completions",
                            headers={"Authorization": f"Bearer {key}"},
-                           json={"model": "glm-5.2",
+                           json={"model": "glm-5.3",
                                  "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_unavailable"
@@ -273,7 +296,7 @@ def test_models_endpoint_falls_back_to_cache(settings):
         async def list_models(self, credential_data):
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover - 未使用
             return raw
@@ -288,7 +311,7 @@ def test_models_endpoint_falls_back_to_cache(settings):
         provider.fail = True
         second = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
     assert second.status_code == 200
-    assert [m["id"] for m in second.json()["data"]] == ["glm-5.2"]
+    assert [m["id"] for m in second.json()["data"]] == ["glm-5.3"]
     assert services.model_list_cache["trae"]      # 缓存保留
 
 def test_models_endpoint_logs_when_no_cache(settings):
@@ -319,7 +342,7 @@ def test_models_cache_fallback_when_ttl_expired(settings):
         async def list_models(self, credential_data):
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover - 未使用
             return raw
@@ -333,7 +356,7 @@ def test_models_cache_fallback_when_ttl_expired(settings):
         provider.fail = True
         app.state.services.model_list_fetched_at.clear()      # 模拟 TTL 过期
         response = c.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
-    assert [m["id"] for m in response.json()["data"]] == ["glm-5.2"]
+    assert [m["id"] for m in response.json()["data"]] == ["glm-5.3"]
 
 def test_models_failure_is_negatively_cached(settings):
     """拉取失败也刷 TTL 时间戳：TTL 内不再重试（有缓存用缓存，无缓存跳过）。"""
@@ -380,7 +403,7 @@ def test_models_failure_keeps_cache_for_ttl(settings):
             type(self).attempts += 1
             if self.fail:
                 raise RuntimeError("upstream down")
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover - 未使用
             return raw
@@ -393,18 +416,18 @@ def test_models_failure_keeps_cache_for_ttl(settings):
     auth = {"Authorization": f"Bearer {key}"}
     with TestClient(app) as c:
         first = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in first.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in first.json()["data"]] == ["glm-5.3"]
         assert Flaky.attempts == 1
 
         provider.fail = True
         services.model_list_fetched_at.clear()       # 模拟 TTL 过期 → 触发重试并失败
         second = c.get("/v1/models", headers=auth)
-        assert [m["id"] for m in second.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in second.json()["data"]] == ["glm-5.3"]
         _drain_model_refresh(c, services)            # SWR：重试在后台，等它跑完
         assert Flaky.attempts == 2
 
         third = c.get("/v1/models", headers=auth)    # 失败后的 TTL 内：不再重试
-        assert [m["id"] for m in third.json()["data"]] == ["glm-5.2"]
+        assert [m["id"] for m in third.json()["data"]] == ["glm-5.3"]
         assert Flaky.attempts == 2
 
 # --------------------------------------------------- #25 dump 有界保留
@@ -419,15 +442,52 @@ def test_dump_request_body_trims_to_keep_limit(tmp_path):
     remaining = list((tmp_path / "dumps").glob("*.json"))
     assert 0 < len(remaining) <= chat.DUMP_KEEP_FILES
 
-def test_dump_request_body_survives_unwritable_dir(tmp_path, monkeypatch):
-    """诊断落盘失败不影响聊天请求。"""
+def test_dump_request_body_survives_unwritable_dir(tmp_path):
+    """诊断落盘失败不影响聊天请求（路径不可用 → OSError 被吞掉）。
+
+    `DATA_DIR/dumps` 已被占成普通文件时 `mkdir` 抛 `FileExistsError`：诊断失败
+    绝不能把请求带崩，也不能向外抛任何异常。
+    """
     from src.api import chat
 
-    def boom(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(Path, "write_text", boom)
+    (tmp_path / "dumps").write_text("not a directory", encoding="utf-8")
     chat.dump_request_body(tmp_path, {"a": 1})      # 不应抛异常
+    assert (tmp_path / "dumps").is_file()
+
+
+def test_dump_files_are_owner_only_and_expire_after_a_day(tmp_path):
+    """请求体含完整对话：目录 0700、文件 0600；条数没超也要按 24h 过期清理。"""
+    import os
+    import time as _time
+
+    from src.api import chat
+
+    chat.dump_request_body(tmp_path, {"messages": [{"role": "user", "content": "hi"}]})
+    dump_dir = tmp_path / "dumps"
+    written = list(dump_dir.glob("*.json"))
+    assert len(written) == 1
+    # 权限位断言只在 POSIX 成立：Windows 的 os.chmod 只翻只读位（平台差异，
+    # 见 AGENTS.md）；落盘与过期清理本身两平台都执行，保住覆盖率。
+    if os.name == "posix":
+        assert dump_dir.stat().st_mode & 0o777 == 0o700
+        assert written[0].stat().st_mode & 0o777 == 0o600
+
+    # 老版本建过 0755 的目录：下一次落盘必须把它收紧（mkdir 的 mode 只影响新建）
+    dump_dir.chmod(0o755)
+    chat.dump_request_body(tmp_path, {"a": 1})
+    if os.name == "posix":
+        assert dump_dir.stat().st_mode & 0o777 == 0o700
+
+    # 条数没超，但超过 24h 的文件也要被清掉（按 mtime 判）
+    fresh = sorted(dump_dir.glob("*.json"))[-1]
+    old = dump_dir / "0000000000001.json"
+    old.write_text("old", encoding="utf-8")
+    _time.sleep(0)
+    os.utime(old, (0, 0))                    # mtime 归零 = 远超 24h
+    chat.dump_request_body(tmp_path, {"b": 2})
+    remaining = {item.name for item in dump_dir.glob("*.json")}
+    assert old.name not in remaining
+    assert fresh.name in remaining
 
 def test_dump_request_body_trims_ignoring_unlink_errors(tmp_path, monkeypatch):
     """淘汰旧文件时遇到错误不抛出（suppress 分支）。"""
@@ -489,14 +549,18 @@ def test_correct_password_not_blocked_by_username_window(app_client_and_settings
                            json={"username": "root", "password": "rootpw"})
     assert response.status_code == 200
 
-def test_transport_windows_rejects_when_global_cap_reached():
-    """全局窗口满时哈希前即拒（全局分支）。"""
-    from src.auth.throttle import LoginThrottle, ThrottledError, ThrottleLimits
+def test_transport_windows_ignores_global_cap():
+    """全局窗口满**不**在哈希前拒绝（改为仅观测）。
+
+    该窗口跨来源共享：按它拒绝等于给未认证攻击者一个「一次打满、全站登不上」
+    的开关——管理台是唯一止血入口，修复通道不能一起被关掉。
+    """
+    from src.auth.throttle import LoginThrottle, ThrottleLimits
 
     throttle = LoginThrottle(ThrottleLimits(max_global=1, max_per_ip=99, max_per_user=99))
     throttle.record_failure(ip="9.9.9.9", username="ghost")
-    with pytest.raises(ThrottledError):
-        throttle.check_transport_windows(ip="1.2.3.4")
+    throttle.check_transport_windows(ip="1.2.3.4")      # 不抛
+    throttle.check(ip="1.2.3.4", username="alice")      # 不抛
 
 def test_transport_windows_pass_within_limits():
     from src.auth.throttle import LoginThrottle, ThrottleLimits

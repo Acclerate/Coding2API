@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import time
+
 from ..stats.collector import StatsCollector
+
+# 周期 rollup 只重算最近窗口（秒）。
+#
+# `record()` 已经在同一事务里增量维护 `usage_hourly`，周期任务的重算只是
+# 对账。此前每 5 分钟做一次**全表** GROUP BY（最多 90 天明细）：事务期间持有
+# SQLite 写锁，期间的 `record()` 撞上 busy_timeout 后异常被上层吞掉 → 这段
+# 时间的用量直接丢失。窗口取 2 小时且按整点对齐：边界小时必须整小时都进入
+# 重算，否则 REPLACE 会把该小时覆盖成「只剩窗口内那部分」的偏小值。
+# 历史全量重算走 `scripts/rollup_hourly.py`（诊断/修复用，不在周期路径上）。
+ROLLUP_OVERLAP_SECONDS = 2 * 3600
 
 
 class RetentionTask:
     """明细 90 天清理 + 小时汇总（永久保留）。
 
-    `credentials` 非 None 时顺带清理已过期的 (凭证, 模型) 冷却行——
-    那些行只在限流/负缓存期间存在，不回收到期行会无限累积（管理台
-    每次列表都要整表扫一遍）。
+    `credentials` 非 None 时顺带清理已过期的冷却行——模型级
+    `credential_model_cooldowns` 整行删除、账号级 `credentials.cooling_until`
+    置 NULL。那些值只在限流/负缓存期间有意义，不回收到期值会无限累积
+    （管理台每次列表都要整表扫一遍，且陈旧值会让「冷却」排序失真）。
 
     `credit_events` 非 None 时同样按保留期清理积分流水：它每轮探测都可能
     落一行，不回收会长期增长（读侧有 LIMIT，但表本身会一直变大）。
@@ -23,11 +36,19 @@ class RetentionTask:
 
     `growth_events` 非 None 时按同一保留期清理成长中心运行记录：每轮探测
     都可能落一行，不回收同样无界增长。
+
+    `checkin_events` 非 None 时按同一保留期清理签到审计日志：每轮签到都可能
+    落一行，不回收同样无界增长。
+
+    `credential_events` 非 None 时清理凭证可用性时间线：它的保留期是**独立
+    常量**（`CREDENTIAL_EVENT_RETENTION_DAYS` = 30 天），不跟随
+    `retention_days`——时间线只解释状态迁移，比请求明细短是刻意的。
     """
 
     def __init__(self, collector: StatsCollector, *, retention_days: int = 90,
                  credentials=None, credit_events=None, audit=None,
-                 alerts=None, growth_events=None) -> None:
+                 alerts=None, growth_events=None, checkin_events=None,
+                 logs=None, credential_events=None) -> None:
         self._collector = collector
         self.retention_days = retention_days
         self._credentials = credentials
@@ -35,13 +56,32 @@ class RetentionTask:
         self._audit = audit
         self._alerts = alerts
         self._growth_events = growth_events
+        self._checkin_events = checkin_events
+        # 日志环形表同样按保留期兜底：容量只在**写入**时裁剪，一个不再产生日志
+        # 的部署会一直留着很久以前的行。
+        self._logs = logs
+        self._credential_events = credential_events
 
-    def run_once(self) -> dict[str, int]:
+    @staticmethod
+    def rollup_since(now: int | None = None) -> int:
+        """本轮 rollup 的起点（整点对齐，见 `ROLLUP_OVERLAP_SECONDS`）。"""
+        raw = int(now if now is not None else time.time()) - ROLLUP_OVERLAP_SECONDS
+        if raw <= 0:
+            # 早期时间戳（测试/时钟异常）：退回全量重算，绝不漏数据。
+            return 0
+        return (raw // 3600) * 3600
+
+    def run_once(self, *, now: int | None = None) -> dict[str, int]:
         """同步执行一轮（CPU/IO 密集，调用方负责放到线程池，见）。"""
-        rolled = self._collector.rollup_hourly()
-        purged = self._collector.purge_expired(self.retention_days)
+        rolled = self._collector.rollup_hourly(since=self.rollup_since(now))
+        # now 同样传播给清理：调用方注入 now（测试/手动触发）时清理必须跟随，
+        # 否则这里会用真实时间删掉测试里的早期明细——测试输出依赖系统时钟。
+        purged = self._collector.purge_expired(self.retention_days, now=now)
         expired_coolings = (
             self._credentials.purge_expired_model_cooldowns()
+            if self._credentials is not None else 0)
+        expired_account_coolings = (
+            self._credentials.purge_expired_account_cooldowns()
             if self._credentials is not None else 0)
         purged_credit_events = (
             self._credit_events.prune(keep_days=self.retention_days)
@@ -55,9 +95,21 @@ class RetentionTask:
         purged_growth = (
             self._growth_events.prune(keep_days=self.retention_days)
             if self._growth_events is not None else 0)
+        purged_checkin_events = (
+            self._checkin_events.prune(keep_days=self.retention_days)
+            if self._checkin_events is not None else 0)
+        purged_logs = (self._logs.purge(keep_days=self.retention_days, now=now)
+                       if self._logs is not None else 0)
+        purged_credential_events = (
+            self._credential_events.prune(now=now)
+            if self._credential_events is not None else 0)
         return {"rolled_up": rolled, "purged": purged,
                 "expired_coolings": expired_coolings,
+                "expired_account_coolings": expired_account_coolings,
                 "purged_credit_events": purged_credit_events,
                 "purged_audit": purged_audit,
                 "purged_alerts": purged_alerts,
-                "purged_growth_events": purged_growth}
+                "purged_growth_events": purged_growth,
+                "purged_checkin_events": purged_checkin_events,
+                "purged_logs": purged_logs,
+                "purged_credential_events": purged_credential_events}

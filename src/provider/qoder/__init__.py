@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,7 @@ from ...provider.base import (
     Model,
     Quota,
 )
+from ...tasks.pacer import paced
 from . import events as qoder_events
 from .client import QoderClient, realm_for
 from .credential import QoderCredential, parse_credential
@@ -98,7 +100,24 @@ class QoderProvider:
         return qoder_events.classify_status(status, body)
 
     async def probe_quota(self, credential_data: dict) -> Quota:
-        return await self.client.probe_quota(QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if credential.realm == "lingma":
+            # lingma-api 域名下没有 openapi 额度端点（/api/v2/quota/usage 打过去
+            # 只会被拒，管理台误报「凭证被渠道拒绝」）。改用同网关、同 COSY 签名
+            # 的模型发现做存活探测；额度数值未知，返回三态的 None。
+            await self.client.fetch_models(credential)
+            return Quota(probed_at=int(time.time()))
+        return await self.client.probe_quota(credential)
+
+    def set_web_cookie(self, credential_data: dict, cookie: str) -> dict:
+        """写入/清除网页 Cookie（逐包到期的数据源，见 `client.probe_quota`）。
+
+        只改这一个字段：不重走 `from_dict` 归一，避免把老凭证里未识别的字段
+        丢掉（导出/再导入的可逆性靠这条保证）。空串 = 清除，回到汇总口径。
+        """
+        data = dict(credential_data)
+        data["web_cookie"] = cookie
+        return data
 
     async def list_models(self, credential_data: dict) -> list[Model]:
         return await self.client.fetch_models(
@@ -108,34 +127,42 @@ class QoderProvider:
                           model: str) -> AsyncIterator[Event]:
         credential = QoderCredential.from_dict(credential_data)
         key = credential_key(credential)
-        if self.pacer is not None:
-            await self.pacer.wait_turn(key)
-        try:
+        async with paced(self.pacer, key):
             async for event in self.client.stream_chat(credential, payload, model):
                 yield event
-        finally:
-            # 并发模式必须归还名额，否则该凭证被当成永远在途而失去节流
-            if self.pacer is not None:
-                self.pacer.release(key)
 
     # ---------------------------------------------------------------- 签到
 
     async def checkin(self, credential_data: dict) -> CheckinResult:
-        return await self.client.checkin(QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            # lingma-api 域名下没有签到活动（/me/campaigns 与旧 daily-check-in
+            # 都是 Qoder openapi 专属端点），pt-token 打过去只会 401
+            # TOKEN_EXPIRE——曾致后台任务每 10 分钟误报签到失败。与
+            # `probe_quota` 的 lingma 特判同源。
+            return CheckinResult(ok=False, message="Lingma 通道无每日签到活动")
+        return await self.client.checkin(credential)
 
     async def checkin_status(self, credential_data: dict) -> dict:
         """只读签到状态（管理台展示连续天数）；本区域无接口时返回非活动状态。"""
-        status, _ = await self.client.fetch_checkin_status(
-            QoderCredential.from_dict(credential_data))
+        credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            return status_to_dict(CheckinStatus())
+        status, _ = await self.client.fetch_checkin_status(credential)
         return status_to_dict(status or CheckinStatus(activity_name="Qoder 每日签到"))
 
-    def checkin_scope(self, credential_data: dict) -> str:
+    def checkin_scope(self, credential_data: dict) -> str | None:
         """签到隔离键：区域 + uid；身份未知时返回空串（调用方回落凭证 ID）。
 
         返回空串而不是「区域|」是安全取向：后者会让同区域所有未知身份的
         凭证算出同一个 scope，CheckinTask 的 seen 集合只跑第一个账号。
+
+        lingma 区域返回 `None`：该通道没有签到活动，任务层按「凭证级无此
+        能力」整类跳过（不重试、不告警），区别于空串的「身份未知仍要签」。
         """
         credential = QoderCredential.from_dict(credential_data)
+        if realm_for(credential) == "lingma":
+            return None
         if not credential.uid:
             return ""
         return f"{realm_for(credential)}|{credential.uid}"

@@ -66,6 +66,15 @@ def test_error_fixtures_classify_plan_and_other():
     assert other.error_code == 4001 and trae_events.classify_error_code(4001) is ErrKind.INVALID
     assert trae_events.classify_error_code(None) is ErrKind.OTHER
 
+def test_error_frame_4008_quota_exhausted_is_credit():
+    """4008 = "Your requests have exceeded the quota."：按配额耗尽处理（等签到恢复）。"""
+    frame = trae_events.SSEFrame(
+        event="error",
+        data='{"code":4008,"message":"Your requests have exceeded the quota."}')
+    event = trae_events.parse_frame(frame)
+    assert event.error_code == 4008
+    assert event.error_kind is ErrKind.CREDIT
+
 @pytest.mark.parametrize(("status", "expected"), [
     (401, ErrKind.DEAD), (404, ErrKind.SOFT), (429, ErrKind.SOFT),
     (500, ErrKind.OTHER), (400, ErrKind.INVALID), (402, ErrKind.CREDIT),
@@ -84,16 +93,40 @@ def test_classify_status_detects_1005_in_body():
     (429, b'{"code": 6004}', ErrKind.MODEL),
     (429, b'{"code": 500}', ErrKind.SOFT),
     (500, b'{"code": 14018}', ErrKind.CREDIT),      # 业务码优先于状态码
+    # 字符串 / 连字符形态的业务码同样认（与 CodeBuddy 共用的 `business_codes`）
+    (400, b'{"code": "11102"}', ErrKind.BLOCKED),
+    (400, b'{"code": "11-102"}', ErrKind.BLOCKED),
+    (402, b'{"code": "14018"}', ErrKind.CREDIT),
+    (403, b'{"code": 4008, "message": "Your requests have exceeded the quota."}',
+     ErrKind.CREDIT),                                # 配额耗尽：HTTP 形态同样判 CREDIT
 ])
 def test_classify_status_business_codes(status, body, expected):
     assert trae_events.classify_status(status, body) is expected
 
 @pytest.mark.parametrize(("code", "expected"), [
-    (1005, ErrKind.PLAN), (14018, ErrKind.CREDIT), (6004, ErrKind.MODEL),
-    (4001, ErrKind.INVALID), (None, ErrKind.OTHER),
+    (1005, ErrKind.PLAN), (14018, ErrKind.CREDIT), (4008, ErrKind.CREDIT),
+    (6004, ErrKind.MODEL), (4001, ErrKind.INVALID),
+    (3004, ErrKind.SOFT),   # 限流：短冷却恢复，不累计三振
+    (None, ErrKind.OTHER), (9999, ErrKind.OTHER),      # 未知码仍走 OTHER 兜底
 ])
 def test_classify_error_code_mapping(code, expected):
     assert trae_events.classify_error_code(code) is expected
+
+def test_classify_error_code_3004_does_not_strike():
+    """限流（3004）绝不累计 err_count：SOFT 与 OTHER 的差别就在这里。
+
+    单凭证渠道上一次 3004 后，凭证只短冷却 60s；若误判 OTHER，3 次限流会把
+    唯一凭证中冷却 10m，期间所有模型都报 no_healthy_credential。
+    """
+    import time
+
+    from src.engine.scheduler import Candidate, Scheduler
+
+    outcome = Scheduler().note_error(
+        Candidate(credential_id="c1", provider="trae", err_count=2),
+        trae_events.classify_error_code(3004), int(time.time()))
+    assert outcome.cooling_until is not None
+    assert outcome.err_count == 2          # 未累计、未清零，保持原值
 
 def test_parse_all_events_non_dict_tool_call_entry_skipped():
     """非对象 tool_call 条目（88）与全空结果（158-160）覆盖。"""
@@ -140,3 +173,34 @@ def test_blank_nameless_tool_call_is_dropped(arguments):
     events = trae_events.parse_all_events(
         trae_events.SSEFrame(event="output", data=payload))
     assert EventKind.TOOL_CALLS not in [e.kind for e in events]
+
+
+def test_output_frame_attaches_upstream_reported_model():
+    """TRAE 帧里带 model 时挂到事件上（观测用）。"""
+    frame = trae_events.SSEFrame(
+        event="output",
+        data='{"model":"trae-model","response":"hi","reasoning_content":"",'
+             '"tool_calls":null}')
+    assert trae_events.parse_frame(frame).model == "trae-model"
+    plain = trae_events.SSEFrame(event="output", data='{"response":"hi"}')
+    assert trae_events.parse_frame(plain).model is None
+
+
+def test_frame_model_reads_metadata_frames_only():
+    """元数据帧回显的真实模型名：extra_info / timing_cost 可读，其余帧不看。"""
+    extra = trae_events.SSEFrame(event="extra_info",
+                                 data='{"model":"glm-5.2","version":"x"}')
+    assert trae_events.frame_model(extra) == "glm-5.2"
+    timing = trae_events.SSEFrame(event="timing_cost",
+                                 data='{"provider_model_name":"glm-5.2"}')
+    assert trae_events.frame_model(timing) == "glm-5.2"
+    # 空串 / 缺键 / 坏 JSON / 非对象 / 非元数据帧 / 无 data 一律 None
+    for frame in (
+        trae_events.SSEFrame(event="metadata", data='{"model":""}'),
+        trae_events.SSEFrame(event="extra_info", data='{}'),
+        trae_events.SSEFrame(event="extra_info", data="{broken"),
+        trae_events.SSEFrame(event="extra_info", data="[1]"),
+        trae_events.SSEFrame(event="output", data='{"model":"glm-5.2"}'),
+        trae_events.SSEFrame(event="extra_info", data=""),
+    ):
+        assert trae_events.frame_model(frame) is None

@@ -17,19 +17,82 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..auth.access import model_allowed
 from ..compat.openai.request import ChatRequest, InvalidRequest
 from ..config import Settings
+from ..engine.compress import estimate_messages
 from ..engine.executor import Executor, StreamSink
+from ..engine.sse import SSE_COMMENT
+from ..key_quota import Lease, QuotaExceeded
+from ..provider.base import aclose_stream
 from ..runtime_settings import RuntimeSettings
-from .deps import ApiKeyPrincipal, read_json_body
-from .streaming import with_keepalive
+from .deps import ApiKeyPrincipal, get_services, read_json_body
+from .streaming import respond_with_keepalive, respond_with_stream_start, with_keepalive
 
 
 def ensure_model_allowed(chat_request: ChatRequest, principal: ApiKeyPrincipal,
                          settings: Settings | RuntimeSettings) -> None:
-    """模型白名单校验：不通过即 400（三个出口与 count_tokens 同一口径）。"""
-    if not model_allowed(chat_request.model, principal.allowed_models,
+    """模型白名单校验：不通过即 400（三个出口与 count_tokens 同一口径）。
+
+    两层策略**同时**生效，缺一不可：
+    - `api_keys.allowed_models`：这把 Key 自己被授予的范围；
+    - `users.allowed_models`：管理员按人设的范围（自助建 Key 时由本人填写，
+      所以不能只看 Key 自己的白名单，否则设一个空列表即可越权）。
+    """
+    ensure_model_allowed_for(chat_request, principal.allowed_models, settings,
+                             subject="this api key")
+    ensure_model_allowed_for(chat_request, principal.user_allowed_models, settings,
+                             subject="this user")
+
+
+def ensure_model_allowed_for(chat_request: ChatRequest, allowed_models: str,
+                             settings: Settings | RuntimeSettings, *,
+                             subject: str) -> None:
+    """白名单校验的共用实现：错误文案里的主体（Key / 用户）由调用方给。
+
+    两种主体共用同一判据：`api_keys.allowed_models`（外部 Key）与
+    `users.allowed_models`（管理台 Playground 的会话直连）。分开写两份实现必然
+    漂移——其中一份漏了「省略模型名即默认模型」的绕过口子，白名单就等于没有。
+    """
+    if not model_allowed(chat_request.model, allowed_models,
                          default_model=settings.default_model):
         raise InvalidRequest(
-            f"model {chat_request.model!r} is not allowed for this api key")
+            f"model {chat_request.model!r} is not allowed for {subject}")
+
+
+# 客户端没给输出上限时的保守占位：没有它，不计上限的客户端在 TPM 判定里
+# 只按输入计费，同一分钟可无限产 token（限流等于没有）。取 1024 是「宁可少放
+# 一个请求」的估值——比绝大多数真实回复长，又不至于把正常请求全判超。
+DEFAULT_OUTPUT_TOKEN_ESTIMATE = 1024
+
+
+def estimated_tokens(chat_request: ChatRequest) -> int:
+    """转发前的 token 预估：输入启发式估算 + 输出上限（TPM 判定用）。
+
+    真实用量要等响应结束才知道，而 TPM 必须在转发前裁决；这里取「输入估算 +
+    客户端给的最大输出」，偏保守（宁可少放一个请求，也不让同一分钟超发）。
+    客户端没给（或给的不是正整数）时按 `DEFAULT_OUTPUT_TOKEN_ESTIMATE` 计：
+    否则不带上限的客户端在 TPM 口径里只算输入，等于绕过限流。
+    """
+    output = 0
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = chat_request.raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            output = max(output, value)
+    if output <= 0:
+        output = DEFAULT_OUTPUT_TOKEN_ESTIMATE
+    return int(estimate_messages(chat_request.messages)) + output
+
+
+def quota_exceeded_response(error: QuotaExceeded) -> JSONResponse:
+    """429：`type` 固定为 `quota_exceeded`（客户端据此区分限流与额度耗尽）。
+
+    刻意不走 `error_payload`：那个把 `type` 固定成 `api_error`，而这里需要
+    让 OpenAI 兼容客户端一眼看出「是 Key 的配额，不是服务故障」。带
+    `Retry-After`：当日配额给到下个北京时间 0 点的秒数，速率类给到窗口滑出。
+    """
+    return JSONResponse(
+        status_code=429,
+        content={"error": {"type": "quota_exceeded", "message": str(error)}},
+        headers={"Retry-After": str(error.retry_after)},
+    )
 
 
 async def dispatch_compat(
@@ -53,16 +116,112 @@ async def dispatch_compat(
     chat_request = parse(body)
     ensure_model_allowed(chat_request, principal, settings)
     binding = principal.provider_binding
+    # 配额准入：读体 + 白名单之后、executor 之前。放在这里而不是鉴权依赖里，
+    # 是因为 TPM 需要预估 token（要解析后的请求体）；放在 executor 里则会让
+    # 三个出口各写一遍。超限返回 429，**不消耗**任何上游调用。
+    try:
+        lease = _admit_quota(request, principal, chat_request)
+    except QuotaExceeded as error:
+        return quota_exceeded_response(error)
     if chat_request.stream:
         # 前置校验：在 200 响应头发出前拒绝不可能成功的请求（否则只能断流）
-        target = executor.preflight(chat_request, binding)
+        try:
+            target = executor.preflight(chat_request, binding,
+                                        username=principal.username)
+        except Exception:
+            lease.release()          # 400 不该占着并发名额
+            raise
         translator = translator_for(target.model) if translator_for else None
-        return StreamingResponse(
-            with_keepalive(executor.stream_guarded(chat_request,
-                                                   username=principal.username,
-                                                   translator=translator,
-                                                   provider_binding=binding)),
+        # 心跳帧随出口协议走：Anthropic 要 `event: ping` 具名事件（只解析
+        # `event:` 行的客户端会忽略注释帧），chat / Responses 保持注释帧
+        # （Responses 无 ping 事件，未知事件类型会让严格解析器报错）。
+        keepalive_frame = (translator.keepalive() if translator is not None
+                           else SSE_COMMENT)
+        # 首帧探测：整条链未出帧就用尽时，`on_terminal` 记下错误码；
+        # 出口据此在发 200 头之前把请求级错误改判 400（见 streaming.py）。
+        terminal: dict[str, str] = {}
+        frames = with_keepalive(executor.stream_guarded(chat_request,
+                                                        username=principal.username,
+                                                        translator=translator,
+                                                        provider_binding=binding,
+                                                        on_terminal=(
+                                                            lambda code, message:
+                                                            terminal.update(code=code,
+                                                                            message=message))),
+                                keepalive_frame=keepalive_frame)
+        return await respond_with_stream_start(
+            _release_when_done(frames, lease), terminal,
             media_type="text/event-stream")
-    completion = await executor.complete(chat_request, username=principal.username,
-                                         provider_binding=binding)
+    # 非流式保活（`nonstream_keepalive_seconds`，默认 0 = 关闭）：宽限期内
+    # 完成仍是逐字节相同的 JSONResponse，超时才转 chunked 吐空白心跳。
+    keepalive = float(getattr(settings, "nonstream_keepalive_seconds", 0) or 0)
+    if keepalive > 0:
+        return await respond_with_keepalive(
+            lambda: executor.complete(chat_request, username=principal.username,
+                                      provider_binding=binding,
+                                      is_disconnected=request.is_disconnected),
+            grace=keepalive, convert=convert, release=lease.release)
+    try:
+        completion = await executor.complete(chat_request, username=principal.username,
+                                             provider_binding=binding,
+                                             is_disconnected=request.is_disconnected)
+    finally:
+        lease.release()
     return JSONResponse(convert(completion) if convert else completion)
+
+
+def _admit_quota(request: Request, principal: ApiKeyPrincipal,
+                 chat_request: ChatRequest) -> Lease:
+    """按 Key 配额 + 用户配额准入；超限抛 `QuotaExceeded`。
+
+    两层**同时**生效，缺一不可：
+    - `api_keys.quota`：这把 Key 自己被授予的上限；
+    - `users.quota`：管理员按人设的上限（自助建 Key 时由本人填写，所以不能
+      只看 Key 自己的配额，否则造一把空配额的 Key 即绕开人均配额）。
+
+    与 Playground 同一判据（`services.user_quota`，用量按**用户名**聚合）。
+    先判 Key 再判用户：两者都通过才计数，任一失败立即释放已占名额。
+
+    不受限的 Key（配额全关）也返回 Lease——`counted=False`，`release()` 是
+    空操作，调用方不必到处判空。
+    """
+    services = get_services(request)
+    tokens = estimated_tokens(chat_request)
+    lease = services.key_quota.admit(
+        principal.key_id, principal.quota, tokens=tokens)
+    # 用户级配额全关时 `admit` 直接返回 counted=False 的 Lease（不查库），
+    # 所以这里不必先判空——省一条分支，也省得两处口径分叉。
+    try:
+        user_lease = services.user_quota.admit(
+            principal.username, principal.user_quota, tokens=tokens, subject="user")
+    except QuotaExceeded:
+        lease.release()              # 用户级拒绝不该占着 Key 的并发名额
+        raise
+    return _CombinedLease(lease, user_lease)
+
+
+class _CombinedLease:
+    """Key 级 + 用户级两层配额的合成租约：`release()` 同时归还两层名额。
+
+    只实现调用方用到的那一个方法（`release`）——`counted` 之类的内部分支
+    调用方从不读，实现了反而是没人测的死代码。
+    """
+
+    def __init__(self, *leases) -> None:
+        self._leases = leases
+
+    def release(self) -> None:
+        for lease in self._leases:
+            lease.release()
+
+
+async def _release_when_done(frames, lease: Lease):
+    """流式收尾归还并发名额：客户端断开 / 正常结束 / 异常都要释放。"""
+    try:
+        async for frame in frames:
+            yield frame
+    finally:
+        lease.release()
+        # 提前结束（如首帧改判 400）时，`async for` 不会关闭被包装的迭代器；
+        # 不显式关闭会让上游流的节流名额等 GC 才归还。
+        await aclose_stream(frames)

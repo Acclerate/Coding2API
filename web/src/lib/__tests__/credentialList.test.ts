@@ -4,14 +4,16 @@ import {
   ANY,
   DEFAULT_FILTERS,
   DEFAULT_GROUP_SORT,
-  filterCredentials,
   groupByProvider,
   matchesFilters,
+  providerLedger,
   providerOptions,
   sortGroups,
   stateOptions,
+  tagOptions,
 } from "../credentialList";
 import type { Credential } from "../../api/types";
+import type { ProviderGroup } from "../credentialList";
 
 function credential(overrides: Record<string, unknown> = {}): Credential {
   return makeCredential(overrides) as Credential;
@@ -54,23 +56,29 @@ describe("matchesFilters", () => {
   it("多个条件是 AND 关系", () => {
     const item = credential({ provider: "trae", nickname: "备用" });
     expect(
-      matchesFilters(item, { query: "备用", provider: "trae", state: "ready" }, NOW),
+      matchesFilters(item, { ...DEFAULT_FILTERS, query: "备用", provider: "trae", state: "ready" }, NOW),
     ).toBe(true);
     expect(
-      matchesFilters(item, { query: "备用", provider: "codebuddy", state: "ready" }, NOW),
+      matchesFilters(item, { ...DEFAULT_FILTERS, query: "备用", provider: "codebuddy", state: "ready" }, NOW),
     ).toBe(false);
   });
-});
 
-describe("filterCredentials", () => {
-  it("保持原顺序，只做剔除", () => {
-    const items = [
-      credential({ id: "a", provider: "trae" }),
-      credential({ id: "b", provider: "codebuddy" }),
-      credential({ id: "c", provider: "trae" }),
-    ];
-    const result = filterCredentials(items, { ...DEFAULT_FILTERS, provider: "trae" }, NOW);
-    expect(result.map((item) => item.id)).toEqual(["a", "c"]);
+  it("标签筛选精确匹配（大小写不敏感），且不参与搜索词", () => {
+    const item = credential({ id: "cred_t", nickname: "主账号", tags: ["Prod", "备用"] });
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: "prod" }, NOW)).toBe(true);
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: " 备用 " }, NOW)).toBe(true);
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, tag: "生" }, NOW)).toBe(false);
+    // 无标签凭证在任一标签筛选下都被剔除
+    expect(matchesFilters(credential({ tags: [] }), { ...DEFAULT_FILTERS, tag: "prod" }, NOW))
+      .toBe(false);
+    // 标签是结构化维度：不该被搜索词命中（否则「搜昵称叫『生产』的号」变得不可能）
+    expect(matchesFilters(item, { ...DEFAULT_FILTERS, query: "prod" }, NOW)).toBe(false);
+  });
+
+  it("tags 缺失（老后端）时不因 undefined 崩，按无标签处理", () => {
+    const legacy = { ...credential(), tags: undefined } as unknown as Credential;
+    expect(matchesFilters(legacy, DEFAULT_FILTERS, NOW)).toBe(true);
+    expect(matchesFilters(legacy, { ...DEFAULT_FILTERS, tag: "prod" }, NOW)).toBe(false);
   });
 });
 
@@ -82,12 +90,37 @@ describe("groupByProvider", () => {
       credential({ id: "c", provider: "codebuddy" }),
       credential({ id: "u", provider: "mystery" as never }),
     ]);
-    expect(groups.map((group) => group.provider)).toEqual([
+    expect(groups.map((group) => group.key)).toEqual([
       "codebuddy",
       "trae",
       "zen",
       "mystery",
     ]);
+  });
+
+  it("CodeArts 只有一个组（不再拆内置/福利），账本为 credits", () => {
+    const groups = groupByProvider([
+      credential({ id: "ca1", provider: "codearts" }),
+      credential({ id: "ca2", provider: "codearts" }),
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      key: "codearts",
+      provider: "codearts",
+      label: "CodeArts",
+      ledger: "credits",
+    });
+    // 一个真实渠道只有一个组：账号只出现一次
+    expect(groups[0].items.map((item) => item.id)).toEqual(["ca1", "ca2"]);
+    expect(groups[0].states).toEqual({ ready: 2 });
+  });
+
+  it("非 CodeArts 渠道只有一组，label 用全站展示名", () => {
+    const groups = groupByProvider([credential({ id: "cb", provider: "codebuddy" })]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      key: "codebuddy", provider: "codebuddy", label: "CodeBuddy", ledger: "pool",
+    });
   });
 
   it("组内保持传入顺序（不改变后端排序语义）", () => {
@@ -167,16 +200,97 @@ describe("groupByProvider", () => {
     expect(group.remaining).toBe(30);
     expect(group.total).toBe(100);
   });
+
+  it("CodeArts 组按通用额度字段聚合到期积分，账本为 credits", () => {
+    const groups = groupByProvider(
+      [
+        credential({
+          id: "ca1", provider: "codearts",
+          quota_expiring_credits: 100,
+          quota_expiring_credits_secondary: 140,
+        }),
+        credential({
+          id: "ca2", provider: "codearts",
+          quota_expiring_credits: 50,
+          quota_expiring_credits_secondary: 60,
+        }),
+      ],
+      NOW,
+    );
+    // 唯一的 CodeArts 组：主/次窗口都按通用字段求和
+    expect(groups).toHaveLength(1);
+    expect(groups[0].ledger).toBe("credits");
+    expect(groups[0].expiring).toBe(150);
+    expect(groups[0].expiringSecondary).toBe(200);
+  });
+
+  it("今日签到：按最近一条记录归已签 / 失败 / 未签，暂停与硬禁用不进分母", () => {
+    const today = (ts: number, ok: 0 | 1) => ({
+      id: `checkin_${ts}`, credential_id: "x", ts, ok, already: 0,
+      credit: null, code: null, message: "", trigger: "auto",
+    });
+    const group = groupByProvider(
+      [
+        credential({
+          id: "signed", provider: "trae",
+          checkin_today: today(NOW - 300, 1),
+        }),
+        credential({
+          id: "failed", provider: "trae",
+          checkin_today: today(NOW - 60, 0),
+        }),
+        credential({ id: "pending", provider: "trae" }),
+        // 暂停（enabled=0）与硬禁用都被签到任务跳过，不该算「未签」
+        credential({ id: "paused", provider: "trae", enabled: 0 }),
+        credential({ id: "dead", provider: "trae", disabled: 1 }),
+      ],
+      NOW,
+    )[0];
+    expect(group.checkin).toEqual({
+      done: 1, failed: 1, pending: 1, lastAt: NOW - 60,
+    });
+  });
+
+  it("今日签到：全组无记录时三项都为 0、时刻为 null（不是失败）", () => {
+    const group = groupByProvider(
+      [credential({ id: "a", provider: "trae" })], NOW)[0];
+    expect(group.checkin).toEqual({
+      done: 0, failed: 0, pending: 1, lastAt: null,
+    });
+    // 全部暂停的组：分母为 0（组头据此不渲染签到块）
+    const paused = groupByProvider(
+      [credential({ id: "b", provider: "trae", enabled: 0 })], NOW)[0];
+    expect(paused.checkin).toEqual({
+      done: 0, failed: 0, pending: 0, lastAt: null,
+    });
+  });
+});
+
+describe("providerLedger", () => {
+  it("CodeArts 与小浣熊记积分账，其余渠道（含未知）记套餐池账", () => {
+    expect(providerLedger("codearts")).toBe("credits");
+    expect(providerLedger("raccoon")).toBe("credits");
+    for (const provider of [
+      "codebuddy", "codebuddy_intl", "trae", "zen", "kilo", "qoder", "officeace", "mystery",
+    ]) {
+      expect(providerLedger(provider)).toBe("pool");
+    }
+  });
 });
 
 describe("sortGroups", () => {
-  const groups = () => [
-    { provider: "codebuddy", items: [], states: {}, remaining: 50, total: 100,
-      expiring: null, expiringSecondary: null },
-    { provider: "trae", items: [], states: {}, remaining: 900, total: 1000,
-      expiring: null, expiringSecondary: null },
-    { provider: "zen", items: [], states: {}, remaining: null, total: null,
-      expiring: null, expiringSecondary: null },
+  /** 手写分组用的「无今日签到数据」占位（排序用例不关心签到）。 */
+  const idleCheckin = { done: 0, failed: 0, pending: 0, lastAt: null };
+  const groups = (): ProviderGroup[] => [
+    { key: "codebuddy", provider: "codebuddy", label: "CodeBuddy",
+      ledger: "pool", items: [], states: {}, remaining: 50, total: 100,
+      expiring: null, expiringSecondary: null, checkin: idleCheckin },
+    { key: "trae", provider: "trae", label: "TRAE",
+      ledger: "pool", items: [], states: {}, remaining: 900, total: 1000,
+      expiring: null, expiringSecondary: null, checkin: idleCheckin },
+    { key: "zen", provider: "zen", label: "OpenCode Zen",
+      ledger: "pool", items: [], states: {}, remaining: null, total: null,
+      expiring: null, expiringSecondary: null, checkin: idleCheckin },
   ];
 
   it("provider 口径原样返回（groupByProvider 已排好）", () => {
@@ -189,7 +303,7 @@ describe("sortGroups", () => {
   });
 
   it("quota 口径按额度合计从高到低", () => {
-    expect(sortGroups(groups(), "quota").map((group) => group.provider)).toEqual([
+    expect(sortGroups(groups(), "quota").map((group) => group.key)).toEqual([
       "trae",
       "codebuddy",
       "zen",
@@ -199,36 +313,56 @@ describe("sortGroups", () => {
   it("无额度接口（remaining null）垫底，不当 0 参与比较", () => {
     const sorted = sortGroups(
       [
-        { provider: "zen", items: [], states: {}, remaining: null, total: null,
-          expiring: null, expiringSecondary: null },
-        { provider: "codebuddy", items: [], states: {}, remaining: 0, total: 100,
-          expiring: null, expiringSecondary: null },
-      ],
+        { key: "zen", provider: "zen", label: "OpenCode Zen",
+          ledger: "pool", items: [], states: {}, remaining: null, total: null,
+          expiring: null, expiringSecondary: null, checkin: idleCheckin },
+        { key: "codebuddy", provider: "codebuddy", label: "CodeBuddy",
+          ledger: "pool", items: [], states: {}, remaining: 0, total: 100,
+          expiring: null, expiringSecondary: null, checkin: idleCheckin },
+      ] as ProviderGroup[],
       "quota",
     );
     // 真的剩 0 的渠道排在「没有额度接口」之前
-    expect(sorted.map((group) => group.provider)).toEqual(["codebuddy", "zen"]);
+    expect(sorted.map((group) => group.key)).toEqual(["codebuddy", "zen"]);
   });
 
   it("额度相同（含都为 null）时回落到渠道顺序，不抖动", () => {
     const sorted = sortGroups(
       [
-        { provider: "zen", items: [], states: {}, remaining: null, total: null,
-          expiring: null, expiringSecondary: null },
-        { provider: "kilo", items: [], states: {}, remaining: null, total: null,
-          expiring: null, expiringSecondary: null },
-      ],
+        { key: "zen", provider: "zen", label: "OpenCode Zen",
+          ledger: "pool", items: [], states: {}, remaining: null, total: null,
+          expiring: null, expiringSecondary: null, checkin: idleCheckin },
+        { key: "kilo", provider: "kilo", label: "Kilo",
+          ledger: "pool", items: [], states: {}, remaining: null, total: null,
+          expiring: null, expiringSecondary: null, checkin: idleCheckin },
+      ] as ProviderGroup[],
       "quota",
     );
     // providerRank 里 zen 在 kilo 前
-    expect(sorted.map((group) => group.provider)).toEqual(["zen", "kilo"]);
+    expect(sorted.map((group) => group.key)).toEqual(["zen", "kilo"]);
+  });
+
+  it("额度相同时按分组 key 兜底定序，不随入参抖动", () => {
+    const sorted = sortGroups(
+      [
+        { key: "mystery-b", provider: "mystery-b", label: "mystery-b",
+          ledger: "pool", items: [], states: {}, remaining: 100,
+          total: 1000, expiring: null, expiringSecondary: null, checkin: idleCheckin },
+        { key: "mystery-a", provider: "mystery-a", label: "mystery-a",
+          ledger: "pool", items: [], states: {}, remaining: 100,
+          total: 1000, expiring: null, expiringSecondary: null, checkin: idleCheckin },
+      ] as ProviderGroup[],
+      "quota",
+    );
+    // 两个未知渠道同权重、同额度 → 回落到 key 字典序
+    expect(sorted.map((group) => group.key)).toEqual(["mystery-a", "mystery-b"]);
   });
 
   it("不改动入参数组的顺序", () => {
     const input = groups();
-    const before = input.map((group) => group.provider);
+    const before = input.map((group) => group.key);
     sortGroups(input, "quota");
-    expect(input.map((group) => group.provider)).toEqual(before);
+    expect(input.map((group) => group.key)).toEqual(before);
   });
 });
 
@@ -284,5 +418,30 @@ describe("stateOptions", () => {
   it("ANY 不是具体状态，不会被当成选中项保留", () => {
     const options = stateOptions([credential({ id: "a" })], NOW, ANY);
     expect(options.map((option) => option.value)).toEqual(["ready"]);
+  });
+});
+
+describe("tagOptions", () => {
+  it("按首次出现顺序列出标签与计数，大小写不敏感合并", () => {
+    const options = tagOptions([
+      credential({ id: "a", tags: ["生产", "prod"] }),
+      credential({ id: "b", tags: ["prod", "PROD"] }),
+      credential({ id: "c", tags: [] }),
+    ]);
+    // prod / PROD 合并成一个，标签取首次写法
+    expect(options).toEqual([
+      { value: "生产", label: "生产", count: 1 },
+      { value: "prod", label: "prod", count: 2 },
+    ]);
+  });
+
+  it("无标签的池没有标签项", () => {
+    expect(tagOptions([credential({ tags: [] })])).toEqual([]);
+    expect(tagOptions([])).toEqual([]);
+  });
+
+  it("老后端缺 tags 字段（undefined）不崩", () => {
+    const legacy = { ...credential(), tags: undefined } as unknown as Credential;
+    expect(tagOptions([legacy])).toEqual([]);
   });
 });

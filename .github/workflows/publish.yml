@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要打的版本号（如 v0.4.3，留空则跳过）'
+        description: '要打的版本号（如 v0.14.3，留空则跳过）'
         required: false
         default: ''
 
@@ -21,34 +21,79 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 确定要发的 tag：tag push 用 github.ref_name，手动触发用 inputs.tag
+      # **直插 shell 的写法一律禁止**：`TAG="${{ inputs.tag }}"` 会把 dispatch 输入
+      # 原样拼进脚本源码，有 dispatch 权限的人可注入任意命令（本 job 带
+      # packages:write，等于能把镜像推到 GHCR）。所以输入先经 env 传递，脚本内
+      # 只用带引号的 "$TAG" 引用。
       - id: meta
         shell: bash
+        env:
+          # 输入只经 env 注入：env 值不参与 shell 解析，杜绝命令注入
+          TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          # tag push 时 github.ref_name 就是标签名；手动触发用输入。
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            TAG="$REF_NAME"
           fi
           if [ -z "$TAG" ]; then
             echo "tag=skip" >> "$GITHUB_OUTPUT"
             echo "::notice::没有 tag，跳过 publish"
-          else
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # 只接受语义版本 vX.Y.Z：白名单式校验顺带堵住注入（含空格、分号、
+          # 换行的输入一律不合法），也拦住 v0.14 / 0.14.3 这类会打出畸形镜像
+          # tag 的写法。
+          # 用 bash 的 `[[ =~ ]]` 而不是 `grep -E`：grep 逐行匹配，多行输入
+          # （"v1.2.3\n恶意命令"）的第一行就能命中、整体放行；bash 正则对
+          # 整个字符串做锚定匹配，$ 后面多一个换行也判不合法。
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag 格式非法: $TAG（应为 vX.Y.Z，例如 v0.14.3）"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: 跳过（无 tag）
         if: steps.meta.outputs.tag == 'skip'
         run: echo "skip publish"
 
+      # ref 必须显式指到该 tag：workflow_dispatch 默认检出**所选分支的 HEAD**，
+      # 于是「在 main 上点一下、输入 v0.14.3」就能把 main 上尚未发布的 commit
+      # 打成 v0.14.3 并覆盖 :latest，绕过 tag 本身指向的代码。
+      # push 触发时 github.ref_name 就是标签名，带 ref 同样正确（切到 tag 指向
+      # 的 commit）。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: steps.meta.outputs.tag != 'skip'
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
         if: steps.meta.outputs.tag != 'skip'
 
-      # tag push 到 v* 时跑后端测试，避免把坏代码发到 GHCR。
-      # 前端由 Dockerfile 的 vite build 兜底，这里不重复。
-      - name: 后端测试（tag push 场景）
-        if: steps.meta.outputs.tag != 'skip' && github.event_name == 'push'
+      # tag 与 pyproject.toml 的 project.version 必须一致，否则镜像 tag 会与
+      # /healthz 自报版本自相矛盾（v0.12.0、v0.13.0 就漏 bump 过）。
+      - name: 校验 tag 与版本号一致
+        if: steps.meta.outputs.tag != 'skip'
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          PYVER=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -n1)
+          if [ -z "$PYVER" ]; then
+            echo "::error::读不到 pyproject.toml 的 project.version"
+            exit 1
+          fi
+          if [ "$TAG" != "v$PYVER" ]; then
+            echo "::error::tag=$TAG 与 pyproject.toml 的 version=$PYVER 不一致，先补 chore(release)"
+            exit 1
+          fi
+          echo "版本一致：$TAG"
+
+      # 发版前必跑后端测试：手动触发的正式发版同样不能跳过，否则坏代码
+      # 会绕过 CI 直接进 GHCR。前端由 Dockerfile 的 vite build 兜底，这里不重复。
+      - name: 后端测试
+        if: steps.meta.outputs.tag != 'skip'
         run: |
           uv sync --frozen
           uv run ruff check src tests scripts
@@ -56,11 +101,11 @@ jobs:
 
       - name: Setup buildx
         if: steps.meta.outputs.tag != 'skip'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       - name: Login to GHCR
         if: steps.meta.outputs.tag != 'skip'
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -68,7 +113,7 @@ jobs:
 
       - name: Build & push
         if: steps.meta.outputs.tag != 'skip'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           push: true

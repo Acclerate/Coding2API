@@ -149,3 +149,189 @@ def test_record_without_request_context_stores_null(db):
     assert get_request_id() is None
     collector.record(username="u", provider="trae", model="m", ok=True)
     assert query.events(username="u")["events"][0]["request_id"] is None
+
+
+# --------------------------------------------------- Key 归属 contextvar
+
+def test_middleware_resets_api_key_id_after_request():
+    """Key 归属必须随请求结束复原（含流式响应体期间的写入）。"""
+    from src.request_context import get_api_key_id, set_api_key_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/keyed")
+    async def keyed():
+        set_api_key_id("key_1")        # 模拟鉴权依赖
+        return {"key": get_api_key_id()}
+
+    with TestClient(app) as client:
+        assert client.get("/keyed").json() == {"key": "key_1"}
+        # 同一线程的下一个请求看不到上一个请求的归属
+        assert client.get("/plain").status_code == 404
+    assert get_api_key_id() is None
+
+
+def test_middleware_resets_request_id_after_request():
+    """request_id 随请求结束复原：超时存活的子任务不能继承旧 ID 写统计。"""
+    from src.request_context import get_request_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/rid")
+    async def rid():
+        from src.request_context import set_request_id
+        set_request_id("stale-after-this")
+        return {"rid": get_request_id()}
+
+    with TestClient(app) as client:
+        assert client.get("/rid").json() == {"rid": "stale-after-this"}
+    assert get_request_id() is None
+
+
+def test_middleware_resets_api_key_id_even_when_handler_raises():
+    from src.request_context import get_api_key_id, set_api_key_id
+
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/boom")
+    async def boom():
+        set_api_key_id("key_2")
+        raise RuntimeError("handler exploded")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.get("/boom").status_code == 500
+    assert get_api_key_id() is None
+
+
+def test_record_persists_api_key_id_from_context(db):
+    from src.request_context import set_api_key_id
+    from src.stats.collector import StatsCollector
+
+    collector = StatsCollector(db)
+    set_api_key_id("key_ctx")
+    try:
+        collector.record(username="u", provider="trae", model="m", ok=True)
+    finally:
+        set_api_key_id(None)
+    assert db.connect().execute(
+        "SELECT api_key_id FROM usage_events").fetchone()["api_key_id"] == "key_ctx"
+
+
+def test_record_without_key_context_stores_null(db):
+    """后台任务 / 内部请求没有 Key 归属 → NULL（= 未归属，不猜）。"""
+    from src.stats.collector import StatsCollector
+    from src.stats.query import StatsQuery
+
+    collector, _query = StatsCollector(db), StatsQuery(db)
+    collector.record(username="u", provider="trae", model="m", ok=True)
+    assert db.connect().execute(
+        "SELECT api_key_id FROM usage_events").fetchone()["api_key_id"] is None
+
+
+# ------------------------------------------------------- 会话标识（E1 的地基）
+
+def test_session_id_defaults_none_and_round_trips():
+    from src.request_context import get_session_id, set_session_id
+
+    assert get_session_id() is None
+    set_session_id("sess-1")
+    assert get_session_id() == "sess-1"
+    set_session_id(None)
+    assert get_session_id() is None
+
+
+def test_sanitize_session_id_accepts_and_rejects():
+    from src.request_context import SESSION_ID_PATTERN, sanitize_session_id
+
+    for raw in ("abc", "a-b.c_d:e", "x" * 128):
+        assert sanitize_session_id(raw) == raw
+    for raw in (None, "", "   ", "has space", "line\nbreak", "x" * 129):
+        assert sanitize_session_id(raw) is None
+    assert SESSION_ID_PATTERN.match("ok")
+
+
+def test_session_id_from_headers_prefers_earlier_header_names():
+    """按 SESSION_ID_HEADERS 顺序取第一个合法值（头名大小写不敏感）。"""
+    from src.request_context import session_id_from_headers
+
+    headers = [(b"conversation-id", b"third"), (b"x-session-id", b"first"),
+               (b"x-opencode-session", b"second")]
+    assert session_id_from_headers(headers) == "first"
+    only_later = [(b"conversation-id", b"conversation")]
+    assert session_id_from_headers(only_later) == "conversation"
+    # 大小写混合的头名同样识别
+    assert session_id_from_headers([(b"X-Session-Id", b"mixed")]) == "mixed"
+
+
+def test_session_id_from_headers_accepts_codex_hyphenated_headers():
+    """Codex 自 2026 起只发 `thread-id` / `session-id`（openai/codex#22193）。"""
+    from src.request_context import session_id_from_headers
+
+    assert session_id_from_headers([(b"thread-id", b"t-1")]) == "t-1"
+    assert session_id_from_headers([(b"session-id", b"s-1")]) == "s-1"
+    # 带前缀的 x-session-id 语义更具体，仍排第一
+    assert session_id_from_headers([(b"thread-id", b"t"), (b"session-id", b"s"),
+                                    (b"x-session-id", b"x")]) == "x"
+    # thread-id 比 session-id / conversation-id 更具体，两者都在时选它
+    assert session_id_from_headers([(b"session-id", b"s"),
+                                    (b"thread-id", b"t")]) == "t"
+    assert session_id_from_headers([(b"conversation-id", b"c"),
+                                    (b"thread-id", b"t")]) == "t"
+    # 头名大小写不敏感
+    assert session_id_from_headers([(b"Thread-Id", b"mixed")]) == "mixed"
+
+
+def test_session_id_from_headers_accepts_claude_code_session_header():
+    """Claude Code 2.1.x 只在头 `X-Claude-Code-Session-Id` 里给会话标识。
+
+    body 只剩 `metadata.user_id` 的 JSON 串，不收这个头就只能靠「消息前缀」
+    兜底，上下文被压缩/裁剪后粘性会断。
+    """
+    from src.request_context import session_id_from_headers
+
+    assert session_id_from_headers(
+        [(b"x-claude-code-session-id", b"cc-1")]) == "cc-1"
+    assert session_id_from_headers(
+        [(b"X-Claude-Code-Session-Id", b"cc-2")]) == "cc-2"
+    # 更具体的 x-session-id 仍然优先
+    assert session_id_from_headers([
+        (b"x-claude-code-session-id", b"cc"), (b"x-session-id", b"x")]) == "x"
+    # Codex 的 thread-id 排在它之后
+    assert session_id_from_headers([
+        (b"thread-id", b"t"), (b"x-claude-code-session-id", b"cc")]) == "cc"
+
+
+def test_session_id_from_headers_skips_invalid_and_returns_none():
+    from src.request_context import session_id_from_headers
+
+    assert session_id_from_headers([]) is None
+    assert session_id_from_headers([(b"x-session-id", b"bad id")]) is None
+    # 第一个头非法时继续看下一个头，而不是整体放弃
+    assert session_id_from_headers([(b"x-session-id", b"bad id"),
+                                    (b"x-opencode-session", b"good")]) == "good"
+
+
+def test_middleware_sets_and_clears_session_id():
+    """中间件从入站头设置会话标识，请求结束后复原。"""
+    from fastapi import FastAPI as _FastAPI
+    from fastapi.testclient import TestClient as _TestClient
+
+    from src.request_context import get_session_id
+
+    app = _FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+
+    @app.get("/sess")
+    async def sess():
+        return {"session": get_session_id()}
+
+    with _TestClient(app) as client:
+        response = client.get("/sess", headers={"x-session-id": "abc-123"})
+        assert response.json()["session"] == "abc-123"
+        # Codex 现行写法（连字符形式）同样经中间件进入 contextvar
+        assert client.get("/sess", headers={"thread-id": "t-9"}).json()["session"] == "t-9"
+        # 复原：下一个请求不带头时读不到上一次的值
+        assert client.get("/sess").json()["session"] is None

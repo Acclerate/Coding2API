@@ -6,9 +6,16 @@ Provider 承担上游协议私有部分：发请求、解析事件、分类错�
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
+import json
+import math
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -25,34 +32,141 @@ class EventKind(StrEnum):
 class ErrKind(StrEnum):
     """错误分类 → 冷却时长。
 
-    分类的粒度决定冷却的作用域：账号级（PLAN/SOFT/DEAD/OTHER）与
+    分类的粒度决定冷却的作用域：账号级（PLAN/SOFT/DEAD/OTHER/RESTRICTED）与
     模型级（MODEL/BLOCKED）必须分开，否则单个模型打满会连累同账号的
     其他模型（实测 6004 只冷却触发的那个模型）。
     """
 
-    PLAN = "plan"      # 权益耗尽（1005）→ 12h 长冷却
+    PLAN = "plan"  # 权益耗尽（1005）→ 12h 长冷却
     # 余额不足（402 / 14018）：等签到恢复，冷却到次日 04:00 而非固定时长
     CREDIT = "credit"
     SOFT = "soft"      # 限流/404 → 60s，不累计错误数
     DEAD = "dead"      # session 失效 → 硬禁用
+    # 账号被上游风控限制（CodeBuddy 11140「request illegal」）：账号级长冷却、
+    # **当前请求不再换号**。与 DEAD 的区别：DEAD 是凭据本身失效（重登可恢复，
+    # 因此永久禁用 + 人工 revive），RESTRICTED 是上游按账号/IP 拉黑（本地无解，
+    # 到期自动半开，逐个号去撞只会扩大标记面）。
+    RESTRICTED = "restricted"
     OTHER = "other"    # 其他 4xx/5xx → 累计，连续 3 次 → 10m
     INVALID = "invalid"  # 请求无效（如模型不存在）→ 不冷却凭证，直接 400 回客户端
     # 模型级限流（6004）：只冷却触发的那个模型，切其他模型立即可用
     MODEL = "model"
-    # 并发会话打满（CodeArts TM.00001041）：在途排空即恢复，用固定短冷却，
-    # 不套 MODEL 的翻倍退避（一次打满锁 10min 起、翻倍到 2h 太久，见 scheduler）。
+    # 并发会话打满（CodeArts TM.00001041）：在途排空即恢复，首枪用 60s 短冷却，
+    # 不套 MODEL 的翻倍退避（一次打满锁 10min 起、翻倍到 2h 太久，见 scheduler）；
+    # 只有「冷却到期后立刻又被打满」才按命中链升级，封顶按渠道分档
+    # （默认 5min；raccoon 这类分钟级频率窗口 30min）。
     CONCURRENCY = "concurrency"
     # 该后端无此模型（11102）：(账号, 模型) 负缓存，重试无意义
     BLOCKED = "blocked"
-    # 请求级错误（请求体坏 11101 / 上下文超限 11115 / 渠道风控 11128 /
-    # 图片无效 11135）：不是账号的问题，不冷却、不累计；仍会换号重试
+    # 请求级错误（请求体坏 11101 / 渠道风控 11128 / 图片无效 11135）：不是
+    # 账号的问题，不冷却、不累计；仍会换号重试。上下文超限（11115）走
+    # CONTEXT、模型能力拒绝（CodeArts 001001020）走 CAPABILITY，三者处置
+    # 相同但统计口径分开（见各自定义）。
     REQUEST = "request"
+    # 上下文超限（CodeBuddy 11115 `prompt is too long: N > M maximum`）：与
+    # REQUEST 同一处置（不冷却、不累计、换号重试），但统计要单独成类——
+    # 归进 `invalid_request` 时归因面板显示「请求无效」，读起来像客户端参数
+    # 写错了，实际动作是「精简上下文或换长窗口模型」（实测 2026-11-02 23:32
+    # `1056943 tokens > 1048576 maximum`）。
+    CONTEXT = "context"
+    # 模型能力不匹配（CodeArts `InferHub.001001020.406 The request model is not
+    # multimodal`）：与 INVALID 同一处置（跳过整个上游、全部拒绝才 400），
+    # 但统计单独成类——「请求无效」会让运维去查参数，实际是「这个模型不支持
+    # 这次请求形态（带图），换支持多模态的模型/渠道」。
+    CAPABILITY = "capability"
+    # 排队中（上游明确回 `isQueued` / `RESOURCE_LIMIT` + `retryAfterSeconds`）：
+    # 既不是账号故障也不是请求错误，是「这个号现在满了，等 N 秒再打它」。
+    # 不冷却、不累计、不占轮换预算，等在原号上重开（见 executor 的排队重开）。
+    # 与 SOFT 的关键差别：SOFT 冷却 60s 且换号，排队按上游点名的秒数等在原号。
+    QUEUE = "queue"
+    # 本机网络/DNS 故障（`httpx.ConnectError` / `socket.gaierror`）：失败发生在
+    # 连上游之前，与具体凭证无关。归 SOFT 会冷却整池健康号（实测 2026-11-05
+    # 睡眠唤醒后 DNS 未就绪，六渠道同时 ENOTFOUND，短冷却把 codebuddy 全部号
+    # 打成「无可用凭证」）。与 REQUEST/CONTEXT 同为**零动作**，但统计口径单独
+    # 成类，避免归因面板把本机故障读成「上游超时」。
+    NETWORK = "network"
+    # 上游响应不符合协议（非 JSON / 字段缺失 / 形状不符 / SSE 帧超限 /
+    # 会话票据失效）。
+    # **为什么这类错误不罚号**：坏的是上游这一路的响应，不是这个账号的额度、
+    # 状态或请求参数——冷却凭证只会把一个健康号打成不可用，六渠道同时抖动时
+    # 还会放大成「整池无可用凭证」（与 NETWORK 同一教训）。换号重试即可。
+    # **为什么必须留痕**：这类异常此前从 `_classify` 返回 None 直接上抛，被
+    # `stream_guarded` 兜成 500 `internal_error`：不冷却、不写 `usage_events`，
+    # 归因面板里连痕迹都没有，已出帧的 token（上游可能已真实计费）全部漏记。
+    # 零动作不等于零记录：与 REQUEST/CONTEXT 同为零惩罚，但统计必须单独成类，
+    # 让运维一眼看出是「渠道响应异常」而非自己参数写错。
+    UPSTREAM_PROTOCOL = "upstream_protocol"
 
 
 # 冷却作用域是「(凭证, 模型)」而非整个凭证的错误类别。
 # 账号级冷却必须显式清空模型级条目（见 scheduler.note_error），
 # 否则上一次模型级限流的豁免会泄漏到本次账号级冷却上（换模型错误绕过）。
 MODEL_SCOPED_KINDS = frozenset({ErrKind.MODEL, ErrKind.BLOCKED, ErrKind.CONCURRENCY})
+
+# 零动作分类：不是账号/凭证的错，不冷却、不累计，只换号重试。
+# REQUEST = 请求体坏 / 渠道风控；CONTEXT = 上下文超限（11115）；
+# NETWORK = 本机 DNS/连接失败（连上游之前就失败，惩罚凭证只会放大网络抖动）；
+# UPSTREAM_PROTOCOL = 上游响应不符合协议（非 JSON / 形状不符 / SSE 帧超限 /
+# 会话票据失效）——同样不罚号，但调用点仍要落一行 `usage_events` 留痕。
+# 与 INVALID 的区别：INVALID 跳过**整个上游**（换号也回同一条），这些只换号。
+NO_PENALTY_KINDS = frozenset({
+    ErrKind.REQUEST, ErrKind.CONTEXT, ErrKind.NETWORK, ErrKind.UPSTREAM_PROTOCOL,
+})
+
+# 「这次请求形态上游不接受」→ 换号无用，跳过整个上游。EXECUTOR 对这两类都
+# `_skip_provider` + 以 400 收尾；统计口径分开（invalid_request / model_capability）。
+REJECT_KINDS = frozenset({ErrKind.INVALID, ErrKind.CAPABILITY})
+
+# 写进上游 HTTP 头的模型名（`X-Model-ID` / `x-model-key`）：非 ASCII 会让 httpx 抛
+# UnicodeEncodeError、CRLF 抛 LocalProtocolError，两者都不是 TransportError，会
+# 穿透成 500。`@` / `/` 是渠道后缀与厂商命名空间，必须放行。
+_HEADER_MODEL_RE = re.compile(r"[A-Za-z0-9._:/@\-]{1,128}")
+
+
+class InvalidModelName(ValueError):
+    """模型名不能写进上游 HTTP 头（非白名单字符 / 超长）。
+
+    归类 INVALID：是请求本身的问题，换号换渠道都没用，也不该冷却凭证。
+    """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.INVALID
+
+
+def header_model_name(model: str) -> str:
+    """校验要写进 HTTP 头的模型名；非法抛 `InvalidModelName`。
+
+    只校验进头的那个值：模型名本身仍原样透传给上游。
+    """
+    if not _HEADER_MODEL_RE.fullmatch(model):
+        raise InvalidModelName(
+            f"model {model!r} contains characters not allowed in upstream headers")
+    return model
+
+
+def normalize_developer_role(messages: Any) -> int:
+    """把 `role: "developer"` 归一为 `system`，返回改写条数。
+
+    OpenAI 在 chat 协议里补了 `developer`（PI 一类客户端对 reasoning 模型会把
+    system 转成 developer），与 `system` 语义等价（都是开发者指令，优先级高于
+    user）。各渠道对它的容忍度却不同，且**都是静默或错位的失败**：
+
+    * qoder：400 `messages[0].role: unknown variant 'developer'`（2026-11-11 实测）
+    * codearts：流内 `InferHub.001001044.400 Message role cannot empty`
+      （2026-11-17 实测，同一报文在三条凭证上各拒一次）
+    * codebuddy：11128 渠道风控；trae：返回空流
+
+    归一无损、幂等，且只作用于**深拷贝后的出站副本**（调用方负责拷贝）。
+    非 list（畸形报文）不动：形状交给上游裁决，本层只改已知会被拒的角色变体。
+    """
+    if not isinstance(messages, list):
+        return 0
+    rewritten = 0
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "developer":
+            message["role"] = "system"
+            rewritten += 1
+    return rewritten
 
 
 def body_hint(body: bytes, limit: int = 2048) -> str:
@@ -71,9 +185,183 @@ def body_hint(body: bytes, limit: int = 2048) -> str:
     return text[:limit] + "…[truncated]"
 
 
+def body_text(body: bytes) -> str:
+    """上游响应体 → 小写文本（隔离非法 UTF-8，供不区分大小写的标记匹配）。
+
+    错误正文只用来对照标记串（`_RELOGIN_MARKERS` 等），故解码即统一小写；
+    非法字节按 `replace` 换成 U+FFFD 而不是抛错——上游返回半截二进制时宁可
+    匹配不到（回落到状态码分类），也不能让错误路径自己炸掉。
+    """
+    return body.decode("utf-8", errors="replace").lower()
+
+
 # 错误响应体的读取上限：只用于生成可读诊断，超出部分丢弃。防止恶意/异常
 # 上游返回超大 body 时把代理进程读爆内存（错误路径本不需要完整正文）。
 BOUNDED_BODY_LIMIT = 256 * 1024
+
+
+_RETRY_AFTER_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*([A-Za-z]+)")
+_RETRY_AFTER_PREFIX = re.compile(r"^(?:try\s+again\s+)?(?:in\s+)?", re.IGNORECASE)
+# 文本式 `Retry-After` 的单位（`Try again in 17h 59m`）：h/m/s 及其常见长写法
+_RETRY_AFTER_UNITS = {
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hrs": 3600.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+    "m": 60.0,
+    "min": 60.0,
+    "mins": 60.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "s": 1.0,
+    "sec": 1.0,
+    "secs": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+}
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """按名取响应头（大小写不敏感，兼容 httpx.Headers 与普通 dict）。"""
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        value = getter(name)
+        if value is not None:
+            return str(value)
+    items = getattr(headers, "items", None)
+    if items is None:
+        return ""
+    lowered = name.lower()
+    for key, value in items():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
+
+
+def _retry_after_delta(raw: str, now: int) -> float | None:
+    """`Retry-After` 原始值 → 距现在多少秒；无法识别返回 None。
+
+    支持三种真实形态：整数秒（RFC 9110 标准）、HTTP-date（标准）、以及
+    部分上游回的「Try again in 17h 59m」文本（实测 cline-proxy 一类网关）。
+    负数 / 过去时刻 / 无法整除的脏值一律 None：宁可回落本地常量，也不
+    让一个坏头把所有凭证瞬间打爆（见 scheduler.note_error 的双端钳制）。
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return float(int(text))
+        except (ValueError, OverflowError):
+            # 超长数字（>4300 位）int() 抛 ValueError、超大整数 float() 抛
+            # OverflowError；坏头不该把构造异常的一方打成 500，回落本地冷却。
+            return None
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        moment = None
+    if moment is not None:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.timestamp() - now
+    body = _RETRY_AFTER_PREFIX.sub("", text)
+    total = 0.0
+    cursor = 0
+    matched = False
+    for match in _RETRY_AFTER_TEXT.finditer(body):
+        # token 之间只允许空白 / 逗号 / and（`17h 59m`、`1 hour, 30 min`）
+        if not re.fullmatch(r"[\s,]*(?:and\s+)?", body[cursor : match.start()]):
+            return None
+        unit = _RETRY_AFTER_UNITS.get(match.group(2).lower())
+        if unit is None:
+            return None
+        total += float(match.group(1)) * unit
+        matched = True
+        cursor = match.end()
+    if not matched or body[cursor:].strip():
+        return None
+    if not math.isfinite(total):
+        return None
+    return total
+
+
+def parse_retry_after(headers: Any, now: int) -> int | None:
+    """上游 `Retry-After` → 「何时恢复」的 epoch 秒；缺头/非法返回 None。
+
+    这是唯一解析入口：九渠道在构造 `UpstreamHTTPError` 时统一调用
+    `retry_hints`（本函数的薄包装），再交给调度器按错误分类的作用域钳制。
+    """
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return int(now + delta)
+
+
+def parse_retry_after_seconds(headers: Any, now: int) -> float | None:
+    """上游 `Retry-After` → 距现在多少秒（同上，保留小数供诊断）。"""
+    delta = _retry_after_delta(_header_value(headers, "retry-after"), now)
+    if delta is None or delta < 0:
+        return None
+    return delta
+
+
+# 响应体里点名的重置时刻：CodeBuddy 国际站 `429 + 6004` 不回 `Retry-After`
+# 头，恢复时刻只写在正文里——`{"code":6004,"msg":"usage exceeds frequency
+# limit, but don't worry, your usage will reset at 2026-10-25 22:34:25 UTC+8,
+# alternatively, you can switch to the other models..."}`。
+# 只解析这一种带显式 UTC 偏移的形态：没有偏移的本地时刻无从判断时区，
+# 猜错会把冷却写到过去（立刻解冻）或几天后（长期移出池子），一律放弃。
+_RESET_AT_TEXT = re.compile(
+    r"reset\s+at\s+(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})"
+    r"\s*UTC\s*([+-])(\d{1,2})(?::?(\d{2}))?",
+    re.IGNORECASE)
+
+
+def parse_reset_at(body: bytes | str, now: int) -> int | None:
+    """响应体里的「usage will reset at … UTC+8」→ 恢复时刻 epoch；无则 None。
+
+    与 `parse_retry_after` 同一语义（「何时恢复」的绝对时刻），供
+    `retry_hints` 在**没有 `Retry-After` 头**时兜底。过去时刻 / 无法解析
+    返回 None：宁可回落本地常量冷却，也不要让一个坏正文把冷却写到过去。
+    """
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    if not text or "reset" not in text.lower():
+        return None
+    match = _RESET_AT_TEXT.search(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, sign, hours, minutes = match.groups()
+    try:
+        offset = timedelta(hours=int(hours), minutes=int(minutes or 0))
+        moment = datetime(int(year), int(month), int(day), int(hour), int(minute),
+                          int(second),
+                          tzinfo=timezone(-offset if sign == "-" else offset))
+    except ValueError:      # 2 月 30 日 / 偏移越界这类脏值
+        return None
+    return int(moment.timestamp()) if int(moment.timestamp()) > now else None
+
+
+def retry_hints(headers: Any, now: int | None = None,
+                body: bytes | str | None = None) -> dict[str, Any]:
+    """`UpstreamHTTPError` 的 retry 关键字参数（无头时两值均为 None）。
+
+    让各渠道的 raise 点保持一行：`**retry_hints(response.headers)`。
+
+    `body` 是**头缺失时的兜底来源**（见 `parse_reset_at`）：部分上游（CodeBuddy
+    国际站 429+6004）只把恢复时刻写在正文里，不给 `Retry-After` 头，不解析正文
+    就只能回落到固定 600s 基数、到期重试再撞一次 429。头优先于正文——头是协议
+    标准位，正文只是文案。
+    """
+    moment = int(time.time()) if now is None else now
+    retry_at = parse_retry_after(headers, moment)
+    retry_after_seconds = parse_retry_after_seconds(headers, moment)
+    if retry_at is None and body is not None:
+        reset_at = parse_reset_at(body, moment)
+        if reset_at is not None:
+            retry_at = reset_at
+            retry_after_seconds = float(reset_at - moment)
+    return {"retry_at": retry_at, "retry_after_seconds": retry_after_seconds}
 
 
 async def read_body_bounded(response: Any, limit: int = BOUNDED_BODY_LIMIT) -> bytes:
@@ -90,7 +378,265 @@ async def read_body_bounded(response: Any, limit: int = BOUNDED_BODY_LIMIT) -> b
     return bytes(collected[:limit])
 
 
-_BUSINESS_CODE_RE = re.compile(r'"code"\s*:\s*(-?\d+)')
+async def read_json_bounded(response: Any, *, what: str,
+                            public: str | None = None,
+                            limit: int = BOUNDED_BODY_LIMIT) -> Any:
+    """有界读取成功响应体并解析 JSON。
+
+    **成功路径**原先直接 `response.json()`（= 无上限 `aread()`）：被控上游或
+    中间盒回一个超大 body 就能把进程内存撑爆。这里与错误路径走同一套有界读取，
+    超过 `limit` 直接按协议违规处理——被截断的 JSON 本来也解析不出完整语义，
+    早失败好过先分配几 GB。
+
+    `what` 只用于日志/诊断（端点路径或 URL）；`public` 是可回显给客户端的
+    文案，缺省沿用 `UpstreamProtocolViolation`「等于 message」的口径。
+    """
+    # 多读 1 字节用于判「是否超限」：刚好等于上限的完整 body 不该被误杀。
+    raw = await read_body_bounded(response, limit + 1)
+    if len(raw) > limit:
+        raise UpstreamProtocolViolation(
+            f"response body from {what} exceeds {limit} bytes",
+            public="upstream returned an oversized response")
+    try:
+        return json.loads(raw)
+    except ValueError as error:
+        raise UpstreamProtocolViolation(
+            f"non-JSON response from {what}", public=public) from error
+
+
+#: 出口 DNS 校验结果的缓存 TTL（秒）。上游网关域名变更频率远低于聊天频率，
+#: 60s 足以挡掉「每次聊天都做一次 DNS」的开销，到期重解析也能跟上 DNS 变更。
+PUBLIC_HOST_CACHE_TTL = 60.0
+
+#: `host -> 上次校验通过的 monotonic 时刻`。只缓存**通过**的结果：解析失败与
+#: 命中黑名单都必须每次都重新判（失败不缓存，否则一次 DNS 抖动会把合法域名
+#: 锁死 60s）。
+_public_host_checked: dict[str, float] = {}
+
+#: RFC 6598 运营商级 NAT 共享地址段。值与
+#: `runtime_settings._CGNAT_SHARED` 相同，理由见 `_is_blocked_host_address`。
+_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_blocked_host_address(text: str) -> bool:
+    """单个解析结果是否指向禁止出站的地址（SSRF 黑名单）。
+
+    这里**复制**了一份 `runtime_settings._is_blocked_webhook_host` 的判定而不
+    直接 import 它：`provider/base.py` 是中立协议层，被九个渠道与测试替身
+    普遍 import；`runtime_settings` 依赖 `config.Settings`（pydantic-settings），
+    反向依赖会让协议层拖上配置模块的装载链，也让「provider 不 import config」
+    这条分层约定失效。两处口径必须保持一致，改动其一要同步另一处。
+    """
+    try:
+        # IPv6 链路本地地址带 `%en0` 作用域后缀（getaddrinfo 原样返回），
+        # 不剥掉 `ip_address` 会直接抛 ValueError——那等于把链路本地当公网放过。
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        # 解析结果不是 IP（畸形 DNS 应答）：宁可阻断也不赌它是公网地址。
+        return True
+    return (address.is_private or address.is_loopback or address.is_link_local
+            or address.is_reserved or address.is_multicast
+            or address.is_unspecified
+            # `is_private` 不覆盖 CGNAT 共享段 100.64.0.0/10（RFC 6598），
+            # 该段在部分云厂商内可达（实测 100.100.100.200 能通）。
+            or address in _CGNAT_SHARED
+            # 非 global 一律拦：覆盖 198.18.0.0/15 基准测试段等
+            # 「保留但 is_private=False」的网段。
+            or not address.is_global)
+
+
+async def _resolve_addresses(host: str) -> list[str]:
+    """异步解析主机名 → 地址文本列表（不阻塞事件循环）。
+
+    单列一个函数是为了让 TTL 缓存与测试都能围绕**一个**解析入口：
+    生产走 `loop.getaddrinfo`（由线程池执行，不占事件循环），测试替换本函数
+    即可模拟私网/混合/解析失败，不必去 patch `asyncio` 的全局状态。
+    """
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, None)
+    return [info[4][0] for info in infos]
+
+
+async def ensure_public_host(host: str) -> None:
+    """出口前校验主机名解析出的**每一个**地址都不指向内网（SSRF 出口校验）。
+
+    导入期只能判字面量 IP：域名要做 DNS，同步函数里解析会阻塞事件循环，也会
+    让 `POST /api/credentials` 卡在 DNS 上。可这个地址最终要带**不过期的**
+    `Authorization: Basic app_key:app_secret` 发出去，所以真正的出口必须补上
+    解析校验——一个解析到 10.x / 169.254.169.254 的域名就是一条 SSRF 跳板，
+    顺带把长期密钥递给内网主机。
+
+    口径与告警 webhook 的投递前复核一致：每个结果各自过黑名单，**任一**命中即
+    阻断；解析失败同样按阻断处理（宁可这次请求失败，也不把密钥发给一个解析不
+    出来的名字）。IPv6 链路本地带 `%en0` 后缀时先剥后缀再判。
+    """
+    normalized = (host or "").strip().lower()
+    if not normalized:
+        raise UpstreamProtocolViolation(
+            "url has no host", public="上游地址缺少主机名，已拒绝发送凭证")
+    now = time.monotonic()
+    checked_at = _public_host_checked.get(normalized)
+    if checked_at is not None and now - checked_at < PUBLIC_HOST_CACHE_TTL:
+        return
+    try:
+        addresses = await _resolve_addresses(normalized)
+    except OSError as error:
+        raise UpstreamProtocolViolation(
+            f"cannot resolve host {normalized}: {error}",
+            public="上游网关地址无法解析，已拒绝发送凭证") from error
+    # 空结果当阻断：一次「解析成功但没有任何地址」不该被读成「干净的公网主机」。
+    if not addresses or any(_is_blocked_host_address(item) for item in addresses):
+        raise UpstreamProtocolViolation(
+            f"host {normalized} resolves to a private/loopback/reserved address",
+            public="上游网关地址指向内网/回环/保留地址，已拒绝发送凭证")
+    _public_host_checked[normalized] = now
+
+
+# 上游「排队中」信号：`isQueued` 为真，或子码点名 RESOURCE_LIMIT。
+# 这是跨渠道的**协议形状**而非某家私有码，故放中立层。
+QUEUE_FLAG_KEYS = ("isQueued", "is_queued", "queued")
+QUEUE_WAIT_KEYS = ("retryAfterSeconds", "retry_after_seconds", "retryAfter", "retry_after")
+# 队列位置：`queueCount: 0` = 已经排到队首，上游仍会给 `retryAfterSeconds`
+# 但照等就是白等（2026-10-31 `mmqz/cpa-multi-plugins` 实测，本仓 10-30/11-03
+# 日志里 92 次 30s 硬等全是这一类）。`null` 是「未上报」，不能当 0。
+QUEUE_COUNT_KEYS = ("queueCount", "queue_count")
+QUEUE_SUB_CODES = ("RESOURCE_LIMIT", "RESOURCE_LIMIT_EXCEEDED")
+# 上游只说「排队」不给秒数时的兜底等待（秒）。取 5s：比 SOFT 的 60s 短得多，
+# 又足以让排队轮次真正错开，不至于变成忙等。
+QUEUE_DEFAULT_WAIT_SECONDS = 5.0
+# 单轮最长等待（秒）：上游可能点名「2 小时后再来」，照等会把客户端连接吊死。
+# 超过上限就按上限等一轮，下一轮仍排队则轮次用尽、退回普通错误处理。
+QUEUE_MAX_WAIT_SECONDS = 60.0
+# 单次请求最多在原号上重开几轮。上限存在的意义：上游若持续排队，无限重开
+# 会把客户端连接吊死；3 轮 + 兜底 5s 最坏多等 ~15s，比直接 503 更友好。
+QUEUE_MAX_ROUNDS = 3
+
+
+def parse_queue_hint(body: bytes | str) -> float | None:
+    """上游 body 是否表示「排队中」→ 建议等待秒数；非排队返回 None。
+
+    形状来自上游信封：`{"isQueued": true, "retryAfterSeconds": 30,
+    "subCode": "RESOURCE_LIMIT"}`。三者**任一**成立即认定排队——只认
+    `isQueued` 会漏掉只给子码的上游，只认子码又会把「配额真的耗尽」误判成
+    排队（故子码只认 `RESOURCE_LIMIT` 这一族，不含 `QUOTA_EXCEEDED`）。
+
+    宁可漏判不可误判：识别不出就返回 None，走原有的错误分类路径（最坏是
+    一次 SOFT 冷却换号），绝不能把普通失败当成排队而无限等下去。
+    """
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    if not text.strip():
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:  # 含 JSONDecodeError；超 4300 位整数时 json 抛 ValueError
+        return None
+    return _queue_wait_in(payload, depth=0)
+
+
+def _queue_wait_in(node: Any, depth: int) -> float | None:
+    """在（可能嵌套的）信封里找排队标记；命中返回等待秒数。
+
+    只下钻 3 层：上游信封常见 `{"data": {"error": {...}}}`，再深就不是
+    协议结构而是业务正文了，继续递归只会在长正文上白烧 CPU。
+
+    **字符串也要下钻**：上游常把内层报文**再序列化成字符串**（Qoder 的
+    排队报文就是 `{"code":"403","message":"{\\"code\\":\\"10605\\",…}"}`，
+    排队标记在第二层字符串里）。只认 dict/list 会漏判排队 → 403 被当成
+    硬失败 → **好凭证被硬禁用**（实测 2026-10-26：kmodel_latest 排队时
+    回 403 + `isQueued`，凭证被误判死）。
+
+    标记节点**没有**秒数时不立即回落兜底值，而是继续往深处找带秒数的
+    那一层（Qoder 的 `retryAfterSeconds:30` 在最内层），实在没有才用兜底。
+    """
+    if depth > 3:
+        return None
+    if isinstance(node, dict):
+        if _is_queue_flag(node):
+            wait = _queue_wait_seconds(node)
+            if wait is not None:
+                return wait
+            for value in node.values():
+                found = _queue_wait_in(value, depth + 1)
+                if found is not None:
+                    return found
+            return QUEUE_DEFAULT_WAIT_SECONDS
+        for value in node.values():
+            found = _queue_wait_in(value, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _queue_wait_in(item, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, str):
+        found = _queue_wait_in_text(node, depth)
+        if found is not None:
+            return found
+    return None
+
+
+def _queue_wait_in_text(text: str, depth: int) -> float | None:
+    """字符串里的 JSON 载荷 → 继续找排队标记（上游把内层报文再序列化）。
+
+    **不额外消耗深度**：串里套串（上游把排队报文序列化两次）是同一个协议
+    层级，计深度会让最内层的 `retryAfterSeconds` 落在预算外（实测 Qoder
+    排队报文串了两层，秒数在最内层）。真正的层级由 dict/list 分支计。
+    """
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:  # 同上：超长整数抛 ValueError 而非 JSONDecodeError
+        return None
+    return _queue_wait_in(parsed, depth)
+
+
+def _is_queue_flag(node: dict[str, Any]) -> bool:
+    for key in QUEUE_FLAG_KEYS:
+        if node.get(key) is True:
+            return True
+    for key in ("subCode", "sub_code", "errorCode", "code"):
+        value = node.get(key)
+        if isinstance(value, str) and value.upper() in QUEUE_SUB_CODES:
+            return True
+    return False
+
+
+def _queue_wait_seconds(node: dict[str, Any]) -> float | None:
+    """节点自带的等待秒数；没有则 None（由调用方决定回落策略）。
+
+    `queueCount == 0` 优先：已经排到队首时上游仍可能给 `retryAfterSeconds`，
+    照等就是白等（本仓实测 92 次 30s 空等）。`queueCount: null` 是「未上报」，
+    不能当 0，继续看秒数。
+    """
+    for key in QUEUE_COUNT_KEYS:
+        value = node.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value == 0:
+            return 0.0
+    for key in QUEUE_WAIT_KEYS:
+        value = node.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+            return float(value)
+    return None
+
+
+_BUSINESS_CODE_RE = re.compile(r'"code"\s*:\s*"?(-?\d+(?:-\d+)*)"?')
+
+
+def _code_value(token: str) -> int:
+    """业务码文本 → 整数。
+
+    上游会用连字符分组写同一族码（`11-128` 即 `11128`，2026-11-02 实测
+    出现在 403 的 body 里）。带连字符时按「去掉分隔符」还原；纯负数
+    （`-3`）保持原义。
+    """
+    if "-" in token[1:]:
+        return int(token.replace("-", ""))
+    return int(token)
 
 
 def business_codes(text: str) -> frozenset[int]:
@@ -103,8 +649,13 @@ def business_codes(text: str) -> frozenset[int]:
     不搜裸数字：时间戳、流水号里也会出现 11102 这类片段，直接 substring
     匹配会把无关响应判成模型错误（例如 `"code":111020` 含有 `11102`）。
     只认 `"code":` 键值形态，且要求整个数字 token 相等。
+
+    **字符串码与连字符码同样认**（2026-11-02 上游已在 wire 上发
+    `{"code":"11-128"}`）：漏认的后果不对称——403/401 分支会把「请求级
+    风控」误判成 `ErrKind.DEAD` 并**硬禁用整池好号**，而多认一个码最多是
+    多一次冷却。故数字前后的引号视为可选，连字符按分组符还原。
     """
-    return frozenset(int(match) for match in _BUSINESS_CODE_RE.findall(text))
+    return frozenset(_code_value(match) for match in _BUSINESS_CODE_RE.findall(text))
 
 
 async def aclose_stream(stream: Any) -> None:
@@ -130,13 +681,27 @@ class UpstreamHTTPError(Exception):
 
     `kind()` 由子类绑定各自的 classify_status，因为 1005 等业务码的
     判定规则是上游协议私有的。
+
+    `retry_at` / `retry_after_seconds` 来自上游 `Retry-After` 头（见
+    `parse_retry_after`）：调度器在**该错误分类的作用域**内据此拉长冷却，
+    实现「上游说什么时候恢复就什么时候恢复」。缺头时为 None，行为与
+    历史版本逐字节一致。
     """
 
     classify_status: ClassVar[Callable[[int, bytes], ErrKind]]
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        retry_at: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         self.status = status
         self.body = body
+        self.retry_at = retry_at
+        self.retry_after_seconds = retry_after_seconds
         # 异常文本里的 body 摘要只进服务端日志（executor 对这些异常打 warning）；
         # 对外响应经 `_error_summary` 只取 status/受控标识，绝不回显上游正文。
         super().__init__(f"upstream http {status}: {body_hint(body)}")
@@ -183,7 +748,14 @@ class UpstreamTransportError(ConnectionError):
     只承载**原始传输异常**（`httpx.TransportError` 等），由各渠道客户端在
     请求处捕获后 `raise ... from error` 抛出，好让上层按类型翻译成可操作
     的原因（network_unreachable），而不是让 `httpx` 私有异常泄漏到翻译层。
+
+    分类固定为 SOFT：传输层失败（连不上 / 写请求体超时 / 读超时）是**链路
+    瞬态**，与具体账号无关，按 SOFT 短冷却、可换号重试，且不累计错误数——
+    累计到阈值会把健康凭证踢出池子，反而放大了网络抖动的影响。
     """
+
+    def kind(self) -> ErrKind:
+        return ErrKind.SOFT
 
 
 @dataclass(slots=True)
@@ -193,7 +765,7 @@ class Usage:
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None   # 输入中命中缓存的 token（上游可选，缺省 None）
     credit: float | None = None   # 上游可选字段，两边都经常为 None
-    # credit 是否为本服务推算（TRAE 按官方单价、CodeArts 福利模型按每日 token 池 1:1）。
+    # credit 是否为本服务推算（TRAE 按官方单价折算）。
     # True 时展示层标 ≈；上游真给 credit 的渠道恒为 False。
     credit_estimated: bool = False
 
@@ -210,6 +782,23 @@ class Event:
     # 流内 error 事件的业务分类：provider 解析时按自己的错误码语义定好，
     # executor 不再维护第二份 code→kind 映射（两份必然漂移）
     error_kind: ErrKind | None = None
+    # 上游点名「过多久再来」（秒）：目前只有排队信号带它。executor 据此决定
+    # 在原号上等多久再重开；None 表示上游没给，按 `QUEUE_DEFAULT_WAIT_SECONDS`。
+    retry_after_seconds: float | None = None
+    # 上游响应的模型名（协议里有就填，缺省 None）：executor 只用来做
+    # 「静默替换模型」观测，不一致时只告警、不改响应、不冷却凭证。
+    model: str | None = None
+
+
+def event_error_kind(event: Event) -> ErrKind:
+    """中立 error 事件的业务分类，未标时按 OTHER。
+
+    provider 解析时已按自己的错误码语义写好 `error_kind`；合成事件 / 测试桩
+    未标时才落到 OTHER（「其它上游失败」），绝不猜成更重的死禁。executor 的
+    流内错误处理与 `UpstreamStreamError.kind()` 共用此口径，避免两处各写一份
+    兜底而漂移。
+    """
+    return event.error_kind if event.error_kind is not None else ErrKind.OTHER
 
 
 @dataclass(slots=True)
@@ -218,14 +807,18 @@ class Quota:
 
     remaining: float | None = None
     total: float | None = None
-    cycle_end: int | None = None      # 最早到期（epoch）；无到期信息的渠道为 None
+    cycle_end: int | None = None  # 最早到期（epoch）；无到期信息的渠道为 None
     # 到期阶梯 [(到期 epoch, 该套餐剩余积分)]：选号按"窗口内即将到期积分"排序。
-    # 按包独立到期的渠道（CodeBuddy、TRAE 的权益包）有值；企业版等无此信息为 None。
+    # 按包独立到期的渠道（CodeBuddy、TRAE 的权益包）有值；上游只给窗口量的渠道
+    # （CodeArts 的「7 天内到期量」）把合计挂在该窗口右端；无到期信息为 None。
     expiry_ladder: list[tuple[int, float]] | None = None
     # 额度明细包：[{"name", "total", "used", "end"}]，仅用于展示。
     # 与 expiry_ladder 分开存：后者的结构装不下名称，且两者口径不同
     # （明细额外含「已过期但仍有余额」与「已用完但仍有效」的包）。
     packages: list[dict[str, Any]] | None = None
+    # 网页明细源状态：None = 未配置网页 Cookie 或失败原因未知；"ok" = 网页明细
+    # 正常；"expired" = 网页会话失效（凭证行提示重贴，额度仍以汇总口径为准）。
+    web_cookie_state: str | None = None
     probed_at: int | None = None
     probe_failed: bool = False
 
@@ -235,14 +828,21 @@ EXHAUSTED = -1
 """HealthScore：0-100 已知；None 未知；-1 已耗尽。"""
 
 
+def _ratio_health(remaining: float | None, total: float | None) -> int:
+    """剩余/总量 → 0-100 百分比（夹紧）；总量缺失或 ≤0 判为「已耗尽」。"""
+    if total is None or total <= 0:
+        return EXHAUSTED
+    return max(0, min(100, round((remaining or 0.0) / total * 100)))
+
+
 def health_score(quota: Quota | None) -> int | None:
     """三态健康度：known(0-100) / unknown(None) / exhausted(-1)。"""
     if quota is None or quota.probe_failed:
         return UNKNOWN
-    if quota.total is None or quota.total <= 0:
-        return EXHAUSTED
-    remaining = quota.remaining or 0.0
-    return max(0, min(100, round(remaining / quota.total * 100)))
+    # 探测成功但额度字段全为空（如 lingma 无 openapi 额度端点）→ 未知，非耗尽
+    if quota.remaining is None and quota.total is None:
+        return UNKNOWN
+    return _ratio_health(quota.remaining, quota.total)
 
 
 @dataclass(slots=True)
@@ -264,6 +864,25 @@ class CheckinResult:
     # 回填成「当前窗口 endAt」（= 下一轮开放的时刻）后，任务在新窗口出现时
     # 会自动再跑一轮，签到窗口每天只打一次上游。
     seal_until: int | None = None
+    # 失败后的最早重试时刻（epoch 秒）；None = 由任务按指数退避决定。
+    # 用于「上游每日积分尚未发放」这类**已知要等到某个时点**的失败，避免
+    # 凌晨 00:00 刚过就每 10 分钟空锤（上游发放/账单同步有延迟）。成功时
+    # 无意义；任务会把该时刻与自身退避取较晚者。
+    retry_at: int | None = None
+
+
+@dataclass(slots=True)
+class ActivityResult:
+    """活跃上报一条的结果。ok=False 时 message 必为一句人话。
+
+    放中立层（而不是某个渠道模块）是因为两个渠道都要用：CodeBuddy 补发
+    对话事件、小浣熊发设备心跳——语义相同（「让上游看到这个账号今天活跃过」），
+    形状也相同，各写一份只会漂移。
+    """
+
+    ok: bool
+    message: str = ""
+    user_id: str = ""
 
 
 @dataclass(slots=True)
@@ -283,7 +902,7 @@ class StepStatus(StrEnum):
     """成长中心单步结果。区分 skipped（无事可做）与 failed（需要人看）。"""
 
     DONE = "done"
-    IDLE = "idle"        # 无事可做（Buddy 还在路上 / 名额用完）——不是错误
+    IDLE = "idle"  # 无事可做（Buddy 还在路上 / 名额用完）——不是错误
     SKIPPED = "skipped"  # 渠道不支持 / 配置关闭
     FAILED = "failed"
 
@@ -303,7 +922,7 @@ class GrowthStep:
     status: StepStatus
     detail: str = ""
     credit: float | None = None
-    reportable: bool | None = None      # None=按 status 判定（DONE/FAILED 进）
+    reportable: bool | None = None  # None=按 status 判定（DONE/FAILED 进）
 
 
 @dataclass(slots=True)
@@ -316,10 +935,10 @@ class GrowthResult:
 
     ok: bool = True
     steps: list[GrowthStep] = field(default_factory=list)
-    credit: float | None = None        # 本轮累计获得积分
+    credit: float | None = None  # 本轮累计获得积分
     energy: int | None = None
     streak_days: int | None = None
-    report: str = ""                   # 一行中文汇报（存 events 表 / 直接展示）
+    report: str = ""  # 一行中文汇报（存 events 表 / 直接展示）
     session_dead: bool = False
 
     @property
@@ -407,8 +1026,16 @@ class Provider(Protocol):
     async def probe_quota(self, credential_data: dict) -> Quota: ...
 
     # 执行与分类
-    async def stream_chat(self, credential_data: dict, payload: dict,
-                          model: str) -> AsyncIterator[Event]: ...
+    async def stream_chat(
+        self, credential_data: dict, payload: dict, model: str
+    ) -> AsyncIterator[Event]: ...
     def classify(self, status: int, body: bytes) -> ErrKind: ...
     def list_models(self, credential_data: dict) -> list[Model]: ...
     async def aclose(self) -> None: ...
+
+    # 可选：`list_models` 的表来源申报（**不是**协议要求，缺省按上游真值处理）。
+    # 有静态兜底表的渠道（TRAE / CodeBuddy）实现它，返回
+    # `(是否降级, 一行原因)`；服务层据此把「这次拉到的其实是静态表」记成失败并
+    # 打 `model_list_degraded` 指标——否则 provider 在内部吞掉异常后，服务层以为
+    # 拉取成功，管理台完全看不出「这个渠道一直没拿到动态模型」（issue #56）。
+    # def model_list_source(self) -> tuple[bool, str]: ...

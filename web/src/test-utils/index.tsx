@@ -38,16 +38,18 @@ export function fullSession(session: TestSession): SessionInfo {
 }
 
 /** 在 Layout 下渲染页面，让 useSessionContext 拿到会话。 */
-export function renderPage(ui: ReactNode, session: TestSession = { username: "root", is_admin: true }) {
+export function renderPage(ui: ReactNode, session: TestSession = { username: "root", is_admin: true },
+                           path = "/page") {
   return render(
     <QueryClientProvider client={makeClient()}>
-      <MemoryRouter initialEntries={["/page"]}>
+      <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route element={<Layout session={fullSession(session)} />}>
             <Route path="/page" element={ui} />
+            {/* 兜住其它入口（含「/?new=1」这类带查询串的深链），且必须在
+                Layout 里，页面才能通过 useOutletContext 拿到会话 */}
+            <Route path="*" element={ui} />
           </Route>
-          {/* Layout 顶部导航含指向「/」的链接（凭证管理是首页），缺这条路由会告警 */}
-          <Route path="/" element={ui} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -70,11 +72,37 @@ export function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * 未显式 mock 时也要能过的请求（Layout 每个页面都在发）。
+ *
+ * 侧栏角标：默认回「无待办」，调用方可用自己的同名路由覆盖。不兜底的话，
+ * 所有 `renderPage` 用例都会在未 mock 的 URL 上直接抛错。
+ */
+const DEFAULT_ROUTES: Record<string, unknown> = {
+  "/api/nav-badges": {},
+  // 失败归因（StatsPage 对 operator+ 恒发）：默认「没有失败」，避免每个用例
+  // 都要 mock 一条；需要真实数据的用例覆盖同名路由即可。
+  "/api/stats/errors": { errors: [] },
+};
+
+/**
+ * 凭证页专用：组头会读 `/api/playground/models`（与 Playground 同源）。
+ *
+ * 单独一个入口，而不是塞进 `DEFAULT_ROUTES` —— 全局兜底会让**别的页面**漏 mock
+ * 时也静默拿到空列表，掩盖真实回归。用例覆盖同名路由即可断言模型数量。
+ */
+export function mockCredentialsFetch(
+  routes: Record<string, unknown | ((url: string) => Response)>,
+) {
+  return mockFetch({ "/api/playground/models": { object: "list", data: [] }, ...routes });
+}
+
 /** 按 URL 分派的 fetch mock；函数路由会收到完整 URL 字符串。 */
 export function mockFetch(routes: Record<string, unknown | ((url: string) => Response)>) {
+  const all = { ...DEFAULT_ROUTES, ...routes };
   const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
-    for (const [pattern, value] of Object.entries(routes)) {
+    for (const [pattern, value] of Object.entries(all)) {
       if (url.includes(pattern)) {
         if (typeof value === "function") return (value as (url: string) => Response)(url);
         return jsonResponse(value);
@@ -97,6 +125,7 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     pinned: 0,
     health: 62,
     cooling_until: null,
+    cooling_kind: null,
     err_count: 0,
     quota_remaining: 62,
     quota_total: 100,
@@ -105,6 +134,8 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     quota_expiring_credits_secondary: null,
     quota_expiry_ladder: null,
     quota_packages: null,
+    web_cookie_state: null,
+    login_secret: null,
     model_cooldowns: [],
     quota_probed_at: 1_700_000_000,
     token_expires_at: 0,
@@ -114,6 +145,8 @@ export function makeCredential(overrides: Record<string, unknown> = {}) {
     created_at: 1_700_000_000,
     added_by: "root",
     limits: null,
+    tags: [],
+    routing_weight: null,
     ...overrides,
   };
 }
@@ -141,3 +174,54 @@ export async function expandCredentialGroups() {
 }
 
 export { userEvent };
+
+/** `EventSource` 替身：测试里手动触发 `message` / `error`，并记录 close 调用。
+ *
+ * jsdom 没有 EventSource，SSE 相关用例需要它。`instances` 让用例断言「打开
+ * 开关才建连、关闭即 close、换过滤重建」。
+ */
+export class MockEventSource {
+  static CLOSED = 2;
+  static instances: MockEventSource[] = [];
+
+  readonly url: string;
+  readyState = 0;
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  closed = false;
+
+  constructor(url: string) {
+    this.url = url;
+    MockEventSource.instances.push(this);
+  }
+
+  /** 推一条事件（等价于服务端发一帧 `data: {...}`）。 */
+  emit(row: unknown) {
+    this.onmessage?.({ data: JSON.stringify(row) } as MessageEvent<string>);
+  }
+
+  /** 推一帧坏数据（半截 JSON），验证页面丢弃而不崩。 */
+  emitRaw(data: string) {
+    this.onmessage?.({ data } as MessageEvent<string>);
+  }
+
+  fail(readyState = 1) {
+    this.readyState = readyState;
+    this.onerror?.(new Event("error"));
+  }
+
+  close() {
+    this.closed = true;
+    this.readyState = MockEventSource.CLOSED;
+  }
+
+  static reset() {
+    MockEventSource.instances = [];
+    vi.unstubAllGlobals();
+    vi.stubGlobal("EventSource", MockEventSource);
+  }
+
+  static last() {
+    return MockEventSource.instances[MockEventSource.instances.length - 1];
+  }
+}

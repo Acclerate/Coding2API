@@ -36,7 +36,9 @@ from ...provider.base import (
     Model,
     Quota,
 )
-from ...provider.proxy import build_client
+from ...tasks.pacer import paced
+from ..http_json import json_or_raise
+from ..lazy_clients import LazyClients
 from . import events as kilo_events
 
 # 上游端点（公开事实，非用户可配置输入）
@@ -45,8 +47,10 @@ EP_CHAT = "/chat/completions"
 EP_MODELS = "/models"
 
 # 流式无总超时防长流截断；短请求 30s 防悬挂（与 Zen/TRAE 同策略）
-STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
-SHORT_TIMEOUT = httpx.Timeout(30.0)
+# 写超时覆盖的是上传请求体阶段，不是首字等待：大上下文请求体可达数 MB，
+# 经代理链路 10s 会稳定超时；首字等待由 read=None +
+# stream_first_event_timeout_seconds 负责，两者不要混为一谈。
+
 
 
 def prepare_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
@@ -58,6 +62,7 @@ def prepare_body(payload: dict[str, Any], model: str) -> dict[str, Any]:
     """
     body = dict(payload)
     body["messages"] = copy.deepcopy(payload.get("messages"))
+    base.normalize_developer_role(body["messages"])
     body["model"] = model
     body["stream"] = True
     return body
@@ -83,7 +88,7 @@ class UpstreamHTTPError(base.UpstreamHTTPError):
     classify_status = staticmethod(kilo_events.classify_status)
 
 
-class KiloClient:
+class KiloClient(LazyClients):
     """上游 HTTP 客户端。host 可覆盖，便于测试与灰度。"""
 
     def __init__(
@@ -99,30 +104,16 @@ class KiloClient:
         self._short_client = short_client
         self._proxy = proxy
 
-    def _stream(self) -> httpx.AsyncClient:
-        if self._stream_client is None:
-            self._stream_client = build_client(timeout=STREAM_TIMEOUT, proxy=self._proxy)
-        return self._stream_client
-
-    def _short(self) -> httpx.AsyncClient:
-        if self._short_client is None:
-            self._short_client = build_client(timeout=SHORT_TIMEOUT, proxy=self._proxy)
-        return self._short_client
-
-    async def aclose(self) -> None:
-        for client in (self._stream_client, self._short_client):
-            if client is not None:
-                await client.aclose()
-
     async def stream_chat(self, payload: dict[str, Any], model: str) -> AsyncIterator[Event]:
         """POST chat/completions 并逐事件产出中立 Event。非 2xx 抛 UpstreamHTTPError。"""
         body = prepare_body(payload, model)
-        async with self._stream().stream(
+        async with self._stream.stream(
             "POST", f"{self.host}{EP_CHAT}", json=body, headers=request_headers(),
         ) as response:
             if response.status_code >= 400:
                 raw = await base.read_body_bounded(response)
-                raise UpstreamHTTPError(response.status_code, raw)
+                raise UpstreamHTTPError(response.status_code, raw,
+                                        **base.retry_hints(response.headers))
             async for frame in iter_frames(response.aiter_bytes()):
                 for event in kilo_events.parse_all_events(frame):
                     yield event
@@ -136,15 +127,11 @@ class KiloClient:
         无静态白名单：上游增删免费模型、改 `isFree` 自动跟随。候选全灭时
         抛出让上层用上次成功的缓存兜底，避免 Kilo 从模型列表里消失。
         """
-        response = await self._short().get(
+        response = await self._short.get(
             f"{self.host}{EP_MODELS}", headers=request_headers())
-        if response.status_code >= 400:
-            raise UpstreamHTTPError(response.status_code,
-                                    await base.read_body_bounded(response))
-        try:
-            data = response.json()
-        except ValueError as error:
-            raise kilo_events.UpstreamProtocolViolation("non-JSON models response") from error
+        data = await json_or_raise(
+            response, UpstreamHTTPError, "models",
+            message="non-JSON models response")
         items = data.get("data") if isinstance(data, dict) else None
         if not isinstance(items, list):
             raise kilo_events.UpstreamProtocolViolation("models response missing data list")
@@ -228,14 +215,9 @@ class KiloProvider:
     async def stream_chat(self, credential_data: dict, payload: dict,
                           model: str) -> AsyncIterator[Event]:
         # 与 zen 同样单桶（同渠道共用一条匿名额度），并发模式下必须配对 release。
-        if self.pacer is not None:
-            await self.pacer.wait_turn("kilo")
-        try:
+        async with paced(self.pacer, "kilo"):
             async for event in self.client.stream_chat(payload, model):
                 yield event
-        finally:
-            if self.pacer is not None:
-                self.pacer.release("kilo")
 
     async def aclose(self) -> None:
         await self.client.aclose()

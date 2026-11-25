@@ -9,10 +9,11 @@
    `tasks.refresh.RefreshTask`（唯一持有者，**先落库再同步**）承担，额度探测
    等旁路**不得**顺手刷新——否则一个一次性 refresh_token 被两个地方各消费一次，
    后到的必然报 `the refresh token has been used`，DB 里的 token 也被烧掉。
-3. **每日签到领 1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`）。
+3. **每日签到**（`/v1/ops/delivery` → `claim` → `confirm`）。
    `CheckinTask` 与管理台靠 `getattr` 自动发现，故这里实现 `checkin` /
    `checkin_status` / `checkin_scope`；`claim` 后**必须** `confirm`，否则积分
-   可能不到账（上游 `CLAIMED` 是「已领未确认」而非终态）。
+   可能不到账（上游 `CLAIMED` 是「已领未确认」而非终态）。活动按
+   `type=USER_LOGIN` 挑、`campaignId` 取当轮响应（上游换过 ID 与面额）。
 4. **SSE 不是标准分隔**（逐行 `data:`、无空行），且 `text` 是**累计全文**，
    解析层必须做替换语义的差量，见 `events.TextSnapshot`。
 
@@ -28,6 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...provider.base import CheckinResult, ErrKind, Event, Model, Quota
+from ...tasks.pacer import paced
+from ..login_identity import login_identity_for
 from . import dpop
 from . import events as codearts_events
 from .client import CodeArtsClient
@@ -86,26 +89,27 @@ class CodeArtsProvider:
     async def probe_quota(self, credential_data: dict) -> Quota:
         # 只读余额：刷新（一次性 refresh_token）唯一归 RefreshTask，见模块 docstring。
         credential = CodeArtsCredential.from_dict(credential_data)
-        # 福利目录按 uid 记账，而模型列表刷新只用 candidates[0] 一个凭证——其余
-        # 账号永远不会入册、请求漏带 maas_type 头（不扣每日池）。额度探测逐凭证
-        # 遍历，顺带把本账号的福利目录补进册（best-effort，失败不影响余额）。
-        await self.client.refresh_benefit_catalog(credential)
         return await self.client.probe_quota(credential)
+
+    def set_web_cookie(self, credential_data: dict, cookie: str) -> dict:
+        """写入/清除网页控制台 Cookie（逐笔积分到期的数据源）。
+
+        只改这一个字段，不重走 `from_dict` 归一（与 Qoder 同纪律）：避免把老
+        凭证里未识别的字段丢掉，导出/再导入的可逆性靠这条保证。空串 = 清除，
+        额度探测回到 statistics 的汇总口径。
+        """
+        data = dict(credential_data)
+        data["web_cookie"] = cookie
+        return data
 
     async def stream_chat(self, credential_data: dict, payload: dict,
                           model: str) -> AsyncIterator[Event]:
         """引擎调用入口：dict 凭证 → 上游流 → 中立事件。"""
         credential = CodeArtsCredential.from_dict(credential_data)
         key = credential_key(credential)
-        if self.pacer is not None:
-            await self.pacer.wait_turn(key)
-        try:
+        async with paced(self.pacer, key):
             async for event in self.client.stream_chat(credential, payload, model):
                 yield event
-        finally:
-            # 并发模式必须归还名额，否则该凭证被当成永远在途而失去节流
-            if self.pacer is not None:
-                self.pacer.release(key)
 
     async def refresh(self, credential_data: dict) -> dict:
         """预刷新：回写新 refresh_token 与临时凭证（一次性 token 必须轮转）。"""
@@ -114,6 +118,14 @@ class CodeArtsProvider:
         return refreshed.to_dict()
 
     # ---------------------------------------------------------------- 签到
+
+    def login_identity(self, credential_data: dict) -> str:
+        """重新登录合并键：上游账号 `uid`（caller-identity 的 principal_id）。
+
+        判据统一在 `provider/login_identity.py`（登录合并与历史重复清理共用
+        同一套），门面这里只做转发。
+        """
+        return login_identity_for(self.id, credential_data)
 
     async def checkin(self, credential_data: dict) -> CheckinResult:
         return await self.client.checkin(

@@ -251,6 +251,62 @@ class TestCrossChannelAlignment:
         assert normalize_model_key("DeepSeek-Flash") != \
             normalize_model_key("DeepSeek-V4-Flash")
 
+    def test_synonym_table_collapses_vendor_prefixed_cb_name(self):
+        """CodeBuddy 的 `Xiaomi MiMo-V2.6-Pro` 与 TRAE 的 `MiMo-V2.6-Pro` 同一条。
+
+        CB 的可读名带厂商前缀（空格式，不是 `Vendor: ` 冒号式，清洗削不到），
+        归一键会多出 `xiaomi-`，同一模型被拆成两条、对外多出
+        `xiaomi-mimo-v2.6-pro`。异名表把键与展示名收敛到 TRAE 的写法。
+        """
+        assert normalize_model_key("Xiaomi MiMo-V2.6-Pro") == "mimo-v2.6-pro"
+        assert normalize_model_key("Xiaomi MiMo-V2.6-Pro") == \
+            normalize_model_key("MiMo-V2.6-Pro")
+        assert display_model_name("Xiaomi MiMo-V2.6-Pro") == "MiMo V2.6 Pro"
+        assert display_model_name("Xiaomi MiMo-V2.6-Pro") == \
+            display_model_name("MiMo-V2.6-Pro")
+        # Flash 档不带前缀，不受影响
+        assert normalize_model_key("MiMo-V2.6-Flash") == "mimo-v2.6-flash"
+
+    def test_synonym_table_collapses_raccoon_sn_prefix(self):
+        """小浣熊的连字符版本号 / 快照日期收敛到其余渠道的写法。
+
+        `sn-` 前缀由 `_strip_noise` 通用剥掉（不依赖本表），这里验证剩下的
+        「版本号用连字符（`5-3`）而非点号（`5.3`）」与快照日期两种异名。
+        其中 `sn-deepseek-v4-1-flash-1017` 的 `1017` 是**快照日期**、不是模型
+        身份——它就是 DeepSeek V4.1 Flash 本身（与 CodeArts 同倍率 0.18x），
+        故收敛到 `deepseek-v4.1-flash` 而不是带 `-1017` 的键。
+        """
+        assert normalize_model_key("sn-glm-5-3") == "glm-5.3"
+        assert normalize_model_key("sn-glm-5-3") == normalize_model_key("glm-5.3")
+        assert display_model_name("sn-glm-5-3") == "GLM 5.3"
+        assert normalize_model_key("sn-sensenova-6-8-flash") == "sensenova-6.8-flash"
+        # 快照日期不是身份：1017 档收敛到不带日期的规范键
+        assert normalize_model_key("sn-deepseek-v4-1-flash-1017") == \
+            "deepseek-v4.1-flash"
+        assert display_model_name("sn-deepseek-v4-1-flash-1017") == \
+            "DeepSeek V4.1 Flash"
+        # 收敛后与 CodeArts 的同名模型是同一键（合并成一条对外条目）
+        assert normalize_model_key("sn-deepseek-v4-1-flash-1017") == \
+            normalize_model_key("deepseek-v4.1-flash")
+
+    def test_raccoon_sn_prefix_is_stripped_generically(self):
+        """小浣熊**所有**模型都去 `sn-` 前缀，未登记同义词的也去。
+
+        商汤给托管模型统一加 `sn-`（`sn-kimi-k3`、`sn-qwen4-max`）。前缀是
+        厂商命名空间、不是模型身份，故在清洗层通用剥掉——新上架的模型无需
+        逐个登记就不会再对外多出 `sn-*` 条目 / 「Sn Xxx」展示名。
+        """
+        assert normalize_model_key("sn-qwen4-max") == "qwen4-max"
+        assert normalize_model_key("sn-qwen4-max") == \
+            normalize_model_key("Qwen4-Max")
+        assert display_model_name("sn-qwen4-max") == "Qwen4 Max"
+        # 未登记同义词的新模型同样剥前缀（大小写都算）
+        assert normalize_model_key("sn-future-x-model") == "future-x-model"
+        assert normalize_model_key("SN-Future-X-Model") == "future-x-model"
+        assert display_model_name("sn-future-x-model") == "Future X Model"
+        # 只剥开头的厂商前缀：模型名中间的 `sn-` 不动
+        assert normalize_model_key("asn-glm-5-3") == "asn-glm-5-3"
+
     def test_synonym_display_is_idempotent(self):
         """规范展示名再洗一遍不变（幂等），否则中心层二次清洗会来回横跳。"""
         canonical = display_model_name("DeepSeek-Flash")

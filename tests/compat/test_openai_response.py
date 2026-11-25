@@ -9,7 +9,7 @@ import pytest
 from src.compat.openai.errors import UpstreamStreamError, error_payload
 from src.compat.openai.response import StreamTranslator, aggregate
 from src.engine.sse import SSE_DONE
-from src.provider.base import Event, EventKind, Usage
+from src.provider.base import ErrKind, Event, EventKind, Usage
 from src.provider.trae import events as trae_events
 from tests.helpers.paths import provider_fixture
 from tests.helpers.sse import parse_frames
@@ -49,6 +49,36 @@ def test_stream_translator_missing_tool_index_gets_stable_position():
     indices = [tc["index"] for tc in json.loads(frames[0].decode()[6:])
                ["choices"][0]["delta"]["tool_calls"]]
     assert indices == [0, 1]
+
+def test_stream_translator_missing_tool_id_gets_stable_id():
+    """`id` 缺失时按 index 补稳定 id：OpenAI 客户端按 id 聚合分片。
+
+    同一个 index 的后续分片必须沿用同一个 id，否则一次调用会被拆成多次。
+    """
+    t = StreamTranslator("m")
+    list(t.translate(Event(kind=EventKind.CONTENT, content="x")))
+    first = list(t.translate(Event(kind=EventKind.TOOL_CALLS,
+                                   tool_calls=[{"index": 0,
+                                                "function": {"name": "f",
+                                                             "arguments": "{"}}])))
+    second = list(t.translate(Event(kind=EventKind.TOOL_CALLS,
+                                    tool_calls=[{"index": 0,
+                                                 "function": {"arguments": "}"}}])))
+    id_a = json.loads(first[0].decode()[6:])["choices"][0]["delta"]["tool_calls"][0]["id"]
+    id_b = json.loads(second[0].decode()[6:])["choices"][0]["delta"]["tool_calls"][0]["id"]
+    assert id_a == id_b
+    assert id_a.startswith("call_0_")
+
+
+def test_stream_translator_keeps_upstream_tool_id():
+    """上游给了 id 就沿用，不覆盖。"""
+    t = StreamTranslator("m")
+    frames = list(t.translate(Event(kind=EventKind.TOOL_CALLS,
+                                    tool_calls=[{"id": "call_up", "index": 0,
+                                                 "function": {"name": "f"}}])))
+    assert json.loads(frames[0].decode()[6:])["choices"][0]["delta"][
+        "tool_calls"][0]["id"] == "call_up"
+
 
 def test_stream_translator_error_frame():
     t = StreamTranslator("m")
@@ -107,6 +137,46 @@ def test_aggregate_without_usage_reports_nulls():
 def test_aggregate_raises_on_stream_error():
     with pytest.raises(UpstreamStreamError):
         aggregate([Event(kind=EventKind.ERROR, error_code=1005, error_message="quota")], "m")
+
+def test_upstream_stream_error_kind_uses_event_classification():
+    """流内业务错误经 `.kind()` 暴露真实分类。
+
+    此前没有这个方法，executor 的分类器（只认 `.kind()`）兜底成
+    `upstream_protocol`，界面显示「渠道响应异常」，真实类型被吞掉。
+    """
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=1005, error_kind=ErrKind.PLAN))
+    assert error.kind() is ErrKind.PLAN
+
+def test_upstream_stream_error_kind_defaults_to_other():
+    """未带业务分类的流内错误回落 OTHER（与 executor 的兜底同口径）。"""
+    error = UpstreamStreamError(Event(kind=EventKind.ERROR, error_message="boom"))
+    assert error.kind() is ErrKind.OTHER
+
+def test_upstream_stream_error_summary_exposes_code_only():
+    """`.summary` 只带错误码，供 503 文案作受控标识。
+
+    上游 message 可能回显请求参数，绝不能进对外响应；无码返回空串回落类名。
+    """
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=3004,
+        error_message="your requests have exceeded the rate limit"))
+    assert error.summary == "upstream code 3004"
+    assert "rate limit" not in error.summary
+
+def test_upstream_stream_error_summary_empty_without_code():
+    """error_code 槽位为 None（CodeArts 的字符串码在 message 里）→ 空串。"""
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_message="ChatAgent.00001001 排队"))
+    assert error.summary == ""
+
+def test_unavailable_message_uses_stream_error_summary():
+    """轮换耗尽的 503 文案带上流内错误码，而不是干巴巴的异常类名。"""
+    from src.engine.executor import _unavailable_message
+
+    error = UpstreamStreamError(Event(
+        kind=EventKind.ERROR, error_code=3004, error_message="rate limit"))
+    assert _unavailable_message(error) == "all credentials unavailable: upstream code 3004"
 
 def test_error_payload_shape():
     payload = error_payload("msg", "code", 400)

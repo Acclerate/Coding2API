@@ -19,7 +19,7 @@ from src.engine.executor import Executor, ExecutorDeps, NoHealthyCredential
 from src.engine.scheduler import Scheduler
 from src.engine.sse import iter_frames
 from src.main import build_app
-from src.provider.base import Event, EventKind, Quota, Usage
+from src.provider.base import ErrKind, Event, EventKind, Quota, Usage
 from src.provider.trae import events as trae_events
 from src.provider.trae.callback import parse_callback_url
 from src.provider.trae.client import TraeClient, TraeCredential, TraeProvider
@@ -146,7 +146,7 @@ def _executor(repo_tuple, script, **kw):
     credentials, _db = repo_tuple
     provider = _ScriptedProvider(script)
     executor = Executor(ExecutorDeps(providers={"trae": provider}, credentials=credentials,
-                                     scheduler=Scheduler(**kw), default_model="glm-5.2"))
+                                     scheduler=Scheduler(**kw), default_model="glm-5.3"))
     return executor, provider, credentials
 
 
@@ -221,10 +221,38 @@ def _request(stream=False):
                                "stream": stream})
 
 
-def test_executor_candidate_lookup_missing_raises(repo):
+def test_candidate_or_none_falls_back_to_placeholder(repo):
+    """记错误路径用占位候选：凭证已被并发删除时不得抛 503 语义的异常。"""
     executor, _provider, _credentials = _executor(repo, [GOOD])
-    with pytest.raises(NoHealthyCredential):
-        executor._candidate("ghost")
+    ghost = executor._candidate_or_none("ghost", "trae")
+    assert ghost.credential_id == "ghost" and ghost.provider == "trae"
+
+
+def test_note_upstream_error_tolerates_concurrently_deleted_credential(repo):
+    """凭证在请求过程中被删 → 记错误只告警不冒泡（此前抛成 503 / 断流）。"""
+    credentials, _db = repo
+    credential_id = credentials.add(provider="trae", credential_data={"accessToken": "a"})
+
+    class _RecordingStats:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def record(self, **fields) -> None:
+            self.events.append(fields)
+
+    stats = _RecordingStats()
+    provider = _ScriptedProvider([GOOD])
+    executor = Executor(ExecutorDeps(providers={"trae": provider}, credentials=credentials,
+                                     scheduler=Scheduler(), default_model="glm-5.3",
+                                     stats=stats))
+    credentials.delete(credential_id)          # 请求进行中被管理员删掉
+
+    attributed = executor._note_upstream_error(
+        credential_id, ErrKind.DEAD, "trae", "m",
+        username="u", started=0.0)
+    # DEAD 仍按「尝试级明细」返回 True，让调用方跳过收尾行（不重复计数）
+    assert attributed is True
+    assert stats.events and stats.events[0]["error_type"] == "credential_unavailable"
 
 
 async def test_executor_skips_concurrently_deleted_credential(repo):
@@ -250,11 +278,12 @@ async def test_executor_skips_concurrently_deleted_credential(repo):
 def test_aggregate_tool_call_without_index_merges_by_generated_position():
     result = aggregate([
         Event(kind=EventKind.TOOL_CALLS,
-              tool_calls=[{"id": "x", "function": {"name": "f", "arguments": "1"}}]),
+              tool_calls=[{"id": "x", "function": {"name": "f", "arguments": '{"a": '}}]),
         Event(kind=EventKind.TOOL_CALLS,
-              tool_calls=[{"id": "x", "function": {"arguments": "2"}}]),
+              tool_calls=[{"id": "x", "function": {"arguments": "1}"}}]),
     ], "m")
-    assert result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "12"
+    assert (result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            == '{"a": 1}')
 
 
 def test_stream_translator_tool_call_without_id_uses_next_slot():
@@ -514,7 +543,7 @@ def test_callback_accepts_upper_case_keys():
 # ------------------------------------------------------------- main app
 
 def test_models_endpoint_lists_connected_providers(tmp_path):
-    """模型列表按渠道凭证加载：有凭证的渠道才合并进列表。"""
+    """模型列表按渠道凭证加载：有凭证的渠道才进列表（同名模型归一合并为一条）。"""
     from src.config import Settings
     from src.provider.base import Model
 
@@ -522,7 +551,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         id = "codebuddy"
 
         async def list_models(self, _credential_data):
-            return [Model(id="glm-5.2"), Model(id="only-cb")]
+            return [Model(id="glm-5.3"), Model(id="only-cb")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -531,7 +560,7 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         id = "trae"
 
         async def list_models(self, _credential_data):
-            return [Model(id="glm-5.2")]
+            return [Model(id="glm-5.3")]
 
         def import_credential(self, raw):  # pragma: no cover
             return raw
@@ -547,5 +576,6 @@ def test_models_endpoint_lists_connected_providers(tmp_path):
         data = test_client.get("/v1/models",
                                headers={"Authorization": f"Bearer {key}"}).json()["data"]
     by_id = {item["id"]: item["providers"] for item in data}
-    assert by_id["glm-5.2"] == ["codebuddy", "trae"]
+    # 同名 `glm-5.3` 两渠道都有 → 归一成一条，providers 并列（字典序）
+    assert by_id["glm-5.3"] == ["codebuddy", "trae"]
     assert by_id["only-cb"] == ["codebuddy"]

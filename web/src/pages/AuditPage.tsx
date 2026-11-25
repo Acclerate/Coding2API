@@ -6,7 +6,10 @@ import { useSessionContext } from "../Layout";
 import { useSort } from "../hooks/useSort";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Pagination } from "../components/Pagination";
 import { SortableHead } from "../components/SortableHead";
+import { DEFAULT_PAGE_SIZE } from "../lib/constants";
+import { errorText } from "../lib/errors";
 import {
   Badge,
   Button,
@@ -15,6 +18,7 @@ import {
   Input,
   Notice,
   Panel,
+  QueryErrorState,
   Select,
   Table,
   TableBody,
@@ -24,22 +28,21 @@ import {
   TableRow,
 } from "../ui";
 
-const PAGE_SIZE = 50;
-
 export function AuditPage() {
   const session = useSessionContext();
   const { sort, order, toggle } = useSort("ts", "desc", { ts: "desc" });
   const [actor, setActor] = useState("");
   const [action, setAction] = useState("");
-  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
 
   // actor 用输入框，提交时才进查询（避免每敲一个字都打一次接口）
   const [actorDraft, setActorDraft] = useState("");
-  const { data, isLoading } = useAudit(session.username, {
+  const { data, isLoading, isError, error, refetch, isFetching } = useAudit(session.username, {
     actor: actor || undefined,
     action: action || undefined,
-    limit: PAGE_SIZE,
-    offset,
+    limit: pageSize,
+    offset: page * pageSize,
     sort,
     order,
   });
@@ -47,16 +50,22 @@ export function AuditPage() {
   const events = data?.events ?? [];
   const labels = data?.labels ?? {};
   const actions = data?.actions ?? [];
+  const total = data?.total ?? 0;
 
+  /** 换筛选 / 排序 = 换数据集：回到第一页，避免停在越界页码上（空白）。 */
   const reset = (next: () => void) => {
-    setOffset(0);
+    setPage(0);
     next();
   };
 
-  // 换排序 = 换数据集：回到第一页，避免停在越界页码上（空白）
   const toggleSort = (columnKey: string) => {
     toggle(columnKey);
-    setOffset(0);
+    setPage(0);
+  };
+
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
   };
 
   return (
@@ -64,7 +73,7 @@ export function AuditPage() {
       <PageHeader
         eyebrow="运维"
         title="审计日志"
-        description="登录、账号变动与凭证写操作留痕。失败登录同样记录——「谁在什么时候试了哪个账号」正是审计的价值。日志绝不包含密码或令牌。"
+        description="登录、账号变动与凭证写操作留痕；失败登录同样记录——「谁在何时试了哪个账号」正是审计价值。不含密码与令牌。"
         icon={<ScrollText className="size-5" />}
       />
 
@@ -77,8 +86,9 @@ export function AuditPage() {
           }}
         >
           <div className="w-56">
-            <Field label="操作者">
+            <Field label="操作者" htmlFor="audit-actor-input">
               <Input
+                id="audit-actor-input"
                 value={actorDraft}
                 data-testid="audit-actor"
                 placeholder="例如 root"
@@ -87,8 +97,9 @@ export function AuditPage() {
             </Field>
           </div>
           <div className="w-56">
-            <Field label="动作">
+            <Field label="动作" htmlFor="audit-action-select">
               <Select
+                id="audit-action-select"
                 value={action}
                 data-testid="audit-action"
                 onChange={(event) => reset(() => setAction(event.target.value))}
@@ -125,16 +136,23 @@ export function AuditPage() {
       <Panel title={`记录${data ? `（本页 ${events.length} 条）` : ""}`} aria-label="审计记录">
         {isLoading ? (
           <PageSkeleton variant="table" rows={6} />
+        ) : isError ? (
+          <QueryErrorState
+            title="审计记录加载失败"
+            description={errorText(error, "拿不到审计记录；缺失的证据不等于没有操作，请重试。")}
+            onRetry={() => void refetch()}
+            data-testid="audit-error-state"
+          />
         ) : events.length === 0 ? (
           <EmptyState
             icon={<ScrollText className="size-5" />}
             title="没有符合条件的记录"
-            description="调整上方筛选条件后再试，或清空筛选查看全部。"
+            description="调整或清空筛选查看全部。"
             data-testid="no-audit"
           />
         ) : (
           <>
-            <Table data-testid="audit-table">
+            <Table data-testid="audit-table" cards>
               <TableHeader>
                 <TableRow>
                   <SortableHead label="时间" columnKey="ts" active={sort === "ts"}
@@ -153,57 +171,43 @@ export function AuditPage() {
               <TableBody>
                 {events.map((event) => (
                   <TableRow key={event.id} data-testid={`audit-row-${event.id}`}>
-                    <TableCell className="whitespace-nowrap text-xs">
+                    <TableCell label="时间" className="whitespace-nowrap text-xs tabular-nums">
                       {formatTime(event.ts)}
                     </TableCell>
-                    <TableCell className="text-xs">{event.actor}</TableCell>
-                    <TableCell>
+                    <TableCell label="操作者" className="text-xs">{event.actor}</TableCell>
+                    <TableCell label="动作">
                       {/* 失败动作对读屏不可见（颜色语义）：加「失败」文案 */}
                       <Badge tone={event.ok ? "muted" : "danger"}>
                         {labels[event.action] ?? event.action}
                         {!event.ok && "（失败）"}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-xs">{event.target ?? "—"}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
+                    <TableCell label="对象" className="text-xs">{event.target ?? "—"}</TableCell>
+                    <TableCell label="详情" className="text-xs text-muted-foreground">
                       {event.detail || "—"}
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{event.ip ?? "—"}</TableCell>
+                    <TableCell label="来源 IP" className="font-mono text-xs">
+                      {event.ip ?? "—"}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
-            <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground">
-              <span>
-                第 {Math.floor(offset / PAGE_SIZE) + 1} 页
-              </span>
-              <span className="inline-flex gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={offset === 0}
-                  data-testid="audit-prev"
-                  onClick={() => setOffset((value) => Math.max(0, value - PAGE_SIZE))}
-                >
-                  上一页
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={events.length < PAGE_SIZE}
-                  data-testid="audit-next"
-                  onClick={() => setOffset((value) => value + PAGE_SIZE)}
-                >
-                  下一页
-                </Button>
-              </span>
-            </div>
+            <Pagination
+              testId="audit"
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              busy={isFetching}
+              onPageChange={setPage}
+              onPageSizeChange={changePageSize}
+            />
           </>
         )}
       </Panel>
 
       <Notice tone="muted">
-        日志保留期与请求明细一致（默认 90 天），由后台清理任务统一裁剪。
+        日志保留期与请求明细一致（默认 90 天），由后台清理任务裁剪。
       </Notice>
     </div>
   );

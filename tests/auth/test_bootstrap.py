@@ -90,7 +90,7 @@ def test_require_admin_accepts_legacy_positional():
 
 def test_session_embeds_and_returns_epoch():
     token = create_session_token("alice", "sec", epoch=7, issued_at=1000, ttl_seconds=60)
-    assert verify_session_token(token, "sec", now=1030) == ("alice", 7)
+    assert verify_session_token(token, "sec", now=1030) == ("alice", 7, 1000)
 
 
 def test_session_token_without_epoch_defaults_to_zero():
@@ -104,7 +104,7 @@ def test_session_token_without_epoch_defaults_to_zero():
                      separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     legacy = f"{payload_b64}.{session_mod._sign(payload_b64, 'sec')}"
-    assert verify_session_token(legacy, "sec", now=1500) == ("alice", 0)
+    assert verify_session_token(legacy, "sec", now=1500) == ("alice", 0, 1000)
 
 
 @pytest.mark.parametrize("epoch", ["7", True, -1])
@@ -150,6 +150,69 @@ def test_db_user_store_rejects_disabled(tmp_path):
     db.close()
 
 
+def test_db_user_store_session_valid(tmp_path):
+    """整库重建后旧 Cookie 的 ep 会重新匹配，必须靠签发时间兜住（issue #37）。"""
+    db, repo = _repo(tmp_path)
+    repo.create("alice", create_password_hash("pw"), now=1000)
+    store = DbUserStore(repo)
+    assert store.session_valid("alice", 0, 1000) is True
+    assert store.session_valid("alice", 0, 940) is True    # 60s 时钟余量内
+    assert store.session_valid("alice", 0, 939) is False   # 早于账号创建
+    assert store.session_valid("alice", 0, None) is True   # 老 Cookie 跳过时间校验
+    assert store.session_valid("alice", 1, 1000) is False  # epoch 已作废
+    assert store.session_valid("ghost", 0, 1000) is False  # 账号不存在
+    repo.set_enabled("alice", False)
+    assert store.session_valid("alice", 1, 1000) is False  # 已禁用
+    db.close()
+
+
+def test_db_user_store_verify_runs_pbkdf2_for_missing_user(tmp_path, monkeypatch):
+    """不存在/禁用的响应必须与「存在但密码错」同耗时，否则可计时枚举用户名。
+
+    600k 迭代 PBKDF2 约 45ms：直接 return False 比真实验证快 ~7000×。修复是
+    给不存在/禁用用户跑一次 dummy 哈希（进程内构造一次，随机口令永远对不上）。
+    """
+    import src.auth.users as users_mod
+
+    db, repo = _repo(tmp_path)
+    repo.create("alice", create_password_hash("pw"), enabled=False, now=1)
+    store = DbUserStore(repo)
+
+    hash_calls: list[str] = []
+    verify_calls: list[str] = []
+    real_hash = users_mod.create_password_hash
+    real_verify = users_mod.verify_password
+
+    def spy_hash(password):
+        hash_calls.append(password)
+        return real_hash(password)
+
+    def spy_verify(password, encoded):
+        verify_calls.append(encoded)
+        return real_verify(password, encoded)
+
+    monkeypatch.setattr(users_mod, "create_password_hash", spy_hash)
+    monkeypatch.setattr(users_mod, "verify_password", spy_verify)
+    monkeypatch.setattr(users_mod, "_DUMMY_HASH_CACHE", [])
+
+    # 不存在：照常跑了一次完整 PBKDF2（dummy 哈希，存进缓存）
+    assert store.verify("ghost", "pw") is False
+    dummy = users_mod._DUMMY_HASH_CACHE[0]
+    assert len(hash_calls) == 1            # 生成 dummy（随机口令）
+    assert verify_calls == [dummy]
+
+    # 第二次不存在的用户：dummy 从缓存来，只有 verify
+    assert store.verify("ghost", "pw") is False
+    assert len(hash_calls) == 1
+    assert verify_calls == [dummy, dummy]
+
+    # 禁用用户同口径：不试真实哈希（不透出「存在但被禁用」）
+    disabled_hash = repo.get("alice")["password_hash"]
+    assert store.verify("alice", "pw") is False
+    assert disabled_hash not in verify_calls
+    db.close()
+
+
 def test_db_user_store_reports_must_change(tmp_path):
     db, repo = _repo(tmp_path)
     repo.create("alice", create_password_hash("pw"), must_change_password=True, now=1)
@@ -178,6 +241,29 @@ def test_bootstrap_imports_viewer_then_promotes_env_admin(tmp_path):
     assert repo.get("alice")["role"] == ROLE_VIEWER
     assert any("导入 2 个用户" in line for line in logs)
     assert any("提权为 admin" in line for line in logs)
+    db.close()
+
+
+def test_bootstrap_skips_promotion_when_already_admin(tmp_path):
+    """提权名单里的用户**本来就是 admin** → 不重复改角色。
+
+    重复 `update_role` 会 bump epoch 把人踢下线，故已是 admin 的必须跳过。
+    构造：库里没有活跃 admin（走提权分支），名单里一个已是 admin（禁用态）、
+    一个是 viewer —— 前者命中「跳过」，后者被提权，兜住「无活跃 admin」的报错。
+    """
+    db, repo = _repo(tmp_path)
+    repo.create("aaa", create_password_hash("a"), role=ROLE_ADMIN, now=1)
+    repo.set_enabled("aaa", False)
+    repo.create("zzz", create_password_hash("z"), role=ROLE_VIEWER, now=1)
+    store = _file(tmp_path, [("aaa", create_password_hash("a")),
+                             ("zzz", create_password_hash("z"))])
+    logs: list[str] = []
+    bootstrap_users(_Config(["aaa", "zzz"]), repo, file_store=store,
+                    log=lambda msg, *args: logs.append(msg % args))
+    assert repo.get("aaa")["role"] == ROLE_ADMIN
+    assert repo.get("zzz")["role"] == ROLE_ADMIN
+    # 只提权了 zzz；aaa 已是 admin 不重复提权
+    assert any("提权为 admin：zzz" in line for line in logs)
     db.close()
 
 
@@ -415,6 +501,74 @@ def test_change_password_rejects_short_new_password(tmp_path, monkeypatch):
         response = client.post("/api/auth/password",
                                json={"current_password": "rootpw", "new_password": "short"})
         assert response.status_code == 400
+    db.close()
+
+
+def test_change_password_runs_pbkdf2_off_the_event_loop(tmp_path, monkeypatch):
+    """PBKDF2 必须走线程池：同步执行会独占事件循环，SSE/健康检查全被拖住。
+
+    实测 10 次同步 `verify_password` 期间 1ms 心跳一次都没跑起来；20 并发改密
+    足以让容器探针判 unhealthy。登录路径早已用 `throttle.verify`，这里同口径。
+    """
+    monkeypatch.setenv("USERS_FILE", str(tmp_path / "none.txt"))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    db = Database(settings.db_path)
+    apply_schema(db.connect())
+    UserRepository(db).create("root", create_password_hash("rootpw"),
+                              role=ROLE_ADMIN, now=1)
+    token = create_session_token("root", SECRET, epoch=0)
+
+    from src.auth import throttle as throttle_module
+
+    calls: list[str] = []
+    real_to_thread = throttle_module.asyncio.to_thread
+
+    async def spy(func, *args):
+        calls.append(getattr(func, "__name__", "?"))
+        return await real_to_thread(func, *args)
+
+    monkeypatch.setattr(throttle_module.asyncio, "to_thread", spy)
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", token)
+        response = client.post("/api/auth/password",
+                               json={"current_password": "rootpw",
+                                     "new_password": "brand-new-pw"})
+        assert response.status_code == 200
+    # 校验旧密码与生成新哈希都必须离开事件循环
+    assert "verify_password" in calls
+    assert "create_password_hash" in calls
+    db.close()
+
+
+def test_change_password_counts_failures_for_throttling(tmp_path, monkeypatch):
+    """猜当前密码要计入限流：会话被盗后不能无限次试。
+
+    与登录共用 `LoginThrottle` 的用户名窗口（max_per_user=5 / 60s），超限后
+    直接 429，不再跑 PBKDF2。
+    """
+    monkeypatch.setenv("USERS_FILE", str(tmp_path / "none.txt"))
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    db = Database(settings.db_path)
+    apply_schema(db.connect())
+    UserRepository(db).create("root", create_password_hash("rootpw"),
+                              role=ROLE_ADMIN, now=1)
+    token = create_session_token("root", SECRET, epoch=0)
+
+    app = build_app(settings)
+    with TestClient(app) as client:
+        client.cookies.set("coding2api_session", token)
+        for _ in range(5):
+            response = client.post("/api/auth/password",
+                                   json={"current_password": "wrong",
+                                         "new_password": "brand-new-pw"})
+            assert response.status_code == 400
+        blocked = client.post("/api/auth/password",
+                              json={"current_password": "wrong",
+                                    "new_password": "brand-new-pw"})
+        assert blocked.status_code == 429
     db.close()
 
 

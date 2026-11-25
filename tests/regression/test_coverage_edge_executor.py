@@ -259,6 +259,7 @@ async def test_complete_exhausts_rotation_without_last_error(tmp_path):
     """换号次数用尽且无 last_error 时的消息分支（executor 135）。
 
     路径：唯一凭证被硬禁用 → 选不到号 → 无 last_error 的 503 消息。
+    文案末尾追加池子成因拆解（`disabled=1`），见 `_pool_hint`。
     """
     credentials, db = _repo(tmp_path)
     credential_id = credentials.add(provider="trae", credential_data={"accessToken": "a"})
@@ -267,10 +268,10 @@ async def test_complete_exhausts_rotation_without_last_error(tmp_path):
     with pytest.raises(NoHealthyCredential) as caught:
         await executor.complete(parse_chat_request(
             {"messages": [{"role": "user", "content": "hi"}]}))
-    assert str(caught.value) == "all credentials unavailable"
+    assert str(caught.value) == "all credentials unavailable (total=1 disabled=1)"
     db.close()
 
-def test_pick_returns_none_when_all_cooling(tmp_path):
+async def test_pick_returns_none_when_all_cooling(tmp_path):
     """_pick 在候选全部冷却时返回 None（executor 154-155）。"""
     import time
 
@@ -284,7 +285,7 @@ def test_pick_returns_none_when_all_cooling(tmp_path):
     credentials.save_error(
         credential_id, Scheduler().note_error(candidate, ErrKind.PLAN, int(time.time())))
     executor = _executor(credentials, _Provider([GOOD]))
-    assert executor._pick(resolve("glm-5.2", "glm-5.2"), set()) is None
+    assert await executor._pick(resolve("glm-5.2", "glm-5.2"), set()) is None
     db.close()
 
 def test_unavailable_text_prefers_model_scoped_wording(tmp_path):
@@ -478,3 +479,21 @@ def test_stream_error_4001_is_invalid_not_other():
     assert _event_kind(Event(kind=EventKind.ERROR, error_code=4001)) is ErrKind.OTHER
     assert _event_kind(Event(kind=EventKind.ERROR, error_code=4001,
                              error_kind=ErrKind.INVALID)) is ErrKind.INVALID
+
+def test_toggle_rejects_non_boolean_enabled(tmp_path):
+    """`{"enabled": "false"}` 必须 400。
+
+    `bool("false") is True`，放过它会把「停用」静默执行成「启用」——写操作
+    语义反转，管理员看不到任何报错。
+    """
+    app, client = _client(tmp_path)
+    app.state.credentials.add(provider="trae", credential_data={"accessToken": "a"})
+    credential_id = app.state.credentials.candidates()[0].credential_id
+    client.cookies.set("coding2api_session", create_session_token("root", SECRET))
+    with client:
+        for bad in ("false", "0", 0, 1, None):
+            response = client.post(f"/api/credentials/{credential_id}/toggle",
+                                   json={"enabled": bad})
+            assert response.status_code == 400, bad
+        assert client.post(f"/api/credentials/{credential_id}/toggle",
+                           json={"enabled": False}).status_code == 200

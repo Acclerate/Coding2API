@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import ipaddress
 
+from ..engine.model_resolver import KNOWN_PROVIDERS
+
 # 单条 Key 的白名单条目数上限：读取路径每次请求都要遍历，且这是给
 # 「自己用的几个出口 IP」设计的，不是给网段清单用的。（单条长度由
 # ipaddress 解析天然有界，无需再设字符总量上限。）
@@ -57,7 +59,9 @@ def normalize_allowed_ips(raw: str | None) -> str:
     return ",".join(normalized)
 
 
-def _parse_networks(raw: str | None) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+def _parse_networks(
+    raw: str | None,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
     """读取路径的宽松解析：解析不了的条目直接丢弃（判定为不匹配）。"""
     networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for entry in split_entries(raw):
@@ -85,7 +89,7 @@ def ip_allowed(client_ip: str, allowed_ips: str | None) -> bool:
         return False
     address_text = (client_ip or "").strip()
     if not address_text:
-        return False                    # 拿不到对端地址：不能默认放行
+        return False  # 拿不到对端地址：不能默认放行
     try:
         address = ipaddress.ip_address(address_text)
     except ValueError:
@@ -111,13 +115,17 @@ def normalize_allowed_models(raw: str | None) -> str:
     return ",".join(normalized)
 
 
-def model_allowed(model: str | None, allowed_models: str | None, *,
-                  default_model: str = "") -> bool:
+def model_allowed(
+    model: str | None, allowed_models: str | None, *, default_model: str = ""
+) -> bool:
     """请求模型是否被该 Key 的模型白名单放行；白名单为空 = 不限制（放行）。
 
     `model` 为 `""`/`auto` 时用 `default_model` 判定：否则用户省略模型名就能
     绕过白名单（引擎会把它解析成默认模型）。`model@provider` 形式的 `@` 后缀
     不参与匹配（渠道由 provider_binding 管），但整体写法也允许被 glob 命中。
+    对外 id 的 `-{渠道}` 后缀同理不参与匹配：裸名模式（`kimi-k3`）因此能
+    覆盖各渠道变体（`kimi-k3-qoder` / `kimi-k3-trae`），与 `/v1/models`
+    过滤展示、请求侧放行三处同口径。
     """
     from fnmatch import fnmatch
 
@@ -132,21 +140,53 @@ def model_allowed(model: str | None, allowed_models: str | None, *,
         # auto/空）：fail closed。否则省略模型名就能绕过白名单触达任意模型。
         return False
     base = name.split("@", 1)[0]
-    return any(fnmatch(base, pattern) or fnmatch(name, pattern)
-               for pattern in patterns)
+    candidates = {name, base}
+    # 对外 id 的 `-{渠道}` 后缀：剥掉裸主体再比一轮（`kimi-k3-qoder` 也
+    # 该被模式 `kimi-k3` 命中）。渠道 id 互不为对方的连字符后缀（已知渠道
+    # 满足），故至多剥出一个主体。
+    for provider_id in KNOWN_PROVIDERS:
+        suffix = f"-{provider_id}"
+        if base.endswith(suffix):
+            candidates.add(base[: -len(suffix)])
+            break
+    return any(
+        fnmatch(candidate, pattern) for candidate in candidates for pattern in patterns
+    )
 
 
 def client_ip(peer: str | None, forwarded_for: str | None, *,
-              trust_proxy: bool) -> str:
+              trust_proxy: bool, trusted_proxies: str = "") -> str:
     """解析请求来源 IP。
 
     TRUST_PROXY 关闭（默认）时只看 TCP 对端地址——X-Forwarded-For 由客户端
     任意填写，信它就等于白名单形同虚设。开启后取 XFF 的**最后一个**条目：
     `$proxy_add_x_forwarded_for` 语义下那是紧邻的受信代理实际看到的地址，
     而第一个条目是客户端自己写的、不可信。
+
+    `trusted_proxies`（IP/CIDR，逗号分隔）非空时，只有**对端命中白名单**才
+    解析 XFF。它堵的是「反代旁还有一条直连路径」：那种部署下任何人都能自带
+    `X-Forwarded-For: <白名单IP>` 冒充来源，把 Key 的 allowed_ips 变成摆设。
     """
-    if trust_proxy:
+    peer_text = (peer or "").strip()
+    if trust_proxy and _peer_trusted(peer_text, trusted_proxies):
         entries = [item.strip() for item in (forwarded_for or "").split(",") if item.strip()]
         if entries:
             return entries[-1]
-    return (peer or "").strip()
+    return peer_text
+
+
+def _peer_trusted(peer: str, trusted_proxies: str) -> bool:
+    """对端是否在受信反代名单内；名单为空 = 不限制（旧行为）。"""
+    raw_entries = split_entries(trusted_proxies)
+    if not raw_entries:
+        return True
+    if not peer:
+        return False
+    networks = _parse_networks(trusted_proxies)
+    if not networks:
+        return False                    # 名单写坏：fail closed，不采信 XFF
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)

@@ -12,8 +12,11 @@ import logging
 import time
 from collections.abc import Callable
 
+from ..db.crypto import CredentialDecryptError
 from ..db.repo import CredentialRepository
+from ..error_text import error_text
 from ..provider.base import UpstreamReloginRequired
+from ..request_context import credential_scope
 from . import TaskReport
 from .pacer import Pacer
 
@@ -39,11 +42,21 @@ class RefreshTask:
         report = TaskReport()
         current = self._now()
         for candidate in self._credentials.candidates():
-            if candidate.disabled:
+            # 硬禁用与用户软暂停（enabled=0）都跳过：暂停凭证不该被预刷新占用
+            # 调度窗口，线上失败的也只会是早已停用的旧凭证（掩盖真实状态）。
+            if candidate.disabled or not candidate.enabled:
                 report.skipped += 1
                 continue
             provider = self._providers.get(candidate.provider)
-            data = self._credentials.credential_data(candidate.credential_id)
+            # 解不开（APP_SECRET 换过 / 密文损坏）→ 跳过这条凭证：一条坏凭证
+            # 不该让整轮预刷新失败（早先直接冒泡 → 整轮任务挂掉）。
+            try:
+                data = self._credentials.credential_data(candidate.credential_id)
+            except CredentialDecryptError:
+                logger.error("预刷新跳过 %s：凭证解密失败（APP_SECRET 是否被更换过？）",
+                             candidate.credential_id)
+                report.skipped += 1
+                continue
             if provider is None or data is None:
                 report.skipped += 1
                 continue
@@ -60,19 +73,26 @@ class RefreshTask:
             async with self._credentials.edit_lock(candidate.credential_id):
                 # 持锁后重读：等锁期间可能已被别的写者改过（如刚切了账号），
                 # 用旧 data 刷新会把那次改动覆盖掉。
-                data = self._credentials.credential_data(candidate.credential_id)
+                try:
+                    data = self._credentials.credential_data(candidate.credential_id)
+                except CredentialDecryptError:
+                    logger.error("预刷新跳过 %s：凭证解密失败（APP_SECRET 是否被更换过？）",
+                                 candidate.credential_id)
+                    report.skipped += 1
+                    continue
                 if data is None:
                     report.skipped += 1
                     continue
                 try:
-                    refreshed = await provider.refresh(data)
+                    with credential_scope(candidate.credential_id):
+                        refreshed = await provider.refresh(data)
                 except UpstreamReloginRequired as error:
                     # 续期凭据已作废：重试无意义，且重试只会继续污染凭证状态。
                     # 标记成需重新登录后本任务下轮直接跳过（candidates 的 disabled
                     # 分支），不再每小时刷一条同样的 warning。
                     logger.warning(
                         "refresh for %s needs re-login, disabling credential: %s",
-                        candidate.credential_id, error)
+                        candidate.credential_id, error_text(error))
                     # 落库文案固定，不写 `str(error)`：该值经 GET /api/credentials
                     # 回显管理台，固定文案可保证「将来有人往异常里塞上游原文」时
                     # 也不会把上游响应写进凭证状态。
@@ -81,7 +101,8 @@ class RefreshTask:
                     report.failed += 1
                     continue
                 except Exception as error:  # noqa: BLE001
-                    logger.warning("refresh failed for %s: %s", candidate.credential_id, error)
+                    logger.warning("refresh failed for %s: %s",
+                                   candidate.credential_id, error_text(error))
                     report.failed += 1
                     continue
                 # 先持久化轮换后的 token，再同步账号（AGENTS.md 顺序约束）

@@ -9,6 +9,7 @@
 -- 注：不建 checkins / model_cache 表——签到去重由 CheckinTask 的当日作用域
 -- 集合实现（上游 status 为准）；模型列表是「进程内 TTL 缓存 + DATA_DIR 落盘
 -- 快照（model_catalog.json）」，不占表（见 src/api/model_catalog.py）。
+-- 签到**审计日志**是另一回事，见 `checkin_events`（只增不改、不参与去重）。
 
 -- 用户建表：users.txt（PBKDF2）降级为「引导输入」，启动时一次性导入，
 -- 之后 DB 是唯一权威源。ADMIN_USERNAMES env 降级为「引导期角色来源 + 防锁死
@@ -23,19 +24,25 @@ CREATE TABLE IF NOT EXISTS api_keys (
     preview       TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     last_used_at  INTEGER,
-    -- 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 七渠道 | ''=自动）与来源 IP
+    -- 多 Key 出口：绑定渠道（见 KNOWN_PROVIDERS 九渠道 | ''=自动）与来源 IP
     -- 白名单（逗号分隔 IP/CIDR，''=不限制）。空值即老库/未设置时的原行为。
     provider_binding TEXT NOT NULL DEFAULT '',
     allowed_ips   TEXT NOT NULL DEFAULT '',
     -- Key 细粒度策略：模型白名单（fnmatch glob，逗号分隔，''=不限制）
     -- 与到期时间（epoch 秒，NULL=永不过期）。
     allowed_models TEXT NOT NULL DEFAULT '',
-    expires_at    INTEGER
+    expires_at    INTEGER,
+    -- Key 级配额（JSON 文本，''=不限制）。结构见 src/auth/access.py
+    -- 的 parse_key_quota：daily_requests / daily_tokens / daily_cost_usd /
+    -- rpm / tpm / max_concurrency，0 或缺失的键 = 该项关闭。
+    -- 存文本而不是拆列：配额项是「可增可减的策略集合」，拆列会让每次加一项
+    -- 都要走迁移；读路径宽容解析，坏行退化为「不限制」而不是崩掉出口。
+    quota         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS credentials (
     id               TEXT PRIMARY KEY,
-    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（七渠道）
+    provider         TEXT NOT NULL,          -- 见 KNOWN_PROVIDERS（九渠道）
     nickname         TEXT NOT NULL DEFAULT '',
     data_enc         BLOB NOT NULL,          -- Fernet 加密的凭证 JSON
     enabled          INTEGER NOT NULL DEFAULT 1,   -- 用户软开关
@@ -44,18 +51,40 @@ CREATE TABLE IF NOT EXISTS credentials (
     pinned           INTEGER NOT NULL DEFAULT 0,   -- 手动指定当前凭证
     health           INTEGER,                      -- NULL=unknown；0-100=known；-1=exhausted
     cooling_until    INTEGER,
+    -- 冷却来源（ErrKind 值：soft / credit / plan / restricted / other / ...）：
+    -- 上游点名的恢复时刻属于「等一会就好」，人工 revive 不该顺手解掉。
+    -- NULL = 无冷却或老库未回填（按「本地冷却」处理，revive 照旧清除）。
+    cooling_kind     TEXT,
     err_count        INTEGER NOT NULL DEFAULT 0,
     quota_remaining  REAL,
     quota_total      REAL,
     quota_cycle_end  INTEGER,                      -- 最早到期 epoch；渠道无此信息为 NULL
     quota_expiry_ladder TEXT,                      -- 到期阶梯 JSON [[epoch, 剩余积分]]；无到期信息为 NULL
-    quota_packages   TEXT,                      -- 额度包明细 JSON [{"name","total","used","end"}]，仅展示
+    quota_packages   TEXT,                      -- 额度包明细 JSON [{"name","total","used","end","expiring"}]，仅展示
+    web_cookie_state TEXT,                      -- 网页明细源状态：NULL=未配置/未知，ok=正常，expired=会话失效（仅提示）
+    -- 账号密码状态（仅小浣熊按需登录用）：NULL=未配置，1=已保存。
+    -- 只存「有没有」，账号密码本身在 data_enc 里（导出时被剔除），
+    -- 故列表页能显示「已保存」而不必解密任何凭据。
+    login_secret INTEGER,
+    routing_weight   INTEGER,                   -- 调度权重：NULL/0=默认；正数越大越先被选中（仅管理员显式偏好）
     quota_probed_at  INTEGER,
     token_expires_at INTEGER,                   -- access token 到期 epoch；NULL=老库未回填，0=未知
     token_issued_at  INTEGER,                   -- access token 签发 epoch（JWT iat）：进度条满量程与「最后续期」
     growth_last_run_at INTEGER,                    -- 成长中心最近一轮执行时间（仅 CodeBuddy）
     growth_last_result TEXT,                       -- 该轮一行中文汇报
+    tags             TEXT NOT NULL DEFAULT '',     -- 逗号分隔的运维标签（纯展示筛选，不参与调度）
     created_at       INTEGER NOT NULL,
+    -- 编辑版本号（乐观并发，第 39 版补列）：管理面每次**人工编辑**该行都推进
+    -- （`MAX(now, 旧值+1)`——同一秒里的两次编辑也不会撞成同版本），编辑端点
+    -- 用请求里的 `expected_updated_at` 比对；不一致 = 别人先保存了，回 409 +
+    -- 当前快照。老库补 0 =「从未编辑」，读路径不必判空即可比较。
+    -- 后台自动写（冷却/额度/健康度/刷新续期）**不推进**：否则打开中的编辑页会被
+    -- 30s 一次的轮询写成「过期」，冲突检测退化成永远 409。
+    updated_at       INTEGER NOT NULL DEFAULT 0,
+    -- 账号级模型白名单（fnmatch glob，逗号分隔，''=不限制，与 api_keys 同语法）：
+    -- 请求模型不在列表里时该凭证**不参与本次选号**（不硬禁用、不写冷却）；只影响
+    -- 对话/推理流量的候选集，签到/刷新/探活等后台任务照常看到全部凭证。
+    allowed_models   TEXT NOT NULL DEFAULT '',
     added_by         TEXT                          -- 应用层校验存在于 users 表
 );
 
@@ -105,11 +134,18 @@ CREATE TABLE IF NOT EXISTS usage_events (
     ttfb_ms          INTEGER,             -- 首字延迟（请求开始到首个内容帧）
     -- 请求 ID（响应头 X-Request-ID 同值）：把「用户报的一个请求」与这行明细、
     -- 以及与上游日志对齐。NULL=老库历史行（未回填）；入站未带头时自生成。
-    request_id       TEXT
+    request_id       TEXT,
+    -- 发起请求的 API Key id（api_keys.id）。NULL = 老库历史行、Cookie 会话调用
+    -- 或未带 Key 的调用。只由鉴权层写入（请求头不可信），供按 Key 计量与自助
+    -- 用量查询；`usage_hourly` 刻意不加该维度（会炸维度，聚合走明细表）。
+    api_key_id       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(username, ts);
+-- `idx_usage_request`（失败归因按 request_id 关联成功行）不在这里建：
+-- request_id 是老库后补的列，`executescript` 先于补列执行会报
+-- "no such column"，只能走 `migrate.py` 的 `_MIGRATION_INDEXES`。
 
 CREATE TABLE IF NOT EXISTS usage_hourly (
     hour_utc      INTEGER NOT NULL,
@@ -154,12 +190,40 @@ CREATE TABLE IF NOT EXISTS growth_events (
 
 CREATE INDEX IF NOT EXISTS idx_growth_cred_ts ON growth_events(credential_id, ts);
 
--- 积分变动流水：额度探测写回时比对余额，只增记一条。
+-- 每日签到运行记录（checkin_events）：每次对一条凭证执行签到就落一行。
+--
+-- 为什么落库：签到「界面显示成功却加不到积分」是实测过的用户反馈，而任务报告
+-- 只有聚合计数（attempted/succeeded/failed/skipped），事后无法回答「这个号昨天
+-- 几点签的、领了多少、上游回了什么码」。故按凭证逐次记一行，保留期与请求明细
+-- 一致（RetentionTask 清理）。
+-- 只存汇总：不落上游原始响应体（可能回显凭证片段）。
+-- 与已删除的 `checkins` 表无关：那张表是**去重**用（现由 CheckinTask 当日作用域
+-- 集合承担），本表是**审计日志**，只增不改、不参与去重。
+CREATE TABLE IF NOT EXISTS checkin_events (
+    id             TEXT PRIMARY KEY,
+    credential_id  TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    ok             INTEGER NOT NULL,
+    already        INTEGER NOT NULL DEFAULT 0,   -- 上游判「今日已签」（已签不算错误）
+    credit         REAL,                         -- 本次领取积分（可缺）
+    code           INTEGER,                      -- 上游业务码（可缺）
+    message        TEXT NOT NULL DEFAULT '',     -- 一行中文/上游文案
+    trigger        TEXT NOT NULL DEFAULT 'auto'  -- auto=定时 | manual=管理台手动
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkin_cred_ts ON checkin_events(credential_id, ts);
+
+-- 变动流水：额度探测写回时比对余额，每本账各增记一条。
 --
 -- 为什么靠 diff：签到 / 成长中心的上游接口普遍不打日志，拿不到「这次动作
 -- 加了多少分」。所以本表记的是**两次探测之间的净变化**，不是动作归因——
 -- source 只表达归因已知度（observed=常规探测区间 / sync=首次建立基线），
 -- 绝不写「签到 +5」这种上游并未告知的结论。
+--
+-- `ledger` 区分两本账：`pool`＝每日 token 池（福利模型用，CodeArts 之外
+-- 各渠道的主账）、`credits`＝积分账（CodeArts 内置模型用）。两本账数值
+-- 量级与语义都不同（每日池约 1000、积分账约 14000），混在一个列表里会被
+-- 读成同一本账的连续读数，故查询侧按它分开读。
 --
 -- before/after 可空：只在两端都拿得到数值时才记 delta；任一为 NULL 时
 -- 本行说明「变化无法量化」（如探测失败后恢复），不猜 0。
@@ -171,8 +235,10 @@ CREATE TABLE IF NOT EXISTS credit_events (
     before         REAL,                         -- 上次观测余额（可空）
     after          REAL,                         -- 本次观测余额（可空）
     delta          REAL,                         -- after - before，仅两端可算时非空
-    source         TEXT NOT NULL DEFAULT 'observed'
+    source         TEXT NOT NULL DEFAULT 'observed',
                    -- observed=两次探测间净变化 | sync=首次建立基线（无对照）
+    ledger         TEXT NOT NULL DEFAULT 'pool'
+                   -- pool=每日 token 池（福利模型）| credits=积分账（内置模型）
 );
 
 CREATE INDEX IF NOT EXISTS idx_credit_events_cred_ts
@@ -194,6 +260,33 @@ CREATE TABLE IF NOT EXISTS credential_model_cooldowns (
 
 CREATE INDEX IF NOT EXISTS idx_model_cooling_until
     ON credential_model_cooldowns(cooling_until);
+
+-- 主动探活结论：(渠道, 模型) 级，与生产冷却/统计**完全隔离**。
+--
+-- 为什么单独建表：`credential_model_cooldowns` 是「调度要不要避开」的权威
+-- 状态，由真实请求的失败驱动；探活只是「再试一次看恢复没有」的观测。把
+-- 探活结论写进冷却表会让一次探测直接改变选号结果（探测失败 ≠ 上游拒绝），
+-- 而写进 usage_events 会污染用量与成本统计。故独立成表，只供管理台展示 +
+-- 「探活成功就清负缓存」这一个动作。
+--
+-- `state`：ok（探活成功）/ failed（上游明确不认这个模型）/ inconclusive
+-- （额度、限流、网络等与模型无关的失败——**绝不能**据此禁用）。
+-- `manual`：人工接管标记（非空 = 跳过自动探活），见 src/api/admin_model_availability.py。
+-- `failed` 时该 (渠道, 模型) 会被模型列表摘掉（**不看**同渠道的
+-- `credential_model_cooldowns` 是否仍生效）；恢复靠复探成功（`ModelProbeTask`
+-- 每轮探 failed 行），隐藏没有到期时间，见 src/api/models.py::merged_entries。
+CREATE TABLE IF NOT EXISTS model_probes (
+    provider      TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT '',
+    failures      INTEGER NOT NULL DEFAULT 0,
+    last_probe_at INTEGER NOT NULL DEFAULT 0,
+    last_ok_at    INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    manual        TEXT NOT NULL DEFAULT '',
+    updated_at    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, model)
+);
 
 -- 运行时配置覆盖：只存「管理台改过」的 key，未出现的 key 回落 env。
 --
@@ -232,7 +325,16 @@ CREATE TABLE IF NOT EXISTS users (
     activation_expires_at INTEGER,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL,
-    created_by           TEXT                     -- 建号者用户名；引导导入为 NULL
+    created_by           TEXT,                    -- 建号者用户名；引导导入为 NULL
+    -- 用户级策略（仅约束**管理台 Playground** 的会话直连，不影响该用户的 API Key）：
+    -- 没有这两列时，viewer 用会话 Cookie 直调任意模型就绕过了 Key 的模型白名单与
+    -- 配额——管理台是「人能进门」的地方，出站策略必须按人再判一次。
+    -- allowed_models：fnmatch glob，逗号分隔，'' = 不限制（与 api_keys 同语法）。
+    allowed_models       TEXT NOT NULL DEFAULT '',
+    -- quota：JSON 文本，'' = 不限制；结构见 src/key_quota.py（当日请求/token/成本、
+    -- rpm/tpm/并发）。用量按**用户名**聚合：该用户经由任何入口（含自己的 Key）
+    -- 产生的用量都计入，配额语义是「这个人一天能用多少」，不是「这把 Key」。
+    quota                TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_role_enabled ON users(role, enabled);
@@ -257,8 +359,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor, ts);
 
--- 运维告警事件：后台周期评估四类风险（池耗尽 / 任务连续失败 / token
--- 临近到期 / 上游错误率骤升），命中即落一行，供管理台「站内告警记录」回看。
+-- 运维告警事件：后台周期评估九类规则（池耗尽 / 任务连续失败 / token
+-- 临近到期 / 上游错误率骤升 / 单 Key 用量暴涨 / 非工作时段 / 预算分层 /
+-- 渠道零成功 / 签到连续失败），
+-- 命中即落一行，供管理台「站内告警记录」回看。
 --
 -- 为什么落库而不是像 TaskStatusStore 只留内存：告警的价值恰在「错过的那段
 -- 时间发生了什么」——夜里池子耗尽、某任务连挂几轮，运维醒来要能看见，而
@@ -282,3 +386,86 @@ CREATE TABLE IF NOT EXISTS alert_events (
 
 CREATE INDEX IF NOT EXISTS idx_alert_ts ON alert_events(ts);
 CREATE INDEX IF NOT EXISTS idx_alert_rule_scope ON alert_events(rule, scope);
+-- 注：resolved_at 上的索引不在这里，因为它引用的列本身是迁移补的
+-- （见 src/db/migrate.py 的 _MIGRATION_INDEXES）——老库执行到本脚本时该列
+-- 尚未补上，CREATE INDEX 会 no such column。新库由迁移循环统一建。
+
+-- 日志环形表（E3 持久化）：进程重启后仍能回看「刚刚发生了什么」。
+-- 与 audit_events 的区别：这里是**运维视图**（路由 / 上游错误文案 / 请求 ID），
+-- 不是合规流水；每行写入前已过 `redact_or_drop` 脱敏，命中敏感形态整行丢弃。
+-- 容量由 `LOG_PERSIST_LINES` 控制（0 = 不落库，只保留内存环），超出时按
+-- `seq` 从旧到新删除——保留最近 N 行而不是按时间，重启前后口径一致。
+CREATE TABLE IF NOT EXISTS log_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,           -- epoch 秒（整数：够排障，省空间）
+    level      TEXT NOT NULL,              -- DEBUG / INFO / WARNING / ERROR
+    logger     TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    request_id TEXT                        -- 无请求上下文（后台任务）时为 NULL
+);
+
+-- 按 request_id 回溯一次请求的全部日志（`GET /api/logs?request_id=…`）
+CREATE INDEX IF NOT EXISTS idx_log_events_request_id ON log_events(request_id);
+
+-- 凭证可用性时间线（credential_events）：每次「可用性状态迁移」落一行。
+--
+-- 为什么单独建表：`credential_model_cooldowns` / `credentials.cooling_until`
+-- 只有**当前态**（覆盖写），回答不了「昨天 14:00 这个号为什么不可用」。
+-- 把历史塞进冷却表会被下一次迁移覆盖掉；写进 `usage_events` 又会污染用量与
+-- 成本统计（那是有请求才有行的口径，冷却到期是后台事件）。故独立成表，只增
+-- 不改，保留期由 RetentionTask（30 天）裁剪。
+--
+-- `event` 取值（写入点全部在 src/db/repo.py 的状态迁移函数内，与状态
+-- UPDATE 同事务；见 `CREDENTIAL_EVENT_KINDS`）：
+--   cooldown_start —— 账号级或 (凭证, 模型) 级冷却开始
+--   cooldown_end   —— 冷却到期回收 / 负缓存被清除
+--   hard_failure   —— 硬禁用（session 死亡 / 上游风控）
+--   revived        —— 人工恢复（force 与否写在 detail）
+--   enabled        —— 管理台用户软开关：启用
+--   disabled       —— 管理台用户软开关：停用
+--
+-- `reason` 只放**脱敏枚举**（ErrKind 值 / 'model' / 'blocked' / 'expired'），
+-- **不得写上游响应正文**：正文可能回显凭证片段。`detail` 是可读短句，同样
+-- 禁止凭证明文。`model` 仅模型级事件非空（账号级为 NULL）；`request_id`
+-- 关联触发这次迁移的请求（后台任务/无请求上下文为 NULL）。
+CREATE TABLE IF NOT EXISTS credential_events (
+    id             TEXT PRIMARY KEY,
+    credential_id  TEXT NOT NULL,
+    ts             INTEGER NOT NULL,             -- 迁移发生时刻（epoch 秒）
+    event          TEXT NOT NULL                -- 见上：六类状态迁移
+                   CHECK (event IN ('cooldown_start', 'cooldown_end', 'hard_failure',
+                                    'revived', 'enabled', 'disabled')),
+    reason         TEXT NOT NULL DEFAULT '',     -- 脱敏枚举（不是上游正文）
+    model          TEXT,                         -- 模型级冷却/负缓存时非空
+    detail         TEXT NOT NULL DEFAULT '',     -- 一行可读短句（无凭证明文）
+    request_id     TEXT                          -- 触发迁移的请求 ID（可空）
+);
+
+-- 时间线按 (凭证, 时间窗) 倒序翻页：没有它会每次全表扫。
+CREATE INDEX IF NOT EXISTS idx_credential_events_cred_ts
+    ON credential_events(credential_id, ts);
+-- 保留期裁剪按 ts 从旧到新删：单列索引让 DELETE 只碰过期段。
+CREATE INDEX IF NOT EXISTS idx_credential_events_ts ON credential_events(ts);
+
+-- 访问冻结（access_freezes）：上游内容拒绝的**发起者**归因计数。
+--
+-- 为什么按发起者而不是凭证：内容安全拒绝（如 CodeBuddy 403 + 11128）是
+-- 请求内容触发的，同池换号只会在更多账号上留下同样的拒绝记录。把发起者
+-- （API Key 所属用户名；无用户名时用 Key id）与渠道组合成冻结键，才能
+-- 「一个人违规只停他自己」，不连累其他租户。
+--
+-- 本表**只增不改**：每一行是一次内容拒绝的命中记录（同一 subject×provider
+-- 可有多行），阈值 `ACCESS_FREEZE_THRESHOLD` 按累计行数判定是否冻结；
+-- 阈值 0 = 只记录不拦截。解冻 = 删除该 (subject, provider) 的全部行并写审计。
+-- `reason` 只入脱敏标识（上游业务码 / HTTP 状态），不得写上游正文。
+CREATE TABLE IF NOT EXISTS access_freezes (
+    subject   TEXT NOT NULL,              -- 发起者：用户名，无则 API Key id
+    provider  TEXT NOT NULL,              -- 渠道 id（与 credentials.provider 同域）
+    reason    TEXT NOT NULL DEFAULT '',   -- 脱敏标识（code=11128 / status=403）
+    frozen_at INTEGER NOT NULL,           -- 命中时刻（epoch 秒）
+    frozen_by TEXT NOT NULL DEFAULT 'auto' -- auto=自动命中；解冻不留行，审计在 audit_events
+);
+
+-- 判定是否冻结按 (subject, provider) 计数；列出/解冻也按这两个键过滤。
+CREATE INDEX IF NOT EXISTS idx_access_freezes_subject_provider
+    ON access_freezes(subject, provider, frozen_at);

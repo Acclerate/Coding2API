@@ -15,9 +15,12 @@ Qoder 与 CodeBuddy / TRAE 的关键差异在这一层：
 
 错误分类沿用本项目中立层（`provider.base.ErrKind`）语义；Qoder 没有观测到
 CB/TRAE 那套 `1005/6004/11102` 业务码，信封里的 `statusCodeValue` 本身就是
-HTTP 状态语义，故按状态码分类。唯一例外：上游会把**自身节点执行故障**也包成
-400（`[FAIL]node:… msg:Execution failed`），这类按 `NODE_FAILURE_MARKERS` 识别后
-归模型级瞬时故障（`ErrKind.MODEL`），见 `classify_error_code`。
+HTTP 状态语义，故按状态码分类——**HTTP 非 2xx 与流内信封共用 `classify_status`
+一套判据**（排队 / 每日计费耗尽 / 会话失效 / 其余 SOFT 的优先级见该函数）。
+两个例外：上游会把**自身节点执行故障**包成 400（`[FAIL]node:… msg:Execution failed`），
+这类按 `NODE_FAILURE_MARKERS` 识别后归模型级瞬时故障（`ErrKind.MODEL`）；
+「每日计费次数用尽」（403 `{"code":"110","message":"Billing daily count exceeded"}`）
+按 `DAILY_QUOTA_MARKERS` 归 `ErrKind.CREDIT`，等次日恢复而不是硬禁用。
 """
 
 from __future__ import annotations
@@ -37,8 +40,9 @@ from ...provider.base import (
     Quota,
     UpstreamProtocolViolation,
     Usage,
+    parse_queue_hint,
 )
-from ..openai_chunk import first_choice
+from ..openai_chunk import first_choice, usage_from_openai
 from ..token_expiry import normalize_epoch
 
 # ---------------------------------------------------------------------------
@@ -94,6 +98,22 @@ REALM_CONFIGS: dict[str, RealmConfig] = {
         send_redirect_uri=False,
         nonce_dashed=False,
     ),
+    "lingma": RealmConfig(
+        # 通义灵码登录态（Qoder CN IDE「Log in with Lingma」，阿里云 RAM 企业账号）：
+        # 推理与模型发现走 lingma-api，COSY 签名与 qoder 网关同构、同一服务端公钥。
+        # 凭证是 state.vscdb 的 pt-/rt- 平台令牌，只能手工导入（auth_source=manual，
+        # 不走设备码登录，也不做 deviceToken 刷新）；openapi 业务端点（额度/签到）
+        # 在该域名下不存在，探测失败仅影响额度展示，不影响聊天与模型列表。
+        name="灵码 (Lingma)",
+        openapi="https://lingma-api.tongyi.aliyun.com",
+        gateway="https://lingma-api.tongyi.aliyun.com",
+        website="https://devops.aliyun.com",
+        client_id="",
+        redirect_uri="",
+        domain="tongyi.aliyun.com",
+        user_agent="QoderWork/1.1.64",
+        send_client_id=False,
+    ),
 }
 
 DEFAULT_REALM = "cn"
@@ -103,6 +123,10 @@ EP_DEVICE_POLL = "/api/v1/deviceToken/poll"
 EP_DEVICE_REFRESH = "/api/v1/deviceToken/refresh"
 EP_USERINFO = "/api/v1/userinfo"
 EP_QUOTA = "/api/v2/quota/usage"
+# 网页账号页的额度接口（需网页登录 Cookie，device token 打不通）：只有它给
+# **逐包到期**（`quota_detail[].expires_at`），device token 的 /quota/usage 只给
+# 两桶汇总。见 parse_web_quota。
+EP_CREDITS_WEB = "/api/v2/me/usages/big_model_credits"
 EP_PLAN = "/api/v2/user/plan"
 EP_CHECKIN_STATUS = "/sash/api/v1/me/daily-check-in/status"
 EP_CHECKIN_CLAIM = "/sash/api/v1/me/daily-check-in/claim"
@@ -137,6 +161,11 @@ EP_MODELS = "/algo/api/v2/model/list?Encode=1"
 MODELS_SIGN_PLAIN = b""
 
 CLIENT_UA = "Go-http-client/2.0"
+# 网页账号页的 UA：额度接口按网页会话鉴权，用 CLI 的 Go-http-client UA 会被
+# 风控挡（实测同 Cookie 下浏览器 UA 200）。只用于 `EP_CREDITS_WEB`。
+WEB_ACCOUNT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0.0.0 Safari/537.36")
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 # 上游主动吊销离线会话的标记：命中则刷新无意义，需要重新登录。
@@ -148,6 +177,12 @@ SESSION_DEAD_MARKERS = ("TOKEN_EXPIRE", "12153", "Offline user session not found
 # 信封 statusCodeValue 都是 400）。这与「模型不存在 / 请求无效」的 400 语义
 # 完全不同：换凭证不解决问题但会自愈，必须归为模型级瞬时冷却而非 INVALID。
 NODE_FAILURE_MARKERS = ("[FAIL]node:", "Execution failed")
+
+# 上游「每日计费次数用尽」（实测 2026-10-27 15:39，流内信封 403
+# `{"code":"110","message":"Billing daily count exceeded"}`）：号本身没坏，
+# 额度按上游日边界恢复——重登无效，硬禁用会把一个明天就能用的号踢出池子。
+# 归 CREDIT（冷却到次日 04:00），不进 DEAD。
+DAILY_QUOTA_MARKERS = ("Billing daily count exceeded",)
 
 # 信封内层 delta 的空占位键（只在取值为空/假时才剔除，非空值一律保留）。
 NOISE_KEYS = ("extra_fields", "refusal", "reasoning_content")
@@ -184,15 +219,23 @@ def is_session_dead(text: str) -> bool:
     return any(marker in text for marker in SESSION_DEAD_MARKERS)
 
 
+def is_daily_quota_exceeded(text: str) -> bool:
+    """响应体是否为「每日计费次数用尽」（次日自动恢复，与凭证状态无关）。"""
+    return any(marker in text for marker in DAILY_QUOTA_MARKERS)
+
+
 def is_node_failure(text: str) -> bool:
     """响应体是否为「上游节点故障」包装的 400（见 `NODE_FAILURE_MARKERS`）。"""
     return any(marker in text for marker in NODE_FAILURE_MARKERS)
 
 
 def classify_error_code(code: int | None, body: bytes | str = b"") -> ErrKind:
-    """状态/信封码 → ErrKind（401/403 的会话失效细节由 `classify_status` 补全）。
+    """状态/信封码 → ErrKind（HTTP 与流内信封共用，判据必须一视同仁）。
 
     * 402 → 余额不足（等签到恢复）
+    * 报文命中 `DAILY_QUOTA_MARKERS` → CREDIT：「每日计费次数用尽」
+      （403 `{"code":"110","message":"Billing daily count exceeded"}`），
+      号没坏、次日自动恢复，重登无效也不能硬禁用
     * 429 → 模型级限流（上游频控点名具体模型，换模型立即可用）
     * 418/500/502/503/504 → SOFT：上游把自身故障包装成 418/5xx，属瞬时类，
       短冷却换号即可，不该累计成「连续 3 次 → 10m」
@@ -200,30 +243,48 @@ def classify_error_code(code: int | None, body: bytes | str = b"") -> ErrKind:
     * 400 且报文命中 `NODE_FAILURE_MARKERS` → MODEL：上游节点执行失败（如
       qfmodel 的 `[FAIL]node:… Execution failed`），属**模型级瞬时**故障，
       只冷却该模型、换模型立即可用，不能当成「模型不存在」直接 400
+    * 报文带排队标记 → QUEUE：上游把「排队中」包成 403，而 403 按状态码看是
+      「会话失效 → 硬禁用凭证」。排队恰恰说明号是好的、只是忙——判成 DEAD
+      会把可自愈的凭证打进冷宫（实测 2026-10-26：kmodel_latest 排队时回
+      403 + `isQueued`，凭证被误判死）。排队判据放在这里（而不是只在调用
+      点）才能保证**任何**入口都不会漏判，`classify_status` 因此只做转发。
+    * 401 → DEAD（硬禁用，需重新登录）：401 是凭据/会话失效的确定信号，
+      实测没有「瞬时抖动」形态（`TOKEN_EXPIRE` 等，见
+      `tests/provider/qoder/test_client.py`）。放宽它只会让已被吊销的凭据
+      在 60s 轮换里反复撞上游（fail-open）。
+    * 403 且带会话失效标记 → DEAD；其余 403 → SOFT：实测 Qoder 的 403 多数
+      是上游瞬时/风控抖动，直接硬禁用会把可自愈的凭证打进冷宫。**流内信封
+      也走这里**（`client._decode_frame` 调 `classify_status`），两条路径必须
+      同一判据。
     """
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
     if code == 402:
         return ErrKind.CREDIT
-    if code in (401, 403):
+    if is_daily_quota_exceeded(text):
+        return ErrKind.CREDIT
+    if parse_queue_hint(text) is not None:
+        return ErrKind.QUEUE
+    if code == 401:
         return ErrKind.DEAD
+    if code == 403:
+        return ErrKind.DEAD if is_session_dead(text) else ErrKind.SOFT
     if code == 429:
         return ErrKind.MODEL
     if code in (418, 500, 502, 503, 504):
         return ErrKind.SOFT
     if code in (400, 404, 422):
-        text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
         return ErrKind.MODEL if is_node_failure(text) else ErrKind.INVALID
     return ErrKind.OTHER
 
 
 def classify_status(status: int, body: bytes = b"") -> ErrKind:
-    """HTTP 状态码分类。
+    """HTTP 状态码分类（流内信封错误同样走这里）。
 
-    401/403 只有**明确带会话失效标记**时才归 DEAD（硬禁用）；否则按 SOFT
-    短冷却轮换——实测 Qoder 的 401/403 多数是上游瞬时/风控抖动，直接硬禁用
-    会把可自愈的凭证打进冷宫。
+    只是 `classify_error_code` 的转发：判据只写一处，HTTP 与流内信封两条
+    路径不可能漂移（历史教训：判据散在两处时，流内 403 被判 DEAD 而 HTTP
+    路径已放宽，同一个号一半请求被硬禁用）。排队 / 计费次数用尽的优先级
+    见 `classify_error_code`。
     """
-    if status in (401, 403) and not is_session_dead(body.decode("utf-8", errors="replace")):
-        return ErrKind.SOFT
     return classify_error_code(status, body)
 
 
@@ -290,6 +351,33 @@ def _load_body(body: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise UpstreamProtocolViolation("Qoder inner chunk is not an object")
     return payload
+
+
+def is_keepalive_body(body: str) -> bool:
+    """内层 body 是否是上游的空载荷（保活帧），而非内容帧。
+
+    实测（2026-10-26）：上游在流中会发
+    `{"headers":…,"body":"null","statusCodeValue":200,"statusCode":"OK"}`
+    这样的**保活帧**——外层状态 200、内层是 JSON `null`。它不含任何内容，
+    只是让连接保持活跃。
+
+    早先把它当成「内层不是对象」→ 抛 `UpstreamProtocolViolation` → 整条流
+    被判失败（2026-10-26 16:29-16:53 连续 13 次「流式响应失败: Qoder
+    inner chunk is not an object」）。模型其实已经在正常输出，只是被保活帧
+    打断——这正是「静默出错」的典型形态。
+
+    判据用**结构**而不是字符串前缀：`json.loads` 成功且结果是 `None` /
+    空字典 / 空列表，都属于空载荷；非空对象不是。
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    if payload is None:
+        return True
+    if isinstance(payload, (dict, list)):
+        return not payload
+    return False
 
 
 def clean_delta(delta: dict[str, Any]) -> dict[str, Any]:
@@ -365,24 +453,15 @@ def parse_inner_chunk(body: str) -> list[Event]:
         events.append(Event(kind=EventKind.USAGE, usage=_usage(usage)))
     if finish_reason is not None:
         events.append(Event(kind=EventKind.FINISH, finish_reason=finish_reason))
+    model = payload.get("model")
+    if isinstance(model, str) and model:
+        for event in events:
+            event.model = model
     return events
 
 
 def _usage(raw: dict[str, Any]) -> Usage:
-    def as_int(key: str) -> int | None:
-        value = raw.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    details = raw.get("prompt_tokens_details")
-    cached = (details or {}).get("cached_tokens") if isinstance(details, dict) else None
-    if not isinstance(cached, int) or isinstance(cached, bool):
-        cached = as_int("cached_tokens")
-    return Usage(
-        input_tokens=as_int("prompt_tokens"),
-        output_tokens=as_int("completion_tokens"),
-        reasoning_tokens=as_int("reasoning_tokens"),
-        cached_tokens=cached,
-    )
+    return usage_from_openai(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -459,12 +538,16 @@ def parse_quota(payload: dict[str, Any], *, now: int) -> Quota:
 
     明细包只作展示（各自独立到期，汇总数字看不出是哪些包），`cycle_end`
     取 `expiresAt`（毫秒自动归一）。
+
+    **这里没有逐包到期**：实测该接口只给两桶汇总，`expiresAt` 是周期重置
+    （实测值 9999-12-31），不承载任何包级到期。要逐包到期必须走网页账号页
+    接口，见 `parse_web_quota`。
     """
     base = _obj(payload.get("userQuota"))
     addon = _obj(payload.get("addOnQuota"))
     remaining = _num(base, "remaining") + _num(addon, "remaining")
     total = _num(base, "total") + _num(addon, "total")
-    end = _opt_epoch(payload.get("expiresAt"))
+    end = _real_epoch(payload.get("expiresAt"))
     packages = [
         {"name": "基础额度", "total": _num(base, "total"),
          "used": _num(base, "used"), "end": end},
@@ -472,6 +555,119 @@ def parse_quota(payload: dict[str, Any], *, now: int) -> Quota:
          "used": _num(addon, "used"), "end": end},
     ]
     return Quota(remaining=max(0.0, remaining), total=total, cycle_end=end,
+                 packages=packages, probed_at=now)
+
+
+# 网页额度接口的容器：顺序即展示顺序。国内版实测三个容器都返回（额度为 0 的
+# 也返回），缺键时当作空容器。
+_WEB_QUOTA_CONTAINERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("套餐内积分", ("plan_quota", "planQuota")),
+    ("资源包", ("resource_package_quota", "resourcePackageQuota")),
+    ("SOTA 专属积分",
+     ("dedicated_resource_package_quota", "dedicatedResourcePackageQuota")),
+)
+
+# `quota_detail[].source` 的中文名：同一个容器里的包来源可能不同（套餐内也有
+# 赠送来源），包名直接写来源更便于判断「哪一笔先过期」。未知来源退回容器名。
+_WEB_QUOTA_SOURCES: dict[str, str] = {
+    "PLAN": "套餐内积分",
+    "RESOURCE_PACKAGE_SOURCE_BONUS": "赠送积分",
+    "RESOURCE_PACKAGE_SOURCE_PURCHASE": "购买积分",
+}
+
+
+def _first_num(source: dict[str, Any], *keys: str) -> float:
+    """取第一个数值字段（兼容 snake_case / camelCase 两套上游拼法）。"""
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
+
+
+def _first_epoch(source: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        epoch = _opt_epoch(source.get(key))
+        if epoch is not None:
+            return epoch
+    return None
+
+
+# 上游「无到期」哨兵：253402214400000 毫秒 = 9999-12-31。真实重置不会在 70 年
+# 之后，任何 ≥ 2100-01-01 的到期值一律按「无到期信息」处理，否则界面会显示
+# 「9999/12/31 重置」这种等于没说的日期。
+EXPIRY_SENTINEL_MIN = 4_102_444_800
+
+
+def _real_epoch(value: Any) -> int | None:
+    epoch = _opt_epoch(value)
+    if epoch is None or epoch >= EXPIRY_SENTINEL_MIN:
+        return None
+    return epoch
+
+
+def parse_web_quota(payload: dict[str, Any], *, now: int) -> Quota | None:
+    """网页账号页额度接口 → Quota（**逐包到期** + 到期阶梯）。
+
+    `GET {website}/api/v2/me/usages/big_model_credits`（需网页登录 Cookie，
+    device token 打不通；见 `client.QoderClient._probe_web_quota`）。响应按容器
+    分组（套餐内 / 资源包 / SOTA），每容器 `quota_detail[]` 给逐包的
+    `limit_value` / `used_value` / `remaining_value` / `expires_at`（毫秒）/
+    `is_active`。只有这个接口能回答「哪笔积分什么时候作废」，`/quota/usage`
+    的顶层 `expiresAt` 做不到。
+
+    口径：
+    - `remaining` / `total` 用各容器 summary 求和（上游已按容器汇总；不再叠加
+      顶层 `total_quota`，那是三者的合计，会翻倍）；
+    - 明细包按 `quota_detail` 逐条展开，`end` 取该包自己的 `expires_at`；
+      `is_active=False` 的包不计入阶梯（上游已判失效，不能再被消耗），但仍
+      保留在 `packages` 里展示——「过期了还剩多少」是排查时最想知道的一条；
+    - `expiry_ladder` 只收 `is_active=True`、剩余 > 0、有到期时间的包，
+      供选号「快过期先用」；
+    - `cycle_end` 取阶梯里最早到期时刻（Quota 的定义）。
+    """
+    packages: list[dict[str, Any]] = []
+    ladder: list[tuple[int, float]] = []
+    total = used = remaining = 0.0
+    for label, keys in _WEB_QUOTA_CONTAINERS:
+        container = _obj(next((payload[key] for key in keys
+                               if isinstance(payload.get(key), dict)), None))
+        summary = _obj(container.get("quota_summary")
+                       or container.get("quotaSummary"))
+        total += _first_num(summary, "limit_value", "limitValue")
+        used += _first_num(summary, "used_value", "usedValue")
+        remaining += _first_num(summary, "remaining_value", "remainingValue")
+        detail = container.get("quota_detail") or container.get("quotaDetail")
+        if not isinstance(detail, list):
+            continue
+        for item in detail:
+            if not isinstance(item, dict):
+                continue
+            limit = _first_num(item, "limit_value", "limitValue")
+            used_value = _first_num(item, "used_value", "usedValue")
+            remain = _first_num(item, "remaining_value", "remainingValue")
+            end = _first_epoch(item, "expires_at", "expiresAt")
+            if end is not None and end >= EXPIRY_SENTINEL_MIN:
+                end = None
+            source = str(item.get("source") or "")
+            active = item.get("is_active", item.get("isActive"))
+            packages.append({
+                "name": _WEB_QUOTA_SOURCES.get(source, label),
+                "total": limit,
+                "used": used_value,
+                "end": end,
+            })
+            if active is False or remain <= 0 or end is None:
+                continue
+            ladder.append((end, remain))
+    if not packages:
+        # 空响应（容器全缺）不是额度 0：返回 None 让调用方回退 `/quota/usage`，
+        # 避免把「上游换了形状」显示成「余额耗尽」。
+        return None
+    cycle_end = min((stamp for stamp, _ in ladder), default=None)
+    return Quota(remaining=max(0.0, remaining), total=total,
+                 cycle_end=cycle_end,
+                 expiry_ladder=sorted(ladder) if ladder else None,
                  packages=packages, probed_at=now)
 
 

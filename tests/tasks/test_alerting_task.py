@@ -307,6 +307,48 @@ def test_public_detail_masks_only_present_pii():
         "nickname": "", "provider": "trae"}
 
 
+def test_public_detail_masks_username_and_api_key_id():
+    """`username` / `api_key_id` 也是内部标识 + PII：外发打码，站内留原文。"""
+    from src.tasks.alerting import _public_detail
+
+    assert _public_detail({"api_key_id": "k1", "username": "alice",
+                           "tokens": 9}) == {
+        "api_key_id": "***", "username": "***", "tokens": 9}
+    # 空值不打码（不制造多余 `***` 噪声）
+    assert _public_detail({"api_key_id": None, "username": ""}) == {
+        "api_key_id": None, "username": ""}
+
+
+async def test_alert_task_key_burst_webhook_redacts_identity(tmp_path):
+    """key_burst 外发 payload 不含 Key id / 账号名原文，站内记录仍保留。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    stats = _KeyStats([{"api_key_id": "key-internal-1", "username": "alice@corp",
+                        "requests": 5, "tokens": 900_000}])
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 10_000,
+        key_burst_tokens=lambda: 500_000,
+        key_burst_window_minutes=lambda: 10,
+        webhook_url=lambda: "https://hook.example/a", client=client)
+    await task.run_once()
+
+    row = alerts.recent()[0]
+    assert json.loads(row["detail"])["api_key_id"] == "key-internal-1"
+    assert json.loads(row["detail"])["username"] == "alice@corp"
+    payload = seen[0]
+    assert payload["detail"]["api_key_id"] == "***"
+    assert payload["detail"]["username"] == "***"
+    assert "key-internal-1" not in json.dumps(payload, ensure_ascii=False)
+    assert "alice@corp" not in json.dumps(payload, ensure_ascii=False)
+    await client.aclose()
+    db.close()
+
+
 def test_alert_public_message_masks_pii_fragments():
     from src.tasks.alerting import Alert
 
@@ -316,6 +358,20 @@ def test_alert_public_message_masks_pii_fragments():
     # 空片段不参与替换（避免把整条文案打散）
     assert Alert(rule="r", severity=SEVERITY_WARNING, scope="s",
                  message="x", pii=("",)).public_message() == "x"
+
+
+def test_alert_public_scope_masks_pii_and_keeps_clean_scopes():
+    from src.tasks.alerting import Alert
+
+    alert = Alert(rule="key_burst", severity=SEVERITY_WARNING,
+                  scope="key-internal-1", message="x", pii=("key-internal-1",))
+    assert alert.public_scope() == "***"
+    # 无 PII 的告警 scope 原样外发
+    assert Alert(rule="pool_empty", severity=SEVERITY_CRITICAL,
+                 scope="pool", message="x").public_scope() == "pool"
+    # 空片段跳过（与 public_message 同口径）
+    assert Alert(rule="r", severity=SEVERITY_WARNING, scope="pool",
+                 message="x", pii=("",)).public_scope() == "pool"
 
 
 def test_alert_task_spec_registered():
@@ -430,6 +486,121 @@ async def test_alert_task_resolve_without_webhook_writes_only(tmp_path):
     db.close()
 
 
+# ------------------------------------------------- 重启后重建「告警中」集合
+
+
+def _task_after_restart(tmp_path, rows, **kwargs):
+    """先落库若干告警行、再构造任务：模拟「重启后进程内状态为空、库里仍有未恢复行」。"""
+    from src.db.conn import Database
+    from src.db.migrate import apply_schema
+    from src.db.repo import AlertRepository
+    from src.tasks.alerting import AlertTask
+    from src.tasks.status import TaskStatusStore
+    from tests.tasks._alerting_support import StubStats
+
+    db = Database(tmp_path / "alert.sqlite3")
+    apply_schema(db.connect())
+    alerts = AlertRepository(db)
+    for row in rows:
+        alerts.record(**row)
+    task = AlertTask(
+        kwargs.pop("credentials", _StubCredentials()),
+        alerts, kwargs.pop("stats", StubStats()),
+        task_status=kwargs.pop("status", TaskStatusStore()), **kwargs)
+    return task, alerts, db
+
+
+async def test_alert_task_rehydrates_and_resolves_after_restart(tmp_path):
+    """重启后重建「告警中」：条件已消失的历史未恢复行被正常标记恢复。
+
+    不重建的话恢复分支只遍历空的 `_active`，那行永远等不到 `resolved_at`
+    ——角标（数 `resolved_at IS NULL`）与「已恢复」标记就永久卡住。
+    """
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="池空", detail='{"ready": 0}', now=100)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),  # 已恢复
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0, now=lambda: 1000)
+    report = await task.run_once()
+    assert report["resolved"] == 1
+    assert alerts.recent()[0]["resolved_at"] == 1000
+    assert alerts.count_unresolved() == 0
+    db.close()
+
+
+async def test_alert_task_rehydrated_entries_keep_latest_row_per_key(tmp_path):
+    """同一 (rule, scope) 的多次提醒：重建按键去重、以最后一行为准，恢复时一起收尾。"""
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="第一次", now=100),
+         dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="第二次", now=200)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0, now=lambda: 1000)
+    assert list(task._active) == ["pool_empty:pool"]
+    assert task._active["pool_empty:pool"].message == "第二次"
+    assert (await task.run_once())["resolved"] == 1
+    assert alerts.count_unresolved() == 0
+    db.close()
+
+
+async def test_alert_task_rehydrated_entry_respects_silence_window(tmp_path):
+    """重建的「告警中」条目仍受静默窗约束：窗口内再次命中不重复落库。"""
+    task, alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="pool_empty", severity=SEVERITY_CRITICAL, scope="pool",
+              message="旧", now=1000)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 0}),  # 仍命中
+        silence_minutes=lambda: 30, now=lambda: 1000)
+    report = await task.run_once()
+    assert report == {"evaluated": 1, "fired": 0, "suppressed": 1, "pending": 0,
+                      "resolved": 0, "delivered": 0}
+    assert len(alerts.recent()) == 1
+    db.close()
+
+
+async def test_alert_task_rehydrated_resolve_masks_pii(tmp_path):
+    """重建的历史行仍带 PII 片段：恢复通知外发时昵称要打码，不泄露原文。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task, _alerts, db = _task_after_restart(
+        tmp_path,
+        [dict(rule="token_expiring", severity=SEVERITY_WARNING, scope="cred_1",
+              message="凭证「a@b.c」即将到期",
+              detail=json.dumps({"nickname": "a@b.c"}), now=100)],
+        credentials=_StubCredentials(counts={"total": 1, "ready": 1}),
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0,
+        webhook_url=lambda: "https://hook.example/a", client=client,
+        now=lambda: 1000)
+    await task.run_once()
+    assert seen[-1]["status"] == "resolved"
+    assert "a@b.c" not in seen[-1]["message"] and "***" in seen[-1]["message"]
+    assert seen[-1]["detail"]["nickname"] == "***"
+    await client.aclose()
+    db.close()
+
+
+def test_alert_from_row_tolerates_dirty_detail():
+    """重建时 detail 可能是空串 / 非法 JSON / 非对象（历史脏行）——一律归空。"""
+    from src.tasks.alerting import _alert_from_row
+
+    base = {"rule": "pool_empty", "severity": SEVERITY_CRITICAL, "scope": "pool",
+            "message": "池空"}
+    for dirty in ("", "not-json", "[1, 2]", '"text"', None):
+        rebuilt = _alert_from_row({**base, "detail": dirty})
+        assert rebuilt.detail == {} and rebuilt.pii == ()
+    # 有 nickname 则反推出 PII 片段（恢复通知据此打码）
+    rebuilt = _alert_from_row({**base, "detail": json.dumps({"nickname": "a@b.c"})})
+    assert rebuilt.pii == ("a@b.c",)
+
+
 def test_sign_webhook_body_is_stable_hmac():
     from src.tasks.alerting import sign_webhook_body
 
@@ -469,3 +640,342 @@ def test_alert_severity_warning_constant():
     assert SEVERITY_WARNING == "warning"
     assert SEVERITY_CRITICAL == "critical"
     assert isinstance(time.time(), float)
+
+class _KeyStats:
+    """统计替身：错误率固定 0，按 Key 用量可注入并记录调用窗口。"""
+
+    def __init__(self, key_usage=None):
+        self.calls: list[int] = []
+        self._key_usage = key_usage or []
+
+    def window_error_rate(self, *, since):
+        return (0, 0)
+
+    def window_key_usage(self, *, since, limit=50):
+        self.calls.append(since)
+        return self._key_usage
+
+
+async def test_alert_task_key_burst_rule_uses_its_own_window(tmp_path):
+    stats = _KeyStats([{"api_key_id": "k1", "username": "alice",
+                        "requests": 5, "tokens": 900_000}])
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 10_000,
+        key_burst_tokens=lambda: 500_000,
+        key_burst_window_minutes=lambda: 10,
+    )
+    await task.run_once()
+    row = alerts.recent()[0]
+    assert row["rule"] == "key_burst"
+    # 窗口用 key_burst_window_minutes（10 分钟），不是错误率窗口
+    assert stats.calls == [10_000 - 600]
+
+
+async def test_alert_task_key_burst_skipped_when_window_closed(tmp_path):
+    stats = _KeyStats([{"api_key_id": "k1", "username": "a",
+                        "requests": 5, "tokens": 900_000}])
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 10_000,
+        key_burst_tokens=lambda: 500_000,
+        key_burst_window_minutes=lambda: 0,
+    )
+    await task.run_once()
+    assert stats.calls == []
+    assert alerts.recent() == []
+
+
+async def test_alert_task_off_hours_uses_beijing_hour_not_utc(tmp_path, monkeypatch):
+    """反证：同一时刻在 UTC 下是 19 点（工作时段内）、在北京时间是 03 点。
+
+    只按 `time.localtime()` 判会漏报；按北京时间判才是运营配置的本意。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # 北京时间 2026-11-18 03:00 = UTC 2026-11-17 19:00
+    early = int(datetime(2026, 11, 18, 3, 0,
+                         tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    # 工作时段 19–23：UTC 小时 19 落在区间内，北京小时 3 不在
+    class _BusyStats:
+        def window_error_rate(self, *, since):
+            return (30, 0)
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        task, alerts, db = _task(
+            tmp_path, stats=_BusyStats(), now=lambda: early,
+            off_hours_start=lambda: 19, off_hours_end=lambda: 23,
+            off_hours_min_requests=lambda: 20,
+        )
+        await task.run_once()
+        assert [row["rule"] for row in alerts.recent()] == ["off_hours"]
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_month_start_is_beijing_month_start(monkeypatch):
+    """预算月起点固定北京时间：TZ=UTC 也不得偏移（与签到日界同口径）。"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tasks.alerting import month_start
+
+    # 北京时间 2026-11-01 00:30（UTC 2026-10-31 16:30）：必须是 11 月起点
+    early = int(datetime(2026, 11, 1, 0, 30,
+                         tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    expected = int(datetime(2026, 11, 1, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        assert month_start(early) == expected
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+async def test_alert_task_error_rate_ignores_client_disconnect(tmp_path):
+    """端到端：窗口内只有客户端断开时不报「上游错误率」。"""
+    from src.db.conn import Database
+    from src.db.migrate import apply_schema
+    from src.stats.collector import StatsCollector
+
+    db = Database(tmp_path / "disconnect.sqlite3")
+    apply_schema(db.connect())
+    for index in range(30):
+        StatsCollector(db).record(username="u", provider="trae", model="m",
+                                  ok=False, error_type="client_disconnect",
+                                  now=10_000 + index)
+    task, alerts, _db = _task(
+        tmp_path, stats=StatsCollector(db), now=lambda: 10_100,
+        error_rate_threshold=lambda: 0.5, error_rate_min_requests=lambda: 20,
+        error_rate_window_minutes=lambda: 15,
+    )
+    await task.run_once()
+    assert [row["rule"] for row in alerts.recent()] == []
+    db.close()
+
+
+async def test_alert_task_error_rate_fires_with_real_upstream_failures(tmp_path):
+    """反证：同一窗口混入真实上游错误时照常告警（排除断连不能把规则弄哑）。"""
+    from src.db.conn import Database
+    from src.db.migrate import apply_schema
+    from src.stats.collector import StatsCollector
+
+    db = Database(tmp_path / "mixed.sqlite3")
+    apply_schema(db.connect())
+    collector = StatsCollector(db)
+    for index in range(10):
+        collector.record(username="u", provider="trae", model="m", ok=False,
+                         error_type="client_disconnect", now=10_000 + index)
+    for index in range(20):
+        collector.record(username="u", provider="trae", model="m", ok=False,
+                         error_type="upstream_error", now=10_020 + index)
+    task, alerts, _db = _task(
+        tmp_path, stats=collector, now=lambda: 10_100,
+        error_rate_threshold=lambda: 0.5, error_rate_min_requests=lambda: 20,
+        error_rate_window_minutes=lambda: 15,
+    )
+    await task.run_once()
+    row = alerts.recent()[0]
+    assert row["rule"] == "error_rate"
+    # 分母是全部请求（30），分子只算上游错误（20）
+    assert "20/30" in row["message"]
+    db.close()
+
+
+class _CostStats:
+    """统计替身：成本按月起点聚合，记录调用窗口。"""
+
+    def __init__(self, spent=0.0):
+        self.calls: list[int] = []
+        self._spent = spent
+
+    def window_error_rate(self, *, since):
+        return (0, 0)
+
+    def window_cost(self, *, since):
+        self.calls.append(since)
+        return (self._spent, 1, 1)
+
+
+async def test_alert_task_budget_uses_month_start(tmp_path):
+    from src.tasks.alerting import month_start
+
+    stats = _CostStats(85.0)
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 1_790_000_000,
+        budget_cny=lambda: 100.0, budget_levels=lambda: "50,80,95,100",
+    )
+    await task.run_once()
+    assert stats.calls == [month_start(1_790_000_000)]
+    row = alerts.recent()[0]
+    assert row["rule"] == "budget"
+    assert row["scope"] == "budget_80"
+
+
+async def test_alert_task_budget_disabled_skips_query(tmp_path):
+    stats = _CostStats(999.0)
+    task, alerts, db = _task(tmp_path, stats=stats, now=lambda: 1_790_000_000,
+                             budget_cny=lambda: 0.0)
+    await task.run_once()
+    assert stats.calls == []
+    assert alerts.recent() == []
+
+
+async def test_alert_task_budget_level_upgrade_resolves_old_level(tmp_path):
+    """50% 档告警后升到 80%：旧档不再命中，一轮迟滞后写成已恢复。"""
+    stats = _CostStats(60.0)
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 1_790_000_000,
+        budget_cny=lambda: 100.0, budget_levels=lambda: "50,80,100",
+        clear_ticks=lambda: 1, silence_minutes=lambda: 0,
+    )
+    await task.run_once()
+    assert [row["scope"] for row in alerts.recent()] == ["budget_50"]
+
+    stats._spent = 85.0
+    await task.run_once()
+    scopes = [row["scope"] for row in alerts.recent()]
+    assert "budget_80" in scopes
+    # 50% 档已被写成恢复（resolved_at 非空），不再算未恢复
+    unresolved = [row["scope"] for row in alerts.unresolved()]
+    assert unresolved == ["budget_80"]
+
+async def test_alert_task_delivers_feishu_and_slack_shapes(tmp_path):
+    """飞书 / Slack 各按自己的消息格式发送，仍带签名头。"""
+    seen: list[tuple[str, dict, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, json.loads(request.content),
+                     request.headers.get("X-Coding2API-Signature")))
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        feishu_url=lambda: "https://open.feishu.cn/hook/f",
+        slack_url=lambda: "https://hooks.slack.example/s",
+        client=client, now=lambda: 5, app_secret=lambda: "secret")
+    report = await task.run_once()
+    assert report["delivered"] == 1
+    assert alerts.recent()[0]["delivered"] == 1
+
+    by_host = {host: body for host, body, _ in seen}
+    feishu = by_host["open.feishu.cn"]
+    assert feishu["msg_type"] == "text"
+    assert "Coding2API" in feishu["content"]["text"]
+    slack = by_host["hooks.slack.example"]
+    assert set(slack) == {"text"} and "Coding2API" in slack["text"]
+    assert all(signature for _, _, signature in seen)
+    await client.aclose()
+    db.close()
+
+async def test_alert_task_channel_failure_isolated(tmp_path):
+    """一个渠道失败不影响其它渠道发送，但整体不算投递成功。"""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(500 if request.url.host.endswith("feishu.cn") else 200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task, alerts, db = _task(
+        tmp_path, credentials=_StubCredentials(counts={"total": 1, "ready": 0}),
+        feishu_url=lambda: "https://open.feishu.cn/hook/f",
+        slack_url=lambda: "https://hooks.slack.example/s",
+        client=client, now=lambda: 5)
+    report = await task.run_once()
+    assert sorted(calls) == ["hooks.slack.example", "open.feishu.cn"]
+    assert report["delivered"] == 0
+    assert alerts.recent()[0]["delivery_error"] is not None
+    await client.aclose()
+    db.close()
+
+
+class _DeadChannelStats:
+    """统计替身：只提供新规则需要的 `window_dead_channels`。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls: list[dict] = []
+
+    def window_dead_channels(self, *, since, min_requests):
+        self.calls.append({"since": since, "min_requests": min_requests})
+        return list(self._rows)
+
+    def window_error_rate(self, *, since):
+        return (0, 0)
+
+
+async def test_alert_task_reports_dead_channel(tmp_path):
+    """渠道零成功进入告警；静默窗内不重复落库。"""
+    stats = _DeadChannelStats([
+        {"provider": "officeace", "requests": 551, "last_ok": 1793000000}])
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 1794000000,
+        channel_dead_min_requests=lambda: 20,
+        channel_dead_window_minutes=lambda: 60)
+    report = await task.run_once()
+    assert report["fired"] == 1
+    assert alerts.recent()[0]["rule"] == "channel_dead"
+    assert stats.calls == [{"since": 1794000000 - 60 * 60, "min_requests": 20}]
+    # 第二轮仍在静默窗内 → 抑制
+    assert (await task.run_once())["suppressed"] == 1
+    db.close()
+
+
+async def test_alert_task_dead_channel_rule_off_skips_query(tmp_path):
+    """阈值 0 = 关闭：连查询都不发（避免无谓扫表）。"""
+    stats = _DeadChannelStats([{"provider": "x", "requests": 99, "last_ok": None}])
+    task, alerts, db = _task(
+        tmp_path, stats=stats, now=lambda: 1794000000,
+        channel_dead_min_requests=lambda: 0)
+    assert (await task.run_once())["evaluated"] == 0
+    assert stats.calls == []
+    assert alerts.recent() == []
+    db.close()
+
+
+async def test_alert_task_reports_checkin_failure_streak(tmp_path):
+    """签到连续失败走独立规则；仓储为 None 时安静跳过。"""
+    class _Checkins:
+        def __init__(self, rows):
+            self._rows = rows
+            self.calls: list[dict] = []
+
+        def consecutive_failures(self, *, min_streak, since):
+            self.calls.append({"min_streak": min_streak, "since": since})
+            return list(self._rows)
+
+    checkins = _Checkins([{"credential_id": "cred_a", "streak": 18,
+                           "last_ts": 1794000000, "message": "上游未发放"}])
+    task, alerts, db = _task(
+        tmp_path, now=lambda: 1794000000, checkins=checkins,
+        checkin_fail_min_streak=lambda: 3,
+        checkin_fail_window_hours=lambda: 24)
+    report = await task.run_once()
+    assert report["fired"] == 1
+    row = alerts.recent()[0]
+    assert row["rule"] == "checkin_failing" and row["scope"] == "cred_a"
+    assert checkins.calls == [{"min_streak": 3,
+                               "since": 1794000000 - 24 * 3600}]
+    db.close()
+
+    # 未注入仓储：规则不生效，也不崩（共用同一个库，只断言本轮无新增评估）
+    off, off_alerts, off_db = _task(
+        tmp_path, now=lambda: 1794000000, checkins=None,
+        checkin_fail_min_streak=lambda: 3)
+    assert (await off.run_once())["evaluated"] == 0
+    off_db.close()
+
+
+def test_alert_public_scope_leaves_non_matching_parts_untouched():
+    """scope 里不含该 PII 片段时原样返回（`replace` 未命中的分支）。"""
+    from src.tasks.alerting import Alert
+
+    alert = Alert(rule="r", severity=SEVERITY_WARNING, scope="pool",
+                  message="x", pii=("someone@example.com",))
+    assert alert.public_scope() == "pool"

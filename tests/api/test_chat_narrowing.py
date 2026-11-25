@@ -341,3 +341,91 @@ async def test_forced_provider_without_usable_credential_keeps_narrowing(dual_re
     with pytest.raises(NoHealthyCredential):
         await executor.complete(_request("deepseek-v4.1-flash@codebuddy"), username="u")
     assert (cb.calls, trae.calls) == (0, 0)
+
+
+async def test_probe_failed_model_still_narrows_to_its_owner(dual_repo):
+    """探活判死的模型仍收窄到持有它的渠道 → 不扇出到无此模型的渠道。
+
+    实测故障（2026-10-26 `deepseek-v4.1-flash-1017`）：officeAce 的
+    `/v2/models` 挂着它但推理端点直接 404 `ModelArts.81009`（上游目录撒谎）。
+    人工探活判死后，若别名登记跟着被摘掉，执行侧 `_narrow_providers` 因
+    「没有任何渠道登记该模型」回退成**全部渠道** → 请求扇出到 codebuddy /
+    codearts / codebuddy_intl，三家各回「无此模型」（11102 / not registered），
+    并被写上 (凭证, 模型) 负缓存——污染的是从没有该模型的渠道。
+
+    修好后：别名登记保留 → 收窄到 officeAce → 负缓存让该渠道的凭证不可选
+    → 快速 503「该模型暂时不可用」，其余渠道零调用、零负缓存。
+    """
+    repo, db = dual_repo
+    officeace_id = repo.add(provider="officeace", credential_data={"t": "x"})
+    repo.add(provider="codebuddy", credential_data={"bearer_token": "cb"})
+    repo.add(provider="codearts", credential_data={"t": "x"})
+    # 负缓存（判死的前提）：officeAce 的这个模型被负缓存锁住
+    repo.save_error(officeace_id, ErrorOutcome(model_cooldowns={
+        "deepseek-v4.1-flash-1017": ModelCooldown(
+            cooling_until=int(time.time()) + 3600, hits=1, reason="blocked")}))
+    officeace = _RejectProvider("officeace", [GOOD])
+    cb = _RejectProvider("codebuddy", [GOOD])
+    codearts = _RejectProvider("codearts", [GOOD])
+    executor = Executor(ExecutorDeps(
+        providers={"officeace": officeace, "codebuddy": cb, "codearts": codearts},
+        credentials=repo, scheduler=Scheduler(),
+        default_model="deepseek-v4.1-flash-1017",
+        # 别名表保留判死渠道的归属（`api.models._hidden_aliases` 的产出）
+        model_aliases={"officeace": {"deepseek-v4.1-flash-1017":
+                                     "deepseek-v4.1-flash-1017"}},
+        upstream_model_name=lambda pid, name: {
+            "officeace": {"deepseek-v4.1-flash-1017": "deepseek-v4.1-flash-1017"}
+        }.get(pid, {}).get(name.lower(), name)))
+
+    with pytest.raises(NoHealthyCredential) as exc_info:
+        await executor.complete(_request("deepseek-v4.1-flash-1017"), username="u")
+    assert "temporarily unavailable on upstream" in str(exc_info.value)
+    # 只有持有该模型的渠道被考虑过；无此模型的渠道零调用
+    assert (officeace.calls, cb.calls, codearts.calls) == (0, 0, 0)
+    # 负缓存零新增：没给任何渠道写「该后端无此模型」
+    assert db.connect().execute(
+        "SELECT COUNT(*) FROM credential_model_cooldowns").fetchone()[0] == 1
+
+async def test_catalog_x0_overridden_by_observed_charge(dual_repo):
+    """目录写 x0、但上游实际在扣费 → 按实测倍率纠正，免费档不再生效。
+
+    实测故障（2026-11-03 起）：`codebuddy_intl/deepseek-v4.1-flash` 目录仍标
+    x0，每次请求却实扣 ~0.14 积分（`credit_estimated=0`）。免费档压过全部
+    到期积分 → officeace 15.8 小时内到期的 100 积分包整夜闲置。校准后 intl
+    回到付费档，健康度重新决定选号。
+    """
+    repo, db = dual_repo
+    cb_id = repo.add(provider="codebuddy", credential_data={"bearer_token": "cb"})
+    intl_id = repo.add(provider="codebuddy_intl",
+                       credential_data={"bearer_token": "intl"})
+    # 健康度拉开差距：校准前免费档赢，校准后健康度高者赢——两种结果可区分
+    db.connect().execute("UPDATE credentials SET health = 100 WHERE id = ?", (cb_id,))
+    db.connect().execute("UPDATE credentials SET health = 50 WHERE id = ?", (intl_id,))
+    cb = _RejectProvider("codebuddy", [GOOD])
+    intl = _RejectProvider("codebuddy_intl", [GOOD])
+
+    def deps(paid_models):
+        return ExecutorDeps(
+            providers={"codebuddy": cb, "codebuddy_intl": intl}, credentials=repo,
+            scheduler=Scheduler(), default_model="deepseek-v4.1-flash",
+            model_aliases={
+                "codebuddy": {"deepseek-v4.1-flash": "deepseek-v4.1-flash"},
+                "codebuddy_intl": {"deepseek-v4.1-flash": "deepseek-v4.1-flash"}},
+            model_list_cache={
+                "codebuddy": {"deepseek-v4.1-flash": Model(
+                    id="deepseek-v4.1-flash", credit_rate=0.11)},
+                "codebuddy_intl": {"deepseek-v4.1-flash": Model(
+                    id="deepseek-v4.1-flash", credit_rate=0.0)}},
+            paid_models=paid_models)
+
+    # 无实扣记录 → 信目录：intl 是 x0，免费档压过健康度
+    executor = Executor(deps(lambda: {}))
+    await executor.complete(_request("deepseek-v4.1-flash"), username="u")
+    assert (cb.calls, intl.calls) == (0, 1)
+
+    # 有实扣记录 → intl 按实测倍率当付费，健康度 100 的 codebuddy 胜出
+    cb.calls = intl.calls = 0
+    executor = Executor(deps(lambda: {("codebuddy_intl", "deepseek-v4.1-flash"): 0.14}))
+    await executor.complete(_request("deepseek-v4.1-flash"), username="u")
+    assert (cb.calls, intl.calls) == (1, 0)

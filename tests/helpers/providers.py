@@ -31,7 +31,7 @@ class ScriptedProvider:
             yield item
 
     async def list_models(self, _credential_data):
-        return [Model(id="glm-5.2")]
+        return [Model(id="glm-5.3")]
 
     def import_credential(self, raw):
         if not raw.get("accessToken"):

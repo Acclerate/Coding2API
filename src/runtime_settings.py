@@ -49,6 +49,9 @@ class HotSetting:
     maximum: float | None = None
     task: str | None = None             # 所属后台任务 key（见 tasks/status.py）；None=网关/调度配置
     group: str | None = None            # task 为 None 时的分组 key（见 GATEWAY_GROUPS）
+    # 任务卡片内的分节标题（同一任务内聚合，如运维告警的「规则阈值」）：
+    # 19 项平铺一列太长；None = 不分组。只对 task 非空的项有意义。
+    section: str | None = None
     # 生效下限（读时钳制）：存量覆盖值可能低于现行下限（旧版 minimum 更宽时
     # 写入），读路径直接钳到 floor 自愈——否则 UI 回显写入值、实际跑钳制值，
     # 两者静默分叉。floor ≥ minimum 恒成立。
@@ -59,13 +62,18 @@ class HotSetting:
         return self.key.upper()
 
 
-# 无任务归属的配置项（`task is None`）在管理台里的分组：key → 界面上的一级 tab
-# 名。顺序即前端展示顺序；分组归属与标签由后端定义，前端不硬编码 key 列表，
-# 后端加项/改归属不用动前端。留空的分组不渲染。
+# 无任务归属的配置项（`task is None`）在管理台里的分组：key → 「网关配置」下的
+# 二级 tab 名。顺序即前端展示顺序；分组归属与标签由后端定义，前端不硬编码 key
+# 列表，后端加项/改归属不用动前端。留空的分组不渲染。
 GATEWAY_GROUPS: tuple[tuple[str, str], ...] = (
-    ("routing", "模型路由"),
+    ("model_routing", "模型与回退"),
+    ("compress", "上下文压缩"),
+    ("stream_thinking", "流式与思考"),
+    ("gateway_control", "网关与计费"),
     ("affinity", "选号与会话"),
-    ("channels", "渠道节流"),
+    ("privacy", "出站隐私"),
+    ("chat_throttle", "聊天节流"),
+    ("codearts_throttle", "CodeArts 节流"),
     ("pacer", "后台任务节流"),
     ("observability", "可观测性"),
 )
@@ -75,29 +83,76 @@ GATEWAY_GROUPS: tuple[tuple[str, str], ...] = (
 HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("default_model", str, "默认模型",
                "请求未指定 model（或为 auto/空）时使用的模型名。",
-               group="routing"),
+               group="model_routing"),
     HotSetting("model_blocklist", str, "模型黑名单",
                "fnmatch glob，逗号分隔；只影响 /v1/models 与 Playground 列表，"
                "直连指定不受影响。留空表示不过滤。",
-               group="routing"),
+               group="model_routing"),
+    HotSetting("trae_account_identities", str, "TRAE 账号身份",
+               "本账号拥有的访问身份编号（逗号分隔，`0`=免费档，`1/2/3/5/100` 为"
+               "付费会员/团队/内部档）。上游按身份授权模型：白名单不含本账号身份的"
+               "模型选中必回 1005，故拉取时直接过滤。默认 `0`；留空 = 不按身份过滤"
+               "（上游给什么就展示什么）。开通会员后填 `0,1,2,3,5` 即可放出会员模型。",
+               group="model_routing"),
     HotSetting("context_compress_enabled", bool, "上下文压缩",
                "按模型目录里的输入上限裁剪过长对话，避免撞上游硬限制"
                "（CodeBuddy 11115 prompt is too long）。目录里查不到上限的模型"
-               "不受影响。", group="routing"),
+               "不受影响。", group="compress"),
     HotSetting("context_compress_reserve_tokens", int, "上下文压缩：预留输出 token",
                "压缩预算里为模型回复预留的输出 token 数。", minimum=0,
-               group="routing"),
+               group="compress"),
     HotSetting("context_compress_min_keep_messages", int, "上下文压缩：至少保留消息数",
                "无论多长都保留的最近消息条数（保证当前这轮对话完整）。",
-               minimum=0, group="routing"),
+               minimum=0, group="compress"),
     HotSetting("context_compress_safety_ratio", float, "上下文压缩：安全系数",
                "按模型上限的百分比计算压缩预算，给 token 估算误差留余量。",
-               minimum=0.0, maximum=1.0, group="routing"),
+               minimum=0.0, maximum=1.0, group="compress"),
+    HotSetting("context_compress_sticky_enabled", bool, "上下文压缩：粘性裁剪",
+               "开启后一次裁到预算的 60% 并记住保留窗口的起点，跨轮前缀不变，"
+               "上游前缀缓存才能命中（客户端每轮重发完整历史时，不粘性就只有 "
+               "system 段可复用，命中率会掉到个位数）。关闭 = 每轮按当轮预算"
+               "重算，只有前缀本来就单调增长时才划算。",
+               group="compress"),
+    HotSetting("tool_output_compress_enabled", bool, "tool 输出压缩",
+               "开启后只压缩 `role=tool` 且超过阈值（下一项）的纯文本结果："
+               "去掉 ANSI 转义、折叠连续重复行、保留命中错误关键字的行。"
+               "确定性压缩（同输入同输出），不破坏上游前缀缓存；"
+               "默认关，关闭时载荷逐字节不变。",
+               group="compress"),
+    HotSetting("tool_output_compress_max_chars", int, "tool 输出压缩：字符阈值",
+               "单条 tool 结果超过该字符数才压缩（≤0 视为关闭）。"
+               "默认 8000（约 2K token 纯 ASCII）。",
+               minimum=0, group="compress"),
     HotSetting("model_fallback_groups", str, "跨渠道 fallback 兼容组",
                "请求模型在主渠道全部不可用时，按兼容组依次回退到组内其他模型。"
                "格式 `组名=成员1,成员2;组名2=成员3`；成员可带 `@渠道` 固定回退渠道。"
                "留空 = 不启用。回退会用尽该组（×3 轮换预算）后正常 503。",
-               group="routing"),
+               group="model_routing"),
+    HotSetting("model_aliases", str, "自定义模型别名",
+               "给客户端一个稳定的对外模型名（上游改 id 时只改这里）。格式 "
+               "`对外名=模型@渠道;对外名2=模型`；列表与请求解析用同一份。"
+               "与真实模型 id 或自动别名撞车视为配置错误，不静默覆盖。"
+               "留空 = 不启用。", group="model_routing"),
+    HotSetting("stream_first_event_timeout_seconds", float, "流式首事件超时（秒）",
+               "上游接了连接却长时间不吐第一个数据帧时，在**出帧前**换号重试"
+               "（此时切换安全）。注释帧/心跳不重置计时。0 = 关闭；实测慢上下文"
+               "首字可达 40–71s，内置默认必须保持关闭，用时按部署实际填（推荐 60）。",
+               minimum=0.0, group="stream_thinking"),
+    HotSetting("stream_idle_timeout_seconds", float, "流式空闲超时（秒）",
+               "**已出帧**后上游长时间不再吐数据时断流并以错误帧收尾——半截输出"
+               "不可回滚，换号会把两个账号的内容拼给客户端。0 = 关闭（推荐 300）。",
+               minimum=0.0, group="stream_thinking"),
+    HotSetting("short_cooldown_wait_seconds", float, "短冷却等待上限（秒）",
+               "全池都在短冷却、没有任何立即可用候选时，最短剩余冷却不超过该值"
+               "则等待后续上（而非直接 503）。本轮轮换试过的号同样参与，等到的"
+               "号会解禁重取一次。等待期间不占在途租约。默认 60；0 = 关闭"
+               "（快速失败）。", minimum=0.0, group="affinity"),
+    HotSetting("nonstream_keepalive_seconds", float, "非流式保活（秒）",
+               "`stream=false` 的请求在聚合完成前不发任何字节，CDN / 反代的空闲"
+               "超时会切连接。设为 N>0 时，N 秒内没完成就转 chunked，先吐空白"
+               "再补 JSON 正文——空白是合法 JSON 前导（RFC 8259），解析器照常"
+               "工作。0 = 关闭（本部署 nginx 3600s + frp TCP 无此问题）；"
+               "只在 CDN 后面需要，推荐 15。", minimum=0.0, group="stream_thinking"),
     HotSetting("quota_expiry_window_seconds", int, "到期积分主窗口（秒）",
                "把「距到期 ≤ 该秒数」的积分加总作为选号第一排序指标；"
                "≤0 关闭整套到期排序（次窗口一并失效）。", minimum=0,
@@ -113,13 +168,19 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("max_inflight_per_credential", int, "单账号在途上限",
                "同一凭证的并发请求达到该值后不再参与选号，避免把单账号打进上游"
                "限流/封号（跨渠道全局生效）。0 = 不限。租约在请求结束后释放，"
-               "另有 600s TTL 兜底漏释放。", minimum=0, group="affinity"),
+               "另有 600s TTL 兜底漏释放。在途数同时是选号的负载键：并发请求"
+               "按「在途最少优先」摊到空闲号（0 = 不限时也照常计数）。",
+               minimum=0, group="affinity"),
     HotSetting("growth_irreversible_actions", bool, "成长中心不可逆动作",
                "是否允许抽奖 / 连登兑换 / 开盲盒 / 消耗补登卡。关闭后仍会领取"
                "旅行礼物与任务奖励。", task="growth"),
     HotSetting("growth_interval_minutes", int, "成长中心周期（分钟）",
                "成长中心后台任务的一轮间隔；下限 5 分钟（更密只会撞上游风控）。",
                minimum=5, task="growth", floor=5),
+    HotSetting("checkin_enabled", bool, "每日签到开关",
+               "Qoder 账号的每日签到（领积分）。lingma 区域无此活动、自动跳过；"
+               "不需要该活动的部署可整体关闭，后台不再定时出网。管理台手动"
+               "「签到」按钮不受影响。", task="checkin"),
     HotSetting("refresh_interval_minutes", int, "token 预刷新周期（分钟）",
                "后台 token 预刷新任务的一轮间隔；下限 5 分钟。短寿命渠道"
                "（CodeArts STS 2h）会把预刷新窗口封顶，此时该周期必须窄于窗口，"
@@ -133,6 +194,14 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "/v1/models 或 Playground 时才刷新，纯 API 用法的部署会让"
                "「模型→渠道」归属表与落盘快照一起变陈旧。下限 5 分钟。",
                minimum=5, task="model_catalog", floor=5),
+    HotSetting("model_probe_minutes", int, "模型探活周期（分钟）",
+               "对仍被负缓存（上游「无此模型」）与已判死的 (渠道, 模型) 发一次"
+               "最小对话的间隔：探活成功立即恢复展示并解除避让，额度/限流类"
+               "失败只记「不确定」不禁用。判死即从模型列表摘掉且无到期时间，"
+               "复探是唯一的恢复入口。"
+               "0 = 关闭（默认）：探活会真发上游请求、消耗额度，是否开启按余量"
+               "决定；负缓存本身 6 小时起步，开启后建议 ≥60 分钟。",
+               minimum=0, task="model_probe"),
     HotSetting("openrouter_catalog_minutes", int, "模型目录刷新周期（分钟）",
                "后台拉取 OpenRouter 公开模型列表的间隔：一次抓取代刊例价（成本"
                "估算）、明细元数据（「模型列表」页）与 Artificial Analysis 能力"
@@ -142,39 +211,60 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("usd_cny_rate", float, "美元兑人民币汇率",
                "成本估算里把 OpenRouter 的美元刊例价折成人民币的汇率"
                "（1 USD = 该值 CNY）；改后只影响之后写入的请求，历史成本不重算。",
-               minimum=0.000001, group="routing"),
+               minimum=0.000001, group="gateway_control"),
     HotSetting("codebuddy_chat_min_interval", float, "CodeBuddy 聊天最小间隔（秒）",
                "同渠道同凭证顺序连发的最小请求间隔（0 关闭）；按凭证分桶、桶内"
                "允许并发，故同渠道同模型的并发请求不会被串行化。",
-               minimum=0.0, group="channels"),
+               minimum=0.0, group="chat_throttle"),
     HotSetting("codebuddy_intl_chat_min_interval", float,
-               "CodeBuddy 国际版聊天最小间隔（秒）",
+               "CodeBuddy 国际聊天最小间隔（秒）",
                "国际站（www.codebuddy.ai）专用节流（默认 5s，0 关闭）。与国内站"
                "各自独立、不共享——共用会让两站请求排进同一条队列互相空等。",
-               minimum=0.0, group="channels"),
+               minimum=0.0, group="chat_throttle"),
     HotSetting("zen_chat_min_interval", float, "Zen 聊天最小间隔（秒）",
                "zen 匿名免费层专用节流（0 关闭，默认）。与 CodeBuddy/TRAE 各自"
                "独立、不共享——共享会让 zen 请求排在 CB/TRAE 之后空等最小间隔。",
-               minimum=0.0, group="channels"),
+               minimum=0.0, group="chat_throttle"),
     HotSetting("kilo_chat_min_interval", float, "Kilo 聊天最小间隔（秒）",
                "Kilo 匿名免费层专用节流（0 关闭，默认）。与 zen / CodeBuddy / TRAE"
-               "各自独立，不共享。", minimum=0.0, group="channels"),
+               "各自独立，不共享。", minimum=0.0, group="chat_throttle"),
+    HotSetting("raccoon_chat_min_interval", float, "小浣熊聊天最小间隔（秒）",
+               "小浣熊真实账号渠道专用节流（0 关闭，默认）。与其余渠道各自独立，"
+               "不共享。", minimum=0.0, group="chat_throttle"),
+    HotSetting("lingxi_chat_min_interval", float, "灵犀聊天最小间隔（秒）",
+               "灵犀真实账号渠道专用节流（0 关闭，默认）。上游按 run 计费，"
+               "run 缓存与单飞已避免重复计费；与其余渠道各自独立，不共享。",
+               minimum=0.0, group="chat_throttle"),
+    HotSetting("raccoon_max_concurrency", int, "小浣熊每账号并发上限",
+               "上游按请求频率限流（实测 5 并发放行、第 6 个 429 "
+               "user_model_rate_limited）。默认 2 留余量；0 关闭上限。",
+               minimum=0, group="codearts_throttle"),
     HotSetting("qoder_chat_min_interval", float, "Qoder 聊天最小间隔（秒）",
                "Qoder 真实账号渠道专用节流（默认 5s，0 关闭）。与其余渠道各自"
-               "独立，不共享。", minimum=0.0, group="channels"),
+               "独立，不共享。", minimum=0.0, group="chat_throttle"),
     HotSetting("codearts_chat_min_interval", float, "CodeArts 聊天最小间隔（秒）",
                "CodeArts 真实账号渠道专用节流（默认 5s，0 关闭）。与其余渠道各自"
-               "独立，不共享。", minimum=0.0, group="channels"),
+               "独立，不共享。", minimum=0.0, group="codearts_throttle"),
+    HotSetting("officeace_chat_min_interval", float,
+               "OfficeAce 聊天最小间隔（秒）",
+               "OfficeAce 真实账号渠道专用节流（默认 0 关闭）。上游没有 CodeArts "
+               "那种硬并发限，被限流时走伪 200 的模型级短冷却；与其余渠道各自"
+               "独立，不共享。", minimum=0.0, group="chat_throttle"),
+    HotSetting("generic_chat_min_interval", float,
+               "通用上游聊天最小间隔（秒）",
+               "标准 OpenAI 兼容端点专用节流（默认 0 关闭）。只用于压低自建网关 / "
+               "官方 API 的 RPM；限流本身由上游 429 表达。可热更。",
+               minimum=0.0, group="chat_throttle"),
     HotSetting("codearts_max_concurrency", int, "CodeArts 每账号并发上限",
                "CodeArts 上游硬限每账号并发会话数 3，超限请求直接 400 "
                "TM.00001041（实测 77% 失败率主因）。默认 3 对齐上游；0 关闭上限"
                "（回到「有在途即放行」，会再次击穿）。", minimum=0,
-               group="channels"),
+               group="codearts_throttle"),
     HotSetting("codearts_request_window_seconds", float, "CodeArts 账号节流窗口（秒）",
                "与「每账号并发上限」组合成滑动窗口：最近这么多秒内最多启动 N 次。"
                "上游口径是「每账号每约 60s 最多 3 个会话」（会话在流结束后仍滞留"
                "数十秒），纯在途上限挡不住突发，故默认 60s；0 关闭窗口口径。",
-               minimum=0.0, group="channels"),
+               minimum=0.0, group="codearts_throttle"),
     HotSetting("pacer_min_seconds", float, "后台任务节流下限（秒）",
                "后台任务相邻上游请求的最小间隔；0 关闭节流。", minimum=0.0,
                group="pacer"),
@@ -182,51 +272,125 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "后台任务相邻上游请求的最大间隔，必须不小于下限。", minimum=0.0,
                group="pacer"),
     HotSetting("activity_report_enabled", bool, "活跃上报",
-               "是否为 CodeBuddy（含国际版）账号补发对话事件以续连连登天数。官方"
+               "是否为 CodeBuddy（含国际）账号补发对话事件以续连连登天数。官方"
                "条款禁止脚本篡改活动数据，开启前请自行评估账号风险。", task="activity"),
     # 与开关配对：开着但时点不对等于没开，只热更开关会让用户以为改坏了。
     HotSetting("activity_report_hour", int, "活跃上报时点（0-23）",
                "本地（北京）时间整点窗口；该小时内每 10 分钟检查一次，每号每天"
                "最多补发一条。", minimum=0, maximum=23, task="activity"),
+    HotSetting("checkin_times", str, "签到时点",
+               "本地时间 HH:MM，逗号分隔（如 `09:37,21:10`）。命中时点才跑一轮"
+               "签到；留空 = 全天每 10 分钟检查一次（旧行为）。上游签到幂等，"
+               "多设几个时点只是多几次重试机会。", task="checkin"),
+    HotSetting("checkin_jitter_minutes", int, "签到抖动（分钟）",
+               "在时点**之前**提前一个 0..N 分钟的随机偏移执行，避免多部署"
+               "同一分钟齐打上游。按「日期 + 时点」去重，抖动不会让同一时点"
+               "跑两次。0 = 不抖。", minimum=0, maximum=1440, task="checkin"),
+    HotSetting("checkin_skip_providers", str, "跳过签到的渠道",
+               "逗号分隔的渠道名（如 `raccoon`）。上游长期停发每日积分时用它"
+               "止损：只跳过这些渠道的签到，聊天与其它渠道不受影响。留空 = 全签。",
+               task="checkin"),
+    HotSetting("raccoon_auto_login", bool, "小浣熊按需登录",
+               "当日没拿到每日积分时，用凭证里的 `phone` / `password` 登录一次换"
+               "新会话（上游只在登录时补发当天 300；`refresh` 换不出新会话）。"
+               "每天每凭证最多一次；密码被拒会把凭证标成「需重新登录」并停手。"
+               "开启等于把账号密码纳入 APP_SECRET 的信任面，按需再开。",
+               task="checkin"),
+    HotSetting("log_persist_lines", int, "日志落库行数",
+               "日志环形表（`log_events`）保留的最近行数：重启后仍可回看，也支持按 "
+               "`request_id` 回溯一次请求。0 = 不落库（只保留内存环）。调小后旧行"
+               "在下一次写入时被裁掉。", minimum=0, group="observability"),
+    HotSetting("log_buffer_lines", int, "日志页保留行数",
+               "「任务与配置」→ 日志页的进程内环形缓冲行数（只收本进程日志，"
+               "不读文件）。0 = 关闭该页（端点返回 404）。日志行发出前经脱敏"
+               "白名单过滤，含 token / secret / authorization / cookie 的行整行丢弃。",
+               minimum=0, group="observability"),
     # 运维告警：全部归到「运维告警」任务卡片下——改阈值时人就在看
     # 这个任务最近报了什么。webhook 留空 = 只留站内记录、不外推。
     HotSetting("alert_enabled", bool, "运维告警开关",
                "是否启用后台告警评估。关闭后不落站内记录也不推送 webhook。",
-               task="alert"),
+               task="alert", section="基础与迟滞"),
     HotSetting("alert_webhook_url", str, "告警 Webhook 地址",
                "命中告警时 POST JSON 的地址，多个用逗号分隔；留空 = 只在管理台"
-               "留站内记录、不外推。", task="alert"),
+               "留站内记录、不外推。", task="alert", section="基础与迟滞"),
+    HotSetting("alert_feishu_webhook_url", str, "飞书机器人 Webhook",
+               "飞书群自定义机器人的入站地址；留空 = 不推飞书。消息按飞书"
+               "文本卡片格式发送（msg_type=text）。",
+               task="alert", section="基础与迟滞"),
+    HotSetting("alert_slack_webhook_url", str, "Slack Incoming Webhook",
+               "Slack 入站 Webhook 地址；留空 = 不推 Slack。消息体为 {text}。",
+               task="alert", section="基础与迟滞"),
     HotSetting("alert_interval_minutes", int, "运维告警周期（分钟）",
-               "后台评估四类风险的一轮间隔；下限 1 分钟。", minimum=1,
-               task="alert", floor=1),
+               "后台评估九类规则的一轮间隔；下限 1 分钟。", minimum=1,
+               task="alert", section="基础与迟滞", floor=1),
     HotSetting("alert_silence_minutes", int, "告警静默窗（分钟）",
                "同一条告警（规则 + 对象）在该窗口内只落库/推送一次，避免持续"
-               "状态每轮刷屏；0 关闭静默（每轮都报）。", minimum=0, task="alert"),
+               "状态每轮刷屏；0 关闭静默（每轮都报）。", minimum=0, task="alert",
+               section="基础与迟滞"),
     HotSetting("alert_for_ticks", int, "告警进入迟滞（连续命中轮数）",
                "同一条告警连续命中这么多轮才真正告警（滤掉单轮毛刺）；"
-               "1 = 不迟滞、首轮即报。", minimum=1, task="alert", floor=1),
+               "1 = 不迟滞、首轮即报。", minimum=1, task="alert", section="基础与迟滞", floor=1),
     HotSetting("alert_clear_ticks", int, "告警恢复迟滞（连续未命中轮数）",
                "告警中的条目连续这么多轮不再命中才确认恢复（写 resolved_at "
                "并外推恢复通知），避免单轮抖动误撤。", minimum=1,
-               task="alert", floor=1),
+               task="alert", section="基础与迟滞", floor=1),
     HotSetting("alert_pool_ready_min", int, "池耗尽阈值（可用数）",
                "凭证池可用数少于该值时告警（服务活着但用不了）；0 关闭该规则。",
-               minimum=0, task="alert"),
+               minimum=0, task="alert", section="规则阈值"),
     HotSetting("alert_task_failures", int, "任务连续失败阈值",
                "某后台任务连续失败达到该次数时告警（成功一轮清零）；0 关闭该规则。",
-               minimum=0, task="alert"),
+               minimum=0, task="alert", section="规则阈值"),
     HotSetting("alert_token_expiry_hours", int, "token 到期预警窗口（小时）",
                "凭证 token 剩余时间少于该小时数时告警；0 关闭该规则。",
-               minimum=0, task="alert"),
+               minimum=0, task="alert", section="规则阈值"),
     HotSetting("alert_error_rate_threshold", float, "上游错误率阈值",
                "统计窗内失败占比达到该值时告警；0 关闭该规则。", minimum=0.0,
-               maximum=1.0, task="alert"),
+               maximum=1.0, task="alert", section="规则阈值"),
     HotSetting("alert_error_rate_min_requests", int, "错误率最小样本数",
                "统计窗内请求数少于该值时不判错误率（样本太小无意义）。",
-               minimum=1, task="alert"),
+               minimum=1, task="alert", section="规则阈值"),
     HotSetting("alert_error_rate_window_minutes", int, "错误率统计窗（分钟）",
                "计算上游错误率的时间窗；0 表示只看当前瞬间（无样本，不触发）。",
-               minimum=0, task="alert"),
+               minimum=0, task="alert", section="规则阈值"),
+    HotSetting("alert_key_burst_tokens", int, "单 Key 用量暴涨阈值（token）",
+               "统计窗内某把 API Key 的 token 总量达到该值即告警（Key 泄露/"
+               "多人共用的信号）；0 关闭该规则。", minimum=0, task="alert",
+               section="单 Key 与时段"),
+    HotSetting("alert_key_burst_window_minutes", int, "单 Key 用量统计窗（分钟）",
+               "按 Key 聚合 token 的时间窗；0 关闭该规则。", minimum=0, task="alert",
+               section="单 Key 与时段"),
+    HotSetting("alert_off_hours_start", int, "非工作时段起点（时）",
+               "与「终点」一起定义工作时间 `[start, end)`（本地时区，可跨零点，"
+               "如 9 → 19）。起点与终点相等 = 关闭该规则。", minimum=0,
+               maximum=23, task="alert", section="单 Key 与时段"),
+    HotSetting("alert_off_hours_end", int, "非工作时段终点（时）",
+               "工作时间区间的右端（不含）。与起点相等 = 关闭该规则。",
+               minimum=0, maximum=23, task="alert", section="单 Key 与时段"),
+    HotSetting("alert_off_hours_min_requests", int, "非工作时段请求数阈值",
+               "非工作时段内请求数达到该值才告警（避免个别重试误报）；0 关闭。",
+               minimum=0, task="alert", section="单 Key 与时段"),
+    HotSetting("alert_budget_cny", float, "月度成本预算（元）",
+               "按本地自然月累计可定价成本，达到分层阈值时告警；0 关闭该规则。"
+               "只统计匹配到价表与汇率的明细，未定价模型不计入。", minimum=0.0,
+               task="alert", section="月度预算"),
+    HotSetting("alert_budget_levels", str, "预算分层（%）",
+               "逗号分隔的百分比档位，默认 50,80,95,100；只报当前达到的最高档，"
+               "100% 为 critical。留空 = 不分层（规则不生效）。", task="alert", section="月度预算"),
+    HotSetting("alert_channel_dead_min_requests", int, "渠道零成功最小样本数",
+               "统计窗内某渠道请求数达到该值且**一次都没成功**才告警；"
+               "0 = 关闭该规则。用于抓「渠道整体挂了」——积分耗尽整批 401 这类"
+               "故障会被错误率阈值稀释。", minimum=0,
+               task="alert", section="渠道与签到"),
+    HotSetting("alert_channel_dead_window_minutes", int, "渠道零成功统计窗（分钟）",
+               "判定「渠道死亡」的回看窗口。渠道故障通常是小时级，比错误率窗长。",
+               minimum=1, task="alert", section="渠道与签到", floor=1),
+    HotSetting("alert_checkin_fail_min_streak", int, "签到连续失败轮数阈值",
+               "同一凭证最近连续这么多轮签到都失败才告警（中间成功一次即清零）；"
+               "0 = 关闭该规则。补「任务跑成功但上游业务返回失败」的盲区。",
+               minimum=0, task="alert", section="渠道与签到"),
+    HotSetting("alert_checkin_fail_window_hours", int, "签到失败回看窗（小时）",
+               "只统计该窗口内的签到记录，避免长期失败凭证在保留期边缘反复进出。",
+               minimum=1, task="alert", section="渠道与签到", floor=1),
     # SQLite 备份：改周期时人就在看这个任务最近备份了什么。
     HotSetting("backup_interval_minutes", int, "备份周期（分钟）",
                "后台把主库一致性快照（VACUUM INTO）写进 DATA_DIR/backups/ 的"
@@ -235,11 +399,86 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
     HotSetting("backup_keep", int, "备份保留份数",
                "只保留最近这么多份备份，更旧的按时间删除；0 表示不清理（只备份）。",
                minimum=0, task="backup"),
+    # 上游状态页聚合：改周期时人就在看这个任务最近抓到了什么。
+    HotSetting("upstream_status_enabled", bool, "上游状态页抓取",
+               "是否抓取各模型 / 网关提供方的官方状态接口并在「上游状态」页展示。"
+               "关闭后页面保留上一次快照并标注已关闭。", task="upstream_status"),
+    HotSetting("upstream_status_minutes", int, "上游状态页周期（分钟）",
+               "并发抓取全部状态源的一轮间隔；官方状态页本身是分钟级更新，抓得"
+               "更密只是白打别人的接口。下限 1 分钟。", minimum=1,
+               task="upstream_status", floor=1),
+    HotSetting("prefix_debug_enabled", bool, "前缀缓存诊断",
+               "每次请求往日志写一行载荷指纹：消息数、system/tools 摘要、与同凭证"
+               "同模型上一条请求的最长公共前缀消息序号、分叉处消息摘要（全部是"
+               "sha256 前 16 位，不含正文）。用来定位命中率异常时前缀在哪条消息"
+               "分叉、压缩是否每轮都在裁剪。默认关。",
+               group="observability"),
+    HotSetting("gateway_paused", bool, "网关暂停（kill switch）",
+               "开启后所有 API Key 鉴权的 `/v1` 端点（chat / messages / responses /"
+               " models / usage / balance）立即返 503（`type=service_paused`），"
+               "管理台与登录照常可用——异常消耗或上游事故时一键止血。暂停原因"
+               "写进日志与审计，不回显给调用方。默认关。",
+               group="gateway_control"),
+    HotSetting("gateway_pause_reason", str, "暂停原因",
+               "配合「网关暂停」使用：写清为什么停（事故编号 / 上游状态页链接），"
+               "只进服务端日志与审计。留空按「未填原因」记录。",
+               group="gateway_control"),
+    HotSetting("dump_request_bodies", bool, "请求体诊断落盘",
+               "把每次 `/v1/chat/completions` 的**原始请求体**（含完整对话内容）"
+               "写到 `DATA_DIR/dumps/`，目录 0700、文件 0600、保留 200 个且不超过 "
+               "24 小时。只用于排查客户端差异，**排查完立刻关**：这是本服务唯一"
+               "把用户对话落盘的开关。改动会进审计。默认关。",
+               group="observability"),
+    HotSetting("privacy_rules", str, "出站隐私脱敏规则",
+               "逗号/空格分隔：`url_credentials` / `email` / `cn_mobile` / "
+               "`private_ip`。只改**出站副本**（messages 正文与 tools 描述），"
+               "不改 request.raw、不做还原；`tool_calls` 参数与 JSON schema 不动。"
+               "留空 = 关闭（默认，逐字节不变）。开启后上游与客户端看到的是占位符。",
+               group="privacy"),
     HotSetting("metrics_enabled", bool, "Prometheus 指标出口",
                "是否暴露 `GET /metrics`（Prometheus text 格式：请求/token/凭证池/"
                "失败计数）。**不鉴权**，与 /healthz 同口径；指标已禁用高基数标签"
                "（不含凭证 ID / 用户名）。关闭后端点返回 404。",
                group="observability"),
+    HotSetting("request_log_enabled", bool, "请求级结构化日志",
+               "每个业务请求（`/api/*`、`/v1/*`、`/authorize`）写一行 logfmt："
+               "`event=request request_id=… method=… route=… status=… duration_ms=…`。"
+               "路由用模板（`/api/credentials/{credential_id}`）而不是实际 ID；"
+               "**不写 query string、请求体、用户名**。5xx 记 WARNING、其余记 INFO。"
+               "关闭后只剩 uvicorn 的裸 access log。",
+               group="observability"),
+    HotSetting("expose_upstream_headers", bool, "上游尝试响应头",
+               "在响应上写 `X-Upstream-Attempts` / `X-Upstream-Degraded`，让调用方"
+               "看到本次请求换过几个号、是否走了 fallback 组。**默认关**：这两个头"
+               "会泄露账号池规模、成本与路由指纹；关闭时中间件还会主动剥离同名响应"
+               "头，防上游/中间盒回传伪造值。只建议自建、可信客户端时打开。",
+               group="observability"),
+    HotSetting("access_freeze_threshold", int, "内容拒绝冻结阈值",
+               "同一 (发起者, 渠道) 累计内容拒绝次数达到该值后，该发起者请求该渠道"
+               "在 preflight 直接 403 `provider_access_frozen`。**默认 0 = 只记录"
+               "不冻结**：一次内容拒绝可能是误判，第一次就冻结会很吵，且冻结需人工"
+               "解冻。达到阈值后只拦该发起者，不影响同渠道的其他凭证/用户。",
+               minimum=0, group="gateway_control"),
+    # reasoning 控制：只给机制、不给策略（不内置默认矩阵——未核实就是编造）
+    HotSetting("force_disable_thinking", bool, "剥离思考内容",
+               "开启后出站响应不再包含模型的思考内容（chat 的 reasoning_content / "
+               "Anthropic 的 thinking 块 / Responses 的 reasoning item 一并过滤）。"
+               "**只过滤响应、不改写请求体**：上游仍照常思考，只是不交给客户端。",
+               group="stream_thinking"),
+    HotSetting("reasoning_effort_map", str, "档位映射（出站）",
+               "把客户端显式给的 `reasoning_effort` 改写成渠道期望的档位。格式 "
+               "`渠道=from:to,from:to;*=from:to`（渠道取 KNOWN_PROVIDERS，`*` 兜底）；"
+               "目标写 `none` 表示删除该键、走渠道默认。留空 = 原样透传。只改写"
+               "客户端显式值，渠道自身补的默认档不受影响。",
+               group="stream_thinking"),
+    HotSetting("anthropic_thinking_efforts", str, "Anthropic thinking→档位",
+               "把 Anthropic 入站的 `thinking.budget_tokens` 翻成上游 "
+               "`reasoning_effort`。格式 `预算:档位,预算:档位,disabled:档位`："
+               "`disabled` 匹配 `thinking.type==\"disabled\"`，其余取「阈值 ≤ "
+               "budget_tokens 中最大的那一档」，低于最小阈值则不映射。留空 = "
+               "完全不映射（`thinking` 照旧忽略）。Anthropic 未给档位对应表，"
+               "阈值由使用者自行决定。",
+               group="stream_thinking"),
 )
 
 HOT_BY_KEY: dict[str, HotSetting] = {item.key: item for item in HOT_SETTINGS}
@@ -296,7 +535,8 @@ def _coerce(spec: HotSetting, raw: Any) -> Any:
         raise InvalidSetting(f"{spec.key} 不能小于 {spec.minimum}")
     if spec.maximum is not None and value > spec.maximum:
         raise InvalidSetting(f"{spec.key} 不能大于 {spec.maximum}")
-    if spec.key == "alert_webhook_url":
+    if spec.key in ("alert_webhook_url", "alert_feishu_webhook_url",
+                    "alert_slack_webhook_url"):
         _validate_webhook_urls(value)
     return value
 
@@ -339,7 +579,20 @@ def _is_blocked_webhook_host(host: str) -> bool:
         return False                    # 域名：写入期解析不了，交给投递前复核
     return (address.is_private or address.is_loopback
             or address.is_link_local or address.is_reserved
-            or address.is_multicast or address.is_unspecified)
+            or address.is_multicast or address.is_unspecified
+            # `is_private` 不覆盖 CGNAT 共享地址段 100.64.0.0/10（RFC 6598）：
+            # `ipaddress` 只对 10/8、172.16/12、192.168/16 等回 True。该段在
+            # 部分云厂商内是可达的内网地址（实测 100.100.100.200 能通），
+            # 不补这条就是 SSRF 绕过的现成口子。
+            or address in _CGNAT_SHARED
+            # 非 global 的地址一律拦：覆盖 198.18.0.0/15（基准测试段）、
+            # 203.0.113.0/24（文档段）等「保留但 is_private=False」的段。
+            or not address.is_global)
+
+
+#: RFC 6598 运营商级 NAT 共享地址段。单独列出是因为 `ipaddress` 的
+#: `is_private` / `is_global` 对它的判定随 Python 版本有过变化，写死更稳。
+_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
 
 
 def blocked_webhook_host(url: str) -> bool:
@@ -535,8 +788,10 @@ class RuntimeSettings:
                 "overridden": self.is_overridden(spec.key),
                 # 所属后台任务（管理台据此把配置归到任务卡片下）；None = 网关/调度项
                 "task": spec.task,
-                # task 为 None 时的分组 key（见 GATEWAY_GROUPS）；前端据此分一级 tab
+                # task 为 None 时的分组 key（见 GATEWAY_GROUPS）；前端据此分组展示
                 "group": spec.group,
+                # 任务卡片内的分节标题；None = 不分组
+                "section": spec.section,
             }
             for spec in HOT_SETTINGS
         ]
@@ -552,8 +807,43 @@ class RuntimeSettings:
         return str(self.get("model_blocklist"))
 
     @property
+    def trae_account_identities(self) -> str:
+        return str(self.get("trae_account_identities"))
+
+    @property
+    def trae_identities(self):
+        """TRAE 身份集合：与 `Settings.trae_identities` 同口径，但基于生效值重算。
+
+        不能委托 `Settings` 的 `cached_property`（那会把 env 值永久缓存，管理台
+        改完身份，模型列表仍按旧身份过滤）。
+        """
+        from .config import parse_identity_set
+
+        return parse_identity_set(self.trae_account_identities)
+
+    @property
     def model_fallback_groups(self) -> str:
         return str(self.get("model_fallback_groups"))
+
+    @property
+    def model_aliases(self) -> str:
+        return str(self.get("model_aliases"))
+
+    @property
+    def stream_first_event_timeout_seconds(self) -> float:
+        return float(self.get("stream_first_event_timeout_seconds"))
+
+    @property
+    def stream_idle_timeout_seconds(self) -> float:
+        return float(self.get("stream_idle_timeout_seconds"))
+
+    @property
+    def short_cooldown_wait_seconds(self) -> float:
+        return float(self.get("short_cooldown_wait_seconds"))
+
+    @property
+    def nonstream_keepalive_seconds(self) -> float:
+        return float(self.get("nonstream_keepalive_seconds"))
 
     @property
     def blocklist_patterns(self) -> tuple[str, ...]:
@@ -577,6 +867,22 @@ class RuntimeSettings:
         return bool(self.get("context_compress_enabled"))
 
     @property
+    def prefix_debug_enabled(self) -> bool:
+        return bool(self.get("prefix_debug_enabled"))
+
+    @property
+    def dump_request_bodies(self) -> bool:
+        return bool(self.get("dump_request_bodies"))
+
+    @property
+    def gateway_paused(self) -> bool:
+        return bool(self.get("gateway_paused"))
+
+    @property
+    def gateway_pause_reason(self) -> str:
+        return str(self.get("gateway_pause_reason") or "")
+
+    @property
     def context_compress_reserve_tokens(self) -> int:
         return int(self.get("context_compress_reserve_tokens"))
 
@@ -587,6 +893,18 @@ class RuntimeSettings:
     @property
     def context_compress_safety_ratio(self) -> float:
         return float(self.get("context_compress_safety_ratio"))
+
+    @property
+    def context_compress_sticky_enabled(self) -> bool:
+        return bool(self.get("context_compress_sticky_enabled"))
+
+    @property
+    def tool_output_compress_enabled(self) -> bool:
+        return bool(self.get("tool_output_compress_enabled"))
+
+    @property
+    def tool_output_compress_max_chars(self) -> int:
+        return int(self.get("tool_output_compress_max_chars"))
 
     @property
     def conversation_sticky_seconds(self) -> int:
@@ -617,6 +935,10 @@ class RuntimeSettings:
         return int(self.get("model_catalog_minutes"))
 
     @property
+    def model_probe_minutes(self) -> int:
+        return int(self.get("model_probe_minutes"))
+
+    @property
     def openrouter_catalog_minutes(self) -> int:
         return int(self.get("openrouter_catalog_minutes"))
 
@@ -641,8 +963,28 @@ class RuntimeSettings:
         return float(self.get("kilo_chat_min_interval"))
 
     @property
+    def raccoon_chat_min_interval(self) -> float:
+        return float(self.get("raccoon_chat_min_interval"))
+
+    @property
+    def lingxi_chat_min_interval(self) -> float:
+        return float(self.get("lingxi_chat_min_interval"))
+
+    @property
+    def raccoon_max_concurrency(self) -> int:
+        return int(self.get("raccoon_max_concurrency"))
+
+    @property
     def qoder_chat_min_interval(self) -> float:
         return float(self.get("qoder_chat_min_interval"))
+
+    @property
+    def officeace_chat_min_interval(self) -> float:
+        return float(self.get("officeace_chat_min_interval"))
+
+    @property
+    def generic_chat_min_interval(self) -> float:
+        return float(self.get("generic_chat_min_interval"))
 
     @property
     def codearts_chat_min_interval(self) -> float:
@@ -669,8 +1011,36 @@ class RuntimeSettings:
         return bool(self.get("activity_report_enabled"))
 
     @property
+    def checkin_enabled(self) -> bool:
+        return bool(self.get("checkin_enabled"))
+
+    @property
     def activity_report_hour(self) -> int:
         return int(self.get("activity_report_hour"))
+
+    @property
+    def checkin_times(self) -> str:
+        return str(self.get("checkin_times"))
+
+    @property
+    def checkin_jitter_minutes(self) -> int:
+        return int(self.get("checkin_jitter_minutes"))
+
+    @property
+    def checkin_skip_providers(self) -> str:
+        return str(self.get("checkin_skip_providers"))
+
+    @property
+    def raccoon_auto_login(self) -> bool:
+        return bool(self.get("raccoon_auto_login"))
+
+    @property
+    def log_buffer_lines(self) -> int:
+        return int(self.get("log_buffer_lines"))
+
+    @property
+    def log_persist_lines(self) -> int:
+        return int(self.get("log_persist_lines"))
 
     # ---------------------------------------------------------- 运维告警
 
@@ -681,6 +1051,14 @@ class RuntimeSettings:
     @property
     def alert_webhook_url(self) -> str:
         return str(self.get("alert_webhook_url"))
+
+    @property
+    def alert_feishu_webhook_url(self) -> str:
+        return str(self.get("alert_feishu_webhook_url"))
+
+    @property
+    def alert_slack_webhook_url(self) -> str:
+        return str(self.get("alert_slack_webhook_url"))
 
     @property
     def alert_interval_minutes(self) -> int:
@@ -722,6 +1100,50 @@ class RuntimeSettings:
     def alert_error_rate_window_minutes(self) -> int:
         return int(self.get("alert_error_rate_window_minutes"))
 
+    @property
+    def alert_key_burst_tokens(self) -> int:
+        return int(self.get("alert_key_burst_tokens"))
+
+    @property
+    def alert_key_burst_window_minutes(self) -> int:
+        return int(self.get("alert_key_burst_window_minutes"))
+
+    @property
+    def alert_off_hours_start(self) -> int:
+        return int(self.get("alert_off_hours_start"))
+
+    @property
+    def alert_off_hours_end(self) -> int:
+        return int(self.get("alert_off_hours_end"))
+
+    @property
+    def alert_off_hours_min_requests(self) -> int:
+        return int(self.get("alert_off_hours_min_requests"))
+
+    @property
+    def alert_budget_cny(self) -> float:
+        return float(self.get("alert_budget_cny"))
+
+    @property
+    def alert_budget_levels(self) -> str:
+        return str(self.get("alert_budget_levels"))
+
+    @property
+    def alert_channel_dead_min_requests(self) -> int:
+        return int(self.get("alert_channel_dead_min_requests"))
+
+    @property
+    def alert_channel_dead_window_minutes(self) -> int:
+        return int(self.get("alert_channel_dead_window_minutes"))
+
+    @property
+    def alert_checkin_fail_min_streak(self) -> int:
+        return int(self.get("alert_checkin_fail_min_streak"))
+
+    @property
+    def alert_checkin_fail_window_hours(self) -> int:
+        return int(self.get("alert_checkin_fail_window_hours"))
+
     # ---------------------------------------------------------- SQLite 备份
 
     @property
@@ -732,9 +1154,49 @@ class RuntimeSettings:
     def backup_keep(self) -> int:
         return int(self.get("backup_keep"))
 
+    # ------------------------------------------------------ 上游状态页聚合
+
+    @property
+    def upstream_status_enabled(self) -> bool:
+        return bool(self.get("upstream_status_enabled"))
+
+    @property
+    def upstream_status_minutes(self) -> int:
+        return int(self.get("upstream_status_minutes"))
+
     @property
     def metrics_enabled(self) -> bool:
         return bool(self.get("metrics_enabled"))
+
+    @property
+    def privacy_rules(self) -> str:
+        return str(self.get("privacy_rules"))
+
+    @property
+    def request_log_enabled(self) -> bool:
+        return bool(self.get("request_log_enabled"))
+
+    @property
+    def expose_upstream_headers(self) -> bool:
+        return bool(self.get("expose_upstream_headers"))
+
+    @property
+    def access_freeze_threshold(self) -> int:
+        return int(self.get("access_freeze_threshold"))
+
+    # ------------------------------------------------------ reasoning 控制
+
+    @property
+    def force_disable_thinking(self) -> bool:
+        return bool(self.get("force_disable_thinking"))
+
+    @property
+    def reasoning_effort_map(self) -> str:
+        return str(self.get("reasoning_effort_map"))
+
+    @property
+    def anthropic_thinking_efforts(self) -> str:
+        return str(self.get("anthropic_thinking_efforts"))
 
     # ---------------------------------------------------------- 透明委托
 

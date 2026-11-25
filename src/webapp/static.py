@@ -13,8 +13,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ..compat.openai.errors import error_payload
 
-# 每个路径前缀对应的 API 错误形状：/v1 走 OpenAI 兼容体，其余走管理台形状
-_API_PREFIXES = ("api/", "v1/")
+# 每个路径前缀对应的 API 错误形状：/v1 走 OpenAI 兼容体，其余走管理台形状。
+# `v1beta/` 是 Gemini 原生出口（`/v1beta/models/{m}:generateContent`）——漏掉它
+# 会让拼错的 Gemini 端点落到 SPA 拿 200 + HTML，SDK 把 HTML 当成功响应解析。
+_API_PREFIXES = ("api/", "v1/", "v1beta/")
 
 # index.html 必须每次回源校验：它引用**内容 hash 化**的 assets，重新构建后
 # 文件名会变，但浏览器若缓存了旧 index.html，就会加载上一版的 bundle——表现是
@@ -80,11 +82,15 @@ def register_spa_routes(app: FastAPI) -> None:
     @app.get("/{path:path}", include_in_schema=False)
     async def spa(path: str):
         """生产模式服务前端产物；开发模式由 Vite 代理，不经过此路由。"""
-        if path.startswith(_API_PREFIXES) or path in ("api", "v1"):
+        if path.startswith(_API_PREFIXES) or path in ("api", "v1", "v1beta"):
             return api_not_found(path)
         dist = frontend_dist()
         if dist is None:
             return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)
+        # NUL 字节在 `Path.resolve` / `lstat` 里抛 ValueError（未鉴权请求即可
+        # 触发 500，且该 500 由 ServerErrorMiddleware 直出、绕过安全头中间件）。
+        if "\x00" in path:
+            return api_not_found(path)
         candidate = (dist / path).resolve()
         if path and candidate.is_file() and dist.resolve() in candidate.parents:
             # 只有 `assets/` 下是 Vite 内容 hash 化的产物，可 immutable；入口
@@ -94,6 +100,25 @@ def register_spa_routes(app: FastAPI) -> None:
             headers = (_ASSET_CACHE_HEADERS if relative.parts[:1] == ("assets",)
                        else _INDEX_CACHE_HEADERS)
             return FileResponse(candidate, headers=headers)
+        index = dist / "index.html"
+        if not index.is_file():
+            return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)
+        return FileResponse(index, headers=_INDEX_CACHE_HEADERS)
+
+    # 写方法同样兜到 JSON 404：只注册 GET 时，未匹配的 POST /api/** 会落到
+    # Starlette 的 405 `{"detail":"Method Not Allowed"}`（FastAPI 的默认
+    # 路由匹配行为），与 PROPOSAL §6「未匹配的 /api、/v1 返回 JSON 404」不符：
+    # 客户端拼错端点 + 错方法时拿到的是 HTML/裸 detail 形状，不是本服务的
+    # 统一错误体（`error.code`），调用方按错误体解析会踩空。
+    @app.api_route("/{path:path}", methods=["POST", "PUT", "PATCH", "DELETE"],
+                   include_in_schema=False)
+    async def spa_write(path: str):
+        """写方法：/api、/v1 前缀回 JSON 404，其余按 SPA 处理。"""
+        if path.startswith(_API_PREFIXES) or path in ("api", "v1"):
+            return api_not_found(path)
+        dist = frontend_dist()
+        if dist is None:
+            return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)
         index = dist / "index.html"
         if not index.is_file():
             return HTMLResponse(_FRONTEND_MISSING_HTML, status_code=503)

@@ -66,24 +66,25 @@ def parse_frame(frame: SSEFrame) -> Event | None:
         raise UpstreamProtocolViolation(f"SSE data for {name!r} is not an object")
 
     if name == "output":
-        return _parse_output(payload)
+        return _attach_model(_parse_output(payload), payload)
     if name == "token_usage":
-        return Event(kind=EventKind.USAGE, usage=_parse_usage(payload))
+        return _attach_model(Event(kind=EventKind.USAGE, usage=_parse_usage(payload)),
+                             payload)
     if name == "done":
         reason = payload.get("finish_reason")
         finish = reason if isinstance(reason, str) else None
-        return Event(kind=EventKind.FINISH, finish_reason=finish)
+        return _attach_model(Event(kind=EventKind.FINISH, finish_reason=finish), payload)
     if name == "error":
         code = payload.get("code")
         message = payload.get("message")
         normalized_code = code if isinstance(code, int) and not isinstance(code, bool) else None
-        return Event(
+        return _attach_model(Event(
             kind=EventKind.ERROR,
             error_code=normalized_code,
             error_message=message if isinstance(message, str) else None,
             # 分类在解析时定死（单一来源）；executor 直接消费
             error_kind=classify_error_code(normalized_code),
-        )
+        ), payload)
     # name ∈ KNOWN_EVENT_NAMES，上面分支已穷尽；防御未来新增名字漏写分支
     raise UpstreamProtocolViolation(  # pragma: no cover
         f"unhandled known event {name!r}")
@@ -214,24 +215,38 @@ def classify_error_code(code: int | None) -> ErrKind:
     TRAE 侧未观测到 6004/11102，但两侧共用同一套 ErrKind 语义；
     这里只把「明确等价」的码映射过去，不臆造未观测的码。
 
-    4001 = 参数/模型不可用（实测原文 "the param is invalid"）：换凭证没用，
-    跳过该上游 —— 与 classify_status 的 400 分支同一结论。
+    1005  = 权益不足（PLAN）
+    14018 = 余额不足（CREDIT）
+    4008  = 请求额度/配额耗尽（实测原文 "Your requests have exceeded the quota."）：
+            与 14018 同为「等恢复」语义，冷却到次日签到，避免继续选号失败
+    6004  = 模型不可用（MODEL）
+    4001  = 参数/模型不可用（实测原文 "the param is invalid"）：换凭证没用，
+            跳过该上游 —— 与 classify_status 的 400 分支同一结论。
+    3004  = 请求频率超限（实测原文 "your requests have exceeded the rate
+            limit"）：滚动窗口滑过即恢复，短冷却挡住连续打即可——不走 OTHER
+            三振（限流是上游节奏问题，累计会把健康凭证中冷却 10m）。
     """
     if code == 1005:
         return ErrKind.PLAN
-    if code == 14018:
+    if code in (14018, 4008):
         return ErrKind.CREDIT
     if code == 6004:
         return ErrKind.MODEL
     if code == 4001:
         return ErrKind.INVALID
+    if code == 3004:
+        return ErrKind.SOFT
     return ErrKind.OTHER
 
 
 def classify_status(status: int, body: bytes = b"") -> ErrKind:
-    """HTTP 状态码分类（与 CodeBuddy 侧同序，见其 classify_status 的说明）。"""
+    """HTTP 状态码分类（与 CodeBuddy 侧同序，见其 classify_status 的说明）。
+
+    body 里的业务码经 business_codes() 提取，与流内 classify_error_code 对齐：
+    14018/4008 都是配额耗尽 → CREDIT（等签到恢复）。
+    """
     codes = business_codes(body.decode("utf-8", errors="replace"))
-    if status == 402 or 14018 in codes:
+    if status == 402 or 14018 in codes or 4008 in codes:
         return ErrKind.CREDIT
     if 1005 in codes:
         return ErrKind.PLAN
@@ -248,3 +263,34 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
         # 换凭证没用 → 跳过该上游；其余 400 同样按请求无效处理
         return ErrKind.INVALID
     return ErrKind.OTHER
+
+
+def _attach_model(event: Event | None, payload: dict[str, Any]) -> Event | None:
+    """把上游自报的模型名挂到事件上（观测用；缺省保持 None）。"""
+    model = payload.get("model")
+    if event is not None and isinstance(model, str) and model:
+        event.model = model
+    return event
+
+
+# 实测 TRAE 只有元数据帧回显真实模型：`metadata.model`（偶发空串）、
+# `extra_info.model`（真实模型名）、`timing_cost.provider_model_name`。
+# output / done / token_usage 帧都不带 → 由 client 把这里取到的名字贴到后续事件。
+_MODEL_HINT_EVENTS = frozenset({"metadata", "timing_cost", "extra_info"})
+
+
+def frame_model(frame: SSEFrame) -> str | None:
+    """元数据帧里回显的真实模型名；缺帧 / 空串 / 坏 JSON 一律 None。"""
+    if frame.event.strip() not in _MODEL_HINT_EVENTS or not frame.data:
+        return None
+    try:
+        payload = json.loads(frame.data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("model", "provider_model_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

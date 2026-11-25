@@ -35,7 +35,7 @@ CRED_KEY = "codearts:3c4e58eff203b042"          # stable_key("codearts", access_
 class _Credentials:
     data: dict = field(default_factory=lambda: dict(CRED_DATA))
 
-    def candidates(self, providers=None, *, selectable_only=False):
+    def candidates(self, providers=None, *, selectable_only=False, model=None):
         return [Candidate(credential_id="c1", provider="codearts")]
 
     def provider_of(self, credential_id):
@@ -66,7 +66,7 @@ class _Scheduler:
     def should_rotate(self, tried):
         return self._rotate
 
-    def note_error(self, candidate, kind, now, *, model=None):
+    def note_error(self, candidate, kind, now, *, model=None, retry_at=None):
         return type("Outcome", (), {"cooling_until": None, "err_count": 1,
                                     "disabled": False})()
 

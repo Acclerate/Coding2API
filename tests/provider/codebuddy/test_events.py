@@ -6,9 +6,11 @@ import json
 
 import pytest
 
-from src.provider.base import EventKind
+from src.provider.base import ErrKind, EventKind
 from src.provider.codebuddy import events as cb_events
+from src.provider.codebuddy.client import CodeBuddyProvider
 from src.provider.codebuddy.events import UpstreamProtocolViolation
+from src.provider.codebuddy.intl import CodeBuddyIntlProvider
 from tests.helpers.paths import provider_fixture
 from tests.helpers.sse import parse_frames
 
@@ -266,3 +268,107 @@ def test_clean_history_tool_calls_removes_dirty_and_orphans(tmp_path):
     assert body4["messages"][0]["role"] == "assistant"
     assert body4["messages"][0]["content"] == "文本"
     assert "tool_calls" not in body4["messages"][0]
+
+def test_classify_429_model_saturated_code_is_model_level():
+    """429 + 14003「模型饱和」→ 模型级，不能落账号级 SOFT。
+
+    国际版实测原文：displayMsg「Model busy. Please switch models or retry
+    later」、displayTips「This model is currently saturated」。上游要求换模型，
+    说明同凭证其他模型可用；落 SOFT 会让整张凭证 60s 全部模型一起不可用。
+    """
+    body = (b'{"code":14003,"msg":"too many requests",'
+            b'"displayMsg":{"en":"Model busy. Please switch models or retry later"},'
+            b'"displayTips":{"en":"This model is currently saturated"}}')
+    assert cb_events.classify_status(429, body) is ErrKind.MODEL
+
+def test_classify_429_model_rate_limit_code_still_model_level():
+    """回归保护：6004「该模型用量超限」仍是模型级。"""
+    assert cb_events.classify_status(429, b'{"code":6004}') is ErrKind.MODEL
+
+def test_classify_429_unknown_code_stays_soft():
+    """回归保护：429 里认不出的业务码仍按账号级软限流。"""
+    assert cb_events.classify_status(429, b'{"code":9999}') is ErrKind.SOFT
+    assert cb_events.classify_status(429, b"") is ErrKind.SOFT
+
+def test_classify_provider_busy_is_queue_not_account_penalty():
+    """`11134` 供应商过载 → 排队语义（不罚号、原号等一轮再开）。
+
+    上游实测 15 分钟内跨 6 个账号同时命中：换号无意义，冷却健康号更错。
+    复用 QUEUE 是因为它的语义恰好是「不冷却、不换号、等 retry_after 后
+    原号重开」（见 `scheduler.note_error` 的 QUEUE 分支）。
+    """
+    assert cb_events.classify_status(429, b'{"code":11134}') is ErrKind.QUEUE
+    # 500/503 形态同样按排队（业务码优先于状态码）
+    assert cb_events.classify_status(500, b'{"code":11134}') is ErrKind.QUEUE
+    assert cb_events.classify_status(503, b'{"code":11134}') is ErrKind.QUEUE
+    # intl 子类走同一分类
+    assert CodeBuddyIntlProvider().classify(429, b'{"code":11134}') is ErrKind.QUEUE
+    # 优先级：余额/权益码仍排在供应过载之前
+    assert cb_events.classify_status(
+        402, b'{"code":11134,"error":"no credit"}') is ErrKind.CREDIT
+    assert cb_events.classify_status(
+        400, b'{"code":1005}') is ErrKind.PLAN
+
+def test_provider_classify_routes_14003_to_model():
+    """国际版复用同一分类：provider 入口（含 intl 子类）同样是模型级。"""
+    body = b'{"code":14003,"msg":"too many requests"}'
+    assert CodeBuddyProvider().classify(429, body) is ErrKind.MODEL
+    assert CodeBuddyIntlProvider().classify(429, body) is ErrKind.MODEL
+    assert CodeBuddyIntlProvider().classify(429, b'{"code":9999}') is ErrKind.SOFT
+
+
+def test_disabled_reason_flags_account_restriction():
+    """403/11140「账号异常行为被限制」→ 可操作原因，不能写成 session dead。
+
+    实测 2026-10-27 08:21 codebuddy_intl 六个号同时回
+    `{"code":11140,...,"displayMsg":{"en":"Your account has been restricted
+    due to unusual activity","zh":"账号存在异常行为，已被限制使用"}}`：重登无效，
+    只能申诉或换号，管理台必须显示真实动作。
+    """
+    body = (b'{"code":11140,"msg":"request illegal",'
+            b'"displayMsg":{"en":"Your account has been restricted due to unusual activity",'
+            b'"zh":"\xe8\xb4\xa6\xe5\x8f\xb7\xe5\xad\x98\xe5\x9c\xa8\xe5\xbc\x82\xe5\xb8\xb8'
+            b'\xe8\xa1\x8c\xe4\xb8\xba\xef\xbc\x8c\xe5\xb7\xb2\xe8\xa2\xab\xe9\x99\x90'
+            b'\xe5\x88\xb6\xe4\xbd\xbf\xe7\x94\xa8"}}')
+    reason = cb_events.disabled_reason(body)
+    assert "账号被上游限制" in reason and "申诉" in reason
+    # 国际版子类走同一实现
+    assert CodeBuddyIntlProvider().disabled_reason(body) == reason
+
+
+def test_disabled_reason_empty_for_plain_403_and_garbage():
+    """认不出原因就返回空串（落库回落 session dead），并且不因坏字节崩。"""
+    assert cb_events.disabled_reason(b'{"code":11128}') == ""
+    assert cb_events.disabled_reason(b"") == ""
+    assert cb_events.disabled_reason(b"\xff\xfe") == ""
+
+
+def test_classify_11140_is_account_restricted_not_dead():
+    """403 + 11140 → RESTRICTED（账号级风控），不能判 DEAD 永久硬禁用。
+
+    DEAD 的处置是 disabled=1 + 人工 revive，而 11140 由上游自行解除；判错会
+    把「等它自己好」变成「必须有人去点恢复」。普通 403 仍是 DEAD。
+    """
+    body = (b'{"code":11140,"msg":"request illegal",'
+            b'"displayMsg":{"en":"Your account has been restricted due to unusual activity"}}')
+    assert cb_events.classify_status(403, body) is ErrKind.RESTRICTED
+    assert cb_events.classify_status(400, body) is ErrKind.RESTRICTED
+    # 三语文案任一条命中即算（上游不同入口的措辞不一致）
+    assert cb_events.classify_status(
+        403, '{"displayMsg":{"zh":"账号存在异常行为，已被限制使用"}}'.encode()
+    ) is ErrKind.RESTRICTED
+    assert cb_events.classify_status(403, b'{"code":403}') is ErrKind.DEAD
+
+
+def test_bare_11140_substring_is_not_account_restricted():
+    """正文里恰好出现 `11140`（非业务码字段）不能判 RESTRICTED。
+
+    整段子串匹配时，request id / 时间戳 / 用户回显内容里带这五个数字就会把这
+    个凭证按账号级风控处理：2h 冷却、窗口内第二次即整渠道 24h 暂停，且换号
+    无效。只有 `"code":11140` 形态或点名话术才算。
+    """
+    body = b'{"code":400,"msg":"bad params, request id 11140"}'
+    assert cb_events.classify_status(400, body) is not ErrKind.RESTRICTED
+    assert cb_events.disabled_reason(body) == ""
+    # 数字 token 必须整个相等（`"code":111401` 不是 11140）
+    assert cb_events.classify_status(403, b'{"code":111401}') is ErrKind.DEAD

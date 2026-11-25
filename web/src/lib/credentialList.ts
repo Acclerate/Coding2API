@@ -5,7 +5,7 @@
  * 没有分组看不出渠道结构，每行还复读同样的渠道名与周期语义。这里把三件事抽成
  * 可单测的纯函数，`CredentialsPage` 只负责渲染：
  *
- * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态；
+ * - 筛选：搜索词（昵称 / 渠道展示名 / 凭证 id）× 渠道 × 状态 × 标签；
  * - 分组：按渠道聚合，组顺序与全站渠道顺序一致（`providerRank`）；
  * - 计数：给筛选控件提供「各项各有多少条」，让零计数的筛选项不占位。
  *
@@ -28,17 +28,32 @@ export interface CredentialFilters {
   provider: string;
   /** 状态筛选：`ANY` 或 `CredentialState` */
   state: string;
+  /** 标签筛选：`ANY` 或某个标签（**精确匹配**，大小写不敏感） */
+  tag: string;
 }
 
 /** 默认筛选：全部可见（页面首屏即池子全貌）。 */
-export const DEFAULT_FILTERS: CredentialFilters = { query: "", provider: ANY, state: ANY };
+export const DEFAULT_FILTERS: CredentialFilters = {
+  query: "", provider: ANY, state: ANY, tag: ANY,
+};
+
+/**
+ * 标签比对用的大小写不敏感键。
+ *
+ * 后端按大小写不敏感去重但保留首次写法，故同一标签在库里只会有一种写法；
+ * 这里再归一一次是为了前端筛选下拉与行内徽章在任何写法下都能对上。
+ */
+function tagKey(tag: string): string {
+  return tag.trim().toLowerCase();
+}
 
 /**
  * 单条凭证是否通过筛选。
  *
  * 搜索同时匹配昵称、渠道展示名与凭证 id：用户可能记得「主账号」「TRAE」或
  * 后端给的 id，任一种都该能找到。渠道名参与匹配是有意的——按渠道筛选之外，
- * 直接打字「codebuddy」也应当收敛。
+ * 直接打字「codebuddy」也应当收敛。**标签不参与搜索**：它是结构化维度，
+ * 已经单列一个下拉；混进搜索词会让「查一个恰好叫『生产』的昵称」变得不可能。
  */
 export function matchesFilters(
   credential: Credential,
@@ -47,27 +62,54 @@ export function matchesFilters(
 ): boolean {
   if (filters.provider !== ANY && credential.provider !== filters.provider) return false;
   if (filters.state !== ANY && credentialState(credential, now) !== filters.state) return false;
+  if (filters.tag !== ANY && !(credential.tags ?? []).some(
+    (tag) => tagKey(tag) === tagKey(filters.tag))) {
+    return false;
+  }
   const needle = filters.query.trim().toLowerCase();
   if (!needle) return true;
   const fields = [credential.nickname, credential.id, providerLabel(credential.provider)];
   return fields.some((field) => (field ?? "").toLowerCase().includes(needle));
 }
 
-export function filterCredentials(
-  credentials: Credential[],
-  filters: CredentialFilters,
-  now: number = Date.now() / 1000,
-): Credential[] {
-  return credentials.filter((credential) => matchesFilters(credential, filters, now));
+/**
+ * 一个渠道组展示的是哪本账。
+ *
+ * `pool`＝套餐 / 每日池口径的余额，`credits`＝积分口径（CodeArts 与
+ * 小浣熊：两家都按积分扣费，与套餐/每日池不是同一本账）。组头额度合计、行内额度数字、变动流水都按它取。
+ */
+export type Ledger = "pool" | "credits";
+
+/**
+ * 渠道 → 账本。与后端 `db.repo.quota_ledger` 同口径：CodeArts 的额度来自积分
+ * 接口（内置模型按积分计费），记 `credits`；其余渠道记 `pool`。两本账在上游是
+ * 两套接口、数值量级也不同，混读会被当成同一本账的连续读数。
+ */
+export function providerLedger(provider: string): Ledger {
+  return provider === "codearts" || provider === "raccoon"
+    || provider === "lingxi" ? "credits" : "pool";
+}
+
+/** 组间顺序：按全站渠道顺序，最后按 key 定序（同渠道只有一组，用于兜底稳定排序）。 */
+function compareGroups(left: ProviderGroup, right: ProviderGroup): number {
+  return providerRank(left.provider) - providerRank(right.provider)
+    || left.key.localeCompare(right.key);
 }
 
 export interface ProviderGroup {
+  /** 分组唯一键＝真实渠道 id */
+  key: string;
+  /** 真实渠道 id（行内渠道语义按它判断） */
   provider: string;
+  /** 组头展示名 */
+  label: string;
+  /** 本组讲哪一本账：pool＝套餐/每日池余额 / credits＝CodeArts 积分（额度合计与流水都按它取） */
+  ledger: Ledger;
   /** 组内凭证，保持传入顺序（即后端排序），分组不改变排序语义 */
   items: Credential[];
   /** 组内各状态计数（只含出现过的态），供组头展示状态分布 */
   states: Partial<Record<CredentialState, number>>;
-  /** 组内额度剩余合计；全部为 null（免费层）时为 null，展示成 — */
+  /** 组内额度剩余合计；全部为 null（免费层 / 无该账）时为 null，展示成 — */
   remaining: number | null;
   /** 组内额度总量合计；与 remaining 同口径 */
   total: number | null;
@@ -75,6 +117,20 @@ export interface ProviderGroup {
   expiring: number | null;
   /** 组内 7 天（次窗口）内将过期的积分合计；全为 null 时为 null */
   expiringSecondary: number | null;
+  /**
+   * 今日签到分布。只数「该签的号」（启用且未硬禁用）：暂停与硬禁用本就被
+   * 签到任务跳过，算进「未签」会让分母永远差几个，读起来像任务漏签。
+   */
+  checkin: {
+    /** 今日已签（含上游回「今日已签」） */
+    done: number;
+    /** 今日最近一轮失败 */
+    failed: number;
+    /** 今日还没有任何记录：任务未轮到 / 尚未运行 */
+    pending: number;
+    /** 组内今日最近一条记录的时刻；无记录为 null */
+    lastAt: number | null;
+  };
 }
 
 /**
@@ -84,10 +140,10 @@ export interface ProviderGroup {
  * 30s 轮询会让列表顺序随排序键变化，若按出现顺序排组，组头会在页面上乱跳。
  * 未知渠道排在已知渠道之后，与模型列表口径一致。
  *
- * 聚合口径与行内展示同源：状态走 `credentialState`，额度与到期积分直接对行内
- * 字段求和。**null 语义必须保住**：免费层（zen / kilo）的 `quota_remaining`
- * 与到期积分恒为 null，若当 0 求和会把「无额度接口」显示成「额度 0」。
- * 故只对非 null 求和，一个都没有时返回 null（调用方显示 —）。
+ * 聚合口径与行内展示同源：状态走 `credentialState`，额度对通用额度字段求和。
+ * **null 语义必须保住**：免费层（zen / kilo）的 `quota_remaining` 恒为 null，
+ * 若当 0 求和会把「无额度接口」显示成「额度 0」。故只对非 null 求和，一个都没有
+ * 时返回 null（调用方显示 —）。
  */
 export function groupByProvider(
   credentials: Credential[],
@@ -107,23 +163,44 @@ export function groupByProvider(
         states[state] = (states[state] ?? 0) + 1;
       }
       return {
+        key: provider,
         provider,
+        label: providerLabel(provider),
+        ledger: providerLedger(provider),
         items,
         states,
         remaining: sumDefined(items, (item) => item.quota_remaining),
         total: sumDefined(items, (item) => item.quota_total),
         expiring: sumDefined(items, (item) => item.quota_expiring_credits),
         expiringSecondary: sumDefined(
-          items,
-          (item) => item.quota_expiring_credits_secondary,
-        ),
+          items, (item) => item.quota_expiring_credits_secondary),
+        checkin: checkinSummary(items),
       };
     })
-    .sort(
-      (left, right) =>
-        providerRank(left.provider) - providerRank(right.provider) ||
-        left.provider.localeCompare(right.provider),
-    );
+    .sort(compareGroups);
+}
+
+/**
+ * 今日签到分布：按凭证的 `checkin_today`（今日最近一条审计日志）归三类。
+ *
+ * `ok=1` 是成功（含上游回「今日已签」——那是 already 字段，ok 仍为真）；
+ * 有记录但 ok=0 是失败；没有记录是「还没结论」，不能说成失败。最近时刻
+ * 取组内最大 ts，让组头能显示「几点签的」。
+ */
+function checkinSummary(items: Credential[]): ProviderGroup["checkin"] {
+  const summary = { done: 0, failed: 0, pending: 0, lastAt: null as number | null };
+  for (const item of items) {
+    if (item.enabled === 0 || item.disabled === 1) continue;
+    const today = item.checkin_today ?? null;
+    if (today === null) {
+      summary.pending += 1;
+      continue;
+    }
+    if (today.ok) summary.done += 1;
+    else summary.failed += 1;
+    if (summary.lastAt === null || today.ts > summary.lastAt) summary.lastAt = today.ts;
+  }
+  return summary;
 }
 
 /**
@@ -147,16 +224,13 @@ export const DEFAULT_GROUP_SORT: GroupSort = "quota";
  */
 export function sortGroups(groups: ProviderGroup[], sort: GroupSort): ProviderGroup[] {
   if (sort === "provider") return groups;
-  const byProviderOrder = (left: ProviderGroup, right: ProviderGroup) =>
-    providerRank(left.provider) - providerRank(right.provider) ||
-    left.provider.localeCompare(right.provider);
   return [...groups].sort((left, right) => {
     if (left.remaining !== right.remaining) {
       if (left.remaining === null) return 1;
       if (right.remaining === null) return -1;
       return right.remaining - left.remaining;
     }
-    return byProviderOrder(left, right);
+    return compareGroups(left, right);
   });
 }
 
@@ -206,6 +280,34 @@ export const STATE_ORDER: CredentialState[] = [
   "off",
   "exhausted",
 ];
+
+/**
+ * 标签筛选项：列表里出现过的标签（带计数），按**首次出现顺序**排。
+ *
+ * 不像渠道那样有全站固定顺序（标签是用户自由起的），按出现顺序排能让常用标签
+ * 稳定地留在原位；同一条凭证上的多个标签合计只算一次。
+ */
+export function tagOptions(credentials: Credential[]): CountedOption[] {
+  const counts = new Map<string, { label: string; count: number }>();
+  for (const credential of credentials) {
+    // 同一条凭证内的重复标签（老数据/大小写不一）只算一次——下拉里的数字是
+    // 「携带该标签的凭证数」，不是标签出现次数。
+    const seenHere = new Set<string>();
+    for (const tag of credential.tags ?? []) {
+      const key = tagKey(tag);
+      if (seenHere.has(key)) continue;
+      seenHere.add(key);
+      const seen = counts.get(key);
+      if (seen) seen.count += 1;
+      else counts.set(key, { label: tag.trim(), count: 1 });
+    }
+  }
+  return [...counts.entries()].map(([value, item]) => ({
+    value,
+    label: item.label,
+    count: item.count,
+  }));
+}
 
 /**
  * 状态筛选项：五态带计数。

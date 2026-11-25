@@ -39,6 +39,47 @@ async def test_growth_task_skips_providers_without_growth_and_disabled(growth_re
     assert report.attempted == 0 and report.skipped == 2
     assert provider.calls == 0
 
+async def test_growth_task_skips_enterprise_accounts(growth_repo):
+    """企业版账号没有成长中心：跳过，白耗 Pacer 也算浪费。"""
+    credentials, events = growth_repo
+    credentials.add(provider="codebuddy",
+                    credential_data={"bearer_token": "t",
+                                     "quota_probe_mode": "enterprise"})
+    provider = _StubGrowthProvider()
+    report = await GrowthTask(credentials, {"codebuddy": provider}, events).run_once()
+    assert report.attempted == 0 and report.skipped == 1
+    assert provider.calls == 0
+
+
+async def test_growth_task_skips_soft_disabled_credentials(growth_repo):
+    """`enabled=0`（用户软暂停）不参与成长中心：暂停不能只停调度。
+
+    与 checkin / refresh / quota_probe 同口径。此前只判 `disabled`，于是
+    「暂停」的号仍被后台任务拿去领积分。
+    """
+    credentials, events = growth_repo
+    paused_id = credentials.add(provider="codebuddy", credential_data={"bearer_token": "p"})
+    assert credentials.set_enabled(paused_id, False)
+    provider = _StubGrowthProvider()
+    report = await GrowthTask(credentials, {"codebuddy": provider}, events).run_once()
+    assert report.attempted == 0 and report.skipped == 1
+    assert provider.calls == 0
+
+
+async def test_growth_task_paused_does_not_claim_shared_account_scope(growth_repo):
+    """暂停凭证必须早于 `seen.add` 跳过，否则会白占同账号的名额。"""
+    credentials, events = growth_repo
+    paused_id = credentials.add(provider="codebuddy",
+                                credential_data={"bearer_token": "a", "account_uid": "same"})
+    credentials.set_enabled(paused_id, False)
+    credentials.add(provider="codebuddy",
+                    credential_data={"bearer_token": "b", "account_uid": "same"})
+    provider = _StubGrowthProvider()
+    report = await GrowthTask(credentials, {"codebuddy": provider}, events).run_once()
+    assert report.attempted == 1 and report.succeeded == 1
+    assert provider.calls == 1
+
+
 async def test_growth_task_dedupes_same_upstream_account(growth_repo):
     """同上游账号多凭证共享一轮：避免重复领取与多余请求。"""
     credentials, events = growth_repo
@@ -71,6 +112,18 @@ async def test_growth_task_failure_is_isolated_and_recorded(growth_repo):
     report = await GrowthTask(credentials, {"codebuddy": provider}, events).run_once()
     assert report.attempted == 2 and report.failed == 2
     assert events.latest_for(credentials.candidates()[0].credential_id) is None
+
+
+async def test_growth_task_failure_log_is_redacted(growth_repo, caplog):
+    """日志走 `error_text`：空消息至少带类名，敏感/凭据形态只留类名。"""
+    credentials, events = growth_repo
+    credentials.add(provider="codebuddy", credential_data={"bearer_token": "t",
+                                                          "account_uid": "1"})
+    provider = _StubGrowthProvider(error=RuntimeError(""))
+    task = GrowthTask(credentials, {"codebuddy": provider}, events)
+    with caplog.at_level("WARNING"):
+        assert (await task.run_once()).failed == 1
+    assert any("RuntimeError" in record.getMessage() for record in caplog.records)
 
 async def test_growth_task_marks_session_dead_result_as_failed(growth_repo):
     """session_dead 结果记为失败（调度器据此硬禁用凭证）。"""

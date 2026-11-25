@@ -1,15 +1,15 @@
-import { RotateCcw, Save, SlidersHorizontal } from "lucide-react";
+import { Play, RotateCcw, Save, SlidersHorizontal } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api/client";
 import { formatAgo, formatDuration, taskReportLabel } from "../api/display";
 import { errorText } from "../lib/errors";
-import { useQueryClient, useSettings, useTasks } from "../api/hooks";
+import { useQueryClient, useRunTask, useSettings, useTasks } from "../api/hooks";
 import { useSessionContext } from "../Layout";
-import type { RuntimeSetting, TaskStatus } from "../api/types";
+import type { RuntimeSetting, TaskRunResult, TaskStatus } from "../api/types";
 import { PageHeader } from "../components/PageHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { Badge, Button, Card, EmptyState, Field, Input, Notice, Panel, Select, Tabs } from "../ui";
+import { Badge, Button, Card, EmptyState, Field, Input, Notice, Panel, QueryErrorState, Select, Tabs } from "../ui";
 
 /** 网关卡在 tabs 里的值：加前缀避免与任务 key 撞车（如任务与分组同名）。 */
 const groupTabValue = (key: string) => `gateway-${key}`;
@@ -89,9 +89,10 @@ function SettingRow({
         <div className="flex items-end gap-2">
           <div className="w-44">
             {/* 输入控件的可读名称：Field 的 label 未与控件 id 关联，读屏拿不到「生效值」属于哪一项 */}
-            <Field label={`${setting.label} 生效值`}>
+            <Field label={`${setting.label} 生效值`} htmlFor={`input-${setting.key}`}>
               {setting.kind === "bool" ? (
                 <Select
+                  id={`input-${setting.key}`}
                   value={draft}
                   disabled={disabled}
                   data-testid={`input-${setting.key}`}
@@ -102,6 +103,7 @@ function SettingRow({
                 </Select>
               ) : (
                 <Input
+                  id={`input-${setting.key}`}
                   value={draft}
                   disabled={disabled}
                   data-testid={`input-${setting.key}`}
@@ -137,15 +139,24 @@ function SettingRow({
  *
  * 归属关系由后端下发（`RuntimeSetting.task`），前端不硬编码 key 列表——
  * 后端加任务/改归属不需要动这里。
+ *
+ * 「立即运行」按钮只在卡片处于前台 tab 时存在；运行中禁用并按 `task.running`
+ * （后端下发的「此刻有一轮在跑」）显示，避免连点打多轮上游。
  */
 function TaskCard({
   task,
   serverTime,
   rows,
+  running,
+  result,
+  onRun,
 }: {
   task: TaskStatus;
   serverTime: number;
   rows: ReactNode[];
+  running: boolean;
+  result: TaskRunResult | null;
+  onRun: () => void;
 }) {
   const tone = task.last_error ? "danger" : task.last_ok ? "ok" : "muted";
   const stateLabel = !task.enabled
@@ -155,6 +166,17 @@ function TaskCard({
       : task.last_ok
         ? "正常"
         : "尚未执行";
+  // 结果文案：区分「跑了」「没排上（已在跑）」「跑了但 no-op（被开关跳过）」。
+  // 三种都叫「已运行」就是在谎报——尤其第三种，任务其实一步没动。
+  const resultText = result
+    ? result.busy
+      ? "该任务正在运行，本次未重复触发"
+      : result.ran
+        ? result.last_ok === false
+          ? `已运行，但本轮失败：${result.last_error ?? "未知原因"}`
+          : `已运行一轮${result.last_report ? `：${taskReportLabel(result.last_report)}` : ""}`
+        : "本轮未执行（任务已关闭或未到执行条件）"
+    : null;
   return (
     <Card
       className="mb-3 gap-0 p-4 last:mb-0"
@@ -180,8 +202,31 @@ function TaskCard({
         {task.runs > 0 && (
           <span className="text-xs text-muted-foreground">已跑 {task.runs} 轮</span>
         )}
+        <Button
+          size="sm"
+          variant="default"
+          className="ml-auto"
+          data-testid={`task-run-${task.key}`}
+          // 关着的任务点了也是 no-op（后端会如实回 ran=false），直接禁用比
+          // 「点了没反应」更诚实；运行中禁用则防连点。
+          disabled={running || task.running || !task.enabled}
+          title={!task.enabled ? "任务已关闭，先打开对应开关" : undefined}
+          onClick={onRun}
+        >
+          <Play className="mr-1 size-3" />
+          {task.running ? "运行中…" : "立即运行"}
+        </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">{task.description}</p>
+      {resultText && (
+        <p
+          className={`mt-1 text-xs ${result?.ran && result.last_ok === false ? "text-destructive" : "text-muted-foreground"}`}
+          data-testid={`task-run-result-${task.key}`}
+          role="status"
+        >
+          {resultText}
+        </p>
+      )}
       {task.last_error && (
         <p className="mt-1 text-xs text-destructive" data-testid={`task-error-${task.key}`}>
           最近失败：{task.last_error}
@@ -205,14 +250,25 @@ function TaskCard({
 
 export function SettingsPage() {
   const session = useSessionContext();
-  const { data, isLoading } = useSettings(session.username);
+  const { data, isLoading, isError, error: settingsError, refetch } =
+    useSettings(session.username);
   const tasksQuery = useTasks(session.username);
+  const runTask = useRunTask(session.username);
   const client = useQueryClient();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [activeTab, setActiveTab] = useState<string | null>(null);
+  // 两级 tab 的选择：一级（任务 / 配置）→ 二级（任务业务分组或网关卡组）→ 任务。
+  // 三个 key 分开存：切走再切回时各自的二级选择还在。
+  const [section, setSection] = useState<"tasks" | "gateway">("tasks");
+  const [taskGroupKey, setTaskGroupKey] = useState<string | null>(null);
+  const [gatewayGroupKey, setGatewayGroupKey] = useState<string | null>(null);
+  const [taskKey, setTaskKey] = useState<string | null>(null);
+  // 手动触发：正在跑的 key + 最近一次结果（按 key 存，切 tab 回来还在）
+  const [runningKey, setRunningKey] = useState<string | null>(null);
+  const [runResults, setRunResults] = useState<Record<string, TaskRunResult>>({});
+  const [runError, setRunError] = useState<{ key: string; text: string } | null>(null);
 
   const settings = useMemo(() => data?.settings ?? [], [data]);
   const tasks = useMemo(() => tasksQuery.data?.tasks ?? [], [tasksQuery.data]);
@@ -234,9 +290,11 @@ export function SettingsPage() {
   );
   const invalid = dirty.filter((setting) => !isSubmittable(setting, drafts[setting.key]));
 
-  // 一屏只展示一块：每个后台任务一个 tab（运行态 + 自己的配置），无任务归属的配置
-  // 按后端下发的网关卡组各占一个 tab。归属对不上的项落进「其他」，绝不吞掉配置。
+  // 两级 tab：一级「后台任务 / 网关配置」；任务按后端下发的业务分组
+  // （TASK_GROUPS）二级切换、组内每个任务一个 tab；配置按网关卡组二级切换。
+  // 归属对不上的配置项落进「其他」，绝不吞掉配置。
   const groups = useMemo(() => data?.groups ?? [], [data]);
+  const taskGroups = useMemo(() => tasksQuery.data?.groups ?? [], [tasksQuery.data]);
   const taskKeys = new Set(tasks.map((task) => task.key));
   const assignTab = (setting: RuntimeSetting) => {
     if (setting.task && taskKeys.has(setting.task)) return setting.task;
@@ -246,25 +304,41 @@ export function SettingsPage() {
     return OTHER_TAB;
   };
 
-  const tabOptions = [
-    ...tasks.map((task) => ({ value: task.key, label: tabText(task) })),
-    // 只列出「确实有配置项」的网关卡组，避免点开是空页
-    ...groups
-      .filter((group) => settings.some((s) => assignTab(s) === groupTabValue(group.value)))
-      .map((group) => ({ value: groupTabValue(group.value), label: group.label })),
-  ];
+  const taskGroupOptions = taskGroups.filter((group) =>
+    tasks.some((task) => task.group === group.value),
+  );
+  const gatewayGroupOptions = groups
+    // 只列出「确实有配置项」的组，避免点开是空页
+    .filter((group) => settings.some((s) => assignTab(s) === groupTabValue(group.value)))
+    .map((group) => ({ value: groupTabValue(group.value), label: group.label }));
   if (settings.some((setting) => assignTab(setting) === OTHER_TAB)) {
-    tabOptions.push({ value: OTHER_TAB, label: "其他" });
+    gatewayGroupOptions.push({ value: OTHER_TAB, label: "其他" });
   }
 
-  const active =
-    activeTab && tabOptions.some((option) => option.value === activeTab)
-      ? activeTab
-      : tabOptions[0]?.value;
-  const activeTask = tasks.find((task) => task.key === active);
-  const activeGroupLabel =
-    tabOptions.find((option) => option.value === active)?.label ?? "未归属配置";
-  const activeRows = settings.filter((setting) => assignTab(setting) === active);
+  // 只有两边都有内容时才显示一级 tab；缺一边就直接落到另一边。
+  const hasSections = taskGroupOptions.length > 0 && gatewayGroupOptions.length > 0;
+  const activeSection: "tasks" | "gateway" = hasSections
+    ? section
+    : taskGroupOptions.length > 0
+      ? "tasks"
+      : "gateway";
+
+  const activeTaskGroup =
+    taskGroupKey && taskGroupOptions.some((option) => option.value === taskGroupKey)
+      ? taskGroupKey
+      : taskGroupOptions[0]?.value;
+  const taskGroupTasks = tasks.filter((task) => task.group === activeTaskGroup);
+  const activeTask =
+    taskGroupTasks.find((task) => task.key === taskKey) ?? taskGroupTasks[0];
+
+  const activeGatewayGroup =
+    gatewayGroupKey && gatewayGroupOptions.some((option) => option.value === gatewayGroupKey)
+      ? gatewayGroupKey
+      : gatewayGroupOptions[0]?.value;
+  const activeRows =
+    activeSection === "tasks" && activeTask
+      ? settings.filter((setting) => setting.task === activeTask.key)
+      : settings.filter((setting) => assignTab(setting) === activeGatewayGroup);
 
   const refresh = () => client.invalidateQueries({ queryKey: ["admin"] });
 
@@ -298,7 +372,12 @@ export function SettingsPage() {
     try {
       await api.updateSettings({ [setting.key]: null });
       setNotice(`「${setting.label}」已恢复 .env 默认值。`);
-      setDrafts({});
+      // 只丢这一项的草稿：其它 tab 里未保存的修改不能因为「恢复默认」被静默丢弃。
+      setDrafts((previous) => {
+        const next = { ...previous };
+        delete next[setting.key];
+        return next;
+      });
       await refresh();
     } catch (caught) {
       setError(errorText(caught, "恢复失败，请稍后重试。"));
@@ -318,18 +397,54 @@ export function SettingsPage() {
     />
   );
 
+  // 卡片内分节（后端下发 `section`）：19 项平铺一列太长，按「基础与迟滞 /
+  // 规则阈值 …」切段；没有 section 的配置项照旧直排，不插空标题。
+  const renderSettings = (rows: RuntimeSetting[]) => {
+    const nodes: ReactNode[] = [];
+    let current: string | null = null;
+    for (const setting of rows) {
+      if (setting.section && setting.section !== current) {
+        nodes.push(
+          <h4
+            key={`section-${setting.key}`}
+            className="mt-4 border-b border-border/70 pb-1 text-xs font-semibold tracking-wide text-muted-foreground first:mt-0"
+            data-testid={`setting-section-${setting.key}`}
+          >
+            {setting.section}
+          </h4>,
+        );
+      }
+      current = setting.section;
+      nodes.push(renderSetting(setting));
+    }
+    return nodes;
+  };
+
+  const triggerRun = async (key: string) => {
+    setRunningKey(key);
+    setRunError(null);
+    try {
+      const result = await runTask.mutateAsync(key);
+      setRunResults((previous) => ({ ...previous, [key]: result }));
+    } catch (caught) {
+      setRunError({ key, text: errorText(caught, "触发失败，请稍后重试。") });
+    } finally {
+      setRunningKey(null);
+    }
+  };
+
   return (
     <div className="space-y-6" data-testid="settings-page">
       <PageHeader
         eyebrow="管理"
         title="任务与配置"
-        description="后台任务最近跑得怎么样、下一次什么时候跑，和它自己的周期/开关放在一起；这里改的值存进数据库并立即生效，无需重启。"
+        description="后台任务的运行情况、周期与开关；改的值存进数据库并立即生效，无需重启。"
         icon={<SlidersHorizontal className="size-5" />}
       />
 
       <Notice tone="warn">
-        覆盖优先级：<strong>数据库覆盖值 &gt; .env</strong>。因此直接改 .env 对已被覆盖的项无效——
-        请先在这里「恢复默认」，或直接改本页的值。启动期项（密钥、端口、数据目录、上游白名单）
+        覆盖优先级：<strong>数据库覆盖值 &gt; .env</strong>。直接改 .env 对已覆盖的项无效——
+        请先在此「恢复默认」，或直接改本页的值。启动期项（密钥、端口、数据目录、上游白名单）
         不在本页，改它们必须重启。
       </Notice>
 
@@ -372,11 +487,18 @@ export function SettingsPage() {
         )}
         {isLoading ? (
           <PageSkeleton variant="table" rows={5} />
+        ) : isError ? (
+          <QueryErrorState
+            title="运行时配置加载失败"
+            description={errorText(settingsError, "拿不到运行时配置，请稍后重试。")}
+            onRetry={() => void refetch()}
+            data-testid="settings-error-state"
+          />
         ) : settings.length === 0 ? (
           <EmptyState
             icon={<SlidersHorizontal className="size-5" />}
             title="没有可热更配置"
-            description="当前没有可在线调整的配置项。"
+            description="当前没有可在线调整的配置。"
             data-testid="no-settings"
           />
         ) : (
@@ -391,29 +513,84 @@ export function SettingsPage() {
               <PageSkeleton variant="table" rows={4} />
             ) : (
               <>
-                <div className="mb-4 overflow-x-auto pb-1">
-                  <Tabs
-                    value={active ?? ""}
-                    options={tabOptions}
-                    onChange={setActiveTab}
-                    testId="settings-tabs"
-                    compact
-                  />
-                </div>
+                {hasSections && (
+                  <div className="mb-3 overflow-x-auto pb-1">
+                    <Tabs
+                      value={activeSection}
+                      options={[
+                        { value: "tasks", label: "后台任务" },
+                        { value: "gateway", label: "网关配置" },
+                      ]}
+                      onChange={(value) => setSection(value as "tasks" | "gateway")}
+                      testId="settings-sections"
+                      compact
+                    />
+                  </div>
+                )}
 
-                {activeTask ? (
-                  <TaskCard
-                    task={activeTask}
-                    serverTime={serverTime}
-                    rows={activeRows.map(renderSetting)}
-                  />
+                {activeSection === "tasks" ? (
+                  <>
+                    <div className="mb-3 overflow-x-auto pb-1">
+                      <Tabs
+                        value={activeTaskGroup ?? ""}
+                        options={taskGroupOptions}
+                        onChange={setTaskGroupKey}
+                        testId="settings-task-groups"
+                        compact
+                      />
+                    </div>
+
+                    {/* 组内只有一个任务时不摆第三排 tab：一排只有一个选项只是噪音 */}
+                    {taskGroupTasks.length > 1 && (
+                      <div className="mb-3 overflow-x-auto pb-1">
+                        <Tabs
+                          value={activeTask?.key ?? ""}
+                          options={taskGroupTasks.map((task) => ({
+                            value: task.key,
+                            label: tabText(task),
+                          }))}
+                          onChange={setTaskKey}
+                          testId="settings-task-tabs"
+                          compact
+                        />
+                      </div>
+                    )}
+
+                    {activeTask ? (
+                      <>
+                        <TaskCard
+                          task={activeTask}
+                          serverTime={serverTime}
+                          rows={renderSettings(activeRows)}
+                          running={runningKey === activeTask.key}
+                          result={runResults[activeTask.key] ?? null}
+                          onRun={() => void triggerRun(activeTask.key)}
+                        />
+                        {runError && runError.key === activeTask.key && (
+                          <div data-testid="task-run-error" role="alert">
+                            <Notice tone="danger">{runError.text}</Notice>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground" data-testid="no-task-in-group">
+                        该分组下没有已装配的任务。
+                      </p>
+                    )}
+                  </>
                 ) : (
                   <>
-                    <h3 className="text-xs font-semibold tracking-wide text-muted-foreground">
-                      {activeGroupLabel}
-                    </h3>
+                    <div className="mb-3 overflow-x-auto pb-1">
+                      <Tabs
+                        value={activeGatewayGroup ?? ""}
+                        options={gatewayGroupOptions}
+                        onChange={setGatewayGroupKey}
+                        testId="settings-gateway-groups"
+                        compact
+                      />
+                    </div>
                     {activeRows.length > 0 ? (
-                      activeRows.map(renderSetting)
+                      renderSettings(activeRows)
                     ) : (
                       <p className="text-xs text-muted-foreground" data-testid="no-gateway-settings">
                         这里没有配置项。

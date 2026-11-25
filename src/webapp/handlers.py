@@ -11,7 +11,9 @@ import logging
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
+from ..api.deps import ServicePaused
 from ..auth.csrf import CsrfRejectedError
 from ..auth.rbac import (
     ForbiddenError,
@@ -24,9 +26,14 @@ from ..auth.throttle import ThrottledError
 from ..compat.openai.errors import error_payload
 from ..compat.openai.request import InvalidRequest
 from ..db.crypto import CredentialDecryptError
-from ..engine.executor import NoHealthyCredential, NoProviderForModel
+from ..engine.executor import (
+    NoHealthyCredential,
+    NoProviderForModel,
+    ProviderAccessFrozen,
+)
 from ..engine.model_resolver import UnknownModelError
 from ..provider.base import UpstreamProtocolViolation
+from ..provider.proxy import EgressUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +71,37 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _no_health(_request, error: NoHealthyCredential):
         # str(error) 由 executor 用受控文案构造（_unavailable_message /
         # _model_cooled_message），只带最后一次错误的受控标识，不含上游正文。
+        response = JSONResponse(
+            status_code=503,
+            content=error_payload(str(error), "no_healthy_credential", 503))
+        # 池内还有会自行恢复的候选时给出最早恢复秒数：缺这个头，OpenAI SDK /
+        # Claude Code 会立即重试，把一次限流放大成请求风暴。
+        if getattr(error, "retry_after", None) is not None:
+            response.headers["Retry-After"] = str(error.retry_after)
+        return response
+
+    @app.exception_handler(ServicePaused)
+    async def _paused(_request, error: ServicePaused):
+        """kill switch：503 + 受控文案。原因只进日志（见 deps._ensure_not_paused），
+        不回显——运维备注可能含事故编号或内部链接。"""
         return JSONResponse(status_code=503,
-                            content=error_payload(str(error), "no_healthy_credential", 503))
+                            content=error_payload(str(error), "service_paused", 503))
 
     @app.exception_handler(NoProviderForModel)
     async def _no_provider(_request, error: NoProviderForModel):
         return JSONResponse(status_code=400,
                             content=error_payload(str(error), "invalid_request", 400))
+
+    @app.exception_handler(ProviderAccessFrozen)
+    async def _access_frozen(_request, error: ProviderAccessFrozen):
+        """内容拒绝累计达阈值：403 + `provider_access_frozen`。
+
+        冻结是 `(发起者, 渠道)` 级：同渠道的其他用户/凭证不受影响；解冻是
+        管理端动作（见 /api/access-freezes/unfreeze）。
+        """
+        return JSONResponse(
+            status_code=403,
+            content=error_payload(str(error), "provider_access_frozen", 403))
 
     @app.exception_handler(ForbiddenError)
     async def _forbidden(_request, error: ForbiddenError):
@@ -126,6 +157,37 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=UPSTREAM_ERROR_STATUS,
             content=error_payload("upstream transport failed",
                                   "upstream_unavailable", UPSTREAM_ERROR_STATUS))
+
+    @app.exception_handler(EgressUnavailable)
+    async def _egress_unavailable(_request, error: EgressUnavailable):
+        """出口代理熔断：503 + `egress_unavailable` + `Retry-After`。
+
+        必须在 `httpx.TransportError` 的 502 兜底之前被 MRO 命中（继承链是
+        `EgressUnavailable -> ProxyError -> TransportError`，Starlette 按
+        `__mro__` 查处理器，更具体的本类优先）。这不是「上游 502」，而是
+        本机出口通道已被熔断、请求根本没发出去——给 503 + 退避秒数才能让
+        客户端等熔断冷却，而不是立刻重试继续撞。
+        """
+        response = JSONResponse(
+            status_code=503,
+            content=error_payload("upstream egress proxy unavailable",
+                                  "egress_unavailable", 503))
+        response.headers["Retry-After"] = str(error.retry_after)
+        return response
+
+    @app.exception_handler(ClientDisconnect)
+    async def _client_disconnected(_request, _error: ClientDisconnect):
+        """读请求体时客户端已断开：不是服务端错误，499 收尾。
+
+        以前 `request.body()` 抛 `ClientDisconnect` 会一路冒泡到
+        ServerErrorMiddleware——落一条 500 + 全量 ASGI Traceback，既刷屏日志，
+        又让「客户端自己取消」混进服务错误统计。499 是网关惯例
+        （nginx「client closed request」），调用方已不在，响应体只为把
+        access log 的状态码记对。
+        """
+        return JSONResponse(status_code=499,
+                            content=error_payload("client disconnected",
+                                                  "client_disconnected", 499))
 
     @app.exception_handler(ThrottledError)
     async def _throttled(_request, _error: ThrottledError):

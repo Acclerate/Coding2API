@@ -1,6 +1,7 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PlaygroundPage } from "../PlaygroundPage";
+import { setUnauthorizedHandler } from "@/api/unauthorized";
 import { jsonResponse, mockFetch, renderPage, userEvent } from "@/test-utils";
 
 const MODELS = {
@@ -52,6 +53,26 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
     expect(screen.getByTestId("playground-page")).toBeInTheDocument();
     expect(screen.queryByTestId("playground-key")).not.toBeInTheDocument();
+  });
+
+  it("自定义别名条目在选择器里带「自定义别名」徽章（当前选择条同样标）", async () => {
+    mockFetch({ "/api/playground/models": {
+      object: "list",
+      data: [
+        {
+          id: "team-fast", object: "model", owned_by: "Coding2API",
+          providers: ["trae"], name: "team-fast",
+          custom_alias: true, alias_target: "glm-5.2",
+        },
+      ],
+    } });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const option = screen.getByTestId("model-option-team-fast@trae");
+    expect(within(option).getByTestId("model-alias-badge")).toHaveTextContent("自定义别名");
+    expect(within(screen.getByTestId("model-current"))
+      .getByTestId("model-current-alias")).toHaveTextContent("自定义别名");
   });
 
   it("默认选中倍率最小的模型；选中后展示上限与能力，双渠道倍率在选择器里按渠道显示", async () => {
@@ -206,9 +227,9 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     // 无倍率数据：只显示渠道徽章，不显示倍率
     const noRate = screen.getByTestId("model-option-no-rate@trae");
     expect(noRate).toHaveTextContent("TRAE");
-    // 无倍率数据：渠道徽章里没有倍率块（免费/「x」数字）
+    // 无倍率数据：渠道徽章里没有倍率块（「免」/「x」数字）
     expect(noRate.querySelector('[data-testid="channel-pill-trae"]')).toBeInTheDocument();
-    expect(noRate.textContent).not.toMatch(/x\d|免费/);
+    expect(noRate.textContent).not.toMatch(/x\d|免/);
   });
 
   it("多渠道徽章不挤压模型名：名称保底宽度、徽章在右侧折行", async () => {
@@ -292,7 +313,44 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByText("没有匹配的模型")).toBeInTheDocument();
   });
 
-  it("免费模型（x0）的倍率块显示「免费」，单渠道当前选择条不打自动路由标", async () => {
+  it("渠道徽章只渲染渠道名与倍率，福标已随渠道重构移除", async () => {
+    const CHANNEL_MODELS = {
+      object: "list",
+      data: [
+        {
+          id: "deepseek-v4.1-flash", object: "model", owned_by: "Coding2API",
+          providers: ["codearts", "trae"],
+          by_provider: {
+            codearts: { raw_id: "deepseek-v4.1-flash" },
+            trae: { raw_id: "deepseek-v4.1-flash", credit_rate: 0.08 },
+          },
+        },
+        {
+          id: "codearts-only", object: "model", owned_by: "Coding2API",
+          providers: ["codearts"],
+        },
+      ],
+    };
+    mockFetch({ "/api/playground/models": CHANNEL_MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    // 多渠道：两侧渠道徽章只渲染渠道名（trae 侧带倍率），不再有「福」标
+    const dual = screen.getByTestId("model-option-deepseek-v4.1-flash");
+    expect(within(dual).getByTestId("channel-pill-codearts")).toHaveTextContent("CodeArts");
+    expect(within(dual).getByTestId("channel-pill-trae")).toHaveTextContent("TRAE");
+    expect(within(dual).getByTestId("channel-pill-trae")).toHaveTextContent("x0.08");
+    expect(dual).not.toHaveTextContent("福");
+    expect(dual.querySelector('[data-testid^="channel-benefit-"]')).not.toBeInTheDocument();
+
+    // 单渠道 CodeArts：同样只有渠道名与（可选的）倍率
+    const single = screen.getByTestId("model-option-codearts-only@codearts");
+    expect(within(single).getByTestId("channel-pill-codearts")).toHaveTextContent("CodeArts");
+    expect(single).not.toHaveTextContent("福");
+    expect(single.querySelector('[data-testid^="channel-benefit-"]')).not.toBeInTheDocument();
+  });
+
+  it("免费模型（x0）的倍率块显示「免」，单渠道当前选择条不打自动路由标", async () => {
     const FREE_MODELS = {
       object: "list",
       data: [
@@ -308,7 +366,12 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
 
     const current = screen.getByTestId("model-current");
     expect(current).toHaveTextContent("kilo-auto/free");
-    expect(within(current).getByTestId("channel-pill-kilo")).toHaveTextContent("免费");
+    const pill = within(current).getByTestId("channel-pill-kilo");
+    expect(pill).toHaveTextContent("免");
+    // 单渠道把徽章拆成「渠道｜倍率」两段（左右不同底色），不是一个胶囊里
+    // 再套一个倍率小块
+    expect(pill.children).toHaveLength(2);
+    expect(pill.children[1]).toHaveTextContent("免");
     // 单渠道模型不显示「自动路由」标
     expect(current).not.toHaveTextContent("自动路由");
   });
@@ -338,7 +401,7 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByTestId("provider-pin-trae")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("provider-pin-trae"));
     expect(screen.getByTestId("provider-pin-trae")).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("model-current")).toHaveTextContent("已强制 TRAE");
+    expect(screen.getByTestId("model-current-pinned")).toHaveTextContent("TRAE");
 
     await fillPromptAndSend("hi");
     const chat = calls.find((item) => item.url.includes("/api/playground/chat/completions"));
@@ -415,22 +478,60 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(await screen.findByTestId("playground-error")).toHaveTextContent("渠道不可用");
   });
 
-  it("会话过期时跳回登录页", async () => {
+  it("会话过期时走统一出口（清缓存 + 回登录页），不裸跳转", async () => {
+    const handled = vi.fn();
+    setUnauthorizedHandler(handled);
     const assign = vi.fn();
     vi.stubGlobal("location", { href: "/", assign });
+    mockFetch({
+      "/api/playground/models": MODELS,
+      "/api/playground/chat/completions": () =>
+        jsonResponse({ error: { code: "unauthorized" } }, 401),
+    });
+
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+    await fillPromptAndSend("hi");
+
+    await waitFor(() => expect(handled).toHaveBeenCalled());
+    // 不再用 window.location.href 整页跳转：那条路绕开清缓存，会留下过期数据
+    expect(assign).not.toHaveBeenCalled();
+    expect(window.location.href).toBe("/");
+    expect(await screen.findByTestId("playground-error")).toHaveTextContent("会话已过期");
+    setUnauthorizedHandler(null);
+  });
+
+  it("后端挂死（首字节迟迟不来）时超时并复位 busy", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes("/api/playground/models")) return jsonResponse(MODELS);
-        return jsonResponse({ error: { code: "unauthorized" } }, 401);
+        // 永不返回，只在被 abort 时拒绝（与真实 fetch 同形）
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
       }),
     );
 
     renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
     await waitForModelLoaded();
     await fillPromptAndSend("hi");
-    await waitFor(() => expect(window.location.href).toBe("/login"));
+    await waitFor(() =>
+      expect(screen.getByTestId("send-request")).toHaveTextContent("请求中"));
+
+    await act(async () => {
+      vi.advanceTimersByTime(120_000);
+    });
+
+    expect(await screen.findByTestId("playground-error")).toHaveTextContent("请求超时");
+    // busy 必须复位，否则按钮永远停在「请求中」，页面等于废了
+    expect(screen.getByTestId("send-request")).toHaveTextContent("发送");
+    expect(screen.getByTestId("send-request")).not.toBeDisabled();
+    vi.useRealTimers();
   });
 
   it("流式请求按 chunk 累积 content 与 reasoning，遇 [DONE] 结束", async () => {
@@ -673,6 +774,99 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     expect(screen.getByTestId("param-effort")).toHaveValue("");
   });
 
+  it("提示词框内 Ctrl/⌘ + Enter 直接发送", async () => {
+    const calls = spyChat(MODELS);
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
+
+    await waitFor(() =>
+      expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(true),
+    );
+  });
+
+  it("多渠道时当前选择条只渲染一份渠道徽章（徽章即渠道按钮）", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const current = screen.getByTestId("model-current");
+    // 徽章不再静态列一遍、渠道按钮再列一遍：每个渠道在「当前选择」条里只出现一次
+    for (const provider of ["codebuddy", "trae"]) {
+      expect(within(current).getAllByTestId(`channel-pill-${provider}`)).toHaveLength(1);
+      // 徽章就挂在渠道按钮内部，点它即强制该渠道
+      expect(
+        within(within(current).getByTestId(`provider-pin-${provider}`))
+          .getByTestId(`channel-pill-${provider}`),
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("当前选择条分三栏：当前选择 | 渠道 | 强制，强制栏有选择才出现", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const current = screen.getByTestId("model-current");
+    const [identityCol, channelCol] = Array.from(current.children) as HTMLElement[];
+    // 渠道控件不与身份挤同一栏：渠道多时只在自己栏内折行
+    expect(channelCol).toContainElement(screen.getByTestId("provider-pin"));
+    expect(identityCol).not.toContainElement(screen.getByTestId("provider-pin"));
+    expect(identityCol).toHaveTextContent("glm-5.2");
+    // 自动路由：没有强制栏（有选择才显示，不留空位）
+    expect(screen.queryByTestId("model-current-pinned")).not.toBeInTheDocument();
+    expect(current.children).toHaveLength(2);
+
+    await userEvent.click(screen.getByTestId("provider-pin-trae"));
+    // 强制后多出第三栏，内容是「强制 + 渠道名」，不与前两栏混在一起
+    const pinnedCol = screen.getByTestId("model-current-pinned");
+    expect(current.children).toHaveLength(3);
+    expect(current.children[2]).toBe(pinnedCol);
+    expect(pinnedCol).toHaveTextContent("强制");
+    expect(pinnedCol).toHaveTextContent("TRAE");
+    expect(identityCol).not.toHaveTextContent("强制");
+    expect(channelCol).not.toHaveTextContent("强制");
+  });
+
+  it("请求进行中再次提交被忽略，不重复发请求", async () => {
+    let release: () => void = () => {};
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: { url: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push({ url });
+        if (url.includes("/api/playground/models")) return jsonResponse(MODELS);
+        await pending;
+        return jsonResponse({ choices: [{ message: { content: "ok" } }] });
+      }),
+    );
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+    await userEvent.click(screen.getByTestId("stream-toggle"));
+
+    await userEvent.type(screen.getByTestId("playground-prompt"), "hi");
+    await userEvent.click(screen.getByTestId("send-request"));
+
+    // 请求在途：⌘/Ctrl+Enter 走 requestSubmit()，真实浏览器里不受发送按钮
+    // disabled 约束（jsdom 会拦，所以这里直接派发 submit 事件来覆盖该路径）。
+    // 没有 busy 守卫时这里会发出第二个 POST，重复计费。
+    const form = screen.getByTestId("playground-prompt").closest("form")!;
+    fireEvent.submit(form);
+
+    release();
+    await waitFor(() =>
+      expect(screen.getByTestId("playground-answer")).toHaveTextContent("ok"),
+    );
+    expect(calls.filter((item) => item.url.includes("/api/playground/chat/completions")))
+      .toHaveLength(1);
+  });
+
   it("非法数值拦住发送并给出提示，不发请求", async () => {
     const calls = spyChat(MODELS);
     renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
@@ -682,5 +876,60 @@ describe("PlaygroundPage（会话鉴权，无需 API Key）", () => {
     await fillPromptAndSend("hi");
     expect(screen.getByTestId("playground-error")).toHaveTextContent("温度需在 0–1000 之间");
     expect(calls.some((item) => item.url.includes("/api/playground/chat/completions"))).toBe(false);
+  });
+});
+describe("PlaygroundPage 图片附件", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("选图后以 image_url 块随请求发送，并可移除", async () => {
+    const spy = mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const file = new File([new Uint8Array([137, 80, 78, 71])], "shot.png",
+                          { type: "image/png" });
+    await userEvent.upload(screen.getByTestId("playground-image-input"), file);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("playground-image-preview")).toHaveLength(1));
+
+    await fillPromptAndSend("这是什么");
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    const call = spy.mock.calls.find(([url]) => String(url).includes("/api/playground/chat"));
+    const body = JSON.parse(String((call?.[1] as RequestInit).body));
+    const content = body.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content[0]).toEqual({ type: "text", text: "这是什么" });
+    expect(content[1].type).toBe("image_url");
+    expect(content[1].image_url.url.startsWith("data:image/png;base64,")).toBe(true);
+
+    fireEvent.click(screen.getByTestId("playground-remove-image"));
+    await waitFor(() =>
+      expect(screen.queryAllByTestId("playground-image-preview")).toHaveLength(0));
+  });
+
+  it("没有图片时 content 仍是纯字符串（旧行为逐字节不变）", async () => {
+    const spy = mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    await fillPromptAndSend("hi");
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    const call = spy.mock.calls.find(([url]) => String(url).includes("/api/playground/chat"));
+    const body = JSON.parse(String((call?.[1] as RequestInit).body));
+    expect(body.messages[0].content).toBe("hi");
+  });
+
+  it("超过 4 张拒绝并提示", async () => {
+    mockFetch({ "/api/playground/models": MODELS });
+    renderPage(<PlaygroundPage />, { username: "root", is_admin: true });
+    await waitForModelLoaded();
+
+    const files = Array.from({ length: 5 }, (_, index) =>
+      new File([new Uint8Array([1])], `p${index}.png`, { type: "image/png" }));
+    await userEvent.upload(screen.getByTestId("playground-image-input"), files);
+    await waitFor(() =>
+      expect(screen.getByText(/最多 4 张图片/)).toBeInTheDocument());
   });
 });

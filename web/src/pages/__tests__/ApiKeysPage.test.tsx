@@ -1,6 +1,7 @@
-import { screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiKeysPage, parseExpiresAt } from "../ApiKeysPage";
+import { expiresAtInput } from "../apikeys/meta";
 import { jsonResponse, mockFetch, renderPage, settle, userEvent } from "@/test-utils";
 
 const KEY = {
@@ -135,6 +136,29 @@ describe("ApiKeysPage", () => {
     expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
   });
 
+  it("删除失败时透出后端文案（不只一句「删除失败」）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          return jsonResponse(
+            { error: { code: "not_found", message: "Key 已不存在，可能已被其他会话删除" } },
+            404,
+          );
+        }
+        return jsonResponse({ api_keys: [KEY] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    await userEvent.click(screen.getByRole("button", { name: "删除" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
+
+    const alert = await screen.findByTestId("api-keys-error");
+    expect(alert).toHaveTextContent("可能已被其他会话删除");
+  });
+
   it("展示渠道绑定与 IP 白名单，空值给出「自动 / 不限制」", async () => {
     const scoped = { ...KEY, id: "key_2", provider_binding: "trae", allowed_ips: "203.0.113.9/32" };
     mockFetch({ "/api/api-keys": { api_keys: [KEY, scoped] } });
@@ -213,12 +237,13 @@ describe("ApiKeysPage", () => {
     );
   });
 
-  it("创建失败时提示检查绑定与白名单格式", async () => {
+  it("创建失败时透出后端的受控原因（不只给通用兜底）", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
         if (init?.method === "POST") {
-          return jsonResponse({ error: { message: "bad" } }, 400);
+          return jsonResponse(
+            { error: { message: "渠道绑定与已有 Key 冲突" } }, 400);
         }
         return jsonResponse({ api_keys: [] });
       }),
@@ -228,7 +253,56 @@ describe("ApiKeysPage", () => {
     await openCreateDialog();
 
     await userEvent.click(screen.getByRole("button", { name: "创建" }));
-    expect(await screen.findByText(/请检查渠道绑定、模型白名单、IP 白名单与到期时间格式/)).toBeInTheDocument();
+    // 后端写好的受控文案要透出来：裸 catch{} 会把它丢掉，用户只能对着
+    // 「创建失败」猜到底是哪一项不对。
+    expect(await screen.findByText(/渠道绑定与已有 Key 冲突/)).toBeInTheDocument();
+  });
+
+  it("创建失败且后端无可用文案时回落通用兜底", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          // 非受控异常（网络层）：没有可展示的 message
+          throw new TypeError("Failed to fetch");
+        }
+        return jsonResponse({ api_keys: [] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await openCreateDialog();
+
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(await screen.findByText(/检查渠道绑定、模型白名单、IP 白名单与到期时间格式/)).toBeInTheDocument();
+  });
+
+  it("无 Clipboard API 时复制一次性 Key 失败会提示手动复制", async () => {
+    vi.stubGlobal("navigator", {});
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => false),
+      configurable: true,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          return jsonResponse({ ...KEY, api_key: "sk-plaintext-value" });
+        }
+        return jsonResponse({ api_keys: [] });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+    await openCreateDialog();
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    await screen.findByTestId("new-key-plaintext");
+
+    const keyCopy = screen.getByTestId("new-key-plaintext").parentElement!.querySelector("button")!;
+    await userEvent.click(keyCopy);
+    // 一次性明文复制失败必须说清楚，否则用户关掉就再也拿不回来
+    expect(await screen.findByTestId("new-key-copy-failed")).toHaveTextContent("请手动");
+    expect(screen.queryByRole("button", { name: "已复制" })).not.toBeInTheDocument();
   });
 });
 
@@ -293,4 +367,205 @@ it("创建 Key 对话框支持 Esc 关闭", async () => {
   await openCreateDialog();
   await userEvent.keyboard("{Escape}");
   expect(screen.queryByTestId("create-key-dialog")).not.toBeInTheDocument();
+});
+
+it("创建中连点只发一次 POST（每次 POST 都会生成不可回收的明文 Key）", async () => {
+  let resolvePost: ((value: Response) => void) | null = null;
+  let posts = 0;
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/api-keys" && init?.method === "POST") {
+      posts += 1;
+      // 挂住第一次请求：给第二次点击留出窗口
+      return new Promise<Response>((resolve) => {
+        resolvePost = resolve;
+      });
+    }
+    return jsonResponse({ api_keys: [] });
+  }));
+  renderPage(<ApiKeysPage />);
+  await settle();
+  await openCreateDialog();
+
+  const submit = screen.getByTestId("create-key-submit");
+  await userEvent.click(submit);
+  // 请求未返回：按钮已禁用并显示提交中文案
+  await waitFor(() => expect(submit).toBeDisabled());
+  expect(submit).toHaveTextContent("创建中");
+  // 强行再点一次（disabled 之外还有 ref 互斥兜底）
+  fireEvent.click(submit);
+  fireEvent.submit(submit.closest("form")!);
+  expect(posts).toBe(1);
+
+  resolvePost!(jsonResponse({ ...KEY, api_key: "sk-once" }));
+  expect(await screen.findByTestId("new-key-plaintext")).toHaveTextContent("sk-once");
+  expect(posts).toBe(1);
+});
+
+describe("ApiKeysPage 首启向导深链", () => {
+  it("?new=1 进来直接打开创建对话框", async () => {
+    mockFetch({ "/api/api-keys": { api_keys: [] } });
+    renderPage(<ApiKeysPage />, { username: "root", is_admin: true }, "/?new=1");
+    expect(await screen.findByTestId("create-key-dialog")).toBeInTheDocument();
+  });
+});
+
+describe("ApiKeysPage 用量窗口", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("默认今日；切到近 7 天带 window=7d 重新取数并改表头文案", async () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        urls.push(url);
+        // 服务端按窗口返回不同聚合：近 7 天的请求数必须来自新的一次取数
+        if (url.includes("window=7d")) {
+          return jsonResponse({
+            api_keys: [{ ...KEY, usage: { requests: 5, tokens: 60, cost_usd: 0 } }],
+            total: 1,
+            window: "7d",
+          });
+        }
+        return jsonResponse({
+          api_keys: [{ ...KEY, usage: { requests: 1, tokens: 10, cost_usd: 0 } }],
+          total: 1,
+          window: "today",
+        });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    expect(screen.getByText("用量 · 今日")).toBeInTheDocument();
+    expect(screen.getByTestId("key-usage-key_1")).toHaveTextContent("1 次");
+
+    await userEvent.click(screen.getByTestId("usage-window-7d"));
+
+    expect(await screen.findByText("用量 · 近 7 天")).toBeInTheDocument();
+    expect(await screen.findByTestId("key-usage-key_1")).toHaveTextContent("5 次");
+    expect(urls.some((url) => url.includes("window=7d"))).toBe(true);
+    // 默认档位也要把窗口显式带给服务端（口径不靠服务端猜默认值）
+    expect(urls.some((url) => url.includes("window=today"))).toBe(true);
+  });
+
+  it("没有用量时按档位显示「未用」", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        return jsonResponse({
+          api_keys: [KEY],
+          total: 1,
+          window: url.includes("window=30d") ? "30d" : "today",
+        });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+    expect(screen.getByTestId("key-usage-key_1")).toHaveTextContent("今日未用");
+
+    await userEvent.click(screen.getByTestId("usage-window-30d"));
+    expect(await screen.findByText("用量 · 近 30 天")).toBeInTheDocument();
+  });
+});
+
+describe("ApiKeysPage 编辑策略", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const EDITABLE = {
+    ...KEY,
+    allowed_ips: "10.0.0.1/32",
+    allowed_models: "glm-*",
+    expires_at: 4102444800,
+  };
+
+  it("回显五个字段并整体提交到 PUT /api/api-keys/{id}", async () => {
+    const puts: { url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (init?.method === "PUT") {
+          puts.push({ url, body: JSON.parse(String(init.body)) });
+          return jsonResponse({ ok: true, changed: ["name"] });
+        }
+        return jsonResponse({ api_keys: [EDITABLE], total: 1, window: "today" });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("edit-key-key_1"));
+    expect(screen.getByTestId("edit-key-name")).toHaveValue("laptop");
+    expect(screen.getByTestId("edit-key-allowed-models")).toHaveValue("glm-*");
+    // 到期时间按**本地时区**回显：直接 toISOString 会差一个时区，一保存就改错
+    expect(screen.getByTestId("edit-key-expires-at"))
+      .toHaveValue(expiresAtInput(4102444800));
+
+    await userEvent.clear(screen.getByTestId("edit-key-name"));
+    await userEvent.type(screen.getByTestId("edit-key-name"), "renamed");
+    await userEvent.click(screen.getByTestId("edit-key-save"));
+
+    await waitFor(() =>
+      expect(puts).toEqual([
+        {
+          url: "/api/api-keys/key_1",
+          body: {
+            name: "renamed",
+            provider_binding: "",
+            allowed_ips: "10.0.0.1/32",
+            allowed_models: "glm-*",
+            expires_at: 4102444800,
+          },
+        },
+      ]),
+    );
+    // 保存成功后关闭对话框
+    await waitFor(() =>
+      expect(screen.queryByTestId("edit-key-dialog")).not.toBeInTheDocument());
+  });
+
+  it("保存失败时在对话框里显示服务端受控文案", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "PUT") {
+          return jsonResponse(
+            { error: { code: "invalid_request", message: "allowed_ips 含非法 IP/CIDR: 'nope'" } },
+            400,
+          );
+        }
+        return jsonResponse({ api_keys: [EDITABLE], total: 1, window: "today" });
+      }),
+    );
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("edit-key-key_1"));
+    await userEvent.click(screen.getByTestId("edit-key-save"));
+
+    expect(await screen.findByText(/非法 IP\/CIDR/)).toBeInTheDocument();
+    // 失败不关对话框：用户要能改完再存
+    expect(screen.getByTestId("edit-key-dialog")).toBeInTheDocument();
+  });
+
+  it("Esc 关闭编辑对话框", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({
+      api_keys: [EDITABLE], total: 1, window: "today",
+    })));
+    renderPage(<ApiKeysPage />);
+    await settle();
+
+    await userEvent.click(screen.getByTestId("edit-key-key_1"));
+    expect(screen.getByTestId("edit-key-dialog")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByTestId("edit-key-dialog")).not.toBeInTheDocument());
+  });
 });

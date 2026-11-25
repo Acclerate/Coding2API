@@ -1,30 +1,49 @@
 """请求体上限（纯 ASGI 中间件，PROPOSAL §6）。
 
-登录接口 8KB（PBKDF2 是 CPU 密集操作，超大 body 无意义），其余 16MB
-（聊天请求可能带图片 base64）。必须挂在最外层：放在内层时下游会先读完
-body，限制就失去意义。
+登录接口 8KB（PBKDF2 是 CPU 密集操作，超大 body 无意义），备份恢复 512MB
+（SQLite 快照本来就是几十到几百 MB），其余 16MB（聊天请求可能带图片 base64）。
+必须挂在最外层：放在内层时下游会先读完 body，限制就失去意义。
 """
 
 from __future__ import annotations
+
+import json
 
 # 请求体上限：登录 8KB（PBKDF2 是 CPU 密集操作，超大 body 无意义）；
 # 其余 16MB（聊天请求可能带图片 base64）。
 LOGIN_BODY_LIMIT = 8 * 1024
 DEFAULT_BODY_LIMIT = 16 * 1024 * 1024
+# 备份恢复：与 `admin_backups.MAX_UPLOAD_BYTES` 必须同值。不同值时的表现是
+# 「端点声称支持 512MB，中间件在 16MB 就 413」——大库的「恢复备份」功能
+# 静默不可用，而错误文案说的是 request body too large，与备份毫无关联。
+BACKUP_UPLOAD_LIMIT = 512 * 1024 * 1024
+
+# 按路径给上限：长的先比（登录路径本身很短，顺序无所谓，但显式排序更稳）。
+_PATH_LIMITS: tuple[tuple[str, int], ...] = (
+    ("/api/auth/login", LOGIN_BODY_LIMIT),
+    ("/api/backups/restore", BACKUP_UPLOAD_LIMIT),
+)
 
 
 def _body_limit(path: str) -> int:
     # rstrip 处理尾斜杠：/api/auth/login/ 同样按登录上限（8KB），否则会先被
     # 按 16MB 读完再 307 重定向，绕过登录限流一次
-    return LOGIN_BODY_LIMIT if path.rstrip("/") == "/api/auth/login" else DEFAULT_BODY_LIMIT
+    trimmed = path.rstrip("/")
+    for prefix, limit in _PATH_LIMITS:
+        if trimmed == prefix:
+            return limit
+    return DEFAULT_BODY_LIMIT
 
 
-async def _send_too_large(send) -> None:
+async def _send_too_large(send, size: int, limit: int) -> None:
+    # 回填实测大小与配置上限：只有「too large」时用户无法判断是哪个限制、
+    # 差多少——调大请求体或改配置都需要这两个数字。
+    message = f"request body {size} bytes exceeds limit {limit} bytes"
+    body = json.dumps({"error": {"message": message, "type": "api_error",
+                                 "code": "invalid_request", "status": 413}})
     await send({"type": "http.response.start", "status": 413,
                 "headers": [(b"content-type", b"application/json")]})
-    await send({"type": "http.response.body",
-                "body": b'{"error":{"message":"request body too large",'
-                        b'"type":"api_error","code":"invalid_request","status":413}}'})
+    await send({"type": "http.response.body", "body": body.encode()})
 
 
 class BodySizeLimitMiddleware:
@@ -48,7 +67,8 @@ class BodySizeLimitMiddleware:
             if name == b"content-length":
                 try:
                     if int(value) > limit:
-                        await _send_too_large(send)
+                        # 未读 body，回填的是声明的 content-length（与实际一致）
+                        await _send_too_large(send, int(value), limit)
                         return
                 except ValueError:
                     break
@@ -78,6 +98,7 @@ class BodySizeLimitMiddleware:
                 return                      # 丢弃下游 body
             if not replaced:
                 replaced = True
-                await _send_too_large(send)
+                # 分块请求没有 content-length，回填的是累计读到的实际字节数
+                await _send_too_large(send, received, limit)
 
         await self.app(scope, limited_receive, guarded_send)

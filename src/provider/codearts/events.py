@@ -38,6 +38,7 @@ from ...provider.base import (
     EventKind,
     UpstreamProtocolViolation,
     Usage,
+    body_text,
     business_codes,
 )
 
@@ -46,16 +47,16 @@ SNAP_ENGINE_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
 SNAP_MANAGER_PREFIX = "/snap-manager"
 STS_HOST = "https://sts.cn-north-4.myhuaweicloud.com"
 PORTAL_HOST = "https://codearts.huaweicloud.com/portal"
-BENEFIT_HOST = "https://opengw.developer.huaweicloud.com"
 # refresh_token 与 client_id 绑定：换值刷新会被 STS 拒（STS5.1806）。
 CLIENT_ID = "codearts-agent"
 
 EP_CHAT_V2 = "/api/v2/chat/completions"
 EP_CHAT = "/v1/chat/chat"
 EP_MODEL_BUILTIN = "/v1/model/builtin"
-EP_BENEFIT_CONFIG = "/api/v1/gateway/config"
-EP_BENEFIT_CLAIM = "/api/v1/benefit/claim"
-EP_TOKEN_BALANCE = "/api/v1/user/tokens/balance"
+# 积分账（内置模型计费，本渠道唯一的额度来源）：**挂在 snap 引擎根上、带
+# `snap-manager` 前缀**，与 `/v1/ops/*`（签到，不带前缀）相反；不带前缀回
+# APIG.0101（实测）。
+EP_STATISTICS_PLUGIN = "/snap-manager/v1/statistics/plugin"
 EP_LOGIN_TICKET = "/v1/login/ticket"
 EP_OAUTH_TOKENS = "/v1/oauth2/tokens"
 EP_CURRENT_USER = "/v1/current/user"
@@ -70,13 +71,33 @@ EP_OPS_CLAIM = "/v1/ops/claim"
 EP_OPS_CONFIRM = "/v1/ops/confirm"
 # delivery 查询的渠道参数（上游按渠道返回可领活动，实测固定 `IDE`）。
 OPS_CHANNEL = "IDE"
-# 「每日签到领1000 积分」的活动 ID（实测：delivery 同时返回推荐码 3 /
-# 新用户 4 / 学生认证 2 / 每日签到 1，只有这个每天可领）。
-CAMPAIGN_DAILY_CREDIT = 1
 
-# 福利模型路由头（逆向记录 §7：无此头报 InferHub.002002009.404 未注册）。
-HEADER_MAAS_TYPE = "maas_type"
-MAAS_BENEFIT = "benefit"
+# 网页控制台（portal）积分明细：`/portal/promptcenter/v1/ops/credit/*`。
+# **只认控制台会话 Cookie**（`devclouddevuibjJ_SESSION_ID` 等），AK/SK 签名
+# 打不通（实测：带签名 + XHR 头回 200 空 body）。还必须带
+# `X-Requested-With: XMLHttpRequest`，否则 portal 回 SPA 首页 HTML。
+# overview 动态列出账号参与过的活动，campaign 按 ID 分页返回逐笔积分。
+EP_CREDIT_OVERVIEW = "/promptcenter/v1/ops/credit/overview"
+EP_CREDIT_CAMPAIGN = "/promptcenter/v1/ops/credit/campaign"
+WEB_CREDIT_PAGE_SIZE = 100
+# 翻页上限：100 条/页 × 20 页 = 2000 笔，签到账号数年也用不满；防上游
+# `total` 异常导致死循环。
+MAX_WEB_CREDIT_PAGES = 20
+WEB_PORTAL_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/130.0.0.0 Safari/537.36")
+# 每日签到活动的**历史** ID。早期活动 ID 是 1（「每日签到领1000 积分」）；2026-11
+# 上游把它换成 ID 34（「每日签到领100积分」），旧常量匹配不到任何条目 →
+# `daily_credit_campaign` 恒返回 None → checkin() 回「官方签到活动未开放」并按
+# 成功封账，于是**签到任务看起来永远成功、积分却不增加**（web 端任务仍在）。
+#
+# 所以不能再按 ID 挑：上游会换 ID、也会改积分面额（1000 → 100），只有
+# `type` = `USER_LOGIN`（`extra.triggerEvent` = `user.login`）是签到活动的稳定标识。
+# ID 1 只作为极老响应的兜底保留。
+CAMPAIGN_DAILY_CREDIT_LEGACY = 1
+# 签到活动的类型标识（上游字段 `type`，与 `extra.triggerEvent` 同源）。
+CAMPAIGN_TYPE_DAILY_LOGIN = "USER_LOGIN"
+
 # 内置模型接口要求（逆向记录 §7）。
 AGENT_TYPE_PROMPT_CENTER = "PromptCenter"
 
@@ -86,13 +107,48 @@ DONE_TEXT = "[DONE]"
 
 # 该账号用不了这个模型（重试无意义）→ (账号, 模型) 负缓存。
 # `InferHub.002002009.404 model is not registered` / `InferHub.4004.200
-# benefit not found` 均来自逆向记录 §7 实测原文。
+# benefit not found` 均来自逆向记录 §7 实测原文；后者是上游「权益未领取」
+# 文案（福利链路已下线，仍保留：命中即模型确实拿不到，值得负缓存）。
 _MODEL_ABSENT_MARKERS = ("002002009", "not registered", "4004.200", "benefit not found")
 # 并发会话打满：上游点名「在途满了」（`TM.00001041`、并发），排空即恢复，
-# 走固定短冷却的 CONCURRENCY，不套 MODEL 的翻倍退避（一次打满锁 10min 太久）。
+# 走 CONCURRENCY 的 60s 首枪冷却，不套 MODEL 的翻倍退避（一次打满锁 10min 太久）。
 _CONCURRENCY_MARKERS = ("00001041", "并发")
 # 模型级限流：上游点名当前模型（TPM、429 等），配额类限流恢复慢，走 MODEL。
 _MODEL_THROTTLE_MARKERS = ("tpm", "429", "rate limit", "throttl")
+# 请求与**模型能力**不匹配（换账号没用、重试也没用）→ INVALID，跳过该上游。
+# `InferHub.001001020.406 The request model is not multimodal` 是实测原文：
+# 请求带了图片而该模型不支持多模态。这是「模型 + 请求形态」的确定性拒绝，
+# 同渠道换任何一个号都会回同一条错误，所以必须跳过**整个上游**去试真正
+# 支持图片的渠道。
+#
+# 曾归 `REQUEST`（换号重试）——那是按「请求体坏 / 渠道风控」的经验套的，对
+# 多模态错误是错的：2026-11-01 22:18–22:20 四个带图请求，每条都在 codearts
+# 的 3 条凭证上各失败一次，`MAX_ROTATE = 3` 被同一渠道吃满，请求根本没机会
+# 落到 `supports_images=True` 的 codebuddy，最终 400 收尾（4 条未救回失败）。
+# 与 `classify_status` 一致：同样的错误走 HTTP 400 时本来就走 INVALID。
+_MODEL_CAPABILITY_MARKERS = ("001001020", "not multimodal")
+# 请求参数本身不合法：`InferHub.001001005.400 The request param is invalid,
+# Please check it`（实测原文，2026-11-03 14:41 三条 codearts 凭证相继命中）。
+#
+# 必须排在下面的 `"1005" in text` 之前：`001001005` 是上游错误码前缀，子串里
+# 含 `1005`，会命中「权益耗尽」那条**子串**判据 → PLAN → 12h 账号级冷却。
+# 实测后果是三条凭证依次被判「套餐耗尽」，整条渠道（约 2.2 万剩余积分）空转
+# 12h，全部负载压到 codebuddy。语义上这条是请求侧问题：换号无用、换渠道/改
+# 请求才有用，判 INVALID（REJECT_KINDS：跳过整个上游并以 400 收尾）。
+#
+# 与 `001001020`（能力不匹配）同一手法：都用错误码前缀做前置 marker，不靠
+# 业务码数字匹配——`CODE.001001005.400` 这种「点分前缀 + 子码」形态里，任何
+# 裸子串判据都会误伤。
+_PARAM_INVALID_MARKERS = ("001001005", "param is invalid")
+# 消息角色不合法：`InferHub.001001044.400 Message role cannot empty`（实测
+# 2026-11-17 20:00–20:51 同一报文在 codearts 三条凭证上相继命中）。触发源是
+# OpenAI 的 `developer` 角色变体：上游只认 system/user/assistant/tool（v2 现已
+# 在 `prepare_body` 归一为 system，这里兜住其它形态）。
+#
+# 与 `001001005` 同属请求侧错误，判 INVALID：换号、换渠道都回同一条 400，
+# 必须跳过该上游并以 400 收尾。判 OTHER 的代价是累计 3 次 → 整条渠道冷却
+# 10min——一个坏报文就能打掉整个渠道（每次请求都会在 3 个号上各撞一次）。
+_ROLE_INVALID_MARKERS = ("001001044", "message role cannot empty")
 # HTTP 状态码侧的限流/并发标记。与流内业务码不同，这里判的是**响应体文本**：
 # 上游把并发超限放在 HTTP 400（不是 429），命中即应算可重试的限流。
 # 并发与否的区分见 _CONCURRENCY_MARKERS（先判并发，再判模型级限流）。
@@ -193,6 +249,16 @@ def parse_line(line: str, snapshot: TextSnapshot) -> list[Event]:
 
 
 def _events_from_payload(payload: dict[str, Any], snapshot: TextSnapshot) -> list[Event]:
+    events = _events_from_payload_raw(payload, snapshot)
+    model = payload.get("model")
+    if isinstance(model, str) and model:
+        for event in events:
+            event.model = model
+    return events
+
+
+def _events_from_payload_raw(payload: dict[str, Any],
+                             snapshot: TextSnapshot) -> list[Event]:
     error_code = payload.get("error_code")
     if isinstance(error_code, str) and error_code not in ("", "0"):
         # 业务错误内嵌在 HTTP 200 的流里：分类在解析时定死（单一来源）。
@@ -301,9 +367,9 @@ def _as_int(value: Any) -> int | None:
 def classify_error_code(code: str | None) -> ErrKind:
     """流内业务码（字符串）分类。
 
-    只有 `002002009.404`（模型未注册）与 `4004.200`（福利未领取）是逆向记录里
-    的实测原文，其余按语义就近映射；未识别的一律 OTHER（累计 3 次 → 10m
-    整条渠道冷却），绝不猜测成更重的死禁。
+    只有 `002002009.404`（模型未注册）与 `4004.200`（上游对应「权益未领取」，
+    福利下线前的实测原文）是逆向记录里的实测原文，其余按语义就近映射；
+    未识别的一律 OTHER（累计 3 次 → 10m 整条渠道冷却），绝不猜测成更重的死禁。
     """
     text = (code or "").strip().lower()
     if not text or text == "0":
@@ -314,6 +380,21 @@ def classify_error_code(code: str | None) -> ErrKind:
         return ErrKind.CONCURRENCY
     if any(marker in text for marker in _MODEL_THROTTLE_MARKERS):
         return ErrKind.MODEL
+    if any(marker in text for marker in _MODEL_CAPABILITY_MARKERS):
+        # 模型能力不匹配（带图请求打到非多模态模型）：换同渠道任何一个号
+        # 都会回同一条错误，必须跳过整个上游。判 REQUEST 会逐个号去撞，
+        # 3 条凭证正好吃满 max_rotate（见 _MODEL_CAPABILITY_MARKERS 注释）。
+        # 统计口径独立成 `model_capability`：处置同 INVALID（跳过上游 + 400），
+        # 但归因面板要说「这个模型不支持这次请求形态」而不是「请求写错了」。
+        return ErrKind.CAPABILITY
+    if any(marker in text for marker in _PARAM_INVALID_MARKERS):
+        # 请求参数不合法（001001005）：见 _PARAM_INVALID_MARKERS 注释。必须排在
+        # `"1005" in text` 之前，否则子串 `1005` 会把「参数无效」判成「权益耗尽」。
+        return ErrKind.INVALID
+    if any(marker in text for marker in _ROLE_INVALID_MARKERS):
+        # 消息角色不合法（001001044）：见 _ROLE_INVALID_MARKERS 注释。请求侧
+        # 问题，判 INVALID 跳过上游；判 OTHER 会累计成整渠道 10min 冷却。
+        return ErrKind.INVALID
     if "1005" in text or "quota" in text or "insufficient" in text:
         return ErrKind.PLAN
     if "apig.0301" in text or "decrypt token" in text:
@@ -331,7 +412,7 @@ def relogin_required(body: bytes) -> str:
     被消费/失配之后每次重试都是同一张废票。判错的代价是「一次偶发故障永久
     废掉一条好凭证」，所以只认 `_RELOGIN_MARKERS` 里上游点名的那几类。
     """
-    text = body.decode("utf-8", errors="replace").lower()
+    text = body_text(body)
     if any(marker in text for marker in _RELOGIN_MARKERS):
         return "刷新令牌已失效，需重新登录"
     return ""
@@ -350,6 +431,10 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
         return ErrKind.CREDIT
     if 1005 in codes:
         return ErrKind.PLAN
+    if any(m in lowered for m in _MODEL_CAPABILITY_MARKERS):
+        # 与流内 `classify_error_code` 同判据：模型能力不匹配（带图请求打到
+        # 非多模态模型）换号无用，跳过整个上游；统计记 `model_capability`。
+        return ErrKind.CAPABILITY
     if status in (400, 404) and (
            11102 in codes or any(m in lowered for m in _MODEL_ABSENT_MARKERS)):
         return ErrKind.BLOCKED
@@ -369,7 +454,7 @@ def classify_status(status: int, body: bytes = b"") -> ErrKind:
     # 限流/并发会话标记：HTTP 400 与 429 都可能承载（实测并发超限走 400 +
     # `TM.00001041`）。统一判为可重试的限流，避免 400 落进 INVALID → 换号重试
     # 也没用、且不触发冷却（与流内 classify_error_code 一致）；其中并发打满
-    # 另判 CONCURRENCY（固定短冷却），不套 MODEL 的翻倍退避。
+    # 另判 CONCURRENCY（60s 首枪、同链升级），不套 MODEL 的翻倍退避。
     if status in (400, 429) and any(
             m in lowered for m in _STATUS_THROTTLE_MARKERS):
         if any(m in lowered for m in _CONCURRENCY_MARKERS):
@@ -394,13 +479,57 @@ CHECKIN_CLAIMED = "CLAIMED"
 CHECKIN_DONE = ("CONFIRMED", "CONSUMED")
 
 
+def campaign_type(campaign: dict[str, Any] | None) -> str:
+    """活动类型标识 → 归一后的字符串；缺失/形状不对返回空串。
+
+    优先 `type`；退化时读 `extra.triggerEvent`（`user.login` → `USER_LOGIN`）。
+    两者是上游同一件事的两个字段，实测同时出现；只认 `type` 时，一次只剩
+    `triggerEvent` 的响应会落到 `campaignId == 1` 兼容分支，报「活动未开放」
+    并按成功封账——签到从此静默失效。
+    """
+    if not isinstance(campaign, dict):
+        return ""
+    value = campaign.get("type")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    extra = campaign.get("extra")
+    if not isinstance(extra, dict):
+        return ""
+    trigger = extra.get("triggerEvent")
+    if not isinstance(trigger, str) or not trigger.strip():
+        return ""
+    # `user.login` → `USER_LOGIN`：上游两种写法指同一个活动类型。
+    return trigger.strip().replace(".", "_").upper()
+
+
+def campaign_id(campaign: dict[str, Any] | None) -> int:
+    """活动 `campaignId` → int；缺失/非 int 返回 0。
+
+    claim / confirm 的 body 必须带当轮响应里的真实 ID（上游会换：2026-11 从
+    1 换成 34）。0 表示「上游没给」，该轮必然失败而不是打着旧 ID 去打错活动。
+    """
+    if not isinstance(campaign, dict):
+        return 0
+    return _as_int(campaign.get("campaignId")) or 0
+
+
 def daily_credit_campaign(data: dict[str, Any]) -> dict[str, Any] | None:
-    """delivery 响应 → 「每日签到领1000 积分」活动条目；找不到返回 None。
+    """delivery 响应 → 每日签到活动条目；找不到返回 None。
 
     上游把活动列表包在 `data.items`（不是顶层），实测同时返回推荐码 / 新用户 /
-    学生认证 / 每日签到四条，按 `campaignId` 精确挑，不靠标题匹配——标题会改。
+    学生认证 / 每日签到四条。**不按 `campaignId` 挑**：上游会换 ID（2026-11 从
+    1 换成 34）也会改面额（1000 → 100 积分），按 ID 匹配会让签到静默失效——
+    表现为任务每天「成功」封账、官网任务仍在、积分不增加。稳定标识只有
+    `type == USER_LOGIN`（等价于 `extra.triggerEvent == user.login`）。
+
+    同类型命中多条时优先 `claimable=true`（今天还没领的那条），否则取第一条；
+    `campaignId` 1 只作为极老响应的兼容兜底（那时上游还没有 `type` 字段）。
     字段缺失或形状不对一律返回 None（上游改版不该让签到任务抛异常，调用方把
     None 归一为「活动未开放」）。
+
+    **`type` 与 `extra.triggerEvent` 等价**（均已由 `campaign_type` 归一）：
+    `type` 缺失只有 `triggerEvent` 时同样命中，否则一次字段调整就会让签到
+    静默失效（见 `campaign_type` 的注释）。
     """
     if not isinstance(data, dict):
         return None
@@ -410,11 +539,22 @@ def daily_credit_campaign(data: dict[str, Any]) -> dict[str, Any] | None:
     items = envelope.get("items")
     if not isinstance(items, list):
         return None
+    candidates: list[dict[str, Any]] = []
     for item in items:
-        if (isinstance(item, dict)
-                and _as_int(item.get("campaignId")) == CAMPAIGN_DAILY_CREDIT):
-            return item
-    return None
+        if not isinstance(item, dict):
+            continue
+        kind = campaign_type(item)
+        if (kind == CAMPAIGN_TYPE_DAILY_LOGIN
+                or (not kind
+                    and _as_int(item.get("campaignId"))
+                    == CAMPAIGN_DAILY_CREDIT_LEGACY)):
+            candidates.append(item)
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if campaign_claimable(candidate):
+            return candidate
+    return candidates[0]
 
 
 def campaign_status(campaign: dict[str, Any] | None) -> str:
@@ -448,7 +588,7 @@ def campaign_end_epoch(campaign: dict[str, Any] | None) -> int | None:
     """活动 `extra.endTime`（ISO8601 UTC）→ epoch；缺失/畸形返回 None。
 
     用于「活动已结束就别再去 claim」。返回 None 时调用方**不**按过期处理——
-    宁可多调一次上游（幂等），也不因为解析失败把每天 1000 积分白白丢掉。
+    宁可多调一次上游（幂等），也不因为解析失败把当天积分白白丢掉。
     """
     if not isinstance(campaign, dict):
         return None

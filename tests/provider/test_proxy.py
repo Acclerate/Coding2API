@@ -138,24 +138,27 @@ def _codearts_client(proxy):
     return CodeArtsClient(proxy=proxy)
 
 
-@pytest.mark.parametrize("factory,module_path,is_property", [
-    (_trae_client, "src.provider.trae.client", False),
-    (_zen_client, "src.provider.zen.client", False),
-    (_kilo_client, "src.provider.kilo.client", False),
-    (_codebuddy_client, "src.provider.codebuddy.client", True),
-    (_qoder_client, "src.provider.qoder.client", True),
-    (_codearts_client, "src.provider.codearts.client", False),
+@pytest.mark.parametrize("factory,module_path", [
+    (_trae_client, "src.provider.trae.client"),
+    (_zen_client, "src.provider.zen.client"),
+    (_kilo_client, "src.provider.kilo.client"),
+    (_codebuddy_client, "src.provider.codebuddy.client"),
+    (_qoder_client, "src.provider.qoder.client"),
+    (_codearts_client, "src.provider.codearts.client"),
 ])
-async def test_provider_client_forwards_proxy(monkeypatch, factory, module_path,
-                                              is_property):
+async def test_provider_client_forwards_proxy(monkeypatch, factory, module_path):
+    """代理按渠道转发：两条池都拿到同一个 proxy。
+
+    `build_client` 现在只在 `lazy_clients` 里调用（7 家共用一份懒建逻辑），
+    所以 patch 点在那里，`module_path` 只用来定位被测客户端类。
+    """
     import importlib
 
-    module = importlib.import_module(module_path)
-    calls = _capture_build(monkeypatch, module)
+    calls = _capture_build(monkeypatch,
+                           importlib.import_module("src.provider.lazy_clients"))
     client = factory("socks5://127.0.0.1:1080")
 
-    stream = client._stream if is_property else client._stream()
-    short = client._short if is_property else client._short()
+    stream, short = client._stream, client._short
     assert calls[0]["proxy"] == "socks5://127.0.0.1:1080"
     assert calls[1]["proxy"] == "socks5://127.0.0.1:1080"
     assert stream is not None and short is not None
@@ -274,3 +277,65 @@ def test_build_app_rejects_bad_provider_proxies(tmp_path):
     settings = _settings(data_dir=str(tmp_path), provider_proxies="nope=http://p:1")
     with pytest.raises(ValueError):
         build_app(settings)
+# ------------------------------------------------- 出口 IP 粘性（按凭证分池）
+
+
+def test_parse_proxy_pool_basic_and_dedupe():
+    from src.provider.proxy import parse_proxy_pool
+
+    assert parse_proxy_pool("") == ()
+    assert parse_proxy_pool(" ; ; ") == ()
+    assert parse_proxy_pool("http://a:1;socks5://b:2") == ("http://a:1", "socks5://b:2")
+    # 重复项按首次出现去重：池子写重了不该让某出口被抽中两次
+    assert parse_proxy_pool("http://a:1;http://a:1") == ("http://a:1",)
+
+
+@pytest.mark.parametrize("bad", ["127.0.0.1:7890", "ftp://p:1", "http:/broken"])
+def test_parse_proxy_pool_rejects_bad_scheme(bad):
+    from src.provider.proxy import parse_proxy_pool
+
+    with pytest.raises(ValueError):
+        parse_proxy_pool(bad)
+
+
+def test_pool_assignment_is_stable_and_bounded():
+    from src.provider.proxy import CredentialProxyPool
+
+    pool = CredentialProxyPool(("http://a:1", "http://b:2", "http://c:3"))
+    assert len(pool) == 3
+    first = pool.for_credential("cred_abc")
+    # 同一凭证永远同一出口（重启后仍成立，分配只依赖 sha256）
+    assert all(pool.for_credential("cred_abc") == first for _ in range(20))
+    assert first in ("http://a:1", "http://b:2", "http://c:3")
+
+
+def test_pool_empty_or_missing_credential_returns_none():
+    from src.provider.proxy import CredentialProxyPool
+
+    assert CredentialProxyPool().for_credential("cred_x") is None
+    assert not CredentialProxyPool()
+    assert CredentialProxyPool(("http://a:1",)).for_credential(None) is None
+
+
+def test_pool_distributes_across_members():
+    from src.provider.proxy import CredentialProxyPool
+
+    pool = CredentialProxyPool(("http://a:1", "http://b:2"))
+    seen = {pool.for_credential(f"cred_{i}") for i in range(50)}
+    assert seen == {"http://a:1", "http://b:2"}
+
+
+def test_set_and_get_pool():
+    from src.provider.proxy import (
+        CredentialProxyPool,
+        credential_proxy,
+        get_proxy_pool,
+        set_proxy_pool,
+    )
+
+    try:
+        set_proxy_pool(CredentialProxyPool(("http://a:1",)))
+        assert get_proxy_pool()
+        assert credential_proxy("cred_1") == "http://a:1"
+    finally:
+        set_proxy_pool(CredentialProxyPool())
