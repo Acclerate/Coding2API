@@ -297,11 +297,19 @@ set LOG_DIR=D:\privategit\github\Coding2API\logs
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 set LOG_FILE=%LOG_DIR%\coding2api_startup.log
 set PYTHONIOENCODING=utf-8
+set HOST=127.0.0.1
+set PORT=8321
 powershell -NoProfile -Command "<7 天剪裁：保留最近 7 天内最早一次会话标记及其之后的内容>"
 echo === uvicorn session start at %date% %time% === >> "%LOG_FILE%"
-powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & 'C:\Users\Administrator\.local\bin\uv.exe' run -- uvicorn src.main:build_app --factory --host 127.0.0.1 --port 8321 2>&1 | ForEach-Object { $line = [string]$_; [IO.File]::AppendAllText('%LOG_FILE%', $line + [char]13 + [char]10, [Text.UTF8Encoding]::new($false)); $line }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }"
+powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & 'C:\Users\Administrator\.local\bin\uv.exe' run -- python -m src.main 2>&1 | ForEach-Object { $line = [string]$_; [IO.File]::AppendAllText('%LOG_FILE%', $line + [char]13 + [char]10, [Text.UTF8Encoding]::new($false)); $line }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }"
 echo [%date% %time%] 服务已退出，退出码: %errorlevel%
 ```
+
+> 启动入口是 `python -m src.main`（`src.main.run`），不要用
+> `uvicorn src.main:build_app --factory`：后者绕过 `run()`，单实例锁
+> （`data/.instance.lock`）永远建不起来，且丢失 uvicorn 加固参数
+> （`proxy_headers=False` 防回环 XFF 伪造、优雅停机窗口、关重复 access log）。
+> HOST/PORT 在脚本里显式钉住（Settings 默认 8000，别依赖 `.env`）。
 
 > 注意：不要用 `| findstr ""` 之类当 tee——空搜索串会让 findstr 立即退出、
 > 打断管道，之后每条日志写入都报 `OSError: [Errno 22]`（`--- Logging error ---

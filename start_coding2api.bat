@@ -40,13 +40,26 @@ echo === uvicorn session start at %date% %time% === >> "%LOG_FILE%"
 :: Chinese reach the pipe as GBK bytes and get mangled downstream.
 set PYTHONIOENCODING=utf-8
 
+:: Pin the bind address explicitly (Settings defaults are HOST=127.0.0.1,
+:: PORT=8000; the .env file may or may not override PORT). These must match
+:: what clients/gateway configs expect: 127.0.0.1:8321.
+set HOST=127.0.0.1
+set PORT=8321
+
 :: Tee via PowerShell: decode child output as UTF-8, append each line to the
 :: log with explicit UTF-8 no-BOM (Add-Content would mojibake non-ASCII and
 :: add a BOM), then echo it back to the console. Do NOT pipe through findstr:
 :: an empty search string exits findstr instantly and breaks the pipe -- every
 :: later write fails with OSError [Errno 22] ("--- Logging error ---" spam).
 :: `exit $LASTEXITCODE` relays uvicorn's exit code back to %errorlevel%.
-powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & 'C:\Users\Administrator\.local\bin\uv.exe' run -- uvicorn src.main:build_app --factory --host 127.0.0.1 --port 8321 2>&1 | ForEach-Object { $line = [string]$_; [IO.File]::AppendAllText('%LOG_FILE%', $line + [char]13 + [char]10, [Text.UTF8Encoding]::new($false)); $line }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }"
+::
+:: Launch via `python -m src.main` (the console entry, src.main.run) instead
+:: of `uvicorn src.main:build_app --factory`: run() acquires the single-
+:: instance lock (the uvicorn CLI form bypassed it entirely, so the lock file
+:: never existed on this deployment) and applies the hardened uvicorn flags
+:: (proxy_headers=False against loopback XFF spoofing, graceful-shutdown
+:: window, access_log off -- request logging is done by the app middleware).
+powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & 'C:\Users\Administrator\.local\bin\uv.exe' run -- python -m src.main 2>&1 | ForEach-Object { $line = [string]$_; [IO.File]::AppendAllText('%LOG_FILE%', $line + [char]13 + [char]10, [Text.UTF8Encoding]::new($false)); $line }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }"
 
 :: Service exited; EXIT_CODE is uvicorn's own exit code, relayed through
 :: `exit $LASTEXITCODE` above (PowerShell itself always exits 0 otherwise).
